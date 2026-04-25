@@ -80,6 +80,19 @@
             <artifactId>assertj-core</artifactId>
             <scope>test</scope>
         </dependency>
+        <!--
+            mockwebserver — used by ThorynCliE2ETest (SSO-736) to stand in for the
+            authorization-hub and api-gateway. The real services boot heavyweight
+            dependencies (Postgres, Redis, Vault) that the CLI itself never talks to;
+            stubbing them gives us a fast, deterministic E2E that still exercises the
+            full HTTP+OAuth wire shape from `thoryn login` through `thoryn clients
+            list` and `thoryn logout`. Version is pinned to okhttp.version in the BOM.
+        -->
+        <dependency>
+            <groupId>com.squareup.okhttp3</groupId>
+            <artifactId>mockwebserver</artifactId>
+            <scope>test</scope>
+        </dependency>
     </dependencies>
 
     <build>

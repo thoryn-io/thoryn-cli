@@ -34,7 +34,15 @@ object ThorynConfig {
      * For local dev the user sets this to the secret of whatever client
      * they registered. CI uses a per-pipeline secret; production binaries
      * may bundle a release-time-injected value.
+     *
+     * Resolution order (first non-blank wins):
+     *   1. `THORYN_CLIENT_SECRET` system property — used by tests (no env-var
+     *      reflection hacks) and by `java -jar` invocations that prefer `-D`
+     *      flags over a separately-set env var.
+     *   2. `THORYN_CLIENT_SECRET` environment variable — the canonical
+     *      knob documented for end users.
      */
     fun resolveClientSecret(): String? =
-        System.getenv("THORYN_CLIENT_SECRET")?.takeIf { it.isNotBlank() }
+        System.getProperty("THORYN_CLIENT_SECRET")?.takeIf { it.isNotBlank() }
+            ?: System.getenv("THORYN_CLIENT_SECRET")?.takeIf { it.isNotBlank() }
 }
