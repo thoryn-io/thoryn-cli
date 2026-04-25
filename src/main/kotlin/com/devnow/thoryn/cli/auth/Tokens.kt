@@ -1,4 +1,4 @@
-package com.devnow.oathy.cli.auth
+package com.devnow.thoryn.cli.auth
 
 /**
  * Tokens kept on disk between CLI invocations.

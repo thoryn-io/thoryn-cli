@@ -1,4 +1,4 @@
-package com.devnow.oathy.cli.auth
+package com.devnow.thoryn.cli.auth
 
 import java.security.MessageDigest
 import java.security.SecureRandom

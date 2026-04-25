@@ -1,12 +1,12 @@
-package com.devnow.oathy.cli.cmd
+package com.devnow.thoryn.cli.cmd
 
-import com.devnow.oathy.cli.auth.FileTokenStore
-import com.devnow.oathy.cli.auth.TokenStore
+import com.devnow.thoryn.cli.auth.FileTokenStore
+import com.devnow.thoryn.cli.auth.TokenStore
 import picocli.CommandLine.Command
 import java.util.concurrent.Callable
 
 /**
- * `oathy logout` — clear the locally stored tokens.
+ * `thoryn logout` — clear the locally stored tokens.
  *
  * Hub-side revocation (RFC 7009) lands as a follow-up; for the scaffold we
  * just delete the token file. After this command the user is "signed out"

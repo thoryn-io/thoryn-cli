@@ -1,4 +1,4 @@
-package com.devnow.oathy.cli.auth
+package com.devnow.thoryn.cli.auth
 
 import tools.jackson.databind.ObjectMapper
 import tools.jackson.module.kotlin.jacksonObjectMapper
@@ -14,13 +14,13 @@ import kotlin.io.path.exists
 /**
  * Where the CLI keeps the user's tokens between invocations.
  *
- * The scaffold uses a chmod-600 file under `~/.config/oathy/tokens.json`
- * (Linux/macOS) or `%APPDATA%/oathy/tokens.json` (Windows). This is *not*
+ * The scaffold uses a chmod-600 file under `~/.config/thoryn/tokens.json`
+ * (Linux/macOS) or `%APPDATA%/thoryn/tokens.json` (Windows). This is *not*
  * the OS keychain — that lands as a follow-up using `java-keyring` or a
  * platform-specific shim. The interface here is what the keychain
  * implementation will satisfy when it does.
  *
- * Override the location with `OATHY_TOKEN_FILE=/path/to/tokens.json` —
+ * Override the location with `THORYN_TOKEN_FILE=/path/to/tokens.json` —
  * useful in CI runners where neither the home directory nor a keychain is
  * available, and for tests that don't want to scribble in the user's home.
  */
@@ -61,7 +61,7 @@ class FileTokenStore(
             Files.deleteIfExists(path)
         } catch (_: IOException) {
             // Best effort — if the file can't be removed (locked on Windows,
-            // permission issue), leave it. The next `oathy login` overwrites it.
+            // permission issue), leave it. The next `thoryn login` overwrites it.
         }
     }
 
@@ -79,7 +79,7 @@ class FileTokenStore(
     }
 
     companion object {
-        const val OVERRIDE_ENV_VAR = "OATHY_TOKEN_FILE"
+        const val OVERRIDE_ENV_VAR = "THORYN_TOKEN_FILE"
 
         fun defaultPath(): Path {
             System.getenv(OVERRIDE_ENV_VAR)?.takeIf { it.isNotBlank() }?.let { return Path(it) }
@@ -87,9 +87,9 @@ class FileTokenStore(
             val isWindows = System.getProperty("os.name", "").startsWith("Windows", ignoreCase = true)
             return if (isWindows) {
                 val appData = System.getenv("APPDATA") ?: "$home/AppData/Roaming"
-                Path("$appData/oathy/tokens.json")
+                Path("$appData/thoryn/tokens.json")
             } else {
-                Path("$home/.config/oathy/tokens.json")
+                Path("$home/.config/thoryn/tokens.json")
             }
         }
     }

@@ -1,8 +1,8 @@
-package com.devnow.oathy.cli.cmd
+package com.devnow.thoryn.cli.cmd
 
-import com.devnow.oathy.cli.auth.FileTokenStore
-import com.devnow.oathy.cli.auth.TokenStore
-import com.devnow.oathy.cli.config.OathyConfig
+import com.devnow.thoryn.cli.auth.FileTokenStore
+import com.devnow.thoryn.cli.auth.TokenStore
+import com.devnow.thoryn.cli.config.ThorynConfig
 import picocli.CommandLine.Command
 import picocli.CommandLine.Option
 import java.net.URI
@@ -13,7 +13,7 @@ import java.time.Duration
 import java.util.concurrent.Callable
 
 /**
- * `oathy clients list` — read the access token from the local store and call
+ * `thoryn clients list` — read the access token from the local store and call
  * `GET /clients` on the gateway.
  *
  * Smoke test for the full chain CLI → gateway → product-api. Returns the raw
@@ -28,8 +28,8 @@ import java.util.concurrent.Callable
 class ClientsCommand : Callable<Int> {
 
     override fun call(): Int {
-        // Top-level `oathy clients` with no subcommand — print usage and exit.
-        System.err.println("Usage: oathy clients <subcommand>")
+        // Top-level `thoryn clients` with no subcommand — print usage and exit.
+        System.err.println("Usage: thoryn clients <subcommand>")
         System.err.println("Subcommands: list")
         return 64
     }
@@ -44,9 +44,9 @@ class ClientsCommand : Callable<Int> {
         @Option(
             names = ["--gateway"],
             description = ["Override the gateway base URL (default: \${DEFAULT-VALUE})."],
-            defaultValue = OathyConfig.DEFAULT_GATEWAY,
+            defaultValue = ThorynConfig.DEFAULT_GATEWAY,
         )
-        var gateway: String = OathyConfig.DEFAULT_GATEWAY
+        var gateway: String = ThorynConfig.DEFAULT_GATEWAY
 
         private val tokenStore: TokenStore = FileTokenStore()
         private val http: HttpClient = HttpClient.newBuilder()
@@ -56,7 +56,7 @@ class ClientsCommand : Callable<Int> {
         override fun call(): Int {
             val tokens = tokenStore.read()
             if (tokens == null) {
-                System.err.println("Not signed in. Run `oathy login` first.")
+                System.err.println("Not signed in. Run `thoryn login` first.")
                 return 1
             }
 

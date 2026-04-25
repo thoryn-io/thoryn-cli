@@ -1,8 +1,8 @@
-package com.devnow.oathy.cli
+package com.devnow.thoryn.cli
 
-import com.devnow.oathy.cli.cmd.ClientsCommand
-import com.devnow.oathy.cli.cmd.LoginCommand
-import com.devnow.oathy.cli.cmd.LogoutCommand
+import com.devnow.thoryn.cli.cmd.ClientsCommand
+import com.devnow.thoryn.cli.cmd.LoginCommand
+import com.devnow.thoryn.cli.cmd.LogoutCommand
 import picocli.CommandLine
 import picocli.CommandLine.Command
 import kotlin.system.exitProcess
@@ -15,9 +15,9 @@ import kotlin.system.exitProcess
  * OS-package distribution land in SSO-733 / SSO-734.
  */
 @Command(
-    name = "oathy",
+    name = "thoryn",
     description = ["Thoryn customer-plane CLI."],
-    version = ["oathy 0.0.1-SNAPSHOT"],
+    version = ["thoryn 0.0.1-SNAPSHOT"],
     mixinStandardHelpOptions = true,
     subcommands = [
         LoginCommand::class,
@@ -25,7 +25,7 @@ import kotlin.system.exitProcess
         ClientsCommand::class,
     ],
 )
-class OathyMain : Runnable {
+class ThorynMain : Runnable {
     override fun run() {
         // Top-level invocation with no subcommand — print usage.
         CommandLine.usage(this, System.out)
@@ -33,6 +33,6 @@ class OathyMain : Runnable {
 }
 
 fun main(args: Array<String>) {
-    val exitCode = CommandLine(OathyMain()).execute(*args)
+    val exitCode = CommandLine(ThorynMain()).execute(*args)
     exitProcess(exitCode)
 }

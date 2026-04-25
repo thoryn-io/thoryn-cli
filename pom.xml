@@ -9,9 +9,9 @@
         <relativePath>../pom.xml</relativePath>
     </parent>
     <groupId>com.devnow.oathy</groupId>
-    <artifactId>oathy-cli</artifactId>
-    <name>oathy-cli</name>
-    <description>oathy — Thoryn customer-plane CLI (SSO-731). Authorization Code + PKCE with loopback redirect (RFC 8252 §7.3); native-image build and OS-package distribution land in SSO-733 / SSO-734.</description>
+    <artifactId>thoryn-cli</artifactId>
+    <name>thoryn-cli</name>
+    <description>thoryn — Thoryn customer-plane CLI (SSO-731). Authorization Code + PKCE with loopback redirect (RFC 8252 §7.3); native-image build and OS-package distribution land in SSO-733 / SSO-734.</description>
 
     <dependencies>
         <dependency>
@@ -45,7 +45,7 @@
     </dependencies>
 
     <build>
-        <finalName>oathy</finalName>
+        <finalName>thoryn</finalName>
         <plugins>
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
@@ -60,7 +60,7 @@
                         <configuration>
                             <transformers>
                                 <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
-                                    <mainClass>com.devnow.oathy.cli.OathyMainKt</mainClass>
+                                    <mainClass>com.devnow.thoryn.cli.ThorynMainKt</mainClass>
                                 </transformer>
                             </transformers>
                             <createDependencyReducedPom>false</createDependencyReducedPom>
