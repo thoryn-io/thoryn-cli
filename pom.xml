@@ -11,7 +11,27 @@
     <groupId>com.devnow.oathy</groupId>
     <artifactId>thoryn-cli</artifactId>
     <name>thoryn-cli</name>
-    <description>thoryn — Thoryn customer-plane CLI (SSO-731). Authorization Code + PKCE with loopback redirect (RFC 8252 §7.3); native-image build and OS-package distribution land in SSO-733 / SSO-734.</description>
+    <description>thoryn — Thoryn customer-plane CLI (SSO-731). Authorization Code + PKCE with loopback redirect (RFC 8252 §7.3); native-image build under SSO-733, OS-package distribution under SSO-734.</description>
+
+    <properties>
+        <picocli.version>4.7.6</picocli.version>
+        <!--
+            org.graalvm.buildtools:native-maven-plugin — the official Oracle plugin
+            that integrates `native-image` into the Maven lifecycle. 0.10.x is the
+            current stable line at time of writing (SSO-733 / 2026-04).
+        -->
+        <native-maven-plugin.version>0.10.6</native-maven-plugin.version>
+        <exec-maven-plugin.version>3.5.0</exec-maven-plugin.version>
+        <!-- Main class — keep in sync with src/main/kotlin/.../ThorynMain.kt -->
+        <thoryn.mainClass>com.devnow.thoryn.cli.ThorynMainKt</thoryn.mainClass>
+        <!--
+            Top-level picocli @Command class. Kotlin compiles `class ThorynMain`
+            to JVM class `com.devnow.thoryn.cli.ThorynMain`; the *file* class
+            with the `main()` function is `ThorynMainKt`. The codegen tool
+            wants the `@Command`-annotated class, not the file class.
+        -->
+        <thoryn.commandClass>com.devnow.thoryn.cli.ThorynMain</thoryn.commandClass>
+    </properties>
 
     <dependencies>
         <dependency>
@@ -21,7 +41,25 @@
         <dependency>
             <groupId>info.picocli</groupId>
             <artifactId>picocli</artifactId>
-            <version>4.7.6</version>
+            <version>${picocli.version}</version>
+        </dependency>
+        <!--
+            picocli-codegen — provides
+            picocli.codegen.aot.graalvm.ReflectionConfigGenerator (and friends)
+            which we run via exec-maven-plugin to produce
+            META-INF/native-image/picocli-generated/... config files.
+
+            Standard picocli annotation-processor wiring is Java-source-only;
+            with Kotlin sources we use the standalone runner instead, which
+            reads compiled .class files. Same output, different dispatcher.
+
+            `provided` scope: only needed at build time, never at runtime.
+        -->
+        <dependency>
+            <groupId>info.picocli</groupId>
+            <artifactId>picocli-codegen</artifactId>
+            <version>${picocli.version}</version>
+            <scope>provided</scope>
         </dependency>
         <dependency>
             <groupId>tools.jackson.core</groupId>
@@ -47,6 +85,70 @@
     <build>
         <finalName>thoryn</finalName>
         <plugins>
+            <!--
+                Generate picocli native-image reflection config after compile.
+                Output goes into target/classes/META-INF/native-image/picocli-generated/
+                so it gets picked up by the shade plugin and ends up inside the
+                fat jar. native-image then picks it up automatically when it
+                scans META-INF/native-image/ during the binary build.
+            -->
+            <plugin>
+                <groupId>org.codehaus.mojo</groupId>
+                <artifactId>exec-maven-plugin</artifactId>
+                <version>${exec-maven-plugin.version}</version>
+                <executions>
+                    <execution>
+                        <id>generate-picocli-reflect-config</id>
+                        <phase>process-classes</phase>
+                        <goals>
+                            <goal>java</goal>
+                        </goals>
+                        <configuration>
+                            <mainClass>picocli.codegen.aot.graalvm.ReflectionConfigGenerator</mainClass>
+                            <classpathScope>compile</classpathScope>
+                            <includePluginDependencies>true</includePluginDependencies>
+                            <addOutputToClasspath>true</addOutputToClasspath>
+                            <addResourcesToClasspath>true</addResourcesToClasspath>
+                            <arguments>
+                                <argument>--output</argument>
+                                <argument>${project.build.outputDirectory}/META-INF/native-image/picocli-generated/${project.groupId}/${project.artifactId}/reflect-config.json</argument>
+                                <argument>${thoryn.commandClass}</argument>
+                            </arguments>
+                        </configuration>
+                    </execution>
+                    <execution>
+                        <id>generate-picocli-resource-config</id>
+                        <phase>process-classes</phase>
+                        <goals>
+                            <goal>java</goal>
+                        </goals>
+                        <configuration>
+                            <mainClass>picocli.codegen.aot.graalvm.ResourceConfigGenerator</mainClass>
+                            <classpathScope>compile</classpathScope>
+                            <includePluginDependencies>true</includePluginDependencies>
+                            <addOutputToClasspath>true</addOutputToClasspath>
+                            <addResourcesToClasspath>true</addResourcesToClasspath>
+                            <arguments>
+                                <argument>--output</argument>
+                                <argument>${project.build.outputDirectory}/META-INF/native-image/picocli-generated/${project.groupId}/${project.artifactId}/resource-config.json</argument>
+                                <argument>${thoryn.commandClass}</argument>
+                            </arguments>
+                        </configuration>
+                    </execution>
+                </executions>
+                <dependencies>
+                    <dependency>
+                        <groupId>info.picocli</groupId>
+                        <artifactId>picocli-codegen</artifactId>
+                        <version>${picocli.version}</version>
+                    </dependency>
+                    <dependency>
+                        <groupId>info.picocli</groupId>
+                        <artifactId>picocli</artifactId>
+                        <version>${picocli.version}</version>
+                    </dependency>
+                </dependencies>
+            </plugin>
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-shade-plugin</artifactId>
@@ -60,8 +162,15 @@
                         <configuration>
                             <transformers>
                                 <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
-                                    <mainClass>com.devnow.thoryn.cli.ThorynMainKt</mainClass>
+                                    <mainClass>${thoryn.mainClass}</mainClass>
                                 </transformer>
+                                <!--
+                                    Merge META-INF/services entries from all jars.
+                                    META-INF/native-image/** is preserved by default —
+                                    the shade plugin only filters MANIFEST.MF and
+                                    signature files unless explicitly told otherwise.
+                                -->
+                                <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
                             </transformers>
                             <createDependencyReducedPom>false</createDependencyReducedPom>
                         </configuration>
@@ -70,4 +179,102 @@
             </plugin>
         </plugins>
     </build>
+
+    <profiles>
+        <!--
+            Native-image profile.
+
+            Local usage:
+                ./mvnw -pl tools/cli -Pnative -DskipTests package
+
+            Requires GraalVM 21 (community or Oracle) on PATH with `native-image`
+            installed (`gu install native-image` on community builds older than 23).
+            JDK 21+ GraalVM bundles native-image by default.
+
+            CI usage: the .github/workflows/cli-native.yml matrix runs this on
+            macOS arm64, macOS x64, Linux x64, and Windows x64. Per-OS sub-profiles
+            below tweak `-march` since macOS arm64 does not support the
+            `compatibility` value.
+
+            Output: tools/cli/target/thoryn (or thoryn.exe on Windows).
+        -->
+        <profile>
+            <id>native</id>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.graalvm.buildtools</groupId>
+                        <artifactId>native-maven-plugin</artifactId>
+                        <version>${native-maven-plugin.version}</version>
+                        <extensions>true</extensions>
+                        <executions>
+                            <execution>
+                                <id>build-native</id>
+                                <phase>package</phase>
+                                <goals>
+                                    <goal>compile-no-fork</goal>
+                                </goals>
+                            </execution>
+                        </executions>
+                        <configuration>
+                            <imageName>thoryn</imageName>
+                            <mainClass>${thoryn.mainClass}</mainClass>
+                            <fallback>false</fallback>
+                            <verbose>false</verbose>
+                            <buildArgs>
+                                <buildArg>--no-fallback</buildArg>
+                                <buildArg>-O2</buildArg>
+                                <!--
+                                    Reflection metadata is generated by picocli's
+                                    ReflectionConfigGenerator into
+                                    META-INF/native-image/picocli-generated/...
+                                    and discovered by native-image automatically.
+                                -->
+                                <buildArg>-H:+ReportExceptionStackTraces</buildArg>
+                            </buildArgs>
+                        </configuration>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+
+        <!--
+            x86_64 (macOS x64, Linux x64, Windows x64): build a portable binary
+            that runs on older CPUs via `-march=compatibility`. Slight perf cost;
+            large portability win for downloadable distribution.
+
+            The activator matches both the Linux/Windows `amd64` and macOS `x86_64`
+            os.arch values via two profiles, since Maven's <os><arch> activation
+            only matches one literal value.
+        -->
+        <profile>
+            <id>native-march-amd64</id>
+            <activation>
+                <property>
+                    <name>native-march</name>
+                    <value>compatibility</value>
+                </property>
+            </activation>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.graalvm.buildtools</groupId>
+                        <artifactId>native-maven-plugin</artifactId>
+                        <version>${native-maven-plugin.version}</version>
+                        <configuration>
+                            <buildArgs combine.children="append">
+                                <buildArg>-march=compatibility</buildArg>
+                            </buildArgs>
+                        </configuration>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+        <!--
+            arm64 (macOS arm64, Linux arm64): GraalVM does not support
+            `-march=compatibility` here, so we leave it at the default.
+            No additional buildArgs needed — the base `native` profile is enough.
+            Activated implicitly by NOT passing -Dnative-march=compatibility.
+        -->
+    </profiles>
 </project>
