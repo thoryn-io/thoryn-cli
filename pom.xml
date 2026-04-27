@@ -14,7 +14,7 @@
     <description>thoryn — Thoryn customer-plane CLI (SSO-731). Authorization Code + PKCE with loopback redirect (RFC 8252 §7.3); native-image build under SSO-733, OS-package distribution under SSO-734.</description>
 
     <properties>
-        <picocli.version>4.7.6</picocli.version>
+        <picocli.version>4.7.7</picocli.version>
         <!--
             org.graalvm.buildtools:native-maven-plugin — the official Oracle plugin
             that integrates `native-image` into the Maven lifecycle. 0.10.x is the
