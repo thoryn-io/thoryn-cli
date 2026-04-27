@@ -1,7 +1,7 @@
 package com.devnow.thoryn.cli.cmd
 
-import com.devnow.thoryn.cli.auth.FileTokenStore
 import com.devnow.thoryn.cli.auth.TokenStore
+import com.devnow.thoryn.cli.auth.TokenStoreFactory
 import com.devnow.thoryn.cli.config.ThorynConfig
 import picocli.CommandLine.Command
 import picocli.CommandLine.Option
@@ -48,7 +48,7 @@ class ClientsCommand : Callable<Int> {
         )
         var gateway: String = ThorynConfig.DEFAULT_GATEWAY
 
-        private val tokenStore: TokenStore = FileTokenStore()
+        private val tokenStore: TokenStore = TokenStoreFactory.default()
         private val http: HttpClient = HttpClient.newBuilder()
             .connectTimeout(Duration.ofSeconds(10))
             .build()

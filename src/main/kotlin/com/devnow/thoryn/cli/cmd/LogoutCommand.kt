@@ -1,7 +1,7 @@
 package com.devnow.thoryn.cli.cmd
 
-import com.devnow.thoryn.cli.auth.FileTokenStore
 import com.devnow.thoryn.cli.auth.TokenStore
+import com.devnow.thoryn.cli.auth.TokenStoreFactory
 import picocli.CommandLine.Command
 import java.util.concurrent.Callable
 
@@ -20,7 +20,7 @@ import java.util.concurrent.Callable
 )
 class LogoutCommand : Callable<Int> {
 
-    private val tokenStore: TokenStore = FileTokenStore()
+    private val tokenStore: TokenStore = TokenStoreFactory.default()
 
     override fun call(): Int {
         tokenStore.delete()

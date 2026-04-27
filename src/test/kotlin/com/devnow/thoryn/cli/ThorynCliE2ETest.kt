@@ -1,5 +1,6 @@
 package com.devnow.thoryn.cli
 
+import com.devnow.thoryn.cli.auth.TokenStoreFactory
 import okhttp3.mockwebserver.Dispatcher
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
@@ -96,6 +97,7 @@ class ThorynCliE2ETest {
 
     private val originalUserHome = System.getProperty("user.home")
     private val originalClientSecretProp = System.getProperty("THORYN_CLIENT_SECRET")
+    private val originalEnvSeam = TokenStoreFactory.environment
 
     @BeforeEach
     fun setUp() {
@@ -113,6 +115,16 @@ class ThorynCliE2ETest {
         // the env var, so the test can set it without reflection. The MockWebServer
         // doesn't validate Basic Auth, so any value works.
         System.setProperty("THORYN_CLIENT_SECRET", "test-secret")
+
+        // SSO-794: TokenStoreFactory now defaults to the OS keychain. Force the
+        // plaintext file store for this test by overriding the env-var seam —
+        // we still want to assert the on-disk JSON, and the test runners
+        // (especially headless Linux CI) rarely have a Secret Service daemon.
+        // The same env-var (THORYN_CI_PLAINTEXT_TOKENS=1) is what CI shell
+        // wrappers will set in production.
+        TokenStoreFactory.environment = { key ->
+            if (key == TokenStoreFactory.PLAINTEXT_OPT_IN_ENV_VAR) "1" else System.getenv(key)
+        }
     }
 
     @AfterEach
@@ -120,6 +132,7 @@ class ThorynCliE2ETest {
         hub.shutdown()
         gateway.shutdown()
         System.setProperty("user.home", originalUserHome ?: "")
+        TokenStoreFactory.environment = originalEnvSeam
         if (originalClientSecretProp == null) {
             System.clearProperty("THORYN_CLIENT_SECRET")
         } else {

@@ -16,6 +16,15 @@
     <properties>
         <picocli.version>4.7.7</picocli.version>
         <!--
+            com.github.javakeyring:java-keyring — wraps macOS Security.framework,
+            Linux Secret Service / KWallet, and Windows DPAPI behind a single Java
+            API. Used by KeychainTokenStore to store CLI tokens in the OS-native
+            credential vault per ADR 2026-04-25 §4 (SSO-794).
+
+            1.0.4 is the latest stable on Maven Central (August 2023).
+        -->
+        <java-keyring.version>1.0.4</java-keyring.version>
+        <!--
             org.graalvm.buildtools:native-maven-plugin — the official Oracle plugin
             that integrates `native-image` into the Maven lifecycle. 0.10.x is the
             current stable line at time of writing (SSO-733 / 2026-04).
@@ -68,6 +77,18 @@
         <dependency>
             <groupId>tools.jackson.module</groupId>
             <artifactId>jackson-module-kotlin</artifactId>
+        </dependency>
+        <!--
+            java-keyring — OS-keychain backend used by KeychainTokenStore.
+            macOS: Keychain (Security.framework via JNA + jkeychain).
+            Linux: Secret Service (gnome-keyring / KWallet via D-Bus).
+            Windows: Credential Manager (DPAPI via JNA).
+            See ADR 2026-04-25 §4 and SSO-794.
+        -->
+        <dependency>
+            <groupId>com.github.javakeyring</groupId>
+            <artifactId>java-keyring</artifactId>
+            <version>${java-keyring.version}</version>
         </dependency>
         <!-- Test deps -->
         <dependency>
@@ -234,6 +255,19 @@
                             <mainClass>${thoryn.mainClass}</mainClass>
                             <fallback>false</fallback>
                             <verbose>false</verbose>
+                            <!--
+                                GraalVM Reachability Metadata Repository — picks up
+                                community-maintained reflect/resource metadata for
+                                third-party libraries that don't ship their own.
+                                Notably covers `net.java.dev.jna:jna` (used by
+                                java-keyring on macOS/Windows) and `dbus-java-core`
+                                (Linux Secret Service). Project-local metadata
+                                under src/main/resources/META-INF/native-image/
+                                is layered on top per ADR 2026-04-25 §4 (SSO-794).
+                            -->
+                            <metadataRepository>
+                                <enabled>true</enabled>
+                            </metadataRepository>
                             <buildArgs>
                                 <buildArg>--no-fallback</buildArg>
                                 <buildArg>-O2</buildArg>
@@ -242,6 +276,10 @@
                                     ReflectionConfigGenerator into
                                     META-INF/native-image/picocli-generated/...
                                     and discovered by native-image automatically.
+
+                                    Token-store keychain hints (java-keyring + JNA)
+                                    live under META-INF/native-image/com.devnow.thoryn.cli/
+                                    in src/main/resources, also discovered automatically.
                                 -->
                                 <buildArg>-H:+ReportExceptionStackTraces</buildArg>
                             </buildArgs>

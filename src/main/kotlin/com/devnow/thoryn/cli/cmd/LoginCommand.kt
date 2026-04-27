@@ -2,10 +2,10 @@ package com.devnow.thoryn.cli.cmd
 
 import com.devnow.thoryn.cli.auth.DeviceCodeException
 import com.devnow.thoryn.cli.auth.DeviceCodeFlow
-import com.devnow.thoryn.cli.auth.FileTokenStore
 import com.devnow.thoryn.cli.auth.HttpSender
 import com.devnow.thoryn.cli.auth.PkceUtil
 import com.devnow.thoryn.cli.auth.TokenStore
+import com.devnow.thoryn.cli.auth.TokenStoreFactory
 import com.devnow.thoryn.cli.config.ThorynConfig
 import picocli.CommandLine.Command
 import picocli.CommandLine.Option
@@ -61,7 +61,7 @@ class LoginCommand : Callable<Int> {
     )
     var statusOnly: Boolean = false
 
-    private val tokenStore: TokenStore = FileTokenStore()
+    private val tokenStore: TokenStore = TokenStoreFactory.default()
 
     override fun call(): Int {
         if (statusOnly) {
