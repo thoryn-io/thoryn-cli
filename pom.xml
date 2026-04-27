@@ -29,7 +29,7 @@
             that integrates `native-image` into the Maven lifecycle. 0.10.x is the
             current stable line at time of writing (SSO-733 / 2026-04).
         -->
-        <native-maven-plugin.version>0.10.6</native-maven-plugin.version>
+        <native-maven-plugin.version>1.1.0</native-maven-plugin.version>
         <exec-maven-plugin.version>3.6.3</exec-maven-plugin.version>
         <!-- Main class — keep in sync with src/main/kotlin/.../ThorynMain.kt -->
         <thoryn.mainClass>com.devnow.thoryn.cli.ThorynMainKt</thoryn.mainClass>
