@@ -3,6 +3,7 @@ package com.devnow.thoryn.cli.cmd
 import com.devnow.thoryn.cli.auth.DeviceCodeException
 import com.devnow.thoryn.cli.auth.DeviceCodeFlow
 import com.devnow.thoryn.cli.auth.HttpSender
+import com.devnow.thoryn.cli.auth.LoopbackRedirectServer
 import com.devnow.thoryn.cli.auth.PkceUtil
 import com.devnow.thoryn.cli.auth.TokenStore
 import com.devnow.thoryn.cli.auth.TokenStoreFactory
@@ -115,33 +116,43 @@ class LoginCommand : Callable<Int> {
 
     private fun runLoopbackPreview(): Int {
         // Loopback flow — full HTTP server + code exchange ships alongside SSO-735.
-        // For now, print the authorize URL the browser would open so the wiring is
-        // visible end-to-end.
+        // For now, bind a real loopback listener (proves the SSO-805 RFC 8252 §7.3
+        // literal-IP behaviour end-to-end) and print the authorize URL the browser
+        // would open so the wiring is visible. The server is closed before the
+        // command exits — the actual /callback dance lives in SSO-735.
         val verifier = PkceUtil.newCodeVerifier()
         val challenge = PkceUtil.codeChallenge(verifier)
         val state = PkceUtil.newState()
-        val authorizeUrl = buildString {
-            append(issuer.trimEnd('/'))
-            append("/oauth2/authorize")
-            append("?response_type=code")
-            append("&client_id=").append(urlEncode(clientId))
-            append("&redirect_uri=").append(urlEncode("http://127.0.0.1:<random>/callback"))
-            append("&scope=").append(urlEncode(scope))
-            append("&code_challenge=").append(urlEncode(challenge))
-            append("&code_challenge_method=S256")
-            append("&state=").append(urlEncode(state))
+        val server = LoopbackRedirectServer()
+        return try {
+            server.start()
+            val redirectUri = server.redirectUri
+            val authorizeUrl = buildString {
+                append(issuer.trimEnd('/'))
+                append("/oauth2/authorize")
+                append("?response_type=code")
+                append("&client_id=").append(urlEncode(clientId))
+                append("&redirect_uri=").append(urlEncode(redirectUri))
+                append("&scope=").append(urlEncode(scope))
+                append("&code_challenge=").append(urlEncode(challenge))
+                append("&code_challenge_method=S256")
+                append("&state=").append(urlEncode(state))
+            }
+            println("Authorization URL (preview — full loopback dance lands in a follow-up):")
+            println(authorizeUrl)
+            println()
+            println("Redirect URI (RFC 8252 §7.3 literal loopback): $redirectUri")
+            println("PKCE verifier: ${verifier.take(8)}… (32 bytes random)")
+            println("PKCE challenge: $challenge")
+            println()
+            System.err.println(
+                "Loopback flow is wired but the local HTTP server / code exchange / token storage " +
+                    "lands in a focused follow-up alongside SSO-735. Use `thoryn login --device-code` for the working flow.",
+            )
+            EXIT_NOT_IMPLEMENTED
+        } finally {
+            server.close()
         }
-        println("Authorization URL (preview — full loopback dance lands in a follow-up):")
-        println(authorizeUrl)
-        println()
-        println("PKCE verifier: ${verifier.take(8)}… (32 bytes random)")
-        println("PKCE challenge: $challenge")
-        println()
-        System.err.println(
-            "Loopback flow is wired but the local HTTP server / code exchange / token storage " +
-                "lands in a focused follow-up alongside SSO-735. Use `thoryn login --device-code` for the working flow.",
-        )
-        return EXIT_NOT_IMPLEMENTED
     }
 
     private fun printStatus(): Int {
