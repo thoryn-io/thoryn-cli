@@ -194,15 +194,36 @@
                             <goal>shade</goal>
                         </goals>
                         <configuration>
+                            <!--
+                                Exclude JAR signature files from all dependency artifacts.
+                                The shade plugin merges content from multiple JARs into one
+                                fat JAR, which invalidates any existing signatures. If the
+                                .SF/.RSA/.DSA/.EC files are left in the shaded JAR the JVM's
+                                JarVerifier throws SecurityException ("Invalid signature file
+                                digest for Manifest main attributes") when it processes the
+                                fat JAR — this surfaces immediately during GraalVM
+                                native-image initialisation (phase 1/8). The fix is to strip
+                                all signature-related META-INF entries from every artifact
+                                before merging. See SSO-940b.
+                            -->
+                            <filters>
+                                <filter>
+                                    <artifact>*:*</artifact>
+                                    <excludes>
+                                        <exclude>META-INF/*.SF</exclude>
+                                        <exclude>META-INF/*.DSA</exclude>
+                                        <exclude>META-INF/*.RSA</exclude>
+                                        <exclude>META-INF/*.EC</exclude>
+                                    </excludes>
+                                </filter>
+                            </filters>
                             <transformers>
                                 <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
                                     <mainClass>${thoryn.mainClass}</mainClass>
                                 </transformer>
                                 <!--
                                     Merge META-INF/services entries from all jars.
-                                    META-INF/native-image/** is preserved by default —
-                                    the shade plugin only filters MANIFEST.MF and
-                                    signature files unless explicitly told otherwise.
+                                    META-INF/native-image/** is preserved by default.
                                 -->
                                 <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
                             </transformers>
