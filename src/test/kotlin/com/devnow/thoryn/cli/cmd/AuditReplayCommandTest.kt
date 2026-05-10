@@ -68,7 +68,75 @@ class AuditReplayCommandTest {
 
         assertThat(exitCode).isEqualTo(0)
         assertThat(out).contains("PASS")
-        assertThat(out).contains("rowId       = row-1")
+        assertThat(out).contains("rowId                    = row-1")
+    }
+
+    @Test
+    fun `queued-offline row with broker MATCH returns OFFLINE_VERIFIED_BROKER_AGREED (0)`() {
+        // SSO-952: a row whose policyVersion = walletless-offline-v1 AND
+        // brokerPostVerification = MATCH represents an offline-verified
+        // credential that the broker subsequently confirmed on flush.
+        // Distinct from PASS so a regulator can tell which audit rows
+        // came from queued evidence.
+        val signature = sign(canonicalPayload, keyPair)
+        val receipt = """
+            {
+                "rowId": "row-1",
+                "tenantId": "tenant-acme",
+                "requestId": "req-1",
+                "createdAt": "2026-05-09T12:00:00Z",
+                "policyVersion": "walletless-offline-v1",
+                "brokerPostVerification": "MATCH",
+                "envelope": {
+                    "kid": "$kid",
+                    "signature": "vault:v1:$signature",
+                    "canonicalPayload": ${jsonString(canonicalPayload)}
+                }
+            }
+        """.trimIndent()
+        val receiptFile = tempDir.resolve("receipt.json").toFile()
+        receiptFile.writeText(receipt)
+
+        val (exitCode, out, _) = run(receiptFile.absolutePath, "--jwks-url", jwksUrl)
+
+        assertThat(exitCode).isEqualTo(0)
+        assertThat(out).contains("OFFLINE_VERIFIED_BROKER_AGREED")
+        assertThat(out).doesNotContain("\nPASS\n")
+        assertThat(out).contains("policyVersion            = walletless-offline-v1")
+        assertThat(out).contains("brokerPostVerification   = MATCH")
+    }
+
+    @Test
+    fun `queued-offline row with brokerPostVerification null returns plain PASS (0)`() {
+        // SSO-952: walletless-offline-v1 but brokerPostVerification null
+        // (broker couldn't run the live re-check at flush time). This is
+        // still PASS — the device's signed evidence is intact — but the
+        // tooling does NOT promise a cross-check happened. Reflects the
+        // queued ack semantics: cross-check is "best effort", not required.
+        val signature = sign(canonicalPayload, keyPair)
+        val receipt = """
+            {
+                "rowId": "row-1",
+                "tenantId": "tenant-acme",
+                "requestId": "req-1",
+                "createdAt": "2026-05-09T12:00:00Z",
+                "policyVersion": "walletless-offline-v1",
+                "brokerPostVerification": null,
+                "envelope": {
+                    "kid": "$kid",
+                    "signature": "vault:v1:$signature",
+                    "canonicalPayload": ${jsonString(canonicalPayload)}
+                }
+            }
+        """.trimIndent()
+        val receiptFile = tempDir.resolve("receipt.json").toFile()
+        receiptFile.writeText(receipt)
+
+        val (exitCode, out, _) = run(receiptFile.absolutePath, "--jwks-url", jwksUrl)
+
+        assertThat(exitCode).isEqualTo(0)
+        assertThat(out).contains("PASS")
+        assertThat(out).doesNotContain("OFFLINE_VERIFIED_BROKER_AGREED")
     }
 
     @Test

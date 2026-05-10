@@ -30,6 +30,14 @@ import java.util.concurrent.Callable
  * - `PASS` — receipt's signature verifies against the looked-up
  *   public key over the canonical payload. The row is genuine, signed
  *   by the broker, untampered.
+ * - `OFFLINE_VERIFIED_BROKER_AGREED` (SSO-952) — same crypto as `PASS`,
+ *   but the row's `policyVersion = walletless-offline-v1` AND
+ *   `brokerPostVerification = MATCH`. This is the queued-offline path:
+ *   apps/scan verified the credential locally while disconnected, then
+ *   on reconnect the broker's live re-check agreed with the device's
+ *   outcome. Distinguishable from `PASS` so a regulator can tell which
+ *   audit rows came from queued evidence and which came from the live
+ *   online path.
  * - `INVALID_SIGNATURE` — kid found in JWKS but signature does not
  *   verify. The row was tampered (column changed) or the receipt was
  *   modified after issuance.
@@ -38,15 +46,24 @@ import java.util.concurrent.Callable
  *   Vault-down failure-open path).
  * - `MALFORMED` — receipt JSON is not the expected shape.
  *
- * **Exit codes**: `0` on PASS; `1` on INVALID_SIGNATURE; `2` on
- * UNVERIFIABLE; `3` on MALFORMED. Distinct codes so CI / scripts can
- * branch.
+ * **Exit codes**: `0` on PASS / OFFLINE_VERIFIED_BROKER_AGREED;
+ * `1` on INVALID_SIGNATURE; `2` on UNVERIFIABLE; `3` on MALFORMED.
+ * Distinct codes so CI / scripts can branch.
  *
  * **No bearer token required.** The historical JWKS endpoint is
  * public (per the audit-chain ADR's *Broker key rotation* section);
  * the receipt was already retrieved via an authenticated call, but
  * the verification step itself is bearer-free. A regulator can run
  * `thoryn audit-replay` with no Lintel credentials.
+ *
+ * **Note on queued-offline rows.** Rows produced by the apps/scan
+ * offline path are signed with the device's per-deploy ECDSA key (kid
+ * `device:<deviceKid>`), NOT with the broker's audit-log signing key.
+ * The replay tool's signature-verify step works the same regardless —
+ * the historical JWKS endpoint is expected to surface device public
+ * keys alongside the broker's, indexed by kid. (If a queued row's kid
+ * resolves to UNVERIFIABLE, the device key has been retired beyond the
+ * retention horizon — same reasoning as broker-key rotation.)
  */
 @Command(
     name = "audit-replay",
@@ -117,12 +134,26 @@ class AuditReplayCommand : Callable<Int> {
         }
 
         return if (ok) {
-            println("PASS")
-            println("  rowId       = ${receipt.rowId}")
-            println("  tenantId    = ${receipt.tenantId ?: "(none)"}")
-            println("  requestId   = ${receipt.requestId}")
-            println("  createdAt   = ${receipt.createdAt}")
-            println("  signingKid  = $kid")
+            // SSO-952: distinguish queued-offline rows from the live online
+            // path. A row whose policyVersion is walletless-offline-v1 AND
+            // whose brokerPostVerification is MATCH represents the device's
+            // offline outcome cross-checked against the broker's live
+            // re-check on flush — different evidentiary class than PASS.
+            val isQueuedOffline = receipt.policyVersion == "walletless-offline-v1" &&
+                receipt.brokerPostVerification == "MATCH"
+            val outcome = if (isQueuedOffline) "OFFLINE_VERIFIED_BROKER_AGREED" else "PASS"
+            println(outcome)
+            println("  rowId                    = ${receipt.rowId}")
+            println("  tenantId                 = ${receipt.tenantId ?: "(none)"}")
+            println("  requestId                = ${receipt.requestId}")
+            println("  createdAt                = ${receipt.createdAt}")
+            println("  signingKid               = $kid")
+            if (receipt.policyVersion != null) {
+                println("  policyVersion            = ${receipt.policyVersion}")
+            }
+            if (receipt.brokerPostVerification != null) {
+                println("  brokerPostVerification   = ${receipt.brokerPostVerification}")
+            }
             0
         } else {
             println("INVALID_SIGNATURE: kid '$kid' resolves to a public key, but the signature does not verify over the canonical payload. The row may have been tampered with after signing.")
@@ -233,6 +264,12 @@ data class AuditReceiptDto(
     val issuerKeyKids: String? = null,
     val policyVersion: String? = null,
     val retentionHorizon: String? = null,
+    /**
+     * SSO-952: post-flush re-check outcome for queued offline-mode
+     * verifications. Null on rows produced by the live online path.
+     * `MATCH` / `DISAGREE` for rows from `POST /broker/verify/walletless/queued`.
+     */
+    val brokerPostVerification: String? = null,
     val envelope: AuditReceiptEnvelopeDto? = null,
 )
 
