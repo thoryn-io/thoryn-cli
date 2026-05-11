@@ -41,6 +41,13 @@ thoryn supply-chain issuer-bridge show <bridgeId>
 thoryn supply-chain issuer-bridge credentials --bridge-id <id> ...
 thoryn supply-chain issuer-bridge revoke --bridge-id <id> --credential-id <cid> --reason "..."
 thoryn supply-chain issuer-bridge rotate-key --bridge-id <id> --step <step>
+
+thoryn supply-chain chain receive     --bridge-id <id> --parent-jws <...>   # SSO-970 — chain-of-custody
+thoryn supply-chain chain issue       --bridge-id <id> --parent <urn> --action processed_combined ...
+thoryn supply-chain chain split       --bridge-id <id> --parent <urn> --template <id> --count <N> --output-zip <file>
+thoryn supply-chain chain walk        <leaf-urn> [--depth 5]
+thoryn supply-chain chain revoke      <urn> --reason "..." [--dry-run]
+thoryn supply-chain chain descendants <urn> [--holder] [--depth 5]
 ```
 
 Every `supply-chain` leaf accepts `--output {table,json,yaml}` (default
@@ -138,7 +145,16 @@ tools/cli/
     │   │       ├── TrustRegistryCommand.kt                  # SSO-954
     │   │       ├── PolicyCommand.kt                         # SSO-955
     │   │       ├── AuditCommand.kt                          # SSO-956
-    │   │       └── IssuerBridgeCommand.kt                   # SSO-957
+    │   │       ├── IssuerBridgeCommand.kt                   # SSO-957
+    │   │       └── chain/                                   # SSO-970 chain-of-custody
+    │   │           ├── ChainCommand.kt                      # parent
+    │   │           ├── ChainTreeRenderer.kt                 # ASCII DAG tree
+    │   │           ├── ReceiveCommand.kt                    # SSO-962
+    │   │           ├── IssueCommand.kt                      # SSO-962 combine
+    │   │           ├── SplitCommand.kt                      # SSO-962 split + SSO-963
+    │   │           ├── WalkCommand.kt                       # SSO-964
+    │   │           ├── RevokeCommand.kt                     # SSO-965
+    │   │           └── DescendantsCommand.kt                # SSO-965 / SSO-967
     │   ├── config/
     │   │   └── ThorynConfig.kt                              # per-env defaults
     │   └── output/
@@ -164,5 +180,7 @@ tools/cli/
 
 * `docs/modules/ROOT/pages/cli/index.adoc` — top-level user docs
 * `docs/modules/ROOT/pages/cli/supply-chain.adoc` — SSO-959 user docs
+* `docs/modules/ROOT/pages/cli/supply-chain-chain.adoc` — SSO-970 chain-of-custody user docs
 * ADR `adrs/2026-04-25-customer-plane-product-api.md`
 * ADR `adrs/2026-05-10-supply-chain-self-service-namespacing.md`
+* ADR `adrs/2026-05-11-credential-chain-of-custody-with-fan-in-and-split.md`

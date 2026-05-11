@@ -1,5 +1,6 @@
 package com.devnow.thoryn.cli.cmd.supplychain
 
+import com.devnow.thoryn.cli.cmd.supplychain.chain.ChainCommand
 import picocli.CommandLine.Command
 import java.util.concurrent.Callable
 
@@ -14,6 +15,8 @@ import java.util.concurrent.Callable
  *  - `policy`             — SSO-955
  *  - `audit`              — SSO-956
  *  - `issuer-bridge`      — SSO-957
+ *  - `chain`              — SSO-970 (chain-of-custody: SSO-962, SSO-963,
+ *                           SSO-964, SSO-965, SSO-967)
  *
  * Authentication: re-uses the existing `thoryn login` flow. The wildcard
  * scope `all-supply-chain` expands client-side via
@@ -26,20 +29,23 @@ import java.util.concurrent.Callable
  */
 @Command(
     name = "supply-chain",
-    description = ["Manage supply-chain self-service surfaces (trust registry, policy, audit, issuer bridges)."],
+    description = ["Manage supply-chain self-service surfaces (trust registry, policy, audit, issuer bridges, chain-of-custody)."],
     mixinStandardHelpOptions = true,
     subcommands = [
         TrustRegistryCommand::class,
         PolicyCommand::class,
         AuditCommand::class,
         IssuerBridgeCommand::class,
+        ChainCommand::class,
     ],
 )
 class SupplyChainCommand : Callable<Int> {
     override fun call(): Int {
         // Top-level `thoryn supply-chain` with no subcommand — print usage.
         System.err.println("Usage: thoryn supply-chain <subcommand>")
-        System.err.println("Subcommands: trust-registry | policy | audit | issuer-bridge")
+        System.err.println(
+            "Subcommands: trust-registry | policy | audit | issuer-bridge | chain",
+        )
         return SupplyChainCommandSupport.EXIT_USAGE
     }
 }

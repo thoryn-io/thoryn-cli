@@ -68,4 +68,15 @@ class ScopeRegistryTest {
         assertThat(ScopeRegistry.SUPPLY_CHAIN_SCOPES)
             .doesNotContain("tenant:supply-chain.issuer-bridge.heartbeat-write")
     }
+
+    @Test
+    fun `intermediary read and write scopes are included in the wildcard set`() {
+        // SSO-970: the chain-of-custody CLI subcommands (`thoryn supply-chain
+        // chain ...`) require the SSO-962 intermediary scopes. Including
+        // them in `all-supply-chain` means a single `oathy login --scope
+        // all-supply-chain` covers the new commands too.
+        assertThat(ScopeRegistry.SUPPLY_CHAIN_SCOPES)
+            .contains("tenant:supply-chain.issuer-bridge.intermediary.read")
+            .contains("tenant:supply-chain.issuer-bridge.intermediary.write")
+    }
 }

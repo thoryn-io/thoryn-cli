@@ -166,6 +166,88 @@ class ProductApiClient(
         return execute(request)
     }
 
+    // ── Chain-of-custody (SSO-970 / SSO-962, SSO-964, SSO-965, SSO-967) ─────
+
+    /**
+     * `POST /api/v1/issuer-bridges/{bridgeId}/intermediary/receive` — server-side
+     * verify N parents without state change. Mirrors the console's Receive
+     * screen (SSO-962). Scope: `tenant:supply-chain.issuer-bridge.intermediary.read`.
+     *
+     * The body carries the list of parents as either compact JWS payloads or
+     * credential URNs; the product-api forwards each to
+     * `POST /broker/verify/walletless` and returns a normalised verdict per
+     * parent for the operator to acknowledge before the action screen.
+     */
+    fun intermediaryReceive(bridgeId: String, body: Map<String, Any?>): JsonNode =
+        post("/api/v1/issuer-bridges/${encode(bridgeId)}/intermediary/receive", body)
+
+    /**
+     * `POST /api/v1/issuer-bridges/{bridgeId}/intermediary/issue` — orchestrates
+     * combine and split paths through the broker's bulk-issue endpoint
+     * (SSO-962 + SSO-963). Scope: `tenant:supply-chain.issuer-bridge.intermediary.write`.
+     *
+     * The body's `action` field discriminates:
+     *  - `processed_combined` / `packaged_combined` — produces 1 child from N parents.
+     *  - `split` — produces N children from 1 parent, returned as a list with
+     *    embedded JWS + (optional) per-child QR-PDF bytes.
+     */
+    fun intermediaryIssue(bridgeId: String, body: Map<String, Any?>): JsonNode =
+        post("/api/v1/issuer-bridges/${encode(bridgeId)}/intermediary/issue", body)
+
+    /**
+     * `POST /broker/verify/walletless?walkChain=true` — chain walker (SSO-964).
+     *
+     * The body carries the leaf credential as compact JWS or URN; the broker
+     * walks `parentCredentialIds` upward and returns a tree with per-node
+     * verdict plus the lowest-common-denominator aggregate at the root. The
+     * default `walkChain=false` path is unchanged from SSO-949.
+     */
+    fun verifyWalletlessWithChain(body: Map<String, Any?>): JsonNode =
+        post("/broker/verify/walletless?walkChain=true", body)
+
+    /**
+     * `POST /broker/internal/credentials/{credentialId}/revoke` — direct revoke
+     * with automatic descendant propagation (SSO-965). Scope:
+     * `tenant:supply-chain.issuer-bridge.revoke`.
+     *
+     * Returns the source revoke audit row plus a summary of descendants
+     * flipped to `REVOKED_VIA_PARENT`.
+     */
+    fun revokeCredentialWithPropagation(credentialId: String, reason: String): JsonNode =
+        post(
+            "/broker/internal/credentials/${encode(credentialId)}/revoke",
+            mapOf("reason" to reason),
+        )
+
+    /**
+     * `GET /broker/internal/credentials/{credentialId}/descendants` — operator
+     * view of the downward DAG (SSO-965 blast-radius preview). Depth-capped
+     * server-side (depth 5 per SSO-964 conventions). Scope:
+     * `tenant:supply-chain.issuer-bridge.revoke` (this is the operator's
+     * pre-revoke "what would I break?" call).
+     */
+    fun getCredentialDescendants(credentialId: String, depth: Int? = null): JsonNode {
+        val path = "/broker/internal/credentials/${encode(credentialId)}/descendants" +
+            if (depth != null) "?depth=$depth" else ""
+        return get(path)
+    }
+
+    /**
+     * `GET /api/v1/holder/credentials/{credentialId}/descendants` — holder-portal
+     * downward view, subject to the tenant's `hideDownstreamFromProducers`
+     * privacy toggle (SSO-967). Returns either the full tree or a
+     * `{ descendants: null, reason: "tenant_privacy_policy" }` payload when
+     * the tenant has the toggle on.
+     *
+     * Scope: same as the holder portal's read filter; the CLI re-uses the
+     * standard tenant scope set.
+     */
+    fun getHolderCredentialDescendants(credentialId: String, depth: Int? = null): JsonNode {
+        val path = "/api/v1/holder/credentials/${encode(credentialId)}/descendants" +
+            if (depth != null) "?depth=$depth" else ""
+        return get(path)
+    }
+
     // ── Generic verbs ───────────────────────────────────────────────────────
 
     private fun get(path: String): JsonNode {

@@ -43,6 +43,11 @@ object ScopeRegistry {
         "tenant:supply-chain.issuer-bridge.read",
         "tenant:supply-chain.issuer-bridge.revoke",
         "tenant:supply-chain.issuer-bridge.rotate-key",
+        // SSO-962 (intermediary flow — Receive → Action → Issue). SSO-970
+        // adds these so `oathy login --scope all-supply-chain` covers the
+        // chain-of-custody CLI subcommands (`thoryn supply-chain chain ...`).
+        "tenant:supply-chain.issuer-bridge.intermediary.read",
+        "tenant:supply-chain.issuer-bridge.intermediary.write",
     )
 
     /**
