@@ -95,10 +95,19 @@ class ProductApiClient(
     /**
      * Fetch the binary PDF receipt for an audit row. Returns the raw bytes
      * so the caller can write to a file (or pipe to stdout for `> file.pdf`).
+     *
+     * SSO-968 — `includeChain=true` requests a chain-of-custody PDF: cover
+     * page + per-link pages + final "how to verify offline" page. If the
+     * server-side PDF exceeds the 20 MB cap, the response is a ZIP-of-PDFs
+     * (content-type `application/zip`); the CLI passes the raw bytes
+     * through and lets the caller inspect the magic header / file extension.
      */
-    fun getAuditLogReceiptPdf(auditRowId: String): ByteArray {
-        val request = baseRequest("/api/v1/audit-log/${encode(auditRowId)}/receipt.pdf")
-            .header("Accept", "application/pdf")
+    fun getAuditLogReceiptPdf(auditRowId: String, includeChain: Boolean = false): ByteArray {
+        val basePath = "/api/v1/audit-log/${encode(auditRowId)}/receipt.pdf"
+        val path = if (includeChain) "$basePath?includeChain=true" else basePath
+        val request = baseRequest(path)
+            // Accept both PDF and ZIP — server picks the format based on size.
+            .header("Accept", "application/pdf, application/zip")
             .GET()
             .build()
         val response = http.send(request, HttpResponse.BodyHandlers.ofByteArray())

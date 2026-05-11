@@ -115,7 +115,42 @@ class AuditCommandTest : SupplyChainCommandTestBase() {
 
         val req = gateway.takeRequest()
         assertThat(req.path).isEqualTo("/api/v1/audit-log/row-42/receipt.pdf")
-        assertThat(req.getHeader("Accept")).isEqualTo("application/pdf")
+        // SSO-968: Accept now also lists `application/zip` because the
+        // server falls back to ZIP-of-PDFs when the chain PDF exceeds the
+        // configured size cap. Single-credential receipts always come back
+        // as PDF, but the CLI advertises both.
+        assertThat(req.getHeader("Accept")).isEqualTo("application/pdf, application/zip")
+    }
+
+    @Test
+    fun `receipt --chain --pdf adds includeChain=true to the URL`() {
+        val pdfBytes = byteArrayOf(0x25, 0x50, 0x44, 0x46) + ByteArray(100)
+        gateway.enqueue(pdfResponse(pdfBytes))
+
+        val (exit, _, _) = runCli(
+            "supply-chain", "audit", "receipt", "row-42",
+            "--pdf", "--chain",
+            "--gateway", gatewayUrl(),
+        )
+
+        assertThat(exit).isEqualTo(0)
+        val req = gateway.takeRequest()
+        assertThat(req.path).isEqualTo("/api/v1/audit-log/row-42/receipt.pdf?includeChain=true")
+    }
+
+    @Test
+    fun `receipt --chain without --pdf is rejected as a usage error`() {
+        // --chain is PDF-only because chain output is a multi-page PDF (or a
+        // ZIP-of-PDFs fallback). The JSON receipt path doesn't carry chain
+        // data, so combining --chain with the default JSON output is a misuse.
+        val (exit, _, err) = runCli(
+            "supply-chain", "audit", "receipt", "row-42",
+            "--chain",
+            "--gateway", gatewayUrl(),
+        )
+
+        assertThat(exit).isEqualTo(SupplyChainCommandSupport.EXIT_USAGE)
+        assertThat(err).contains("--chain requires --pdf")
     }
 
     @Test

@@ -215,6 +215,177 @@ class AuditReplayCommandTest {
         assertThat(err).contains("MALFORMED")
     }
 
+    // ── SSO-968 chain-replay tests ──────────────────────────────────────────
+
+    @Test
+    fun `chain replay PASSes when every link signature verifies`() {
+        // Sign three canonical payloads with the same EC key and serve them
+        // via the in-process JWKS server (already running).
+        val link1Payload = """{"id":"RETAIL-203"}"""
+        val link2Payload = """{"id":"ROAST-W18"}"""
+        val link3Payload = """{"id":"PLOT-12"}"""
+        val link1Sig = "vault:v1:${sign(link1Payload, keyPair)}"
+        val link2Sig = "vault:v1:${sign(link2Payload, keyPair)}"
+        val link3Sig = "vault:v1:${sign(link3Payload, keyPair)}"
+
+        val pdf = synthesizeChainPdf(
+            mapOf(
+                link1Payload to (kid to link1Sig),
+                link2Payload to (kid to link2Sig),
+                link3Payload to (kid to link3Sig),
+            ),
+            aggregateVerdict = "VALID",
+        )
+        val pdfFile = tempDir.resolve("chain.pdf").toFile()
+        pdfFile.writeBytes(pdf)
+
+        val (exitCode, out, _) = run(pdfFile.absolutePath, "--chain", "--jwks-url", jwksUrl)
+
+        assertThat(exitCode).isEqualTo(0)
+        assertThat(out).contains("Chain: 3 links")
+        assertThat(out).contains("Signature: PASS")
+        // Aggregate from broker is `VALID`; signature replay aggregate is PASS.
+        assertThat(out).contains("Aggregate: VALID")
+        assertThat(out).contains("Signature replay: PASS")
+        assertThat(out).contains("JWKS source: $jwksUrl")
+    }
+
+    @Test
+    fun `chain replay reports INVALID_SIGNATURE when one link's signature is tampered`() {
+        val link1Payload = """{"id":"RETAIL-203"}"""
+        val link2Payload = """{"id":"ROAST-W18"}"""
+        // Sign link 1 properly, but use a stale signature for link 2.
+        val link1Sig = "vault:v1:${sign(link1Payload, keyPair)}"
+        val tamperedSig = "vault:v1:${sign("totally-different", keyPair)}"
+
+        val pdf = synthesizeChainPdf(
+            mapOf(
+                link1Payload to (kid to link1Sig),
+                link2Payload to (kid to tamperedSig),
+            ),
+            aggregateVerdict = "VALID",
+        )
+        val pdfFile = tempDir.resolve("chain.pdf").toFile()
+        pdfFile.writeBytes(pdf)
+
+        val (exitCode, out, _) = run(pdfFile.absolutePath, "--chain", "--jwks-url", jwksUrl)
+
+        assertThat(exitCode).isEqualTo(1)
+        assertThat(out).contains("INVALID_SIGNATURE")
+        assertThat(out).contains("Signature replay: FAIL")
+    }
+
+    @Test
+    fun `chain replay --jwks file works fully offline`() {
+        val link1Payload = """{"id":"RETAIL-203"}"""
+        val link1Sig = "vault:v1:${sign(link1Payload, keyPair)}"
+
+        val pdf = synthesizeChainPdf(
+            mapOf(link1Payload to (kid to link1Sig)),
+            aggregateVerdict = "VALID",
+        )
+        val pdfFile = tempDir.resolve("chain.pdf").toFile()
+        pdfFile.writeBytes(pdf)
+
+        // Dump the JWKS to a local file so the CLI can read it offline.
+        val jwksFile = tempDir.resolve("cached.jwks").toFile()
+        jwksFile.writeText(jwksJsonForKey(keyPair, kid))
+
+        // Use a deliberately-broken jwks-url to prove the file path wins.
+        val (exitCode, out, _) = run(
+            pdfFile.absolutePath,
+            "--chain",
+            "--jwks-url", "http://127.0.0.1:1/should/not/be/hit",
+            "--jwks", jwksFile.absolutePath,
+        )
+
+        assertThat(exitCode).isEqualTo(0)
+        assertThat(out).contains("Signature: PASS")
+        assertThat(out).contains("Aggregate: VALID")
+        // The JWKS source line surfaces the file path, not the URL.
+        assertThat(out).contains("JWKS source: ${jwksFile.absolutePath}")
+    }
+
+    @Test
+    fun `chain replay returns MALFORMED when PDF lacks a manifest`() {
+        // A PDF that doesn't carry the `chainManifestB64=` sentinel — e.g.
+        // a single-credential receipt or anything else.
+        val pdfFile = tempDir.resolve("chain.pdf").toFile()
+        pdfFile.writeText("%PDF-1.7\n%not a thoryn chain receipt\n")
+
+        val (exitCode, _, err) = run(pdfFile.absolutePath, "--chain", "--jwks-url", jwksUrl)
+
+        assertThat(exitCode).isEqualTo(3)
+        assertThat(err).contains("MALFORMED")
+        assertThat(err).contains("Thoryn chain manifest")
+    }
+
+    /**
+     * Builds a minimal "PDF" that carries the Thoryn chain manifest in its
+     * Keywords block. Not a syntactically rigorous PDF — the CLI's
+     * manifest extractor scans for the sentinel string anywhere in the
+     * file, so any container that embeds the base64 chunk works.
+     *
+     * The receipt-PDF builder (product-api) is the production path; this
+     * synthesizer is a test affordance so the CLI test doesn't need to
+     * import OpenPDF.
+     */
+    private fun synthesizeChainPdf(
+        linksByPayload: Map<String, Pair<String, String>>,
+        aggregateVerdict: String,
+    ): ByteArray {
+        val mapper = tools.jackson.databind.json.JsonMapper.builder()
+            .addModule(tools.jackson.module.kotlin.kotlinModule())
+            .build()
+        val links = linksByPayload.entries.mapIndexed { idx, (payload, sigKid) ->
+            mapOf(
+                "position" to (idx + 1),
+                "credentialId" to "link-${idx + 1}",
+                "verdict" to "VALID",
+                "actionType" to "test",
+                "issuerKid" to sigKid.first,
+                "issuedAt" to "2026-05-01T00:00:00Z",
+                "policyVersion" to "walletless-v1",
+                "splitEventId" to null,
+                "siblingCount" to null,
+                "canonicalPayload" to payload,
+                "signature" to sigKid.second,
+                "historicalJwksUrl" to jwksUrl,
+                "parentsTruncated" to false,
+                "remainingDepth" to null,
+            )
+        }
+        val manifest = mapOf(
+            "auditRowId" to "row-test",
+            "verdict" to aggregateVerdict,
+            "depth" to links.size,
+            "totalCredentials" to links.size,
+            "truncated" to false,
+            "historicalJwksUrl" to jwksUrl,
+            "links" to links,
+        )
+        val json = mapper.writeValueAsString(manifest)
+        val b64 = Base64.getEncoder().encodeToString(json.toByteArray(Charsets.UTF_8))
+        // Minimal PDF-shaped wrapper: starts with %PDF-, carries the sentinel
+        // somewhere inside (the CLI's parser only needs the sentinel + b64 +
+        // a terminator that's not in the base64 alphabet).
+        return ("%PDF-1.7\n/Keywords (chainManifestB64=$b64)\n%EOF\n").toByteArray(Charsets.UTF_8)
+    }
+
+    /** Produces a JWKS JSON for [keyPair] under [kid]. */
+    private fun jwksJsonForKey(keyPair: KeyPair, kid: String): String {
+        val publicKey = keyPair.public as java.security.interfaces.ECPublicKey
+        val xBytes = publicKey.w.affineX.toByteArray().let {
+            if (it.size == 33 && it[0] == 0.toByte()) it.copyOfRange(1, 33) else it
+        }.let { padTo32(it) }
+        val yBytes = publicKey.w.affineY.toByteArray().let {
+            if (it.size == 33 && it[0] == 0.toByte()) it.copyOfRange(1, 33) else it
+        }.let { padTo32(it) }
+        val xB64 = Base64.getUrlEncoder().withoutPadding().encodeToString(xBytes)
+        val yB64 = Base64.getUrlEncoder().withoutPadding().encodeToString(yBytes)
+        return """{"keys":[{"kty":"EC","crv":"P-256","kid":"$kid","alg":"ES256","x":"$xB64","y":"$yB64"}]}"""
+    }
+
     private fun receiptJson(sig: String, kid: String, payload: String): String =
         """
         {

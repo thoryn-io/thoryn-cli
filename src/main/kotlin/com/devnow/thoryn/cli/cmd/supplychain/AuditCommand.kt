@@ -206,6 +206,18 @@ class AuditCommand : Callable<Int> {
         var pdf: Boolean = false
 
         @Option(
+            names = ["--chain"],
+            description = [
+                "SSO-968: include the credential's chain-of-custody walk. Only valid " +
+                    "with --pdf. The PDF gains one section per chain link plus a final " +
+                    "'how to verify offline' page. If the produced PDF would exceed 20 MB " +
+                    "the server falls back to a ZIP-of-PDFs (one per link); the response " +
+                    "content-type indicates which format the server returned.",
+            ],
+        )
+        var chain: Boolean = false
+
+        @Option(
             names = ["-o", "--output-file"],
             description = ["Write the receipt to this file instead of stdout."],
         )
@@ -218,9 +230,17 @@ class AuditCommand : Callable<Int> {
             val tokens = SupplyChainCommandSupport.readTokens()
                 ?: return SupplyChainCommandSupport.EXIT_NOT_SIGNED_IN
             val client = SupplyChainCommandSupport.client(gateway, tokens)
+            if (chain && !pdf) {
+                System.err.println("--chain requires --pdf; chain output is PDF-only.")
+                return SupplyChainCommandSupport.EXIT_USAGE
+            }
             return try {
                 if (pdf) {
-                    val bytes = client.getAuditLogReceiptPdf(auditRowId)
+                    val bytes = if (chain) {
+                        client.getAuditLogReceiptPdf(auditRowId, includeChain = true)
+                    } else {
+                        client.getAuditLogReceiptPdf(auditRowId)
+                    }
                     val target = outputFile
                     if (target != null) {
                         Files.write(target.toPath(), bytes)
