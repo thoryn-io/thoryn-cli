@@ -4,6 +4,7 @@ import com.devnow.thoryn.cli.cmd.AuditReplayCommand
 import com.devnow.thoryn.cli.cmd.ClientsCommand
 import com.devnow.thoryn.cli.cmd.LoginCommand
 import com.devnow.thoryn.cli.cmd.LogoutCommand
+import com.devnow.thoryn.cli.cmd.supplychain.SupplyChainCommand
 import picocli.CommandLine
 import picocli.CommandLine.Command
 import kotlin.system.exitProcess
@@ -25,6 +26,7 @@ import kotlin.system.exitProcess
         LogoutCommand::class,
         ClientsCommand::class,
         AuditReplayCommand::class,
+        SupplyChainCommand::class,
     ],
 )
 class ThorynMain : Runnable {

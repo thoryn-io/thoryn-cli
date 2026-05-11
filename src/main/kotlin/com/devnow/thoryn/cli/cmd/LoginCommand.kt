@@ -5,6 +5,7 @@ import com.devnow.thoryn.cli.auth.DeviceCodeFlow
 import com.devnow.thoryn.cli.auth.HttpSender
 import com.devnow.thoryn.cli.auth.LoopbackRedirectServer
 import com.devnow.thoryn.cli.auth.PkceUtil
+import com.devnow.thoryn.cli.auth.ScopeRegistry
 import com.devnow.thoryn.cli.auth.TokenStore
 import com.devnow.thoryn.cli.auth.TokenStoreFactory
 import com.devnow.thoryn.cli.config.ThorynConfig
@@ -64,6 +65,13 @@ class LoginCommand : Callable<Int> {
 
     private val tokenStore: TokenStore = TokenStoreFactory.default()
 
+    /**
+     * SSO-959: expand `all-supply-chain` (and any other client-side
+     * wildcards) into the literal scope set the hub will see. The hub does
+     * not understand wildcards — they are a CLI ergonomic.
+     */
+    private fun expandedScope(): String = ScopeRegistry.expand(scope)
+
     override fun call(): Int {
         if (statusOnly) {
             return printStatus()
@@ -92,7 +100,7 @@ class LoginCommand : Callable<Int> {
         )
 
         return try {
-            val tokens = flow.run(scope) { authorization ->
+            val tokens = flow.run(expandedScope()) { authorization ->
                 val verifyUrl = authorization.verificationUriComplete ?: authorization.verificationUri
                 println()
                 println("To sign in, open this URL on any device:")
@@ -133,7 +141,7 @@ class LoginCommand : Callable<Int> {
                 append("?response_type=code")
                 append("&client_id=").append(urlEncode(clientId))
                 append("&redirect_uri=").append(urlEncode(redirectUri))
-                append("&scope=").append(urlEncode(scope))
+                append("&scope=").append(urlEncode(expandedScope()))
                 append("&code_challenge=").append(urlEncode(challenge))
                 append("&code_challenge_method=S256")
                 append("&state=").append(urlEncode(state))
