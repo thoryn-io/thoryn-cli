@@ -55,7 +55,7 @@ import kotlin.system.measureTimeMillis
  * public (per the audit-chain ADR's *Broker key rotation* section);
  * the receipt was already retrieved via an authenticated call, but
  * the verification step itself is bearer-free. A regulator can run
- * `thoryn audit-replay` with no Lintel credentials.
+ * `thoryn audit-replay` with no Thoryn credentials.
  *
  * **Note on queued-offline rows.** Rows produced by the apps/scan
  * offline path are signed with the device's per-deploy ECDSA key (kid
