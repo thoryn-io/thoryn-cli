@@ -3,6 +3,8 @@ package com.devnow.thoryn.cli.cmd
 import com.devnow.thoryn.cli.auth.DeviceCodeException
 import com.devnow.thoryn.cli.auth.DeviceCodeFlow
 import com.devnow.thoryn.cli.auth.HttpSender
+import com.devnow.thoryn.cli.auth.IssuerUrlValidationException
+import com.devnow.thoryn.cli.auth.IssuerUrlValidator
 import com.devnow.thoryn.cli.auth.LoopbackRedirectServer
 import com.devnow.thoryn.cli.auth.PkceUtil
 import com.devnow.thoryn.cli.auth.ScopeRegistry
@@ -63,6 +65,20 @@ class LoginCommand : Callable<Int> {
     )
     var statusOnly: Boolean = false
 
+    /**
+     * SSO-1145: bypass the `http://` non-loopback issuer-URL guard for local
+     * development scenarios where TLS is not available. A WARN is printed to
+     * stderr whenever this flag is active so the operator is aware.
+     *
+     * Never use `--dev` in a production or staging workflow — the access token
+     * will be transmitted in plaintext.
+     */
+    @Option(
+        names = ["--dev"],
+        description = ["Allow http:// issuers for non-loopback hosts (local development only). Prints a WARN."],
+    )
+    var devMode: Boolean = false
+
     private val tokenStore: TokenStore = TokenStoreFactory.default()
 
     /**
@@ -75,6 +91,13 @@ class LoginCommand : Callable<Int> {
     override fun call(): Int {
         if (statusOnly) {
             return printStatus()
+        }
+        // SSO-1145: validate the issuer URL before any network activity begins.
+        try {
+            IssuerUrlValidator.validate(issuer, devMode)
+        } catch (e: IssuerUrlValidationException) {
+            System.err.println("Error: ${e.message}")
+            return EXIT_USAGE
         }
         if (useDeviceCode) {
             return runDeviceCodeFlow()
