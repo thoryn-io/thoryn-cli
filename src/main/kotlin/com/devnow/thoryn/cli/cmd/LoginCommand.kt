@@ -1,5 +1,7 @@
 package com.devnow.thoryn.cli.cmd
 
+import com.devnow.thoryn.cli.auth.AuthorizationCodeException
+import com.devnow.thoryn.cli.auth.AuthorizationCodeFlow
 import com.devnow.thoryn.cli.auth.ClientCredentialsException
 import com.devnow.thoryn.cli.auth.ClientCredentialsFlow
 import com.devnow.thoryn.cli.auth.DeviceCodeException
@@ -8,6 +10,7 @@ import com.devnow.thoryn.cli.auth.HttpSender
 import com.devnow.thoryn.cli.auth.IssuerUrlValidationException
 import com.devnow.thoryn.cli.auth.IssuerUrlValidator
 import com.devnow.thoryn.cli.auth.LoopbackRedirectServer
+import com.devnow.thoryn.cli.auth.LoopbackTimeoutException
 import com.devnow.thoryn.cli.auth.PkceUtil
 import com.devnow.thoryn.cli.auth.ScopeRegistry
 import com.devnow.thoryn.cli.auth.TokenStore
@@ -23,8 +26,9 @@ import java.util.concurrent.Callable
 /**
  * `thoryn login` — three sign-in modes:
  *
- *  - **Authorization Code + PKCE with loopback redirect** (default) — the
- *    interactive browser flow. The full loopback dance lands alongside SSO-735.
+ *  - **Authorization Code + PKCE with loopback redirect** (default, SSO-2820) — the
+ *    interactive browser flow (RFC 8252 native app + RFC 7636 PKCE): opens the browser, captures the
+ *    redirect on a single-shot literal-loopback listener, and redeems the code for tokens.
  *  - **Device-code (RFC 8628)** via `--device-code` — interactive, but on a
  *    second device; useful on headless-but-human machines.
  *  - **Client-credentials (RFC 6749 §4.4)** via `--client-credentials`
@@ -144,7 +148,7 @@ class LoginCommand : Callable<Int> {
         if (useDeviceCode) {
             return runDeviceCodeFlow()
         }
-        return runLoopbackPreview()
+        return runLoopbackFlow()
     }
 
     /**
@@ -239,12 +243,18 @@ class LoginCommand : Callable<Int> {
         }
     }
 
-    private fun runLoopbackPreview(): Int {
-        // Loopback flow — full HTTP server + code exchange ships alongside SSO-735.
-        // For now, bind a real loopback listener (proves the SSO-805 RFC 8252 §7.3
-        // literal-IP behaviour end-to-end) and print the authorize URL the browser
-        // would open so the wiring is visible. The server is closed before the
-        // command exits — the actual /callback dance lives in SSO-735.
+    /**
+     * SSO-2820 — the default interactive sign-in: Authorization Code + PKCE (RFC 7636) with a
+     * literal-loopback redirect (RFC 8252 §7.3). Starts a single-shot local listener, opens the
+     * browser at the authorize URL, waits for the `?code=&state=` redirect, verifies `state`,
+     * redeems the code (+ PKCE verifier) at `/oauth2/token`, and stores the tokens.
+     *
+     * Public client by default (no secret — PKCE is the authorize↔token binding); if a client secret
+     * is available (`THORYN_CLIENT_SECRET` / `--client-secret-file`) the exchange authenticates the
+     * client with HTTP Basic instead. No interactive secret prompt here — a loopback sign-in is
+     * meant to be one keystroke.
+     */
+    private fun runLoopbackFlow(): Int {
         val verifier = PkceUtil.newCodeVerifier()
         val challenge = PkceUtil.codeChallenge(verifier)
         val state = PkceUtil.newState()
@@ -263,18 +273,62 @@ class LoginCommand : Callable<Int> {
                 append("&code_challenge_method=S256")
                 append("&state=").append(urlEncode(state))
             }
-            println("Authorization URL (preview — full loopback dance lands in a follow-up):")
-            println(authorizeUrl)
+
+            println("Opening your browser to sign in…")
+            println("If it doesn't open, visit this URL:")
             println()
-            println("Redirect URI (RFC 8252 §7.3 literal loopback): $redirectUri")
-            println("PKCE verifier: ${verifier.take(8)}… (32 bytes random)")
-            println("PKCE challenge: $challenge")
+            println("    $authorizeUrl")
             println()
-            System.err.println(
-                "Loopback flow is wired but the local HTTP server / code exchange / token storage " +
-                    "lands in a focused follow-up alongside SSO-735. Use `thoryn login --device-code` for the working flow.",
+            BrowserLauncher.open(authorizeUrl)
+            println("Waiting for the sign-in redirect (${LOOPBACK_TIMEOUT.toMinutes()} min)…")
+
+            val params = server.awaitCallback(LOOPBACK_TIMEOUT)
+
+            // RFC 6749 §4.1.2.1 — the AS may redirect back with an error instead of a code.
+            params["error"]?.let { err ->
+                val desc = params["error_description"].orEmpty()
+                System.err.println("Sign-in failed: $err${if (desc.isNotBlank()) " — $desc" else ""}")
+                return EXIT_LOOPBACK_FAILED
+            }
+            // RFC 6749 §10.12 — reject a callback whose state does not match the one we sent (CSRF).
+            val returnedState = params["state"]
+            if (returnedState != state) {
+                System.err.println("Sign-in failed: state mismatch — discarding the callback (possible CSRF).")
+                return EXIT_LOOPBACK_FAILED
+            }
+            val code = params["code"]
+            if (code.isNullOrBlank()) {
+                System.err.println("Sign-in failed: the authorization server returned no code.")
+                return EXIT_LOOPBACK_FAILED
+            }
+
+            // Public client by default; use the secret only if one is already available (no prompt).
+            val secret = ThorynConfig.resolveClientSecret() ?: clientSecretFile
+                ?.takeIf { it.isFile }
+                ?.readText()
+                ?.trim()
+                ?.takeIf { it.isNotBlank() }
+            val flow = AuthorizationCodeFlow(
+                issuer = issuer,
+                clientId = clientId,
+                clientSecret = secret,
+                redirectUri = redirectUri,
+                codeVerifier = verifier,
+                sender = realHttpSender(),
+                devMode = devMode,
             )
-            EXIT_NOT_IMPLEMENTED
+            val tokens = flow.exchange(code)
+            tokenStore.write(tokens)
+            println()
+            println("Signed in.")
+            tokens.scope?.let { println("Scopes: $it") }
+            EXIT_OK
+        } catch (e: LoopbackTimeoutException) {
+            System.err.println("Sign-in timed out: ${e.message}")
+            EXIT_LOOPBACK_FAILED
+        } catch (e: AuthorizationCodeException) {
+            System.err.println("Sign-in failed: ${e.message}")
+            EXIT_LOOPBACK_FAILED
         } finally {
             server.close()
         }
@@ -303,11 +357,16 @@ class LoginCommand : Callable<Int> {
 
     companion object {
         const val EXIT_OK = 0
-        const val EXIT_NOT_IMPLEMENTED = 64
         const val EXIT_USAGE = 65
         const val EXIT_DEVICE_CODE_FAILED = 70
 
         /** SSO-1553 — client-credentials grant rejected by the hub (bad secret, scope, …). */
         const val EXIT_CLIENT_CREDENTIALS_FAILED = 71
+
+        /** SSO-2820 — the interactive loopback flow failed (timeout, state mismatch, error redirect, bad code). */
+        const val EXIT_LOOPBACK_FAILED = 72
+
+        /** SSO-2820 — how long to wait for the browser sign-in redirect on the loopback listener. */
+        private val LOOPBACK_TIMEOUT: Duration = Duration.ofMinutes(5)
     }
 }
