@@ -16,12 +16,25 @@ import java.util.Locale
  * Strategy: prefer `java.awt.Desktop.browse` when supported, else fall back to the platform opener
  * (`open` on macOS, `xdg-open` on Linux/BSD, `rundll32 url.dll,FileProtocolHandler` on Windows). The
  * URL is one the CLI itself built (the hub authorize endpoint), not attacker-controlled input.
+ *
+ * Set `THORYN_NO_BROWSER` (truthy) to skip the auto-open entirely and rely on the printed URL — for
+ * SSH sessions, CI, scripting, and the CLI e2e (where Playwright, not a real browser, drives the
+ * authorize URL).
  */
 object BrowserLauncher {
 
     fun open(url: String): Boolean {
+        if (noBrowserRequested()) return false
         if (tryDesktop(url)) return true
         return tryPlatformOpener(url)
+    }
+
+    /** True when `THORYN_NO_BROWSER` (env or `-D`) is set to a truthy value (`1`/`true`/`yes`, case-insensitive). */
+    private fun noBrowserRequested(): Boolean {
+        val raw = System.getProperty("THORYN_NO_BROWSER")?.takeIf { it.isNotBlank() }
+            ?: System.getenv("THORYN_NO_BROWSER")?.takeIf { it.isNotBlank() }
+            ?: return false
+        return raw.lowercase(Locale.ROOT) in setOf("1", "true", "yes", "on")
     }
 
     private fun tryDesktop(url: String): Boolean = try {

@@ -16,7 +16,19 @@ package com.devnow.thoryn.cli.config
  */
 object ThorynConfig {
     const val DEFAULT_ISSUER = "http://localhost:54702"
-    const val DEFAULT_CLIENT_ID = "oathy-cli"
+
+    /**
+     * SSO-2821 — the default OAuth client id for `thoryn login`.
+     *
+     * MUST match the client the hub actually seeds for the CLI: `thoryn-cli` (hub migration V32),
+     * a confidential customer-plane `authorization_code` + `refresh_token` + device-code client with
+     * literal-loopback redirect URIs (`http://127.0.0.1/callback`, `http://[::1]/callback`, V136) and
+     * the `tenant:*` scope set. The former default `oathy-cli` was never seeded, so `thoryn login`
+     * failed out of the box unless the user passed `--client-id thoryn-cli`. `thoryn-cli` is
+     * confidential, so interactive/device/CI sign-in still needs the client secret via
+     * `THORYN_CLIENT_SECRET` / `--client-secret-file` (see [resolveClientSecret]).
+     */
+    const val DEFAULT_CLIENT_ID = "thoryn-cli"
     const val DEFAULT_GATEWAY = "http://localhost:8991"
 
     /** Convenience constant — pass to `--issuer` to point the CLI at the staging hub. */
