@@ -1,0 +1,208 @@
+package com.devnow.thoryn.cli.cmd
+
+import com.devnow.thoryn.cli.api.ProductApiClient
+import com.devnow.thoryn.cli.api.ProductApiException
+import com.devnow.thoryn.cli.auth.ScopeRegistry
+import com.devnow.thoryn.cli.auth.TokenStoreFactory
+import com.devnow.thoryn.cli.auth.Tokens
+import com.devnow.thoryn.cli.output.OutputFormat
+import com.devnow.thoryn.cli.output.Printers
+import tools.jackson.databind.JsonNode
+import java.io.PrintStream
+
+/**
+ * SSO-1552 — shared helpers for the tenant-configuration command tree
+ * (`clients`, `federation`, `workspace`, `audit`).
+ *
+ * Provides the shared exit-code contract and the token-resolution / output /
+ * error-rendering shape for the tenant-config command tree. (The supply-chain
+ * command tree that once had a parallel `SupplyChainCommandSupport` was pruned
+ * when the CLI was relocated to a Hub-only oauthy — SSO-2817.)
+ *
+ * Exit codes (consistent across all tenant-config subcommands):
+ *  - `0`  — success.
+ *  - `1`  — not signed in / no local token.
+ *  - `2`  — HTTP non-2xx from the gateway/hub (auth error, validation, 404, …).
+ *  - `3`  — unexpected IO/network failure.
+ *  - `64` — invalid CLI usage (unknown `--output`, missing required flag).
+ *  - `65` — a required secret could not be obtained (see [SecretIo.EXIT_NO_SECRET]).
+ */
+internal object CommandSupport {
+
+    const val EXIT_OK: Int = 0
+    const val EXIT_NOT_SIGNED_IN: Int = 1
+    const val EXIT_HTTP_ERROR: Int = 2
+    const val EXIT_IO_ERROR: Int = 3
+    const val EXIT_USAGE: Int = 64
+
+    /**
+     * SSO-2413 — shared help text for the `--confirm <workspace-slug>` option on the
+     * destructive subcommands (`clients delete`, `clients rotate-secret`,
+     * `federation delete`). Production-plane destructive actions are gated by
+     * product-api's `ProductionConfirmationInterceptor` (428 without a matching
+     * `X-Thoryn-Confirm` header); sandbox / non-production actions are not.
+     */
+    const val CONFIRM_OPTION_DESC: String =
+        "Confirm a destructive action on a PRODUCTION workspace by passing your workspace slug. " +
+            "Required only when the target workspace is a production environment; " +
+            "sandbox / non-production actions need no confirmation."
+
+    /** Resolve a [Tokens] from the local store, or print guidance and return null. */
+    fun readTokens(err: PrintStream = System.err): Tokens? {
+        val tokens = try {
+            TokenStoreFactory.default().read()
+        } catch (e: Exception) {
+            err.println("Failed to read local token store: ${e.message}")
+            return null
+        }
+        if (tokens == null) {
+            err.println("Not signed in. Run `thoryn login` first.")
+            return null
+        }
+        return tokens
+    }
+
+    /** Build a [ProductApiClient] against [baseUrl] (gateway for product-api, hub for workspace). */
+    fun client(baseUrl: String, tokens: Tokens): ProductApiClient =
+        ProductApiClient(gateway = baseUrl, tokens = tokens)
+
+    /** Parse `--output <raw>`; null on unknown values (caller returns [EXIT_USAGE]). */
+    fun parseFormat(raw: String?, err: PrintStream = System.err): OutputFormat? {
+        val parsed = OutputFormat.parse(raw)
+        if (parsed == null) {
+            err.println("Error: --output must be one of json|yaml|table (was '$raw').")
+        }
+        return parsed
+    }
+
+    /** Emit a list-shaped response; [tableHeaders]/[rowMapper] drive the table layout. */
+    fun emitList(
+        format: OutputFormat,
+        body: JsonNode,
+        tableHeaders: List<String>,
+        rowMapper: (JsonNode) -> List<Any?>,
+        out: PrintStream = System.out,
+    ) {
+        when (format) {
+            OutputFormat.JSON -> Printers.json(body, out)
+            OutputFormat.YAML -> Printers.yaml(body, out)
+            OutputFormat.TABLE -> {
+                val items: List<JsonNode> = when {
+                    body.isArray -> body.toList()
+                    body.isObject && body.has("items") && body["items"].isArray ->
+                        body["items"].toList()
+                    body.isObject -> listOf(body)
+                    else -> emptyList()
+                }
+                val rows = items.map { rowMapper(it) }
+                Printers.table(tableHeaders, rows, out)
+            }
+        }
+    }
+
+    /** Emit a single-record response; table format uses a key/value layout. */
+    fun emitRecord(
+        format: OutputFormat,
+        body: JsonNode,
+        recordFields: (JsonNode) -> List<Pair<String, Any?>>,
+        out: PrintStream = System.out,
+    ) {
+        when (format) {
+            OutputFormat.JSON -> Printers.json(body, out)
+            OutputFormat.YAML -> Printers.yaml(body, out)
+            OutputFormat.TABLE -> Printers.record(recordFields(body), out)
+        }
+    }
+
+    /** Emit an arbitrary value (a hand-built confirmation map) honouring [format]. */
+    fun emitValue(format: OutputFormat, value: Any?, tableLine: String, out: PrintStream = System.out) {
+        when (format) {
+            OutputFormat.JSON -> Printers.json(value, out)
+            OutputFormat.YAML -> Printers.yaml(value, out)
+            OutputFormat.TABLE -> out.println(tableLine)
+        }
+    }
+
+    /**
+     * SSO-2413 — actionable guidance for product-api's production destructive-action
+     * confirmation guard. `428 production_confirmation_required` means the target is a
+     * production workspace and the caller must re-run with `--confirm <slug>`;
+     * `422 production_confirmation_mismatch` means the value did not match.
+     */
+    private const val CONFIRM_REQUIRED_HINT: String =
+        "This is a production workspace. Re-run with --confirm <your-workspace-slug> " +
+            "to confirm this destructive action."
+    private const val CONFIRM_MISMATCH_HINT: String =
+        "The --confirm value did not match this workspace's slug."
+
+    /**
+     * Render a [ProductApiException]. On `insufficient_scope` (403) with a
+     * supplied [requiredScope], prints the exact `oathy login --scope …` line.
+     * On the SSO-2413 production-confirmation responses (428 / 422) prints the
+     * actionable `--confirm` guidance. Returns [EXIT_HTTP_ERROR].
+     */
+    fun renderError(
+        format: OutputFormat,
+        ex: ProductApiException,
+        requiredScope: String? = null,
+        out: PrintStream = System.out,
+        err: PrintStream = System.err,
+    ): Int {
+        // SSO-2413 — production destructive-action confirmation guard takes precedence:
+        // its guidance ("re-run with --confirm <slug>") is more actionable than the
+        // generic HTTP-error rendering.
+        if (ex.isProductionConfirmationRequired) return renderConfirmation(format, ex, CONFIRM_REQUIRED_HINT, out, err)
+        if (ex.isProductionConfirmationMismatch) return renderConfirmation(format, ex, CONFIRM_MISMATCH_HINT, out, err)
+
+        val structured = linkedMapOf<String, Any?>(
+            "error" to (ex.errorCode ?: "unknown"),
+            "errorDescription" to ex.errorDescription,
+            "httpStatus" to ex.httpStatus,
+        )
+        if (requiredScope != null && ex.isInsufficientScope) {
+            structured["requiredScope"] = requiredScope
+            structured["loginHint"] = ScopeRegistry.loginHintForScope(requiredScope)
+        }
+        when (format) {
+            OutputFormat.JSON -> Printers.json(structured, out)
+            OutputFormat.YAML -> Printers.yaml(structured, out)
+            OutputFormat.TABLE -> {
+                val description = ex.errorDescription?.let { " — $it" } ?: ""
+                err.println("Error: ${ex.errorCode ?: "HTTP ${ex.httpStatus}"}$description")
+                if (requiredScope != null && ex.isInsufficientScope) {
+                    err.println("Required scope: $requiredScope")
+                    err.println("Run: ${ScopeRegistry.loginHintForScope(requiredScope)}")
+                }
+            }
+        }
+        return EXIT_HTTP_ERROR
+    }
+
+    /**
+     * SSO-2413 — render the production-confirmation guard response. TABLE prints the
+     * actionable [hint] to stderr; JSON/YAML emit a structured error carrying the same
+     * hint so scripted callers can branch on `errorCode`. Returns [EXIT_HTTP_ERROR].
+     */
+    private fun renderConfirmation(
+        format: OutputFormat,
+        ex: ProductApiException,
+        hint: String,
+        out: PrintStream,
+        err: PrintStream,
+    ): Int {
+        when (format) {
+            OutputFormat.JSON -> Printers.json(confirmationStructured(ex, hint), out)
+            OutputFormat.YAML -> Printers.yaml(confirmationStructured(ex, hint), out)
+            OutputFormat.TABLE -> err.println(hint)
+        }
+        return EXIT_HTTP_ERROR
+    }
+
+    private fun confirmationStructured(ex: ProductApiException, hint: String): Map<String, Any?> =
+        linkedMapOf(
+            "error" to (ex.errorCode ?: "production_confirmation"),
+            "errorDescription" to ex.errorDescription,
+            "httpStatus" to ex.httpStatus,
+            "hint" to hint,
+        )
+}

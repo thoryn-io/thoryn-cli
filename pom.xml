@@ -1,0 +1,367 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns="http://maven.apache.org/POM/4.0.0"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+    <parent>
+        <groupId>com.devnow</groupId>
+        <artifactId>tools</artifactId>
+        <version>0.0.1-SNAPSHOT</version>
+        <relativePath>../pom.xml</relativePath>
+    </parent>
+    <groupId>com.devnow.oathy</groupId>
+    <artifactId>thoryn-cli</artifactId>
+    <name>thoryn-cli</name>
+    <description>thoryn — Thoryn customer-plane CLI (SSO-731). Authorization Code + PKCE with loopback redirect (RFC 8252 §7.3); native-image build under SSO-733, OS-package distribution under SSO-734.</description>
+
+    <properties>
+        <picocli.version>4.7.7</picocli.version>
+        <!--
+            com.github.javakeyring:java-keyring — wraps macOS Security.framework,
+            Linux Secret Service / KWallet, and Windows DPAPI behind a single Java
+            API. Used by KeychainTokenStore to store CLI tokens in the OS-native
+            credential vault per ADR 2026-04-25 §4 (SSO-794).
+
+            1.0.4 is the latest stable on Maven Central (August 2023).
+        -->
+        <java-keyring.version>1.0.4</java-keyring.version>
+        <!--
+            org.graalvm.buildtools:native-maven-plugin — the official Oracle plugin
+            that integrates `native-image` into the Maven lifecycle. 0.10.x is the
+            current stable line at time of writing (SSO-733 / 2026-04).
+        -->
+        <native-maven-plugin.version>1.1.1</native-maven-plugin.version>
+        <exec-maven-plugin.version>3.6.3</exec-maven-plugin.version>
+        <!-- Main class — keep in sync with src/main/kotlin/.../ThorynMain.kt -->
+        <thoryn.mainClass>com.devnow.thoryn.cli.ThorynMainKt</thoryn.mainClass>
+        <!--
+            Top-level picocli @Command class. Kotlin compiles `class ThorynMain`
+            to JVM class `com.devnow.thoryn.cli.ThorynMain`; the *file* class
+            with the `main()` function is `ThorynMainKt`. The codegen tool
+            wants the `@Command`-annotated class, not the file class.
+        -->
+        <thoryn.commandClass>com.devnow.thoryn.cli.ThorynMain</thoryn.commandClass>
+    </properties>
+
+    <dependencies>
+        <dependency>
+            <groupId>org.jetbrains.kotlin</groupId>
+            <artifactId>kotlin-stdlib</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>info.picocli</groupId>
+            <artifactId>picocli</artifactId>
+            <version>${picocli.version}</version>
+        </dependency>
+        <!--
+            picocli-codegen — provides
+            picocli.codegen.aot.graalvm.ReflectionConfigGenerator (and friends)
+            which we run via exec-maven-plugin to produce
+            META-INF/native-image/picocli-generated/... config files.
+
+            Standard picocli annotation-processor wiring is Java-source-only;
+            with Kotlin sources we use the standalone runner instead, which
+            reads compiled .class files. Same output, different dispatcher.
+
+            `provided` scope: only needed at build time, never at runtime.
+        -->
+        <dependency>
+            <groupId>info.picocli</groupId>
+            <artifactId>picocli-codegen</artifactId>
+            <version>${picocli.version}</version>
+            <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <groupId>tools.jackson.core</groupId>
+            <artifactId>jackson-databind</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>tools.jackson.module</groupId>
+            <artifactId>jackson-module-kotlin</artifactId>
+        </dependency>
+        <!--
+            java-keyring — OS-keychain backend used by KeychainTokenStore.
+            macOS: Keychain (Security.framework via JNA + jkeychain).
+            Linux: Secret Service (gnome-keyring / KWallet via D-Bus).
+            Windows: Credential Manager (DPAPI via JNA).
+            See ADR 2026-04-25 §4 and SSO-794.
+        -->
+        <dependency>
+            <groupId>com.github.javakeyring</groupId>
+            <artifactId>java-keyring</artifactId>
+            <version>${java-keyring.version}</version>
+        </dependency>
+        <!-- Test deps -->
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.assertj</groupId>
+            <artifactId>assertj-core</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <!--
+            mockwebserver — used by ThorynCliE2ETest (SSO-736) to stand in for the
+            authorization-hub and api-gateway. The real services boot heavyweight
+            dependencies (Postgres, Redis, Vault) that the CLI itself never talks to;
+            stubbing them gives us a fast, deterministic E2E that still exercises the
+            full HTTP+OAuth wire shape from `thoryn login` through `thoryn clients
+            list` and `thoryn logout`. Version is pinned to okhttp.version in the BOM.
+        -->
+        <dependency>
+            <groupId>com.squareup.okhttp3</groupId>
+            <artifactId>mockwebserver</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <finalName>thoryn</finalName>
+        <plugins>
+            <!-- Pin maven-surefire-plugin to a JUnit-5/Platform-aware version.
+                 thoryn-web-parent imports the spring-boot BOM (versions only) rather
+                 than inheriting spring-boot-starter-parent, so surefire is NOT managed
+                 and Maven falls back to its built-in 2.12.4 — a JUnit-3/4-only provider
+                 that silently discovers ZERO JUnit Jupiter tests ("Tests run: 0"). The
+                 CLI's tests (TrustRegistryCommandTest, ChainCommandTest, the SSO-1552
+                 tenant-config command tests, …) were therefore never actually executed
+                 by `./mvnw -pl tools/cli test`. 3.5.x auto-detects the JUnit Platform via
+                 the surefire-junit-platform provider. Same fix the BFF carries
+                 (servers/self-service-bff/pom.xml, SSO-1499). (SSO-1552.) -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <version>3.5.2</version>
+            </plugin>
+            <!--
+                Generate picocli native-image reflection config after compile.
+                Output goes into target/classes/META-INF/native-image/picocli-generated/
+                so it gets picked up by the shade plugin and ends up inside the
+                fat jar. native-image then picks it up automatically when it
+                scans META-INF/native-image/ during the binary build.
+            -->
+            <plugin>
+                <groupId>org.codehaus.mojo</groupId>
+                <artifactId>exec-maven-plugin</artifactId>
+                <version>${exec-maven-plugin.version}</version>
+                <executions>
+                    <execution>
+                        <id>generate-picocli-reflect-config</id>
+                        <phase>process-classes</phase>
+                        <goals>
+                            <goal>java</goal>
+                        </goals>
+                        <configuration>
+                            <mainClass>picocli.codegen.aot.graalvm.ReflectionConfigGenerator</mainClass>
+                            <classpathScope>compile</classpathScope>
+                            <includePluginDependencies>true</includePluginDependencies>
+                            <addOutputToClasspath>true</addOutputToClasspath>
+                            <addResourcesToClasspath>true</addResourcesToClasspath>
+                            <arguments>
+                                <argument>--output</argument>
+                                <argument>${project.build.outputDirectory}/META-INF/native-image/picocli-generated/${project.groupId}/${project.artifactId}/reflect-config.json</argument>
+                                <argument>${thoryn.commandClass}</argument>
+                            </arguments>
+                        </configuration>
+                    </execution>
+                    <execution>
+                        <id>generate-picocli-resource-config</id>
+                        <phase>process-classes</phase>
+                        <goals>
+                            <goal>java</goal>
+                        </goals>
+                        <configuration>
+                            <mainClass>picocli.codegen.aot.graalvm.ResourceConfigGenerator</mainClass>
+                            <classpathScope>compile</classpathScope>
+                            <includePluginDependencies>true</includePluginDependencies>
+                            <addOutputToClasspath>true</addOutputToClasspath>
+                            <addResourcesToClasspath>true</addResourcesToClasspath>
+                            <arguments>
+                                <argument>--output</argument>
+                                <argument>${project.build.outputDirectory}/META-INF/native-image/picocli-generated/${project.groupId}/${project.artifactId}/resource-config.json</argument>
+                                <argument>${thoryn.commandClass}</argument>
+                            </arguments>
+                        </configuration>
+                    </execution>
+                </executions>
+                <dependencies>
+                    <dependency>
+                        <groupId>info.picocli</groupId>
+                        <artifactId>picocli-codegen</artifactId>
+                        <version>${picocli.version}</version>
+                    </dependency>
+                    <dependency>
+                        <groupId>info.picocli</groupId>
+                        <artifactId>picocli</artifactId>
+                        <version>${picocli.version}</version>
+                    </dependency>
+                </dependencies>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-shade-plugin</artifactId>
+                <version>3.6.2</version>
+                <executions>
+                    <execution>
+                        <phase>package</phase>
+                        <goals>
+                            <goal>shade</goal>
+                        </goals>
+                        <configuration>
+                            <!--
+                                Exclude JAR signature files from all dependency artifacts.
+                                The shade plugin merges content from multiple JARs into one
+                                fat JAR, which invalidates any existing signatures. If the
+                                .SF/.RSA/.DSA/.EC files are left in the shaded JAR the JVM's
+                                JarVerifier throws SecurityException ("Invalid signature file
+                                digest for Manifest main attributes") when it processes the
+                                fat JAR — this surfaces immediately during GraalVM
+                                native-image initialisation (phase 1/8). The fix is to strip
+                                all signature-related META-INF entries from every artifact
+                                before merging. See SSO-940b.
+                            -->
+                            <filters>
+                                <filter>
+                                    <artifact>*:*</artifact>
+                                    <excludes>
+                                        <exclude>META-INF/*.SF</exclude>
+                                        <exclude>META-INF/*.DSA</exclude>
+                                        <exclude>META-INF/*.RSA</exclude>
+                                        <exclude>META-INF/*.EC</exclude>
+                                    </excludes>
+                                </filter>
+                            </filters>
+                            <transformers>
+                                <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
+                                    <mainClass>${thoryn.mainClass}</mainClass>
+                                </transformer>
+                                <!--
+                                    Merge META-INF/services entries from all jars.
+                                    META-INF/native-image/** is preserved by default.
+                                -->
+                                <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
+                            </transformers>
+                            <createDependencyReducedPom>false</createDependencyReducedPom>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+
+    <profiles>
+        <!--
+            Native-image profile.
+
+            Local usage:
+                ./mvnw -pl tools/cli -Pnative -DskipTests package
+
+            Requires GraalVM 21 (community or Oracle) on PATH with `native-image`
+            installed (`gu install native-image` on community builds older than 23).
+            JDK 21+ GraalVM bundles native-image by default.
+
+            CI usage: the .github/workflows/cli-native.yml matrix runs this on
+            macOS arm64, macOS x64, Linux x64, and Windows x64. Per-OS sub-profiles
+            below tweak `-march` since macOS arm64 does not support the
+            `compatibility` value.
+
+            Output: tools/cli/target/thoryn (or thoryn.exe on Windows).
+        -->
+        <profile>
+            <id>native</id>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.graalvm.buildtools</groupId>
+                        <artifactId>native-maven-plugin</artifactId>
+                        <version>${native-maven-plugin.version}</version>
+                        <extensions>true</extensions>
+                        <executions>
+                            <execution>
+                                <id>build-native</id>
+                                <phase>package</phase>
+                                <goals>
+                                    <goal>compile-no-fork</goal>
+                                </goals>
+                            </execution>
+                        </executions>
+                        <configuration>
+                            <imageName>thoryn</imageName>
+                            <mainClass>${thoryn.mainClass}</mainClass>
+                            <fallback>false</fallback>
+                            <verbose>false</verbose>
+                            <!--
+                                GraalVM Reachability Metadata Repository — picks up
+                                community-maintained reflect/resource metadata for
+                                third-party libraries that don't ship their own.
+                                Notably covers `net.java.dev.jna:jna` (used by
+                                java-keyring on macOS/Windows) and `dbus-java-core`
+                                (Linux Secret Service). Project-local metadata
+                                under src/main/resources/META-INF/native-image/
+                                is layered on top per ADR 2026-04-25 §4 (SSO-794).
+                            -->
+                            <metadataRepository>
+                                <enabled>true</enabled>
+                            </metadataRepository>
+                            <buildArgs>
+                                <buildArg>--no-fallback</buildArg>
+                                <buildArg>-O2</buildArg>
+                                <!--
+                                    Reflection metadata is generated by picocli's
+                                    ReflectionConfigGenerator into
+                                    META-INF/native-image/picocli-generated/...
+                                    and discovered by native-image automatically.
+
+                                    Token-store keychain hints (java-keyring + JNA)
+                                    live under META-INF/native-image/com.devnow.thoryn.cli/
+                                    in src/main/resources, also discovered automatically.
+                                -->
+                                <buildArg>-H:+ReportExceptionStackTraces</buildArg>
+                            </buildArgs>
+                        </configuration>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+
+        <!--
+            x86_64 (macOS x64, Linux x64, Windows x64): build a portable binary
+            that runs on older CPUs via `-march=compatibility`. Slight perf cost;
+            large portability win for downloadable distribution.
+
+            The activator matches both the Linux/Windows `amd64` and macOS `x86_64`
+            os.arch values via two profiles, since Maven's <os><arch> activation
+            only matches one literal value.
+        -->
+        <profile>
+            <id>native-march-amd64</id>
+            <activation>
+                <property>
+                    <name>native-march</name>
+                    <value>compatibility</value>
+                </property>
+            </activation>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.graalvm.buildtools</groupId>
+                        <artifactId>native-maven-plugin</artifactId>
+                        <version>${native-maven-plugin.version}</version>
+                        <configuration>
+                            <buildArgs combine.children="append">
+                                <buildArg>-march=compatibility</buildArg>
+                            </buildArgs>
+                        </configuration>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+        <!--
+            arm64 (macOS arm64, Linux arm64): GraalVM does not support
+            `-march=compatibility` here, so we leave it at the default.
+            No additional buildArgs needed — the base `native` profile is enough.
+            Activated implicitly by NOT passing -Dnative-march=compatibility.
+        -->
+    </profiles>
+</project>
