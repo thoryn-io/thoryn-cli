@@ -99,17 +99,22 @@ class WorkspaceCommandTest : CommandTestBase() {
     }
 
     @Test
-    fun `switch records the selection and prints the re-auth command`() {
+    fun `switch silently exchanges the current token for the target tenant and records the selection`() {
+        // 1) workspace-list validation call.
         server.enqueue(
             jsonResponse(
                 200,
                 """[{"tenantId":"t-1","slug":"acme","displayName":"Acme","archived":false,"loginUrl":"/x"}]""",
             ),
         )
+        // 2) SSO-2818 token-exchange response — the hub mints a target-tenant token.
+        server.enqueue(
+            jsonResponse(
+                200,
+                """{"access_token":"acme-tenant-token","token_type":"Bearer","expires_in":900,"scope":"openid tenant:applications.read"}""",
+            ),
+        )
 
-        // --hub points at the MockWebServer so the validation list-call is served
-        // locally; the derived tenant issuer is whatever WorkspaceTenantHost
-        // computes from that base URL (host prefixed with the slug).
         val expectedIssuer = WorkspaceTenantHost.tenantIssuer(baseUrl(), "acme")
         val (exit, out, _) = runCli(
             "workspace", "switch", "acme",
@@ -119,15 +124,25 @@ class WorkspaceCommandTest : CommandTestBase() {
 
         assertThat(exit).isEqualTo(0)
         val parsed = parseJson(out)
-        assertThat(parsed["selected"]).isEqualTo("acme")
+        assertThat(parsed["switched"]).isEqualTo("acme")
         assertThat(parsed["tenantHubIssuer"]).isEqualTo(expectedIssuer)
-        assertThat(parsed["reauthCommand"]).isEqualTo("thoryn login --issuer $expectedIssuer")
 
-        // The selection is persisted next to the token store (user.home is the
-        // @TempDir from CommandTestBase, so the store lands under .config/thoryn).
+        // The second request is the RFC 8693 token exchange naming the target tenant.
+        server.takeRequest() // list
+        val exchange = server.takeRequest()
+        val body = exchange.body.readUtf8()
+        assertThat(body).contains("grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Atoken-exchange")
+        assertThat(body).contains("subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token")
+        assertThat(body).contains("resource=")
+
+        // The selection is persisted next to the token store (@TempDir home).
         val workspaceFile = tempHome.resolve(".config/thoryn/workspace.json")
         assertThat(Files.exists(workspaceFile)).isTrue()
         assertThat(Files.readString(workspaceFile)).contains("acme")
+
+        // The exchanged token becomes the active bearer.
+        val tokenFile = tempHome.resolve(".config/thoryn/tokens.json")
+        assertThat(Files.readString(tokenFile)).contains("acme-tenant-token")
     }
 
     @Test

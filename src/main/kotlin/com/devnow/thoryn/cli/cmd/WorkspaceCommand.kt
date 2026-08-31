@@ -1,6 +1,10 @@
 package com.devnow.thoryn.cli.cmd
 
 import com.devnow.thoryn.cli.api.ProductApiException
+import com.devnow.thoryn.cli.auth.HttpSender
+import com.devnow.thoryn.cli.auth.TokenExchangeException
+import com.devnow.thoryn.cli.auth.TokenExchangeFlow
+import com.devnow.thoryn.cli.auth.TokenStoreFactory
 import com.devnow.thoryn.cli.config.ThorynConfig
 import com.devnow.thoryn.cli.output.OutputFormat
 import picocli.CommandLine.Command
@@ -8,6 +12,10 @@ import picocli.CommandLine.Option
 import picocli.CommandLine.Parameters
 import tools.jackson.databind.JsonNode
 import java.net.URI
+import java.net.http.HttpClient
+import java.nio.file.Files
+import java.nio.file.Path
+import java.time.Duration
 import java.util.concurrent.Callable
 
 /**
@@ -175,7 +183,7 @@ class WorkspaceCommand : Callable<Int> {
      * redirect itself (no browser session); this is the honest thin-client
      * equivalent of the console's `loginUrl` redirect.
      */
-    @Command(name = "switch", description = ["Select a workspace to operate on (prints the re-auth command)."], mixinStandardHelpOptions = true)
+    @Command(name = "switch", description = ["Switch into a workspace you belong to (silent — no browser)."], mixinStandardHelpOptions = true)
     class SwitchSubcommand : Callable<Int> {
 
         @Parameters(index = "0", description = ["Workspace slug to switch into."])
@@ -184,11 +192,25 @@ class WorkspaceCommand : Callable<Int> {
         @Option(names = ["--hub"], description = ["Override the hub base URL (default: \${DEFAULT-VALUE})."], defaultValue = ThorynConfig.DEFAULT_HUB)
         var hub: String = ThorynConfig.DEFAULT_HUB
 
+        @Option(names = ["--client-id"], description = ["OAuth client id used for the switch exchange (default: \${DEFAULT-VALUE})."], defaultValue = ThorynConfig.DEFAULT_CLIENT_ID)
+        var clientId: String = ThorynConfig.DEFAULT_CLIENT_ID
+
+        @Option(names = ["--client-secret-file"], description = ["File with the client secret for a confidential client. Public clients omit it. Falls back to THORYN_CLIENT_SECRET."])
+        var clientSecretFile: String? = null
+
         @Option(names = ["--output"])
         var outputRaw: String? = null
 
         /** Test seam: where the selected-workspace marker is persisted. */
         internal var store: SelectedWorkspaceStore = SelectedWorkspaceStore()
+
+        /** Test seam: HTTP sender for the token exchange. */
+        internal var sender: HttpSender = HttpSender { request, handler ->
+            HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build().send(request, handler)
+        }
+
+        /** Test seam: where the exchanged token is persisted (defaults to the OS-selected token store). */
+        internal var tokenWriter: (com.devnow.thoryn.cli.auth.Tokens) -> Unit = { TokenStoreFactory.default().write(it) }
 
         override fun call(): Int {
             val format = CommandSupport.parseFormat(outputRaw) ?: return CommandSupport.EXIT_USAGE
@@ -218,18 +240,44 @@ class WorkspaceCommand : Callable<Int> {
                 return CommandSupport.EXIT_IO_ERROR
             }
 
+            // SSO-2818 — silent cross-tenant switch: exchange the current token for a token in the
+            // target tenant (no browser). The hub grants it only if we're an active member of it.
+            val secret = clientSecretFile
+                ?.let { runCatching { Files.readString(Path.of(it)).trim() }.getOrNull()?.takeIf(String::isNotBlank) }
+                ?: System.getenv("THORYN_CLIENT_SECRET")?.takeIf { it.isNotBlank() }
+            val exchanged = try {
+                TokenExchangeFlow(
+                    issuer = hub,
+                    clientId = clientId,
+                    clientSecret = secret,
+                    subjectToken = tokens.accessToken,
+                    targetResource = tenantHub,
+                    sender = sender,
+                ).run()
+            } catch (ex: TokenExchangeException) {
+                System.err.println("Could not switch to '$slug': ${ex.oauthError}.")
+                if (ex.oauthError == "invalid_grant") {
+                    System.err.println("You may not be a member of '$slug', or your session expired. Run `thoryn login` and retry.")
+                } else if (ex.oauthError == "unauthorized_client") {
+                    System.err.println("Client '$clientId' is not permitted to switch workspaces (allow_token_exchange).")
+                }
+                return CommandSupport.EXIT_HTTP_ERROR
+            } catch (ex: Exception) {
+                System.err.println("Could not switch to '$slug': ${ex.message}")
+                return CommandSupport.EXIT_IO_ERROR
+            }
+
+            tokenWriter(exchanged)
             store.write(SelectedWorkspace(tenantId = tenantId, slug = slug, tenantHubIssuer = tenantHub))
 
-            val loginLine = "thoryn login --issuer $tenantHub"
             CommandSupport.emitValue(
                 format,
                 mapOf(
-                    "selected" to slug,
+                    "switched" to slug,
                     "tenantId" to tenantId,
                     "tenantHubIssuer" to tenantHub,
-                    "reauthCommand" to loginLine,
                 ),
-                "Selected workspace '$slug'. Re-authenticate to activate it:\n  $loginLine",
+                "Switched to workspace '$slug'. Subsequent commands operate on it.",
             )
             return CommandSupport.EXIT_OK
         }
