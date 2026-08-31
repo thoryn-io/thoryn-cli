@@ -27,10 +27,9 @@ import java.util.Base64
  *      - 400 `expired_token` — user took too long; fail.
  *      - 200 with tokens — success.
  *
- * The CLI authenticates as a confidential client (Basic Auth using
- * `client_id` + `client_secret`). True public-client support (no secret)
- * lands when the hub's `DeviceAuthorizationEndpointFilter` grows a public
- * client branch.
+ * Client authentication is confidential OR public (SSO-2822): with a [clientSecret] the CLI uses
+ * HTTP Basic; without one it sends only its `client_id` in the form body (RFC 8628 §3.1) — the hub's
+ * `DeviceAuthorizationEndpointFilter` accepts a public client (`thoryn-cli`) by client_id alone.
  *
  * ## Transport security (SSO-1993 / pentest SSO-849 item 5)
  *
@@ -48,7 +47,13 @@ import java.util.Base64
 class DeviceCodeFlow(
     private val issuer: String,
     private val clientId: String,
-    private val clientSecret: String,
+    /**
+     * SSO-2822 — nullable. A CONFIDENTIAL client supplies its secret (HTTP Basic on both device-code
+     * requests); a PUBLIC client (RFC 8252 native app — `thoryn-cli`) passes `null` and authenticates
+     * with just its `client_id` in the form body (RFC 8628 §3.1). The device_code itself is the
+     * security material for a public device client.
+     */
+    private val clientSecret: String?,
     private val sender: HttpSender,
     /**
      * When `true`, a non-loopback `http://` issuer is permitted (with a WARN to
@@ -94,17 +99,19 @@ class DeviceCodeFlow(
         val body = formEncode(
             buildList {
                 if (scope.isNotBlank()) add("scope" to scope)
+                // SSO-2822: public client authenticates with client_id in the body (no Basic).
+                if (clientSecret == null) add("client_id" to clientId)
             },
         )
-        val request = HttpRequest.newBuilder()
+        val builder = HttpRequest.newBuilder()
             // SSO-1993: baseIssuer was https/loopback-validated in init.
             .uri(URI.create("$baseIssuer/oauth2/device_authorization"))
             .timeout(Duration.ofSeconds(10))
             .header("Content-Type", "application/x-www-form-urlencoded")
-            .header("Authorization", basicAuth(clientId, clientSecret))
             .header("Accept", "application/json")
             .POST(HttpRequest.BodyPublishers.ofString(body))
-            .build()
+        if (clientSecret != null) builder.header("Authorization", basicAuth(clientId, clientSecret))
+        val request = builder.build()
 
         val response = sender.send(request, HttpResponse.BodyHandlers.ofString())
         if (response.statusCode() != 200) {
@@ -151,15 +158,17 @@ class DeviceCodeFlow(
                 "client_id" to clientId,
             ),
         )
-        val request = HttpRequest.newBuilder()
+        val builder = HttpRequest.newBuilder()
             // SSO-1993: baseIssuer was https/loopback-validated in init.
             .uri(URI.create("$baseIssuer/oauth2/token"))
             .timeout(Duration.ofSeconds(10))
             .header("Content-Type", "application/x-www-form-urlencoded")
-            .header("Authorization", basicAuth(clientId, clientSecret))
             .header("Accept", "application/json")
             .POST(HttpRequest.BodyPublishers.ofString(body))
-            .build()
+        // SSO-2822: confidential client authenticates with Basic; public client already carried its
+        // client_id in the form body above.
+        if (clientSecret != null) builder.header("Authorization", basicAuth(clientId, clientSecret))
+        val request = builder.build()
 
         val response = sender.send(request, HttpResponse.BodyHandlers.ofString())
         if (response.statusCode() == 200) {

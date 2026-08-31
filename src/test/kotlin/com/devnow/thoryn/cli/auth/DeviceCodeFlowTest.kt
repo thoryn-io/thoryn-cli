@@ -8,6 +8,8 @@ import java.io.IOException
 import java.net.http.HttpHeaders
 import java.net.http.HttpRequest
 import java.net.http.HttpResponse
+import java.nio.ByteBuffer
+import java.util.concurrent.Flow
 import java.util.concurrent.atomic.AtomicLong
 import javax.net.ssl.SSLSession
 import java.net.URI
@@ -242,7 +244,51 @@ class DeviceCodeFlowTest {
         }.doesNotThrowAnyException()
     }
 
+    @Test
+    fun `public client (no secret) authenticates with client_id in the body and no Basic auth`() {
+        // SSO-2822: thoryn-cli is a public native client — device-code sends client_id in the form
+        // body (RFC 8628 §3.1) on BOTH requests and NO Authorization header.
+        val requests = mutableListOf<HttpRequest>()
+        val bodies = mutableListOf<String>()
+        val queue = mutableListOf(stub(200, authorizationResponse), stub(200, tokenResponse))
+        val sender = HttpSender { req, _ ->
+            requests += req
+            bodies += req.bodyPublisher().map { readBody(it) }.orElse("")
+            if (queue.isEmpty()) throw IOException("Test ran out of scripted responses")
+            queue.removeFirst()
+        }
+
+        val flow = DeviceCodeFlow(
+            issuer = "https://hub.example.com",
+            clientId = "thoryn-cli",
+            clientSecret = null,
+            sender = sender,
+            sleeper = CountingSleeper(),
+        )
+        flow.run("openid") { /* nothing */ }
+
+        // device_authorization request
+        assertThat(requests[0].headers().firstValue("Authorization")).isEmpty()
+        assertThat(bodies[0]).contains("client_id=thoryn-cli")
+        // token poll
+        assertThat(requests[1].headers().firstValue("Authorization")).isEmpty()
+        assertThat(bodies[1]).contains("client_id=thoryn-cli")
+    }
+
     // ── helpers ────────────────────────────────────────────────────────
+
+    private fun readBody(publisher: HttpRequest.BodyPublisher): String {
+        val sb = StringBuilder()
+        publisher.subscribe(object : Flow.Subscriber<ByteBuffer> {
+            override fun onSubscribe(subscription: Flow.Subscription) = subscription.request(Long.MAX_VALUE)
+            override fun onNext(item: ByteBuffer) {
+                val bytes = ByteArray(item.remaining()); item.get(bytes); sb.append(String(bytes, Charsets.UTF_8))
+            }
+            override fun onError(throwable: Throwable) = Unit
+            override fun onComplete() = Unit
+        })
+        return sb.toString()
+    }
 
     private fun scriptedSender(vararg responses: HttpResponse<String>): HttpSender {
         val queue = responses.toMutableList()

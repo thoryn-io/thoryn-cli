@@ -200,15 +200,11 @@ class LoginCommand : Callable<Int> {
     }
 
     private fun runDeviceCodeFlow(): Int {
-        val secret = resolveClientSecret("Client secret for '$clientId': ")
-        if (secret == null) {
-            System.err.println(
-                "No client secret available. The device-code endpoint requires confidential " +
-                    "client authentication; set THORYN_CLIENT_SECRET, pass --client-secret-file <path>, " +
-                    "or run interactively to be prompted.",
-            )
-            return EXIT_USAGE
-        }
+        // SSO-2822: the default `thoryn-cli` is now a PUBLIC client (RFC 8252) — device-code needs no
+        // secret (client_id-only, RFC 8628 §3.1). A CONFIDENTIAL client may still supply one via
+        // THORYN_CLIENT_SECRET / --client-secret-file; we resolve it if present but never prompt.
+        val secret = ThorynConfig.resolveClientSecret()
+            ?: clientSecretFile?.takeIf { it.isFile }?.readText()?.trim()?.takeIf { it.isNotBlank() }
 
         val flow = DeviceCodeFlow(
             issuer = issuer,
