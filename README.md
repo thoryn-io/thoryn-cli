@@ -47,6 +47,12 @@ thoryn tenant seed --non-interactive --secret-dir <dir> \
 thoryn audit query [--from <ts>] [--to <ts>] [--event-type <t>] [--actor <sub>] [--limit <n>]
 
 thoryn audit-replay <receipt.json>           # SSO-940b — offline replay tool
+
+# Runnable examples (SSO-2830) — provision a real config in your own account and see it work.
+thoryn examples list
+thoryn examples setup    <name>              # e.g. simple-signin
+thoryn examples run      <name>              # opens your browser
+thoryn examples teardown <name>
 ```
 
 > The supply-chain / verifiable-credential command tree was **removed** when the
@@ -203,6 +209,36 @@ thoryn clients list                                      # uses the session gate
 The gateway is derived from the hub host (`hub.<env>` → `api.<env>`); for a
 non-standard topology set it explicitly at login with `--gateway <url>`. An
 explicit `--hub` / `--gateway` on any command still overrides the session.
+
+## Examples (SSO-2830)
+
+`thoryn examples` provisions a real, in-boundary configuration in **your own
+account** using only supported product workflows (never DB seeds or demo
+endpoints — the product-boundary rule), lets you see the real interaction, and
+tears down what it created. Each example has three explicit steps so you can
+inspect your account state between them:
+
+```bash
+thoryn examples list
+thoryn examples setup simple-signin      # create a dedicated example workspace + a loopback OAuth app
+thoryn examples run   simple-signin      # opens your browser — register a user, sign in, land on a protected page
+thoryn examples teardown simple-signin   # remove what setup created (best-effort)
+```
+
+**`simple-signin`** creates a dedicated workspace (via the real
+`workspace create` workflow, which attaches the tenant's identity provider) and
+a public **loopback** OAuth client, then `run` stands up a tiny **ephemeral local
+relying party** (a localhost app with a public + a protected page) and opens your
+browser. You register a new user and sign in on the real hosted screens and land
+on the protected page, which shows your ID-token claims. Nothing is added to
+oathy's deployed services — the demo app lives only for the duration of `run`.
+
+**Teardown is partial by design.** It deletes the OAuth client it created, but
+there is no customer-plane API yet to delete the example workspace or the user
+you registered (tracked as **SSO-2831** — archive/delete a workspace with a
+name-confirmation guard); those artifacts remain in your account until that
+lands. A `--headless` mode that drives register + sign-in programmatically is a
+planned follow-up (it needs privileged provisioning credentials).
 
 ## Build
 

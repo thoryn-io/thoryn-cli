@@ -62,6 +62,53 @@ object ThorynConfig {
         }
     }
 
+    /** Local-dev identity-service base URL (the CLI examples' user-facing sign-in host). */
+    const val DEFAULT_IDENTITY = "http://localhost:9099"
+
+    /**
+     * SSO-2830 — the identity-service base host for a tenant `slug`, derived from the
+     * hub [issuer]. identity-service is tenant-scoped by REQUEST HOST (SSO-1920), so a
+     * user provisioned for tenant X can only sign in when the login leg hits
+     * `{slug}.identity.<env>`. Thoryn names the identity host by swapping the hub's
+     * `hub.` label for `identity.` (hub.stg.thoryn.org → identity.stg.thoryn.org) and
+     * prefixing the tenant slug (→ `{slug}.identity.stg.thoryn.org`), preserving
+     * scheme/port. A hub host that isn't `hub.<env>` (local dev) has no derivable
+     * identity host, so we fall back to [DEFAULT_IDENTITY] (no slug prefix locally).
+     */
+    fun tenantIdentityHost(issuer: String, slug: String): String {
+        return try {
+            val uri = java.net.URI(issuer.trim().trimEnd('/'))
+            val host = uri.host ?: return DEFAULT_IDENTITY
+            if (!host.startsWith("hub.")) return DEFAULT_IDENTITY
+            val identityHost = "$slug.identity." + host.removePrefix("hub.")
+            java.net.URI(uri.scheme, uri.userInfo, identityHost, uri.port, null, null, null)
+                .toString()
+                .trimEnd('/')
+        } catch (_: Exception) {
+            DEFAULT_IDENTITY
+        }
+    }
+
+    /**
+     * SSO-2830 — the tenant hub issuer for a workspace `slug`, derived from the base
+     * hub [issuer] by prefixing the slug on the hub host (hub.stg.thoryn.org →
+     * `{slug}.hub.stg.thoryn.org`). This is the issuer a per-tenant relying party
+     * authenticates against so the minted token carries the tenant's `tnt` claim.
+     * A non-`hub.` host (local dev) is returned unchanged.
+     */
+    fun tenantIssuer(issuer: String, slug: String): String {
+        return try {
+            val uri = java.net.URI(issuer.trim().trimEnd('/'))
+            val host = uri.host ?: return issuer.trimEnd('/')
+            if (!host.startsWith("hub.")) return issuer.trimEnd('/')
+            java.net.URI(uri.scheme, uri.userInfo, "$slug.$host", uri.port, null, null, null)
+                .toString()
+                .trimEnd('/')
+        } catch (_: Exception) {
+            issuer.trimEnd('/')
+        }
+    }
+
     /**
      * Default scope set requested by `thoryn login`.
      *
