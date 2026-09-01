@@ -1,9 +1,13 @@
 package com.devnow.thoryn.cli.cmd.examples
 
 import com.devnow.thoryn.cli.api.ProductApiClient
+import com.devnow.thoryn.cli.auth.HttpSender
+import com.devnow.thoryn.cli.auth.TokenExchangeFlow
 import com.devnow.thoryn.cli.auth.Tokens
 import com.devnow.thoryn.cli.cmd.CommandSupport
+import com.devnow.thoryn.cli.config.ThorynConfig
 import java.io.PrintStream
+import java.net.http.HttpClient
 
 /**
  * SSO-2830 — a runnable, in-boundary product example.
@@ -52,6 +56,26 @@ internal class ExampleContext(
 
     /** Client for the gateway → product-api surface (clients, federation). */
     fun gatewayClient(): ProductApiClient = CommandSupport.client(gateway, tokens)
+
+    /**
+     * SSO-2831 — a gateway client scoped to the target workspace named by [tenantIssuer]
+     * (`https://{slug}.hub.<domain>`). Silently exchanges the session token for a token in that
+     * tenant (RFC 8693, the same mechanism as `thoryn workspace switch`), so resources are created
+     * UNDER the workspace — not the caller's login tenant. Without this the RP client would be
+     * registered in the login tenant while sign-in runs against the workspace's issuer, and the
+     * authorize call fails `invalid_request` (client_id not found in that tenant).
+     */
+    fun tenantGatewayClient(tenantIssuer: String): ProductApiClient {
+        val exchanged = TokenExchangeFlow(
+            issuer = hub,
+            clientId = ThorynConfig.DEFAULT_CLIENT_ID,
+            clientSecret = null,
+            subjectToken = tokens.accessToken,
+            targetResource = tenantIssuer,
+            sender = HttpSender { request, handler -> HttpClient.newHttpClient().send(request, handler) },
+        ).run()
+        return CommandSupport.client(gateway, exchanged)
+    }
 
     /** Emit a numbered step heading so the walkthrough reads as a sequence. */
     fun step(n: Int, message: String) = out.println("\n[$n] $message")

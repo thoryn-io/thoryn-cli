@@ -57,30 +57,28 @@ internal class SimpleSigninExample : Example {
             ctx.warn("product-api tenant registration did not complete (${CommandSupport.describeThrowable(ex)}); continuing — it is idempotent.")
         }
 
-        ctx.step(2, "Registering a public loopback OAuth client for the local example app…")
+        // The client MUST be registered UNDER the new workspace (its tenant issuer is where sign-in
+        // runs). Creating it in the login tenant — as an unswitched gatewayClient() would — leaves the
+        // authorize call failing `invalid_request` (client_id not found in the workspace's tenant).
+        val tenantIssuer = ThorynConfig.tenantIssuer(ctx.hub, slug)
+        ctx.step(2, "Switching into '$slug' and registering a loopback OAuth client UNDER it…")
         val redirectUri = "http://127.0.0.1/callback"
-        val clientId: String
-        try {
-            val app = ctx.gatewayClient().createApplication(
-                mapOf(
-                    "displayName" to "Sign-in Example App",
-                    "redirectUris" to listOf(redirectUri),
-                    "clientType" to "public",
-                    "grantTypes" to listOf("authorization_code"),
-                    "scopes" to listOf("openid", "profile", "email"),
-                ),
-            )
-            clientId = (app["clientId"] ?: app["client_id"])?.asString()
-                ?: run { ctx.warn("Client created but no clientId was returned; cannot continue."); return CommandSupport.EXIT_IO_ERROR }
-            ctx.info("client:    clientId=$clientId  redirectUri=$redirectUri (loopback, port-agnostic)")
+        val clientPayload = mapOf(
+            "displayName" to "Sign-in Example App",
+            "redirectUris" to listOf(redirectUri),
+            "clientType" to "public",
+            "grantTypes" to listOf("authorization_code"),
+            "scopes" to listOf("openid", "profile", "email"),
+        )
+        val clientId: String = try {
+            createClientInNewWorkspace(ctx, tenantIssuer, clientPayload)
         } catch (ex: ProductApiException) {
             ctx.warn("Could not create the OAuth client: ${ex.errorCode ?: "HTTP ${ex.httpStatus}"}${ex.errorDescription?.let { " — $it" } ?: ""}")
             return CommandSupport.EXIT_HTTP_ERROR
         } catch (ex: Exception) {
             return CommandSupport.renderRequestFailure(ex, ctx.gateway, ctx.err)
         }
-
-        val tenantIssuer = ThorynConfig.tenantIssuer(ctx.hub, slug)
+        ctx.info("client:    clientId=$clientId  redirectUri=$redirectUri (loopback, port-agnostic)")
         val identityHost = ThorynConfig.tenantIdentityHost(ctx.hub, slug)
         ctx.state.write(
             ExampleState(
@@ -103,6 +101,39 @@ internal class SimpleSigninExample : Example {
         ctx.out.println()
         ctx.out.println("Next:  thoryn examples $name run")
         return CommandSupport.EXIT_OK
+    }
+
+    /**
+     * Register the RP client UNDER the freshly-created workspace. Exchanges the session token for a
+     * workspace-scoped token once (RFC 8693, hub-side — succeeds immediately since the caller founded
+     * the workspace), then retries the create while the GATEWAY's tenant-issuer trust snapshot
+     * ([core] `TrustedTenantSlugRegistry`, scheduled ~45s) catches up with the just-registered tenant
+     * — otherwise the workspace token is rejected until the next refresh. ~75s budget.
+     */
+    private fun createClientInNewWorkspace(
+        ctx: ExampleContext,
+        tenantIssuer: String,
+        payload: Map<String, Any?>,
+    ): String {
+        val tenantClient = ctx.tenantGatewayClient(tenantIssuer)
+        val deadline = System.currentTimeMillis() + 75_000
+        var lastError: ProductApiException? = null
+        var announced = false
+        while (System.currentTimeMillis() < deadline) {
+            try {
+                val app = tenantClient.createApplication(payload)
+                return (app["clientId"] ?: app["client_id"])?.asString()
+                    ?: throw IllegalStateException("client created but no clientId was returned")
+            } catch (ex: ProductApiException) {
+                lastError = ex
+                if (!announced) {
+                    ctx.info("waiting for the new workspace to become reachable (its issuer trust refreshes ~45s)…")
+                    announced = true
+                }
+                Thread.sleep(4_000)
+            }
+        }
+        throw lastError ?: IllegalStateException("timed out creating the client under '$tenantIssuer'")
     }
 
     override fun run(ctx: ExampleContext): Int {
