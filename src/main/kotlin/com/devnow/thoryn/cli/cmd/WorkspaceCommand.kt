@@ -265,6 +265,10 @@ class WorkspaceCommand : Callable<Int> {
                     System.err.println("You may not be a member of '$slug', or your session expired. Run `thoryn login` and retry.")
                 } else if (ex.oauthError == "unauthorized_client") {
                     System.err.println("Client '$clientId' is not permitted to switch workspaces (allow_token_exchange).")
+                } else if (ex.oauthError == "unknown") {
+                    // The hub returned a non-OAuth-shaped error — surface the raw status + body so the
+                    // failure is diagnosable instead of an opaque "unknown".
+                    System.err.println("The hub returned HTTP ${ex.status ?: "?"}: ${ex.bodySnippet ?: "(empty body)"}")
                 }
                 return CommandSupport.EXIT_HTTP_ERROR
             } catch (ex: Exception) {

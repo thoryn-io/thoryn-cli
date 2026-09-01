@@ -53,7 +53,15 @@ class TokenExchangeFlow(
         val response = sender.send(builder.build(), HttpResponse.BodyHandlers.ofString())
         if (response.statusCode() != 200) {
             val errorCode = parseErrorCode(response.body()) ?: "unknown"
-            throw TokenExchangeException("Hub returned ${response.statusCode()}: $errorCode", oauthError = errorCode)
+            val location = response.headers().firstValue("location").orElse(null)
+            val detail = response.body().take(300).replace(Regex("\\s+"), " ").trim()
+                .ifBlank { location?.let { "redirect -> $it" } ?: "(empty body)" }
+            throw TokenExchangeException(
+                "Hub returned ${response.statusCode()}: $errorCode",
+                oauthError = errorCode,
+                status = response.statusCode(),
+                bodySnippet = detail,
+            )
         }
         val map: Map<String, Any?> = mapper.readValue(response.body())
         val expiresIn = (map["expires_in"] as? Number)?.toLong()
@@ -91,4 +99,8 @@ class TokenExchangeFlow(
 class TokenExchangeException(
     message: String,
     val oauthError: String,
+    /** HTTP status the hub returned (null only for pre-2818 callers that did not set it). */
+    val status: Int? = null,
+    /** A short, whitespace-collapsed snippet of the response body — surfaced when [oauthError] is `unknown`. */
+    val bodySnippet: String? = null,
 ) : RuntimeException(message)
