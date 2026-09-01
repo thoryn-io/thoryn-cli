@@ -38,6 +38,8 @@ thoryn federation delete <memberId> [--confirm <workspace-slug>]
 thoryn workspace list                        # Workspaces (hub /account/workspaces)
 thoryn workspace create --slug <slug> --display-name <name>
 thoryn workspace switch <slug>               # prints the `thoryn login --issuer <tenant-hub>` line
+thoryn workspace archive <slug> --confirm <slug>   # SSO-2831 — archive (reversible); name-confirmed
+thoryn workspace reactivate <slug>           # SSO-2831 — clear the archive flag
 
 # Tenant seeding (SSO-1553) — one-shot, zero-interaction provisioner for CI.
 thoryn tenant seed --non-interactive --secret-dir <dir> \

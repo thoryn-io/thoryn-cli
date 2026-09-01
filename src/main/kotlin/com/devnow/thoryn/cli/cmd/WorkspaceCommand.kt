@@ -46,13 +46,15 @@ import java.util.concurrent.Callable
         WorkspaceCommand.CreateSubcommand::class,
         WorkspaceCommand.ListSubcommand::class,
         WorkspaceCommand.SwitchSubcommand::class,
+        WorkspaceCommand.ArchiveSubcommand::class,
+        WorkspaceCommand.ReactivateSubcommand::class,
     ],
 )
 class WorkspaceCommand : Callable<Int> {
 
     override fun call(): Int {
         System.err.println("Usage: thoryn workspace <subcommand>")
-        System.err.println("Subcommands: create | list | switch")
+        System.err.println("Subcommands: create | list | switch | archive | reactivate")
         return CommandSupport.EXIT_USAGE
     }
 
@@ -286,10 +288,108 @@ class WorkspaceCommand : Callable<Int> {
         }
     }
 
+    /**
+     * `thoryn workspace archive <slug> --confirm <slug>` — SSO-2831.
+     *
+     * Archives (reversible soft-disable) a workspace you own. Name-confirmation guarded:
+     * you must pass `--confirm <slug>` (echoed to the hub as `X-Thoryn-Confirm`) so an
+     * archive can't be triggered by accident. `reactivate` reverses it.
+     */
+    @Command(name = "archive", description = ["Archive a workspace you own (reversible). Requires --confirm <slug>."], mixinStandardHelpOptions = true)
+    class ArchiveSubcommand : Callable<Int> {
+
+        @Parameters(index = "0", description = ["Workspace slug to archive."])
+        lateinit var slug: String
+
+        @Option(names = ["--hub"], description = ["Override the hub base URL. Defaults to the hub you signed into, else http://localhost:54702."])
+        var hub: String = ThorynConfig.DEFAULT_HUB
+
+        @Option(names = ["--confirm"], description = [CommandSupport.CONFIRM_OPTION_DESC])
+        var confirm: String? = null
+
+        @Option(names = ["--output"])
+        var outputRaw: String? = null
+
+        override fun call(): Int {
+            val format = CommandSupport.parseFormat(outputRaw) ?: return CommandSupport.EXIT_USAGE
+            val tokens = CommandSupport.readTokens() ?: return CommandSupport.EXIT_NOT_SIGNED_IN
+            hub = CommandSupport.resolveHub(hub, tokens)
+            val client = CommandSupport.client(hub, tokens)
+            val tenantId = resolveTenantIdBySlug(client, slug) ?: return workspaceNotFound(slug)
+            return try {
+                val body = client.archiveWorkspace(tenantId, confirm)
+                CommandSupport.emitRecord(format, body, { node -> workspaceRecordFields(node) })
+                CommandSupport.EXIT_OK
+            } catch (ex: ProductApiException) {
+                renderConfirmHint(ex, slug) ?: CommandSupport.renderError(format, ex)
+            } catch (ex: Exception) {
+                CommandSupport.renderRequestFailure(ex, hub)
+            }
+        }
+    }
+
+    /** `thoryn workspace reactivate <slug>` — SSO-2831 — clears the archive flag. */
+    @Command(name = "reactivate", description = ["Reactivate an archived workspace you own."], mixinStandardHelpOptions = true)
+    class ReactivateSubcommand : Callable<Int> {
+
+        @Parameters(index = "0", description = ["Workspace slug to reactivate."])
+        lateinit var slug: String
+
+        @Option(names = ["--hub"], description = ["Override the hub base URL. Defaults to the hub you signed into, else http://localhost:54702."])
+        var hub: String = ThorynConfig.DEFAULT_HUB
+
+        @Option(names = ["--output"])
+        var outputRaw: String? = null
+
+        override fun call(): Int {
+            val format = CommandSupport.parseFormat(outputRaw) ?: return CommandSupport.EXIT_USAGE
+            val tokens = CommandSupport.readTokens() ?: return CommandSupport.EXIT_NOT_SIGNED_IN
+            hub = CommandSupport.resolveHub(hub, tokens)
+            val client = CommandSupport.client(hub, tokens)
+            val tenantId = resolveTenantIdBySlug(client, slug) ?: return workspaceNotFound(slug)
+            return try {
+                val body = client.reactivateWorkspace(tenantId)
+                CommandSupport.emitRecord(format, body, { node -> workspaceRecordFields(node) })
+                CommandSupport.EXIT_OK
+            } catch (ex: ProductApiException) {
+                CommandSupport.renderError(format, ex)
+            } catch (ex: Exception) {
+                CommandSupport.renderRequestFailure(ex, hub)
+            }
+        }
+    }
+
     companion object {
         internal val LIST_HEADERS: List<String> = listOf(
             "slug", "displayName", "tenantId", "archived",
         )
+
+        /** Resolve a workspace slug to its tenantId via the caller's workspace list, or null. */
+        internal fun resolveTenantIdBySlug(client: com.devnow.thoryn.cli.api.ProductApiClient, slug: String): String? =
+            runCatching { client.listWorkspaces() }.getOrNull()
+                ?.toList()?.firstOrNull { it["slug"]?.asString() == slug }
+                ?.get("tenantId")?.asString()
+
+        /** Consistent "no such workspace" error + exit code for the slug-addressed ops. */
+        internal fun workspaceNotFound(slug: String): Int {
+            System.err.println("No workspace with slug '$slug' found for your account.")
+            System.err.println("Run `thoryn workspace list` to see your workspaces.")
+            return CommandSupport.EXIT_HTTP_ERROR
+        }
+
+        /** SSO-2831 — actionable hints for the name-confirmation guard (428/422). Null if not a confirm error. */
+        internal fun renderConfirmHint(ex: ProductApiException, slug: String): Int? = when (ex.httpStatus) {
+            428 -> {
+                System.err.println("Archiving '$slug' is a protected action. Re-run with:")
+                System.err.println("  thoryn workspace archive $slug --confirm $slug")
+                CommandSupport.EXIT_HTTP_ERROR
+            }
+            422 -> {
+                System.err.println("The --confirm value did not match the workspace slug '$slug'.")
+                CommandSupport.EXIT_HTTP_ERROR
+            }
+            else -> null
+        }
 
         internal fun workspaceRow(node: JsonNode): List<Any?> = listOf(
             node["slug"]?.asString(),

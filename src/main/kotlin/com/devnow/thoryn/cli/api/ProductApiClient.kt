@@ -122,6 +122,20 @@ class ProductApiClient(
         post("/account/workspace", body)
 
     /**
+     * SSO-2831 — `POST /account/workspace/{tenantId}/archive` — archives (soft-suspends)
+     * a workspace. Guarded by a name-confirmation: [confirmSlug] is sent as the
+     * [CONFIRM_HEADER] (`X-Thoryn-Confirm`) and must equal the workspace slug, or the hub
+     * answers `428 workspace_confirmation_required` (missing) / `422 workspace_confirmation_mismatch`.
+     * Reversible via [reactivateWorkspace]. Hub-routed (not the gateway).
+     */
+    fun archiveWorkspace(tenantId: String, confirmSlug: String? = null): JsonNode =
+        post("/account/workspace/${encode(tenantId)}/archive", emptyMap<String, Any?>(), confirmSlug)
+
+    /** SSO-2831 — `POST /account/workspace/{tenantId}/reactivate` — clears the archive flag. */
+    fun reactivateWorkspace(tenantId: String): JsonNode =
+        post("/account/workspace/${encode(tenantId)}/reactivate", emptyMap<String, Any?>())
+
+    /**
      * `POST /api/v1/tenants` on product-api (gateway-routed) — registers a
      * freshly-created hub workspace in product-api's `tenant_registry`. The only
      * product-api endpoint exempt from the `tnt`-claim filter. Called against a

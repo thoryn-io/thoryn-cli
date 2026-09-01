@@ -156,6 +156,53 @@ class WorkspaceCommandTest : CommandTestBase() {
             .isEqualTo("https://globex.hub.example.com")
     }
 
+    // ---- SSO-2831: archive / reactivate ------------------------------------
+
+    @Test
+    fun `archive with a matching confirm archives the workspace and sends the confirm header`() {
+        server.enqueue(jsonResponse(200, """[{"tenantId":"t-1","slug":"acme","displayName":"Acme","archived":false,"loginUrl":"/x"}]"""))
+        server.enqueue(jsonResponse(200, """{"tenantId":"t-1","slug":"acme","displayName":"Acme","archived":true,"loginUrl":"/x"}"""))
+
+        val (exit, out, _) = runCli("workspace", "archive", "acme", "--confirm", "acme", "--hub", baseUrl(), "--output", "json")
+
+        assertThat(exit).isEqualTo(0)
+        assertThat(parseJson(out)["archived"]).isEqualTo(true)
+        server.takeRequest() // the workspace-list lookup
+        val archiveReq = server.takeRequest()
+        assertThat(archiveReq.path).endsWith("/account/workspace/t-1/archive")
+        assertThat(archiveReq.getHeader("X-Thoryn-Confirm")).isEqualTo("acme")
+    }
+
+    @Test
+    fun `archive without confirm surfaces the name-confirmation hint (428)`() {
+        server.enqueue(jsonResponse(200, """[{"tenantId":"t-1","slug":"acme","displayName":"Acme","archived":false,"loginUrl":"/x"}]"""))
+        server.enqueue(jsonResponse(428, """{"errorCode":"workspace_confirmation_required","detail":"confirmation required"}"""))
+
+        val (exit, _, err) = runCli("workspace", "archive", "acme", "--hub", baseUrl())
+
+        assertThat(exit).isEqualTo(CommandSupport.EXIT_HTTP_ERROR)
+        assertThat(err).contains("thoryn workspace archive acme --confirm acme")
+    }
+
+    @Test
+    fun `reactivate clears the archive flag`() {
+        server.enqueue(jsonResponse(200, """[{"tenantId":"t-1","slug":"acme","displayName":"Acme","archived":true,"loginUrl":"/x"}]"""))
+        server.enqueue(jsonResponse(200, """{"tenantId":"t-1","slug":"acme","displayName":"Acme","archived":false,"loginUrl":"/x"}"""))
+
+        val (exit, out, _) = runCli("workspace", "reactivate", "acme", "--hub", baseUrl(), "--output", "json")
+
+        assertThat(exit).isEqualTo(0)
+        assertThat(parseJson(out)["archived"]).isEqualTo(false)
+    }
+
+    @Test
+    fun `archive of an unknown slug reports not-found`() {
+        server.enqueue(jsonResponse(200, """[{"tenantId":"t-1","slug":"acme","displayName":"Acme","archived":false,"loginUrl":"/x"}]"""))
+        val (exit, _, err) = runCli("workspace", "archive", "nope", "--confirm", "nope", "--hub", baseUrl())
+        assertThat(exit).isEqualTo(CommandSupport.EXIT_HTTP_ERROR)
+        assertThat(err).contains("No workspace with slug 'nope'")
+    }
+
     @Test
     fun `switch to an unknown slug reports an error`() {
         server.enqueue(
