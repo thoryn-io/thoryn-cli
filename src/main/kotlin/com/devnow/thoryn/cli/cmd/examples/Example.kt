@@ -58,12 +58,28 @@ internal class ExampleContext(
     fun gatewayClient(): ProductApiClient = CommandSupport.client(gateway, tokens)
 
     /**
+     * SSO-2836 — a gateway client authenticated with the **workspace-scoped provisioning token**
+     * that `POST /account/workspace` returns for a just-created workspace (ADR
+     * `2026-09-01-workspace-create-returns-scoped-provisioning-token`). Preferred over
+     * [tenantGatewayClient]: the hub minted this token for the founder at create time, so it carries
+     * `tnt=<new workspace>` directly with NO client-side token-exchange — sidestepping the
+     * public-client / membership / refresh-clobber friction of the switch. Resources are created
+     * UNDER the workspace, exactly as with the switch.
+     */
+    fun provisioningGatewayClient(provisioningToken: String): ProductApiClient =
+        CommandSupport.client(gateway, Tokens(accessToken = provisioningToken))
+
+    /**
      * SSO-2831 — a gateway client scoped to the target workspace named by [tenantIssuer]
      * (`https://{slug}.hub.<domain>`). Silently exchanges the session token for a token in that
      * tenant (RFC 8693, the same mechanism as `thoryn workspace switch`), so resources are created
      * UNDER the workspace — not the caller's login tenant. Without this the RP client would be
      * registered in the login tenant while sign-in runs against the workspace's issuer, and the
      * authorize call fails `invalid_request` (client_id not found in that tenant).
+     *
+     * **Fallback path** (SSO-2836): the create response now returns a provisioning token, so
+     * [provisioningGatewayClient] is the preferred route. This token-exchange path stays as the
+     * fallback for a hub that predates the provisioning token (the field is absent on the response).
      */
     fun tenantGatewayClient(tenantIssuer: String): ProductApiClient {
         val exchanged = TokenExchangeFlow(
