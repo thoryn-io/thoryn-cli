@@ -29,7 +29,7 @@ internal class SimpleSigninExample : Example {
     override fun setup(ctx: ExampleContext): Int {
         ctx.state.read(name)?.let { existing ->
             ctx.warn("An existing '$name' setup was found (workspace '${existing.workspaceSlug}').")
-            ctx.warn("Run `thoryn examples $name teardown` first to start fresh, or `run` to use it.")
+            ctx.warn("Run `thoryn examples teardown $name` first to start fresh, or `run` to use it.")
             return CommandSupport.EXIT_OK
         }
 
@@ -99,7 +99,7 @@ internal class SimpleSigninExample : Example {
         ctx.info("sign-in host   : $identityHost")
         ctx.info("app client id  : $clientId")
         ctx.out.println()
-        ctx.out.println("Next:  thoryn examples $name run")
+        ctx.out.println("Next:  thoryn examples run $name")
         return CommandSupport.EXIT_OK
     }
 
@@ -138,7 +138,7 @@ internal class SimpleSigninExample : Example {
 
     override fun run(ctx: ExampleContext): Int {
         val state = ctx.state.read(name)
-            ?: run { ctx.warn("No '$name' setup found. Run `thoryn examples $name setup` first."); return CommandSupport.EXIT_USAGE }
+            ?: run { ctx.warn("No '$name' setup found. Run `thoryn examples setup $name` first."); return CommandSupport.EXIT_USAGE }
         val tenantIssuer = state.tenantIssuer
             ?: run { ctx.warn("Stored state is missing the tenant issuer; re-run setup."); return CommandSupport.EXIT_USAGE }
         val clientId = state.clientId
@@ -169,10 +169,10 @@ internal class SimpleSigninExample : Example {
             val ok = signedIn.await(5, TimeUnit.MINUTES)
             return if (ok) {
                 ctx.out.println()
-                ctx.out.println("Done. When finished:  thoryn examples $name teardown")
+                ctx.out.println("Done. When finished:  thoryn examples teardown $name")
                 CommandSupport.EXIT_OK
             } else {
-                ctx.warn("Timed out waiting for sign-in. Re-run `thoryn examples $name run` to try again.")
+                ctx.warn("Timed out waiting for sign-in. Re-run `thoryn examples run $name` to try again.")
                 CommandSupport.EXIT_IO_ERROR
             }
         } finally {
