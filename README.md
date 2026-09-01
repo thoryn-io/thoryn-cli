@@ -47,45 +47,16 @@ thoryn tenant seed --non-interactive --secret-dir <dir> \
 thoryn audit query [--from <ts>] [--to <ts>] [--event-type <t>] [--actor <sub>] [--limit <n>]
 
 thoryn audit-replay <receipt.json>           # SSO-940b — offline replay tool
-
-thoryn supply-chain credential-types catalog # SSO-1593 — adopt platform credential types
-thoryn supply-chain credential-types list
-thoryn supply-chain credential-types enable <slug> [--name --description --background-color --text-color --logo-uri]
-thoryn supply-chain credential-types disable <slug>
-
-thoryn supply-chain trust-registry list      # SSO-954 / SSO-959 — Trust Registry
-thoryn supply-chain trust-registry preview
-thoryn supply-chain trust-registry add
-thoryn supply-chain trust-registry remove
-
-thoryn supply-chain policy list              # SSO-955 / SSO-959 — Verification policy
-thoryn supply-chain policy show
-thoryn supply-chain policy set
-
-thoryn supply-chain audit search             # SSO-956 / SSO-959 — Walletless audit log
-thoryn supply-chain audit get <auditRowId>
-thoryn supply-chain audit receipt <id>           # JSON receipt to stdout (or `-o file`)
-thoryn supply-chain audit receipt <id> --pdf     # Binary PDF/A-3 to stdout
-thoryn supply-chain audit replay <auditRowId>    # alias for `thoryn audit-replay`
-
-thoryn supply-chain issuer-bridge list       # SSO-957 / SSO-959 — Issuer-bridge ops
-thoryn supply-chain issuer-bridge show <bridgeId>
-thoryn supply-chain issuer-bridge credentials --bridge-id <id> ...
-thoryn supply-chain issuer-bridge revoke --bridge-id <id> --credential-id <cid> --reason "..."
-thoryn supply-chain issuer-bridge rotate-key --bridge-id <id> --step <step>
-
-thoryn supply-chain chain receive     --bridge-id <id> --parent-jws <...>   # SSO-970 — chain-of-custody
-thoryn supply-chain chain issue       --bridge-id <id> --parent <urn> --action processed_combined ...
-thoryn supply-chain chain split       --bridge-id <id> --parent <urn> --template <id> --count <N> --output-zip <file>
-thoryn supply-chain chain walk        <leaf-urn> [--depth 5]
-thoryn supply-chain chain revoke      <urn> --reason "..." [--dry-run]
-thoryn supply-chain chain descendants <urn> [--holder] [--depth 5]
 ```
 
-Every `supply-chain` leaf and every tenant-config leaf (`clients`,
-`federation`, `workspace`, `audit`) accepts `--output {table,json,yaml}`
-(default `table`). Errors go to stderr with non-zero exit code; on
-`--output json` errors emit structured JSON on stdout.
+> The supply-chain / verifiable-credential command tree was **removed** when the
+> CLI was relocated into oauthy as a Hub-only tool (SSO-2817); those commands
+> belong to the VC product (`thoryn-vc-broker`), not the customer-plane CLI.
+
+Every tenant-config leaf (`clients`, `federation`, `workspace`, `audit`)
+accepts `--output {table,json,yaml}` (default `table`). Errors go to stderr
+with a non-zero exit code; on `--output json` errors emit structured JSON on
+stdout.
 
 The tenant-config commands are **thin wrappers**: all business logic lives in
 product-api (the single source of truth). The CLI only marshals the request,
@@ -144,31 +115,22 @@ or land in shell history:
 # tenant:audit.read) so `clients`, `federation`, and `audit` work out of the
 # box. `workspace` rides on SCOPE_openid (the hub /account surface). The hub
 # drops any scope the tenant admin doesn't actually hold.
-oathy login
+thoryn login
 
 # Grab the whole tenant-config scope set explicitly.
-oathy login --scope all-tenant-config
+thoryn login --scope all-tenant-config
 
 # Headless (no browser).
 export THORYN_CLIENT_SECRET=...
-oathy login --device-code
-
-# Grab every supply-chain scope in one shot.
-oathy login --scope all-supply-chain
-
-# Single supply-chain scope.
-oathy login --scope tenant:supply-chain.trust-registry.write
-
-# Multiple, comma-separated.
-oathy login --scope tenant:supply-chain.audit.read,tenant:supply-chain.policy.read
+thoryn login --device-code
 ```
 
-The wildcard `all-supply-chain` expands client-side per
-`ScopeRegistry.kt` to the literal supply-chain scope set. The hub does
-NOT understand the wildcard — it's a CLI ergonomic.
+The wildcard `all-tenant-config` expands client-side per `ScopeRegistry.kt`
+to the literal tenant-config scope set. The hub does NOT understand the
+wildcard — it's a CLI ergonomic.
 
 When a command rejects with `insufficient_scope`, the CLI prints the
-exact `oathy login --scope <required>` line to fix it.
+exact `thoryn login --scope <required>` line to fix it.
 
 ## Non-interactive auth & tenant seeding (SSO-1553)
 
@@ -179,13 +141,13 @@ second device:
 # Service-account login (RFC 6749 §4.4 client-credentials). Secret from env,
 # NEVER argv. --issuer MUST be the tenant subdomain so the hub mints `tnt`.
 export THORYN_CLIENT_SECRET="$CI_SERVICE_ACCOUNT_SECRET"
-oathy login --client-credentials --client-id ci-bot \
+thoryn login --client-credentials --client-id ci-bot \
   --issuer https://acme.hub.stg.thoryn.org \
   --scope "tenant:applications.write tenant:federation.write"
 
 # One-shot tenant seed: sample OAuth clients + identity-service federation member.
 export THORYN_FEDERATION_SECRET="$CI_IDENTITY_SERVICE_SECRET"
-oathy tenant seed --non-interactive --secret-dir ./seed-secrets \
+thoryn tenant seed --non-interactive --secret-dir ./seed-secrets \
   --clients 2 --gateway https://api.identity.stg.thoryn.org
 ```
 
@@ -199,7 +161,7 @@ validation are identical) — it does not call any new server endpoint:
    member, unless `--skip-federation`.
  - `POST /tenants` first, when `--tenant-id` + `--slug` are supplied (the
    tnt-exempt product-api bootstrap, SSO-912). Creating a brand-new **hub**
-   workspace is a user/OpenID flow — use `oathy workspace create` for that.
+   workspace is a user/OpenID flow — use `thoryn workspace create` for that.
 
 A client-credentials token carries no user; its `tnt` claim is minted by the hub
 from the tenant subdomain the token is requested against. Point `--issuer` at
@@ -218,13 +180,29 @@ plaintext fallback explicitly:
 
 ```bash
 export THORYN_CI_PLAINTEXT_TOKENS=1
-oathy login --device-code
+thoryn login --device-code
 ```
 
 The fallback writes a chmod-0600 JSON file to
 `~/.config/thoryn/tokens.json` (Linux/macOS) or
 `%APPDATA%/thoryn/tokens.json` (Windows). Override the path with
 `THORYN_TOKEN_FILE=/path/to/tokens.json`.
+
+## Session endpoints (SSO-2827)
+
+`thoryn login` records the hub issuer (`--issuer`) and the customer-plane
+gateway alongside the token, so the other commands default to them — you do
+**not** need to repeat `--hub` / `--gateway` on every call after signing in:
+
+```bash
+thoryn login --issuer https://acme.hub.stg.thoryn.org   # records hub + gateway for the session
+thoryn workspace list                                    # uses the session hub, no --hub needed
+thoryn clients list                                      # uses the session gateway, no --gateway needed
+```
+
+The gateway is derived from the hub host (`hub.<env>` → `api.<env>`); for a
+non-standard topology set it explicitly at login with `--gateway <url>`. An
+explicit `--hub` / `--gateway` on any command still overrides the session.
 
 ## Build
 
@@ -234,13 +212,11 @@ The fallback writes a chmod-0600 JSON file to
 
 # Shaded fat jar (run via java -jar)
 ./mvnw -pl tools/cli package
-java -jar tools/cli/target/thoryn.jar supply-chain trust-registry list \
-    --credential-class FSISustainabilityCertification
+java -jar tools/cli/target/thoryn.jar login --status
 
 # GraalVM native image (SSO-733; per-OS/arch matrix on CI)
 ./mvnw -pl tools/cli -Pnative -DskipTests package
-./tools/cli/target/thoryn supply-chain trust-registry list \
-    --credential-class FSISustainabilityCertification
+./tools/cli/target/thoryn workspace list --hub https://hub.stg.thoryn.org
 ```
 
 ## Module layout
@@ -272,23 +248,7 @@ tools/cli/
     │   │   ├── TenantCommand.kt                             # SSO-1553 tenant seed (non-interactive provisioner)
     │   │   ├── SelectedWorkspaceStore.kt                    # SSO-1552 records the switched-into workspace
     │   │   ├── AuditCommand.kt                              # SSO-1552 audit query (config + auth events)
-    │   │   ├── AuditReplayCommand.kt                        # SSO-940b
-    │   │   └── supplychain/                                 # SSO-959 command tree
-    │   │       ├── SupplyChainCommand.kt                    # parent
-    │   │       ├── SupplyChainCommandSupport.kt             # shared helpers
-    │   │       ├── TrustRegistryCommand.kt                  # SSO-954
-    │   │       ├── PolicyCommand.kt                         # SSO-955
-    │   │       ├── AuditCommand.kt                          # SSO-956
-    │   │       ├── IssuerBridgeCommand.kt                   # SSO-957
-    │   │       └── chain/                                   # SSO-970 chain-of-custody
-    │   │           ├── ChainCommand.kt                      # parent
-    │   │           ├── ChainTreeRenderer.kt                 # ASCII DAG tree
-    │   │           ├── ReceiveCommand.kt                    # SSO-962
-    │   │           ├── IssueCommand.kt                      # SSO-962 combine
-    │   │           ├── SplitCommand.kt                      # SSO-962 split + SSO-963
-    │   │           ├── WalkCommand.kt                       # SSO-964
-    │   │           ├── RevokeCommand.kt                     # SSO-965
-    │   │           └── DescendantsCommand.kt                # SSO-965 / SSO-967
+    │   │   └── AuditReplayCommand.kt                        # SSO-940b
     │   ├── config/
     │   │   └── ThorynConfig.kt                              # per-env defaults
     │   └── output/
@@ -307,16 +267,12 @@ tools/cli/
   changes needed.
 * `java-keyring` + `JNA` reflection lives in
   `src/main/resources/META-INF/native-image/com.devnow.thoryn.cli/`.
-* New supply-chain subcommands use only `java.net.http.HttpClient` +
-  Jackson 3 + picocli, all of which are already native-image-ready.
+* All subcommands use only `java.net.http.HttpClient` + Jackson 3 + picocli,
+  all of which are already native-image-ready.
 
 ## Related
 
 * `docs/modules/ROOT/pages/cli/index.adoc` — top-level user docs
 * `docs/modules/ROOT/pages/cli/tenant-configuration.adoc` — SSO-1552 clients/federation/workspace/audit
 * `docs/modules/ROOT/pages/cli/non-interactive-automation.adoc` — SSO-1553 client-credentials + tenant seed
-* `docs/modules/ROOT/pages/cli/supply-chain.adoc` — SSO-959 user docs
-* `docs/modules/ROOT/pages/cli/supply-chain-chain.adoc` — SSO-970 chain-of-custody user docs
 * ADR `adrs/2026-04-25-customer-plane-product-api.md`
-* ADR `adrs/2026-05-10-supply-chain-self-service-namespacing.md`
-* ADR `adrs/2026-05-11-credential-chain-of-custody-with-fan-in-and-split.md`

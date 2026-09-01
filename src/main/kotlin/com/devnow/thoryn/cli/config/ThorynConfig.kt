@@ -34,6 +34,34 @@ object ThorynConfig {
     /** Convenience constant — pass to `--issuer` to point the CLI at the staging hub. */
     const val STAGING_ISSUER = "https://hub.stg.thoryn.org"
 
+    /** The staging gateway (customer-plane ingress) matching [STAGING_ISSUER]. */
+    const val STAGING_GATEWAY = "https://api.stg.thoryn.org"
+
+    /**
+     * SSO-2827 — best-effort gateway base URL for a hub [issuer], used at
+     * `thoryn login` to record the session's gateway when `--gateway` isn't given.
+     *
+     * Thoryn deployments name the customer-plane gateway by swapping the `hub.`
+     * label of the hub host for `api.` (hub.stg.thoryn.org → api.stg.thoryn.org,
+     * hub.thoryn.org → api.thoryn.org), preserving scheme/port/path. A hub host
+     * that doesn't start with `hub.` (local dev `localhost`, or a bespoke
+     * topology) has no derivable gateway, so we fall back to [DEFAULT_GATEWAY];
+     * pass `thoryn login --gateway <url>` to set it explicitly there.
+     */
+    fun gatewayForIssuer(issuer: String): String {
+        return try {
+            val uri = java.net.URI(issuer.trim().trimEnd('/'))
+            val host = uri.host ?: return DEFAULT_GATEWAY
+            if (!host.startsWith("hub.")) return DEFAULT_GATEWAY
+            val apiHost = "api." + host.removePrefix("hub.")
+            java.net.URI(uri.scheme, uri.userInfo, apiHost, uri.port, null, null, null)
+                .toString()
+                .trimEnd('/')
+        } catch (_: Exception) {
+            DEFAULT_GATEWAY
+        }
+    }
+
     /**
      * Default scope set requested by `thoryn login`.
      *

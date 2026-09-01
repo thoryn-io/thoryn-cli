@@ -69,6 +69,7 @@ class AuditCommand : Callable<Int> {
         override fun call(): Int {
             val format = CommandSupport.parseFormat(outputRaw) ?: return CommandSupport.EXIT_USAGE
             val tokens = CommandSupport.readTokens() ?: return CommandSupport.EXIT_NOT_SIGNED_IN
+            gateway = CommandSupport.resolveGateway(gateway, tokens) // SSO-2827 — default to the gateway you signed into
             val client = CommandSupport.client(gateway, tokens)
             val query = linkedMapOf<String, String?>(
                 "from" to from,
@@ -85,8 +86,7 @@ class AuditCommand : Callable<Int> {
             } catch (ex: ProductApiException) {
                 CommandSupport.renderError(format, ex, requiredScope = "tenant:audit.read")
             } catch (ex: Exception) {
-                System.err.println("Request failed: ${ex.message}")
-                CommandSupport.EXIT_IO_ERROR
+                CommandSupport.renderRequestFailure(ex, gateway)
             }
         }
     }

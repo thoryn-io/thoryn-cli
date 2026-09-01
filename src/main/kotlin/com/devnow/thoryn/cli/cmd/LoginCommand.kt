@@ -15,6 +15,7 @@ import com.devnow.thoryn.cli.auth.PkceUtil
 import com.devnow.thoryn.cli.auth.ScopeRegistry
 import com.devnow.thoryn.cli.auth.TokenStore
 import com.devnow.thoryn.cli.auth.TokenStoreFactory
+import com.devnow.thoryn.cli.auth.Tokens
 import com.devnow.thoryn.cli.config.ThorynConfig
 import picocli.CommandLine.Command
 import picocli.CommandLine.Option
@@ -54,6 +55,19 @@ class LoginCommand : Callable<Int> {
         defaultValue = ThorynConfig.DEFAULT_ISSUER,
     )
     var issuer: String = ThorynConfig.DEFAULT_ISSUER
+
+    /**
+     * SSO-2827 — the customer-plane gateway this session should use for the
+     * gateway-routed command trees (`clients`, `federation`, `audit`). Recorded
+     * in the token session so those commands default to it instead of localhost.
+     * When omitted it is derived from `--issuer` ([ThorynConfig.gatewayForIssuer]:
+     * `hub.<env>` → `api.<env>`), falling back to the local-dev gateway.
+     */
+    @Option(
+        names = ["--gateway"],
+        description = ["Override the customer-plane gateway URL recorded for this session. Default: derived from --issuer (hub.<env> -> api.<env>), else http://localhost:8991."],
+    )
+    var gateway: String? = null
 
     @Option(
         names = ["--client-id"],
@@ -119,6 +133,17 @@ class LoginCommand : Callable<Int> {
     var devMode: Boolean = false
 
     private val tokenStore: TokenStore = TokenStoreFactory.default()
+
+    /**
+     * SSO-2827 — stamp the hub issuer + gateway this login used onto the token
+     * before persisting, so later commands default to them. The gateway is the
+     * explicit `--gateway` when given, otherwise derived from `--issuer`.
+     */
+    private fun withSession(tokens: Tokens): Tokens =
+        tokens.copy(
+            issuer = issuer,
+            gateway = gateway?.takeIf { it.isNotBlank() } ?: ThorynConfig.gatewayForIssuer(issuer),
+        )
 
     /**
      * SSO-959: expand `all-supply-chain` (and any other client-side
@@ -189,7 +214,7 @@ class LoginCommand : Callable<Int> {
 
         return try {
             val tokens = flow.run(expandedScope())
-            tokenStore.write(tokens)
+            tokenStore.write(withSession(tokens))
             println("Signed in (client-credentials / service account '$clientId').")
             tokens.scope?.let { println("Scopes: $it") }
             EXIT_OK
@@ -228,7 +253,7 @@ class LoginCommand : Callable<Int> {
                 println()
                 println("Waiting for sign-in (expires in ${authorization.expiresIn / 60} minutes)…")
             }
-            tokenStore.write(tokens)
+            tokenStore.write(withSession(tokens))
             println()
             println("Signed in.")
             0
@@ -314,7 +339,7 @@ class LoginCommand : Callable<Int> {
                 devMode = devMode,
             )
             val tokens = flow.exchange(code)
-            tokenStore.write(tokens)
+            tokenStore.write(withSession(tokens))
             println()
             println("Signed in.")
             tokens.scope?.let { println("Scopes: $it") }

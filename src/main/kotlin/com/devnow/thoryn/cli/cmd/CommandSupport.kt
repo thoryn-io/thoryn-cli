@@ -5,6 +5,7 @@ import com.devnow.thoryn.cli.api.ProductApiException
 import com.devnow.thoryn.cli.auth.ScopeRegistry
 import com.devnow.thoryn.cli.auth.TokenStoreFactory
 import com.devnow.thoryn.cli.auth.Tokens
+import com.devnow.thoryn.cli.config.ThorynConfig
 import com.devnow.thoryn.cli.output.OutputFormat
 import com.devnow.thoryn.cli.output.Printers
 import tools.jackson.databind.JsonNode
@@ -65,6 +66,58 @@ internal object CommandSupport {
     /** Build a [ProductApiClient] against [baseUrl] (gateway for product-api, hub for workspace). */
     fun client(baseUrl: String, tokens: Tokens): ProductApiClient =
         ProductApiClient(gateway = baseUrl, tokens = tokens)
+
+    /**
+     * SSO-2827 — resolve the hub base URL with precedence:
+     *   1. an explicit, non-default `--hub`;
+     *   2. the hub recorded in the session at login ([Tokens.issuer]);
+     *   3. the built-in local-dev default ([ThorynConfig.DEFAULT_HUB]).
+     *
+     * An explicit `--hub` equal to the local-dev default is treated as "unset" so
+     * a signed-in session still wins — passing the localhost default while signed
+     * into a remote hub is not a real use case, and before SSO-2827 that stale
+     * default is exactly what produced `Request failed` after a successful login.
+     */
+    fun resolveHub(explicit: String, tokens: Tokens?): String =
+        if (explicit != ThorynConfig.DEFAULT_HUB) explicit
+        else tokens?.issuer?.takeIf { it.isNotBlank() } ?: explicit
+
+    /** SSO-2827 — as [resolveHub], for the gateway base URL ([Tokens.gateway]). */
+    fun resolveGateway(explicit: String, tokens: Tokens?): String =
+        if (explicit != ThorynConfig.DEFAULT_GATEWAY) explicit
+        else tokens?.gateway?.takeIf { it.isNotBlank() } ?: explicit
+
+    /**
+     * SSO-2828 — render a transport-level failure with the target host AND a real
+     * cause. The bare `System.err.println("Request failed: ${ex.message}")` printed
+     * `Request failed: null` whenever the underlying exception carried a null message
+     * (a `ConnectException` to a dead host, an HTTP timeout, a TLS handshake error) —
+     * no host, no cause, nothing to act on. Returns [EXIT_IO_ERROR].
+     */
+    fun renderRequestFailure(ex: Throwable, target: String, err: PrintStream = System.err): Int {
+        err.println("Request failed: could not reach $target — ${describeThrowable(ex)}")
+        return EXIT_IO_ERROR
+    }
+
+    /**
+     * Summarise a throwable for [renderRequestFailure]: classify the root cause into
+     * a human phrase and append the most specific non-blank message in the cause
+     * chain. Walks at most 8 links so a self-referential cause can't loop.
+     */
+    internal fun describeThrowable(ex: Throwable): String {
+        val chain = generateSequence(ex as Throwable?) { it.cause }.take(8).toList()
+        val root = chain.last()
+        val kind = when (root) {
+            is java.net.UnknownHostException -> "unknown host"
+            is java.net.ConnectException -> "connection refused"
+            is java.net.http.HttpConnectTimeoutException -> "connection timed out"
+            is java.net.http.HttpTimeoutException -> "request timed out"
+            is javax.net.ssl.SSLException -> "TLS handshake failed"
+            else -> root.javaClass.simpleName
+        }
+        val msg = chain.firstNotNullOfOrNull { it.message?.takeIf { m -> m.isNotBlank() } }
+        return if (msg != null && !msg.equals(kind, ignoreCase = true)) "$kind ($msg)" else kind
+    }
 
     /** Parse `--output <raw>`; null on unknown values (caller returns [EXIT_USAGE]). */
     fun parseFormat(raw: String?, err: PrintStream = System.err): OutputFormat? {

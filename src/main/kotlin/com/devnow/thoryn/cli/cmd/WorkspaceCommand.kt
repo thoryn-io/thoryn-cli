@@ -69,6 +69,7 @@ class WorkspaceCommand : Callable<Int> {
         override fun call(): Int {
             val format = CommandSupport.parseFormat(outputRaw) ?: return CommandSupport.EXIT_USAGE
             val tokens = CommandSupport.readTokens() ?: return CommandSupport.EXIT_NOT_SIGNED_IN
+            hub = CommandSupport.resolveHub(hub, tokens) // SSO-2827 — default to the hub you signed into
             val client = CommandSupport.client(hub, tokens)
             return try {
                 val body = client.listWorkspaces()
@@ -79,8 +80,7 @@ class WorkspaceCommand : Callable<Int> {
                 // a tenant-scope problem, so no --scope hint is offered.
                 CommandSupport.renderError(format, ex)
             } catch (ex: Exception) {
-                System.err.println("Request failed: ${ex.message}")
-                CommandSupport.EXIT_IO_ERROR
+                CommandSupport.renderRequestFailure(ex, hub)
             }
         }
     }
@@ -114,6 +114,9 @@ class WorkspaceCommand : Callable<Int> {
         override fun call(): Int {
             val format = CommandSupport.parseFormat(outputRaw) ?: return CommandSupport.EXIT_USAGE
             val tokens = CommandSupport.readTokens() ?: return CommandSupport.EXIT_NOT_SIGNED_IN
+            // SSO-2827 — default the hub + gateway to the ones recorded at login.
+            hub = CommandSupport.resolveHub(hub, tokens)
+            gateway = CommandSupport.resolveGateway(gateway, tokens)
             val hubClient = CommandSupport.client(hub, tokens)
 
             // Step 1: create the hub workspace.
@@ -122,8 +125,7 @@ class WorkspaceCommand : Callable<Int> {
             } catch (ex: ProductApiException) {
                 return CommandSupport.renderError(format, ex)
             } catch (ex: Exception) {
-                System.err.println("Request failed: ${ex.message}")
-                return CommandSupport.EXIT_IO_ERROR
+                return CommandSupport.renderRequestFailure(ex, hub)
             }
 
             val tenantId = workspace["tenantId"]?.asString()
@@ -146,7 +148,8 @@ class WorkspaceCommand : Callable<Int> {
                     )
                 } catch (ex: Exception) {
                     System.err.println(
-                        "Warning: hub workspace created but product-api registration failed (${ex.message}). " +
+                        "Warning: hub workspace created but product-api registration failed " +
+                            "(could not reach $gateway — ${CommandSupport.describeThrowable(ex)}). " +
                             "Re-run `thoryn workspace create` with the same slug to retry.",
                     )
                 }
@@ -215,6 +218,7 @@ class WorkspaceCommand : Callable<Int> {
         override fun call(): Int {
             val format = CommandSupport.parseFormat(outputRaw) ?: return CommandSupport.EXIT_USAGE
             val tokens = CommandSupport.readTokens() ?: return CommandSupport.EXIT_NOT_SIGNED_IN
+            hub = CommandSupport.resolveHub(hub, tokens) // SSO-2827 — the hub you signed into (also feeds the token exchange below)
             val client = CommandSupport.client(hub, tokens)
 
             val workspaces = try {
@@ -222,8 +226,7 @@ class WorkspaceCommand : Callable<Int> {
             } catch (ex: ProductApiException) {
                 return CommandSupport.renderError(format, ex)
             } catch (ex: Exception) {
-                System.err.println("Request failed: ${ex.message}")
-                return CommandSupport.EXIT_IO_ERROR
+                return CommandSupport.renderRequestFailure(ex, hub)
             }
 
             val match = workspaces.toList().firstOrNull { it["slug"]?.asString() == slug }
@@ -263,7 +266,7 @@ class WorkspaceCommand : Callable<Int> {
                 }
                 return CommandSupport.EXIT_HTTP_ERROR
             } catch (ex: Exception) {
-                System.err.println("Could not switch to '$slug': ${ex.message}")
+                System.err.println("Could not switch to '$slug': ${CommandSupport.describeThrowable(ex)}")
                 return CommandSupport.EXIT_IO_ERROR
             }
 

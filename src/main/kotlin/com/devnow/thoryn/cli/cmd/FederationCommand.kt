@@ -65,6 +65,7 @@ class FederationCommand : Callable<Int> {
         override fun call(): Int {
             val format = CommandSupport.parseFormat(outputRaw) ?: return CommandSupport.EXIT_USAGE
             val tokens = CommandSupport.readTokens() ?: return CommandSupport.EXIT_NOT_SIGNED_IN
+            gateway = CommandSupport.resolveGateway(gateway, tokens) // SSO-2827 — default to the gateway you signed into
             val client = CommandSupport.client(gateway, tokens)
             return try {
                 val body = client.listFederationMembers()
@@ -73,8 +74,7 @@ class FederationCommand : Callable<Int> {
             } catch (ex: ProductApiException) {
                 CommandSupport.renderError(format, ex, requiredScope = "tenant:federation.read")
             } catch (ex: Exception) {
-                System.err.println("Request failed: ${ex.message}")
-                CommandSupport.EXIT_IO_ERROR
+                CommandSupport.renderRequestFailure(ex, gateway)
             }
         }
     }
@@ -132,6 +132,7 @@ class FederationCommand : Callable<Int> {
             ) ?: return SecretIo.EXIT_NO_SECRET
 
             val tokens = CommandSupport.readTokens() ?: return CommandSupport.EXIT_NOT_SIGNED_IN
+            gateway = CommandSupport.resolveGateway(gateway, tokens) // SSO-2827 — default to the gateway you signed into
             val client = CommandSupport.client(gateway, tokens)
 
             val body = linkedMapOf<String, Any?>(
@@ -151,8 +152,7 @@ class FederationCommand : Callable<Int> {
             } catch (ex: ProductApiException) {
                 CommandSupport.renderError(format, ex, requiredScope = "tenant:federation.write")
             } catch (ex: Exception) {
-                System.err.println("Request failed: ${ex.message}")
-                CommandSupport.EXIT_IO_ERROR
+                CommandSupport.renderRequestFailure(ex, gateway)
             }
         }
 
@@ -190,6 +190,7 @@ class FederationCommand : Callable<Int> {
         override fun call(): Int {
             val format = CommandSupport.parseFormat(outputRaw) ?: return CommandSupport.EXIT_USAGE
             val tokens = CommandSupport.readTokens() ?: return CommandSupport.EXIT_NOT_SIGNED_IN
+            gateway = CommandSupport.resolveGateway(gateway, tokens) // SSO-2827 — default to the gateway you signed into
             val client = CommandSupport.client(gateway, tokens)
             return try {
                 client.deleteFederationMember(memberId, confirm)
@@ -202,8 +203,7 @@ class FederationCommand : Callable<Int> {
             } catch (ex: ProductApiException) {
                 CommandSupport.renderError(format, ex, requiredScope = "tenant:federation.write")
             } catch (ex: Exception) {
-                System.err.println("Request failed: ${ex.message}")
-                CommandSupport.EXIT_IO_ERROR
+                CommandSupport.renderRequestFailure(ex, gateway)
             }
         }
     }

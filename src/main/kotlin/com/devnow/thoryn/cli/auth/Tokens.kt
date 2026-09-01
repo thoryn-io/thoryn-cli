@@ -15,4 +15,12 @@ data class Tokens(
     val tokenType: String = "Bearer",
     val expiresAtEpochSecond: Long? = null,
     val scope: String? = null,
+    // SSO-2827 — the hub issuer and gateway base URL this session authenticated
+    // against, recorded at login so subsequent commands (`workspace`, `clients`,
+    // `federation`, `audit`) default to them instead of silently re-defaulting to
+    // localhost. Nullable + defaulted for backward-compatibility with token files
+    // written before SSO-2827 (an older file simply has no session hosts, and the
+    // commands fall back to the built-in defaults). Neither is a secret.
+    val issuer: String? = null,
+    val gateway: String? = null,
 )

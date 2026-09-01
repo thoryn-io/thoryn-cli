@@ -74,6 +74,7 @@ class ClientsCommand : Callable<Int> {
         override fun call(): Int {
             val format = CommandSupport.parseFormat(outputRaw) ?: return CommandSupport.EXIT_USAGE
             val tokens = CommandSupport.readTokens() ?: return CommandSupport.EXIT_NOT_SIGNED_IN
+            gateway = CommandSupport.resolveGateway(gateway, tokens) // SSO-2827 — default to the gateway you signed into
             val client = CommandSupport.client(gateway, tokens)
             return try {
                 val body = client.listApplications()
@@ -82,8 +83,7 @@ class ClientsCommand : Callable<Int> {
             } catch (ex: ProductApiException) {
                 CommandSupport.renderError(format, ex, requiredScope = "tenant:applications.read")
             } catch (ex: Exception) {
-                System.err.println("Request failed: ${ex.message}")
-                CommandSupport.EXIT_IO_ERROR
+                CommandSupport.renderRequestFailure(ex, gateway)
             }
         }
     }
@@ -104,6 +104,7 @@ class ClientsCommand : Callable<Int> {
         override fun call(): Int {
             val format = CommandSupport.parseFormat(outputRaw) ?: return CommandSupport.EXIT_USAGE
             val tokens = CommandSupport.readTokens() ?: return CommandSupport.EXIT_NOT_SIGNED_IN
+            gateway = CommandSupport.resolveGateway(gateway, tokens) // SSO-2827 — default to the gateway you signed into
             val client = CommandSupport.client(gateway, tokens)
             return try {
                 val body = client.getApplication(clientId)
@@ -112,8 +113,7 @@ class ClientsCommand : Callable<Int> {
             } catch (ex: ProductApiException) {
                 CommandSupport.renderError(format, ex, requiredScope = "tenant:applications.read")
             } catch (ex: Exception) {
-                System.err.println("Request failed: ${ex.message}")
-                CommandSupport.EXIT_IO_ERROR
+                CommandSupport.renderRequestFailure(ex, gateway)
             }
         }
     }
@@ -162,6 +162,7 @@ class ClientsCommand : Callable<Int> {
         override fun call(): Int {
             val format = CommandSupport.parseFormat(outputRaw) ?: return CommandSupport.EXIT_USAGE
             val tokens = CommandSupport.readTokens() ?: return CommandSupport.EXIT_NOT_SIGNED_IN
+            gateway = CommandSupport.resolveGateway(gateway, tokens) // SSO-2827 — default to the gateway you signed into
             val client = CommandSupport.client(gateway, tokens)
 
             val body = linkedMapOf<String, Any?>(
@@ -179,8 +180,7 @@ class ClientsCommand : Callable<Int> {
             } catch (ex: ProductApiException) {
                 CommandSupport.renderError(format, ex, requiredScope = "tenant:applications.write")
             } catch (ex: Exception) {
-                System.err.println("Request failed: ${ex.message}")
-                CommandSupport.EXIT_IO_ERROR
+                CommandSupport.renderRequestFailure(ex, gateway)
             }
         }
 
@@ -236,6 +236,7 @@ class ClientsCommand : Callable<Int> {
                 return CommandSupport.EXIT_USAGE
             }
             val tokens = CommandSupport.readTokens() ?: return CommandSupport.EXIT_NOT_SIGNED_IN
+            gateway = CommandSupport.resolveGateway(gateway, tokens) // SSO-2827 — default to the gateway you signed into
             val client = CommandSupport.client(gateway, tokens)
             val body = linkedMapOf<String, Any?>()
             displayName?.let { body["displayName"] = it }
@@ -248,8 +249,7 @@ class ClientsCommand : Callable<Int> {
             } catch (ex: ProductApiException) {
                 CommandSupport.renderError(format, ex, requiredScope = "tenant:applications.write")
             } catch (ex: Exception) {
-                System.err.println("Request failed: ${ex.message}")
-                CommandSupport.EXIT_IO_ERROR
+                CommandSupport.renderRequestFailure(ex, gateway)
             }
         }
     }
@@ -285,6 +285,7 @@ class ClientsCommand : Callable<Int> {
         override fun call(): Int {
             val format = CommandSupport.parseFormat(outputRaw) ?: return CommandSupport.EXIT_USAGE
             val tokens = CommandSupport.readTokens() ?: return CommandSupport.EXIT_NOT_SIGNED_IN
+            gateway = CommandSupport.resolveGateway(gateway, tokens) // SSO-2827 — default to the gateway you signed into
             val client = CommandSupport.client(gateway, tokens)
             return try {
                 val response = client.rotateApplicationSecret(clientId, confirm)
@@ -304,8 +305,7 @@ class ClientsCommand : Callable<Int> {
             } catch (ex: ProductApiException) {
                 CommandSupport.renderError(format, ex, requiredScope = "tenant:applications.write")
             } catch (ex: Exception) {
-                System.err.println("Request failed: ${ex.message}")
-                CommandSupport.EXIT_IO_ERROR
+                CommandSupport.renderRequestFailure(ex, gateway)
             }
         }
     }
@@ -329,6 +329,7 @@ class ClientsCommand : Callable<Int> {
         override fun call(): Int {
             val format = CommandSupport.parseFormat(outputRaw) ?: return CommandSupport.EXIT_USAGE
             val tokens = CommandSupport.readTokens() ?: return CommandSupport.EXIT_NOT_SIGNED_IN
+            gateway = CommandSupport.resolveGateway(gateway, tokens) // SSO-2827 — default to the gateway you signed into
             val client = CommandSupport.client(gateway, tokens)
             return try {
                 client.deleteApplication(clientId, confirm)
@@ -341,8 +342,7 @@ class ClientsCommand : Callable<Int> {
             } catch (ex: ProductApiException) {
                 CommandSupport.renderError(format, ex, requiredScope = "tenant:applications.write")
             } catch (ex: Exception) {
-                System.err.println("Request failed: ${ex.message}")
-                CommandSupport.EXIT_IO_ERROR
+                CommandSupport.renderRequestFailure(ex, gateway)
             }
         }
     }
