@@ -361,7 +361,21 @@ class LoginCommand : Callable<Int> {
             println("Not signed in. Run `thoryn login`.")
             return 1
         }
-        println("Signed in.")
+        // SSO-2834 — report real access-token validity, not just token presence. A stale access
+        // token auto-refreshes on the next command when a refresh token is stored (offline_access).
+        val exp = tokens.expiresAtEpochSecond
+        val now = System.currentTimeMillis() / 1000
+        val canRefresh = !tokens.refreshToken.isNullOrBlank()
+        when {
+            exp == null -> println("Signed in (access-token expiry unknown).")
+            exp <= now && canRefresh -> println("Signed in — access token expired; it will auto-refresh on the next command.")
+            exp <= now -> println("Signed in — access token EXPIRED. Run `thoryn login` to re-authenticate.")
+            else -> {
+                val mins = (exp - now) / 60
+                val suffix = if (canRefresh) ", auto-refreshes near expiry" else ""
+                println("Signed in — access token valid for ${mins}m$suffix.")
+            }
+        }
         tokens.scope?.let { println("Scopes: $it") }
         return 0
     }

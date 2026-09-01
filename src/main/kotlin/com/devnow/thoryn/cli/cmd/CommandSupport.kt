@@ -2,6 +2,8 @@ package com.devnow.thoryn.cli.cmd
 
 import com.devnow.thoryn.cli.api.ProductApiClient
 import com.devnow.thoryn.cli.api.ProductApiException
+import com.devnow.thoryn.cli.auth.HttpSender
+import com.devnow.thoryn.cli.auth.RefreshTokenFlow
 import com.devnow.thoryn.cli.auth.ScopeRegistry
 import com.devnow.thoryn.cli.auth.TokenStoreFactory
 import com.devnow.thoryn.cli.auth.Tokens
@@ -10,6 +12,8 @@ import com.devnow.thoryn.cli.output.OutputFormat
 import com.devnow.thoryn.cli.output.Printers
 import tools.jackson.databind.JsonNode
 import java.io.PrintStream
+import java.net.http.HttpClient
+import java.time.Duration
 
 /**
  * SSO-1552 — shared helpers for the tenant-configuration command tree
@@ -63,9 +67,57 @@ internal object CommandSupport {
         return tokens
     }
 
-    /** Build a [ProductApiClient] against [baseUrl] (gateway for product-api, hub for workspace). */
+    /**
+     * Build a [ProductApiClient] against [baseUrl] (gateway for product-api, hub for workspace).
+     *
+     * SSO-2834 — refreshes the access token first when it is at/near expiry (see [ensureFresh]), so
+     * every command that builds its client here transparently recovers from a stale ~15-minute access
+     * token instead of returning `HTTP 401` until the next `thoryn login`.
+     */
     fun client(baseUrl: String, tokens: Tokens): ProductApiClient =
-        ProductApiClient(gateway = baseUrl, tokens = tokens)
+        ProductApiClient(gateway = baseUrl, tokens = ensureFresh(tokens))
+
+    /** Seconds before expiry at which [ensureFresh] proactively refreshes the access token. */
+    private const val REFRESH_SKEW_SECONDS: Long = 60
+
+    /**
+     * SSO-2834 — return a [Tokens] whose access token is valid, refreshing it via [RefreshTokenFlow]
+     * (RFC 6749 §6) when it is within [REFRESH_SKEW_SECONDS] of expiry. The refreshed bundle is
+     * written back to the store (preserving the CLI-local [Tokens.issuer] / [Tokens.gateway] session
+     * fields, which are not part of the token response) so subsequent invocations reuse it.
+     *
+     * Best-effort and non-fatal: a token whose expiry is unknown, that carries no refresh token, or
+     * that recorded no issuer to refresh against is returned unchanged; a failed refresh (expired /
+     * revoked refresh token, unreachable hub) prints a one-line hint and falls back to the existing
+     * token so the caller still attempts the request (and surfaces the real `401`).
+     */
+    fun ensureFresh(tokens: Tokens, err: PrintStream = System.err): Tokens {
+        // Prefer the store as the source of truth: a prior client() call in THIS process may have
+        // already refreshed (and, under refresh-token rotation, consumed the token in `tokens`). Using
+        // the freshest persisted bundle avoids a double-refresh that would fail on a rotated token.
+        val current = runCatching { TokenStoreFactory.default().read() }.getOrNull() ?: tokens
+        val expiresAt = current.expiresAtEpochSecond ?: return current
+        val now = System.currentTimeMillis() / 1000
+        if (expiresAt - now > REFRESH_SKEW_SECONDS) return current
+        val refreshToken = current.refreshToken?.takeIf { it.isNotBlank() } ?: return current
+        val issuer = current.issuer?.takeIf { it.isNotBlank() } ?: return current
+        return try {
+            val refreshed = RefreshTokenFlow(issuer = issuer, sender = realHttpSender())
+                .refresh(refreshToken)
+                // Preserve the CLI-local session hosts (not returned by /oauth2/token).
+                .copy(issuer = current.issuer, gateway = current.gateway)
+            runCatching { TokenStoreFactory.default().write(refreshed) }
+            refreshed
+        } catch (e: Exception) {
+            err.println("Could not refresh the session token (${e.message}); run `thoryn login` if the command fails.")
+            current
+        }
+    }
+
+    private fun realHttpSender(): HttpSender {
+        val client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(15)).build()
+        return HttpSender { request, handler -> client.send(request, handler) }
+    }
 
     /**
      * SSO-2827 — resolve the hub base URL with precedence:
