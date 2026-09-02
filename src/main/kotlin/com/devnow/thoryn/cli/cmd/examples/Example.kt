@@ -67,7 +67,13 @@ internal class ExampleContext(
      * UNDER the workspace, exactly as with the switch.
      */
     fun provisioningGatewayClient(provisioningToken: String): ProductApiClient =
-        CommandSupport.client(gateway, Tokens(accessToken = provisioningToken))
+        // SSO-2841: construct the client DIRECTLY with the provisioning token — do NOT route through
+        // CommandSupport.client, whose ensureFresh() "prefers the store as the source of truth"
+        // (SSO-2834) and would DISCARD this token, replacing it with the logged-in SESSION token
+        // (tnt=default) from the keychain. That silently registered the workspace's OAuth client under
+        // the `default` tenant, so sign-in at the workspace issuer 400'd. This token is a distinct,
+        // one-shot, non-refreshable provisioning credential; it must be sent verbatim.
+        ProductApiClient(gateway = gateway, tokens = Tokens(accessToken = provisioningToken))
 
     /**
      * SSO-2831 — a gateway client scoped to the target workspace named by [tenantIssuer]
