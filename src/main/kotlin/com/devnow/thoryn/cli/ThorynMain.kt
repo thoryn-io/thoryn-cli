@@ -6,6 +6,7 @@ import com.devnow.thoryn.cli.cmd.ClientsCommand
 import com.devnow.thoryn.cli.cmd.FederationCommand
 import com.devnow.thoryn.cli.cmd.LoginCommand
 import com.devnow.thoryn.cli.cmd.LogoutCommand
+import com.devnow.thoryn.cli.cmd.StatusCommand
 import com.devnow.thoryn.cli.cmd.TenantCommand
 import com.devnow.thoryn.cli.cmd.WhoamiCommand
 import com.devnow.thoryn.cli.cmd.WorkspaceCommand
@@ -30,6 +31,7 @@ import kotlin.system.exitProcess
         LoginCommand::class,
         LogoutCommand::class,
         WhoamiCommand::class,
+        StatusCommand::class,
         ClientsCommand::class,
         FederationCommand::class,
         WorkspaceCommand::class,
