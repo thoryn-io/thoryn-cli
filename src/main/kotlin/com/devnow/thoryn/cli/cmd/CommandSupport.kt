@@ -75,7 +75,14 @@ internal object CommandSupport {
      * token instead of returning `HTTP 401` until the next `thoryn login`.
      */
     fun client(baseUrl: String, tokens: Tokens): ProductApiClient =
-        ProductApiClient(gateway = baseUrl, tokens = ensureFresh(tokens))
+        ProductApiClient(
+            gateway = baseUrl,
+            tokens = ensureFresh(tokens),
+            // SSO-2861 — reactive complement to ensureFresh: on a 401 the client forces one refresh
+            // and retries. Covers the cases the proactive skew check misses (unknown/short expiry,
+            // clock skew, a token the hub invalidated early).
+            reauthenticate = { forceRefresh() },
+        )
 
     /** Seconds before expiry at which [ensureFresh] proactively refreshes the access token. */
     private const val REFRESH_SKEW_SECONDS: Long = 60
@@ -99,8 +106,26 @@ internal object CommandSupport {
         val expiresAt = current.expiresAtEpochSecond ?: return current
         val now = System.currentTimeMillis() / 1000
         if (expiresAt - now > REFRESH_SKEW_SECONDS) return current
-        val refreshToken = current.refreshToken?.takeIf { it.isNotBlank() } ?: return current
-        val issuer = current.issuer?.takeIf { it.isNotBlank() } ?: return current
+        return forceRefresh(err) ?: current
+    }
+
+    /**
+     * SSO-2861 — force a refresh-token redemption regardless of expiry, for the reactive on-401 retry
+     * ([ProductApiClient] reauthenticator) and the proactive [ensureFresh] skew path. Reads the
+     * freshest persisted bundle (a prior refresh this process may have rotated the token), redeems it
+     * via [RefreshTokenFlow] (RFC 6749 §6), writes the result back (preserving the CLI-local
+     * [Tokens.issuer] / [Tokens.gateway] session fields, absent from the token response), and returns
+     * the refreshed bundle.
+     *
+     * Returns null when there is nothing to refresh with (no persisted store / refresh token / issuer)
+     * or the redemption fails (expired or revoked refresh token, unreachable hub) — the caller then
+     * surfaces the original `401` / falls back to the existing token. A one-line hint is printed on a
+     * genuine redemption failure so the user knows to re-run `thoryn login`.
+     */
+    internal fun forceRefresh(err: PrintStream = System.err): Tokens? {
+        val current = runCatching { TokenStoreFactory.default().read() }.getOrNull() ?: return null
+        val refreshToken = current.refreshToken?.takeIf { it.isNotBlank() } ?: return null
+        val issuer = current.issuer?.takeIf { it.isNotBlank() } ?: return null
         return try {
             val refreshed = RefreshTokenFlow(issuer = issuer, sender = realHttpSender())
                 .refresh(refreshToken)
@@ -110,7 +135,7 @@ internal object CommandSupport {
             refreshed
         } catch (e: Exception) {
             err.println("Could not refresh the session token (${e.message}); run `thoryn login` if the command fails.")
-            current
+            null
         }
     }
 

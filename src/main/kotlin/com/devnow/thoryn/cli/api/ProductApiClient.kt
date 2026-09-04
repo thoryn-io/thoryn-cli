@@ -23,9 +23,16 @@ import java.time.Duration
  *
  * Authentication: every method takes a [Tokens] (read from the local store
  * by the caller) and adds `Authorization: Bearer <access>` automatically.
- * A 401 from the gateway surfaces as a [ProductApiException]
- * (HTTP 401) — the existing `LogoutCommand` clears local tokens; an explicit
- * "refresh + retry" loop is a follow-up.
+ *
+ * **Reactive refresh-on-401 (SSO-2861).** [CommandSupport.ensureFresh] refreshes
+ * *proactively* before a call when the access token is near expiry (SSO-2834);
+ * this is its reactive complement. When a request returns `401` and a
+ * [reauthenticate] callback is present, the client invokes it once to obtain a
+ * fresh [Tokens] (a forced refresh-token redemption), swaps the bearer, and
+ * retries the request **exactly once**. If no callback is wired, the refresh
+ * yields no new token, or the retry still `401`s, the `401` surfaces as a
+ * [ProductApiException] unchanged — so callers without a reauthenticator behave
+ * exactly as before.
  *
  * Errors: any non-2xx response throws [ProductApiException] carrying the
  * status code and the OAuth2 `error` code parsed from the body, when
@@ -39,10 +46,20 @@ import java.time.Duration
  */
 class ProductApiClient(
     private val gateway: String,
-    private val tokens: Tokens,
+    tokens: Tokens,
     private val http: HttpClient = defaultClient(),
     private val mapper: ObjectMapper = defaultMapper(),
+    /**
+     * SSO-2861 — invoked once when a request returns `401`, to obtain a fresh
+     * [Tokens] for a single retry. Returns null (or the same access token) to
+     * decline the retry and let the `401` surface. Null means "no reactive
+     * refresh" — the pre-SSO-2861 behaviour.
+     */
+    private val reauthenticate: (() -> Tokens?)? = null,
 ) {
+
+    /** Current bearer material; swapped in place by the reactive refresh-on-401 retry. */
+    private var tokens: Tokens = tokens
 
     // ── OAuth applications / clients (SSO-1552; product-api SSO-1027/SSO-1028) ─
     //
@@ -261,12 +278,13 @@ class ProductApiClient(
     fun getAuditLogReceiptPdf(auditRowId: String, includeChain: Boolean = false): ByteArray {
         val basePath = "/api/v1/audit-log/${encode(auditRowId)}/receipt.pdf"
         val path = if (includeChain) "$basePath?includeChain=true" else basePath
-        val request = baseRequest(path)
-            // Accept both PDF and ZIP — server picks the format based on size.
-            .header("Accept", "application/pdf, application/zip")
-            .GET()
-            .build()
-        val response = http.send(request, HttpResponse.BodyHandlers.ofByteArray())
+        val response = sendAuthed(HttpResponse.BodyHandlers.ofByteArray()) { at ->
+            baseRequest(path).authed(at)
+                // Accept both PDF and ZIP — server picks the format based on size.
+                .header("Accept", "application/pdf, application/zip")
+                .GET()
+                .build()
+        }
         if (response.statusCode() !in 200..299) {
             // For PDF endpoint a non-2xx body might still be JSON error.
             val body = response.body()?.let { String(it, Charsets.UTF_8) } ?: ""
@@ -314,12 +332,13 @@ class ProductApiClient(
         // "current kid" from the bridge record so the CLI doesn't have to
         // chain a GET.
         val body = mapOf("step" to step)
-        val request = baseRequest("/api/v1/issuer-bridges/${encode(bridgeId)}/keys/current")
-            .header("Content-Type", "application/json")
-            .header("Accept", "application/json")
-            .method("PATCH", HttpRequest.BodyPublishers.ofString(mapper.writeValueAsString(body)))
-            .build()
-        return execute(request)
+        return executeJson { at ->
+            baseRequest("/api/v1/issuer-bridges/${encode(bridgeId)}/keys/current").authed(at)
+                .header("Content-Type", "application/json")
+                .header("Accept", "application/json")
+                .method("PATCH", HttpRequest.BodyPublishers.ofString(mapper.writeValueAsString(body)))
+                .build()
+        }
     }
 
     // ── Chain-of-custody (SSO-970 / SSO-962, SSO-964, SSO-965, SSO-967) ─────
@@ -406,48 +425,43 @@ class ProductApiClient(
 
     // ── Generic verbs ───────────────────────────────────────────────────────
 
-    private fun get(path: String): JsonNode {
-        val request = baseRequest(path)
+    private fun get(path: String): JsonNode = executeJson { at ->
+        baseRequest(path).authed(at)
             .header("Accept", "application/json")
             .GET()
             .build()
-        return execute(request)
     }
 
-    private fun post(path: String, body: Any, confirmSlug: String? = null): JsonNode {
-        val request = baseRequest(path)
+    private fun post(path: String, body: Any, confirmSlug: String? = null): JsonNode = executeJson { at ->
+        baseRequest(path).authed(at)
             .header("Content-Type", "application/json")
             .header("Accept", "application/json")
             .withConfirmation(confirmSlug)
             .POST(HttpRequest.BodyPublishers.ofString(mapper.writeValueAsString(body)))
             .build()
-        return execute(request)
     }
 
-    private fun put(path: String, body: Any): JsonNode {
-        val request = baseRequest(path)
+    private fun put(path: String, body: Any): JsonNode = executeJson { at ->
+        baseRequest(path).authed(at)
             .header("Content-Type", "application/json")
             .header("Accept", "application/json")
             .PUT(HttpRequest.BodyPublishers.ofString(mapper.writeValueAsString(body)))
             .build()
-        return execute(request)
     }
 
-    private fun patch(path: String, body: Any): JsonNode {
-        val request = baseRequest(path)
+    private fun patch(path: String, body: Any): JsonNode = executeJson { at ->
+        baseRequest(path).authed(at)
             .header("Content-Type", "application/json")
             .header("Accept", "application/json")
             .method("PATCH", HttpRequest.BodyPublishers.ofString(mapper.writeValueAsString(body)))
             .build()
-        return execute(request)
     }
 
-    private fun delete(path: String): JsonNode {
-        val request = baseRequest(path)
+    private fun delete(path: String): JsonNode = executeJson { at ->
+        baseRequest(path).authed(at)
             .header("Accept", "application/json")
             .DELETE()
             .build()
-        return execute(request)
     }
 
     /**
@@ -456,19 +470,20 @@ class ProductApiClient(
      * federation delete paths where the server returns no JSON.
      */
     private fun deleteNoContent(path: String, confirmSlug: String? = null) {
-        val request = baseRequest(path)
-            .header("Accept", "application/json")
-            .withConfirmation(confirmSlug)
-            .DELETE()
-            .build()
-        val response = http.send(request, HttpResponse.BodyHandlers.ofString())
+        val response = sendAuthed(HttpResponse.BodyHandlers.ofString()) { at ->
+            baseRequest(path).authed(at)
+                .header("Accept", "application/json")
+                .withConfirmation(confirmSlug)
+                .DELETE()
+                .build()
+        }
         if (response.statusCode() !in 200..299) {
             throw ProductApiException.fromResponse(response.statusCode(), response.body() ?: "", mapper)
         }
     }
 
-    private fun execute(request: HttpRequest): JsonNode {
-        val response = http.send(request, HttpResponse.BodyHandlers.ofString())
+    private fun executeJson(build: (accessToken: String) -> HttpRequest): JsonNode {
+        val response = sendAuthed(HttpResponse.BodyHandlers.ofString(), build)
         val body = response.body() ?: ""
         if (response.statusCode() !in 200..299) {
             throw ProductApiException.fromResponse(response.statusCode(), body, mapper)
@@ -477,13 +492,36 @@ class ProductApiClient(
         return mapper.readTree(body)
     }
 
+    /**
+     * SSO-2861 — send [build]'s request with the current bearer, and on a `401`
+     * perform a single reactive refresh-and-retry when [reauthenticate] is wired.
+     * The request is rebuilt with the fresh access token (an [HttpRequest] is
+     * immutable) so exactly one extra attempt is made; a null / unchanged refresh
+     * result, or a still-`401` retry, returns the response for the caller to raise.
+     */
+    private fun <T> sendAuthed(
+        handler: HttpResponse.BodyHandler<T>,
+        build: (accessToken: String) -> HttpRequest,
+    ): HttpResponse<T> {
+        val first = http.send(build(tokens.accessToken), handler)
+        if (first.statusCode() != 401) return first
+        val reauth = reauthenticate ?: return first
+        val refreshed = runCatching { reauth() }.getOrNull() ?: return first
+        if (refreshed.accessToken == tokens.accessToken) return first
+        tokens = refreshed
+        return http.send(build(tokens.accessToken), handler)
+    }
+
     private fun baseRequest(path: String): HttpRequest.Builder {
         val uri = URI.create("${gateway.trimEnd('/')}$path")
         return HttpRequest.newBuilder()
             .uri(uri)
             .timeout(Duration.ofSeconds(30))
-            .header("Authorization", "Bearer ${tokens.accessToken}")
     }
+
+    /** Attach the bearer for [accessToken] — applied per-send so a refreshed token is used on retry. */
+    private fun HttpRequest.Builder.authed(accessToken: String): HttpRequest.Builder =
+        header("Authorization", "Bearer $accessToken")
 
     private fun encode(s: String): String = URLEncoder.encode(s, Charsets.UTF_8)
 
