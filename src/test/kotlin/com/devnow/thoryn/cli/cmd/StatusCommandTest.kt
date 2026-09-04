@@ -82,6 +82,18 @@ class StatusCommandTest : CommandTestBase() {
     }
 
     @Test
+    fun `surfaces the active workspace when one is selected`() {
+        SelectedWorkspaceStore().write(SelectedWorkspace(tenantId = "t-1", slug = "testq2", tenantHubIssuer = "https://testq2.hub.example.org"))
+        server.enqueue(jsonResponse(200, """{"issuer":"https://hub"}"""))
+        server.enqueue(jsonResponse(200, """{"items":[]}"""))
+
+        val (exit, out, _) = runCli("status", "--hub", baseUrl(), "--gateway", baseUrl(), "--output", "json")
+
+        assertThat(exit).isEqualTo(0)
+        assertThat(parseJson(out)["activeWorkspace"]).isEqualTo("testq2")
+    }
+
+    @Test
     fun `reports an EXPIRED token without refreshing it`() {
         seedTokens(Tokens(accessToken = "AT", refreshToken = "RT", expiresAtEpochSecond = Instant.now().epochSecond - 60))
         server.enqueue(jsonResponse(200, """{"issuer":"https://hub"}"""))

@@ -87,6 +87,8 @@ class StatusCommand : Callable<Int> {
             put("signedIn", tokens != null)
             claims?.get("sub")?.asString()?.let { put("subject", it) }
             claims?.get("tnt")?.asString()?.let { put("tenant", it) }
+            // SSO-2867 — the workspace an active `switch` operates on (base `tenant` is the login tenant).
+            runCatching { SelectedWorkspaceStore().read() }.getOrNull()?.slug?.let { put("activeWorkspace", it) }
             if (tokens != null) put("authAccepted", authAccepted)
             put("tokenStatus", tokenStatus)
         }
@@ -103,6 +105,7 @@ class StatusCommand : Callable<Int> {
                 "signedIn" to n["signedIn"]?.asBoolean(),
                 "subject" to n["subject"]?.asString(),
                 "tenant" to n["tenant"]?.asString(),
+                "activeWorkspace" to n["activeWorkspace"]?.asString(),
                 "authAccepted" to n["authAccepted"]?.asBoolean(),
                 "tokenStatus" to n["tokenStatus"]?.asString(),
             ).filter { it.second != null }

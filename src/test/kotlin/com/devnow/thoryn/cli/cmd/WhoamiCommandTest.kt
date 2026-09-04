@@ -64,4 +64,24 @@ class WhoamiCommandTest : CommandTestBase() {
         assertThat(exit).isEqualTo(CommandSupport.EXIT_NOT_SIGNED_IN)
         assertThat(err).contains("Not signed in")
     }
+
+    @Test
+    fun `whoami surfaces the active workspace when one is selected`() {
+        seedTokens(Tokens(accessToken = jwt("""{"sub":"u","tnt":"default"}"""), expiresAtEpochSecond = Instant.now().epochSecond + 3600))
+        SelectedWorkspaceStore().write(SelectedWorkspace(tenantId = "t-1", slug = "testq2", tenantHubIssuer = "https://testq2.hub.example.org"))
+
+        val (exit, out, _) = runCli("whoami", "--output", "json")
+
+        assertThat(exit).isEqualTo(0)
+        val json = parseJson(out)
+        assertThat(json["tenant"]).isEqualTo("default")
+        assertThat(json["activeWorkspace"]).isEqualTo("testq2")
+    }
+
+    @Test
+    fun `whoami omits activeWorkspace when no workspace is selected`() {
+        seedTokens(Tokens(accessToken = jwt("""{"sub":"u","tnt":"default"}""")))
+        val (_, out, _) = runCli("whoami", "--output", "json")
+        assertThat(parseJson(out)).doesNotContainKey("activeWorkspace")
+    }
 }

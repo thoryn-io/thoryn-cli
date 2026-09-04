@@ -37,10 +37,15 @@ class WhoamiCommand : Callable<Int> {
         val claims = JwtClaims.of(tokens.accessToken)
         val expEpoch = tokens.expiresAtEpochSecond ?: claims["exp"]?.asLong()
         val (expiresAtIso, status) = tokenStatus(expEpoch)
+        // SSO-2867 — since SSO-2863 a `workspace switch` no longer rewrites the base token (its `tnt`
+        // stays the login tenant); it records a SelectedWorkspace that commands exchange into per call.
+        // Surface it so `tenant` (the base token) and the workspace you're actually operating in agree.
+        val activeWorkspace = runCatching { SelectedWorkspaceStore().read() }.getOrNull()?.slug
 
         val node: JsonNode = mapper.createObjectNode().apply {
             put("subject", claims["sub"]?.asString())
             put("tenant", claims["tnt"]?.asString())
+            activeWorkspace?.let { put("activeWorkspace", it) }
             put("clientId", claims["client_id"]?.asString() ?: claims["azp"]?.asString())
             claims["name"]?.asString()?.let { put("name", it) }
             claims["email"]?.asString()?.let { put("email", it) }
@@ -55,6 +60,7 @@ class WhoamiCommand : Callable<Int> {
             listOf(
                 "subject" to n["subject"]?.asString(),
                 "tenant" to n["tenant"]?.asString(),
+                "activeWorkspace" to n["activeWorkspace"]?.asString(),
                 "clientId" to n["clientId"]?.asString(),
                 "name" to n["name"]?.asString(),
                 "email" to n["email"]?.asString(),
