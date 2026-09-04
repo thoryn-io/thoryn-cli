@@ -195,6 +195,48 @@ class WorkspaceCommandTest : CommandTestBase() {
         assertThat(parseJson(out)["archived"]).isEqualTo(false)
     }
 
+    // ---- SSO-2859: hard-delete (permanent) ---------------------------------
+
+    @Test
+    fun `hard-delete with a matching confirm purges the workspace (202) and sends the confirm header`() {
+        server.enqueue(jsonResponse(200, """[{"tenantId":"t-1","slug":"acme","displayName":"Acme","archived":false,"loginUrl":"/x"}]"""))
+        server.enqueue(jsonResponse(202, """{"tenantId":"t-1","slug":"acme","displayName":"Acme","archived":true,"loginUrl":"/x"}"""))
+
+        val (exit, out, _) = runCli("workspace", "hard-delete", "acme", "--confirm", "acme", "--hub", baseUrl(), "--output", "json")
+
+        assertThat(exit).isEqualTo(0)
+        assertThat(parseJson(out)["archived"]).isEqualTo(true)
+
+        server.takeRequest() // the listWorkspaces slug→tenantId lookup
+        val delReq = server.takeRequest()
+        assertThat(delReq.path).endsWith("/account/workspace/t-1/hard-delete")
+        assertThat(delReq.getHeader("X-Thoryn-Confirm")).isEqualTo("acme")
+    }
+
+    @Test
+    fun `hard-delete without confirm surfaces the permanent-delete hint (428)`() {
+        server.enqueue(jsonResponse(200, """[{"tenantId":"t-1","slug":"acme","displayName":"Acme","archived":false,"loginUrl":"/x"}]"""))
+        server.enqueue(jsonResponse(428, """{"errorCode":"workspace_confirmation_required","detail":"confirmation required"}"""))
+
+        val (exit, _, err) = runCli("workspace", "hard-delete", "acme", "--hub", baseUrl())
+
+        assertThat(exit).isEqualTo(CommandSupport.EXIT_HTTP_ERROR)
+        assertThat(err).contains("Permanently deleting 'acme'")
+        assertThat(err).contains("thoryn workspace hard-delete acme --confirm acme")
+    }
+
+    @Test
+    fun `the delete alias maps to hard-delete`() {
+        server.enqueue(jsonResponse(200, """[{"tenantId":"t-1","slug":"acme","displayName":"Acme","archived":false,"loginUrl":"/x"}]"""))
+        server.enqueue(jsonResponse(202, """{"tenantId":"t-1","slug":"acme","displayName":"Acme","archived":true,"loginUrl":"/x"}"""))
+
+        val (exit, _, _) = runCli("workspace", "delete", "acme", "--confirm", "acme", "--hub", baseUrl(), "--output", "json")
+
+        assertThat(exit).isEqualTo(0)
+        server.takeRequest()
+        assertThat(server.takeRequest().path).endsWith("/account/workspace/t-1/hard-delete")
+    }
+
     @Test
     fun `archive of an unknown slug reports not-found`() {
         server.enqueue(jsonResponse(200, """[{"tenantId":"t-1","slug":"acme","displayName":"Acme","archived":false,"loginUrl":"/x"}]"""))

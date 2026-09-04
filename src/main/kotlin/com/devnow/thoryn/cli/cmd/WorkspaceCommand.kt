@@ -48,13 +48,14 @@ import java.util.concurrent.Callable
         WorkspaceCommand.SwitchSubcommand::class,
         WorkspaceCommand.ArchiveSubcommand::class,
         WorkspaceCommand.ReactivateSubcommand::class,
+        WorkspaceCommand.HardDeleteSubcommand::class,
     ],
 )
 class WorkspaceCommand : Callable<Int> {
 
     override fun call(): Int {
         System.err.println("Usage: thoryn workspace <subcommand>")
-        System.err.println("Subcommands: create | list | switch | archive | reactivate")
+        System.err.println("Subcommands: create | list | switch | archive | reactivate | hard-delete")
         return CommandSupport.EXIT_USAGE
     }
 
@@ -363,6 +364,62 @@ class WorkspaceCommand : Callable<Int> {
         }
     }
 
+    /**
+     * `thoryn workspace hard-delete <slug> --confirm <slug>` (alias `delete`) — SSO-2859.
+     *
+     * PERMANENTLY deletes a workspace you own via the hub's distributed teardown (SSO-2831): the
+     * tenant is suspended immediately (sign-in, token issuance, and issuer trust die at once) and
+     * the purge of every tenant-scoped row across hub / product-api / identity + the per-tenant
+     * Vault keys is enqueued (HTTP 202; completed asynchronously). **There is no undo.** Use
+     * `archive` instead for a reversible soft-disable. Name-confirmation guarded: pass
+     * `--confirm <slug>` (echoed to the hub as `X-Thoryn-Confirm`) so a delete can't happen by
+     * accident.
+     */
+    @Command(
+        name = "hard-delete",
+        aliases = ["delete"],
+        description = ["Permanently delete a workspace you own (IRREVERSIBLE — purges all data). Requires --confirm <slug>. Use `archive` for a reversible soft-disable."],
+        mixinStandardHelpOptions = true,
+    )
+    class HardDeleteSubcommand : Callable<Int> {
+
+        @Parameters(index = "0", description = ["Workspace slug to permanently delete."])
+        lateinit var slug: String
+
+        @Option(names = ["--hub"], description = ["Override the hub base URL. Defaults to the hub you signed into, else http://localhost:54702."])
+        var hub: String = ThorynConfig.DEFAULT_HUB
+
+        @Option(names = ["--confirm"], description = [CommandSupport.CONFIRM_OPTION_DESC])
+        var confirm: String? = null
+
+        @Option(names = ["--output"])
+        var outputRaw: String? = null
+
+        override fun call(): Int {
+            val format = CommandSupport.parseFormat(outputRaw) ?: return CommandSupport.EXIT_USAGE
+            val tokens = CommandSupport.readTokens() ?: return CommandSupport.EXIT_NOT_SIGNED_IN
+            hub = CommandSupport.resolveHub(hub, tokens)
+            val client = CommandSupport.client(hub, tokens)
+            val tenantId = resolveTenantIdBySlug(client, slug) ?: return workspaceNotFound(slug)
+            return try {
+                val body = client.hardDeleteWorkspace(tenantId, confirm)
+                CommandSupport.emitRecord(format, body, { node -> workspaceRecordFields(node) })
+                if (format == OutputFormat.TABLE) {
+                    System.err.println(
+                        "Workspace '$slug' is suspended and permanent deletion is in progress. " +
+                            "This is irreversible; the purge completes asynchronously.",
+                    )
+                }
+                CommandSupport.EXIT_OK
+            } catch (ex: ProductApiException) {
+                renderConfirmHint(ex, slug, subcommand = "hard-delete", verb = "Permanently deleting")
+                    ?: CommandSupport.renderError(format, ex)
+            } catch (ex: Exception) {
+                CommandSupport.renderRequestFailure(ex, hub)
+            }
+        }
+    }
+
     companion object {
         internal val LIST_HEADERS: List<String> = listOf(
             "slug", "displayName", "tenantId", "archived",
@@ -381,11 +438,20 @@ class WorkspaceCommand : Callable<Int> {
             return CommandSupport.EXIT_HTTP_ERROR
         }
 
-        /** SSO-2831 — actionable hints for the name-confirmation guard (428/422). Null if not a confirm error. */
-        internal fun renderConfirmHint(ex: ProductApiException, slug: String): Int? = when (ex.httpStatus) {
+        /**
+         * SSO-2831/SSO-2859 — actionable hints for the name-confirmation guard (428/422). Null if
+         * not a confirm error. [subcommand] + [verb] tailor the wording for `archive` (reversible)
+         * vs `hard-delete` (irreversible) so the re-run line is copy-pasteable for either.
+         */
+        internal fun renderConfirmHint(
+            ex: ProductApiException,
+            slug: String,
+            subcommand: String = "archive",
+            verb: String = "Archiving",
+        ): Int? = when (ex.httpStatus) {
             428 -> {
-                System.err.println("Archiving '$slug' is a protected action. Re-run with:")
-                System.err.println("  thoryn workspace archive $slug --confirm $slug")
+                System.err.println("$verb '$slug' is a protected action. Re-run with:")
+                System.err.println("  thoryn workspace $subcommand $slug --confirm $slug")
                 CommandSupport.EXIT_HTTP_ERROR
             }
             422 -> {

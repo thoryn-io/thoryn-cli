@@ -136,6 +136,17 @@ class ProductApiClient(
         post("/account/workspace/${encode(tenantId)}/reactivate", emptyMap<String, Any?>())
 
     /**
+     * SSO-2859 — `POST /account/workspace/{tenantId}/hard-delete` — IRREVERSIBLY deletes a
+     * workspace (SSO-2831 distributed teardown): suspends the tenant immediately and enqueues the
+     * purge of every tenant-scoped row across hub / product-api / identity + the per-tenant Vault
+     * keys. Returns **202 Accepted** (the async poller completes the purge). Name-confirmation
+     * guarded: [confirmSlug] rides as [CONFIRM_HEADER] (`X-Thoryn-Confirm`) and must equal the
+     * workspace slug, or the hub replies 428 (required) / 422 (mismatch).
+     */
+    fun hardDeleteWorkspace(tenantId: String, confirmSlug: String? = null): JsonNode =
+        post("/account/workspace/${encode(tenantId)}/hard-delete", emptyMap<String, Any?>(), confirmSlug)
+
+    /**
      * `POST /api/v1/tenants` on product-api (gateway-routed) — registers a
      * freshly-created hub workspace in product-api's `tenant_registry`. The only
      * product-api endpoint exempt from the `tnt`-claim filter. Called against a
