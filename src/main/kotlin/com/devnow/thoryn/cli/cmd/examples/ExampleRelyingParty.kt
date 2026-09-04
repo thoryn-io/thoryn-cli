@@ -76,7 +76,9 @@ internal class ExampleRelyingParty(
     }
 
     fun stop() {
-        if (this::server.isInitialized) server.stop(0)
+        // SSO-2868 — give in-flight exchanges up to 2s to finish so a just-served /protected page is
+        // never truncated by the shutdown.
+        if (this::server.isInitialized) server.stop(2)
     }
 
     private fun route(ex: HttpExchange) {
@@ -152,10 +154,6 @@ internal class ExampleRelyingParty(
             redirect(ex, "/login")
             return
         }
-        if (!signalled) {
-            signalled = true
-            runCatching { onSignedIn(claims) }
-        }
         val subject = (claims["email"] ?: claims["preferred_username"] ?: claims["sub"])?.toString() ?: "you"
         val rows = claims.entries
             .filter { it.key !in setOf("nonce", "at_hash", "c_hash") }
@@ -169,6 +167,15 @@ internal class ExampleRelyingParty(
             <p style="margin-top:1.5rem"><a href="/logout">Sign out</a></p>
         """.trimIndent()
         respond(ex, 200, "text/html", page("Protected page", body))
+
+        // SSO-2868 — signal ONLY AFTER the protected page has been fully written to the browser.
+        // Previously onSignedIn fired first, `run` woke on the latch and called `stop()`, and the
+        // server shut down mid-response → the browser got ERR_CONNECTION_REFUSED on /protected even
+        // though the CLI reported success. `respond()` fully flushes the body before this runs.
+        if (!signalled) {
+            signalled = true
+            runCatching { onSignedIn(claims) }
+        }
     }
 
     private fun exchangeCode(code: String, verifier: String): JsonNode? {

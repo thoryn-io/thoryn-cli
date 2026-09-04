@@ -185,8 +185,16 @@ internal class SimpleSigninExample : Example {
             ctx.out.println("Waiting for you to sign in and reach the protected page (5 min)…")
             val ok = signedIn.await(5, TimeUnit.MINUTES)
             return if (ok) {
+                // SSO-2868 — keep the local app running so the protected page stays viewable. Before,
+                // `run` stopped the server the instant sign-in was detected, so the browser's render of
+                // /protected (and any reload) hit a dead port — the user saw a connection-refused error
+                // page instead of the protected page. Block here until the user is done; a non-TTY
+                // stdin (piped / CI) hits EOF immediately and proceeds to tear down.
                 ctx.out.println()
-                ctx.out.println("Done. When finished:  thoryn examples teardown $name")
+                ctx.out.println("The protected page is live at ${rp.baseUrl}/protected — explore it in your browser.")
+                ctx.out.println("Press Enter here to shut down the local example app.")
+                runCatching { readlnOrNull() }
+                ctx.out.println("Local app stopped. When finished:  thoryn examples teardown $name")
                 CommandSupport.EXIT_OK
             } else {
                 ctx.warn("Timed out waiting for sign-in. Re-run `thoryn examples run $name` to try again.")
