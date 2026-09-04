@@ -75,7 +75,7 @@ class ClientsCommand : Callable<Int> {
             val format = CommandSupport.parseFormat(outputRaw) ?: return CommandSupport.EXIT_USAGE
             val tokens = CommandSupport.readTokens() ?: return CommandSupport.EXIT_NOT_SIGNED_IN
             gateway = CommandSupport.resolveGateway(gateway, tokens) // SSO-2827 — default to the gateway you signed into
-            val client = CommandSupport.client(gateway, tokens)
+            val client = CommandSupport.gatewayClient(gateway, tokens)
             return try {
                 val body = client.listApplications()
                 CommandSupport.emitList(format, body, LIST_HEADERS, ::clientRow)
@@ -105,7 +105,7 @@ class ClientsCommand : Callable<Int> {
             val format = CommandSupport.parseFormat(outputRaw) ?: return CommandSupport.EXIT_USAGE
             val tokens = CommandSupport.readTokens() ?: return CommandSupport.EXIT_NOT_SIGNED_IN
             gateway = CommandSupport.resolveGateway(gateway, tokens) // SSO-2827 — default to the gateway you signed into
-            val client = CommandSupport.client(gateway, tokens)
+            val client = CommandSupport.gatewayClient(gateway, tokens)
             return try {
                 val body = client.getApplication(clientId)
                 CommandSupport.emitRecord(format, body, ::clientRecordFields)
@@ -163,7 +163,7 @@ class ClientsCommand : Callable<Int> {
             val format = CommandSupport.parseFormat(outputRaw) ?: return CommandSupport.EXIT_USAGE
             val tokens = CommandSupport.readTokens() ?: return CommandSupport.EXIT_NOT_SIGNED_IN
             gateway = CommandSupport.resolveGateway(gateway, tokens) // SSO-2827 — default to the gateway you signed into
-            val client = CommandSupport.client(gateway, tokens)
+            val client = CommandSupport.gatewayClient(gateway, tokens)
 
             val body = linkedMapOf<String, Any?>(
                 "displayName" to displayName,
@@ -237,7 +237,7 @@ class ClientsCommand : Callable<Int> {
             }
             val tokens = CommandSupport.readTokens() ?: return CommandSupport.EXIT_NOT_SIGNED_IN
             gateway = CommandSupport.resolveGateway(gateway, tokens) // SSO-2827 — default to the gateway you signed into
-            val client = CommandSupport.client(gateway, tokens)
+            val client = CommandSupport.gatewayClient(gateway, tokens)
             val body = linkedMapOf<String, Any?>()
             displayName?.let { body["displayName"] = it }
             redirectUris?.let { body["redirectUris"] = it.toList() }
@@ -286,7 +286,7 @@ class ClientsCommand : Callable<Int> {
             val format = CommandSupport.parseFormat(outputRaw) ?: return CommandSupport.EXIT_USAGE
             val tokens = CommandSupport.readTokens() ?: return CommandSupport.EXIT_NOT_SIGNED_IN
             gateway = CommandSupport.resolveGateway(gateway, tokens) // SSO-2827 — default to the gateway you signed into
-            val client = CommandSupport.client(gateway, tokens)
+            val client = CommandSupport.gatewayClient(gateway, tokens)
             return try {
                 val response = client.rotateApplicationSecret(clientId, confirm)
                 val secret = response["newSecret"]?.asString()
@@ -330,7 +330,7 @@ class ClientsCommand : Callable<Int> {
             val format = CommandSupport.parseFormat(outputRaw) ?: return CommandSupport.EXIT_USAGE
             val tokens = CommandSupport.readTokens() ?: return CommandSupport.EXIT_NOT_SIGNED_IN
             gateway = CommandSupport.resolveGateway(gateway, tokens) // SSO-2827 — default to the gateway you signed into
-            val client = CommandSupport.client(gateway, tokens)
+            val client = CommandSupport.gatewayClient(gateway, tokens)
             return try {
                 client.deleteApplication(clientId, confirm)
                 CommandSupport.emitValue(

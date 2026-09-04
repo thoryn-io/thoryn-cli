@@ -4,7 +4,6 @@ import com.devnow.thoryn.cli.api.ProductApiException
 import com.devnow.thoryn.cli.auth.HttpSender
 import com.devnow.thoryn.cli.auth.TokenExchangeException
 import com.devnow.thoryn.cli.auth.TokenExchangeFlow
-import com.devnow.thoryn.cli.auth.TokenStoreFactory
 import com.devnow.thoryn.cli.config.ThorynConfig
 import com.devnow.thoryn.cli.output.OutputFormat
 import picocli.CommandLine.Command
@@ -215,9 +214,6 @@ class WorkspaceCommand : Callable<Int> {
             HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build().send(request, handler)
         }
 
-        /** Test seam: where the exchanged token is persisted (defaults to the OS-selected token store). */
-        internal var tokenWriter: (com.devnow.thoryn.cli.auth.Tokens) -> Unit = { TokenStoreFactory.default().write(it) }
-
         override fun call(): Int {
             val format = CommandSupport.parseFormat(outputRaw) ?: return CommandSupport.EXIT_USAGE
             val tokens = CommandSupport.readTokens() ?: return CommandSupport.EXIT_NOT_SIGNED_IN
@@ -248,10 +244,16 @@ class WorkspaceCommand : Callable<Int> {
 
             // SSO-2818 — silent cross-tenant switch: exchange the current token for a token in the
             // target tenant (no browser). The hub grants it only if we're an active member of it.
+            //
+            // SSO-2863 — this exchange now VALIDATES membership only; its result is discarded. The
+            // switch must NOT persist the exchanged token as the session — that token carries no
+            // refresh token, so it would kill the CLI's refresh ability and die at ~15 minutes.
+            // Instead we record the selection (below) and `CommandSupport.gatewayClient` mints a
+            // switched token from the refreshable base session on demand.
             val secret = clientSecretFile
                 ?.let { runCatching { Files.readString(Path.of(it)).trim() }.getOrNull()?.takeIf(String::isNotBlank) }
                 ?: System.getenv("THORYN_CLIENT_SECRET")?.takeIf { it.isNotBlank() }
-            val exchanged = try {
+            try {
                 TokenExchangeFlow(
                     issuer = hub,
                     clientId = clientId,
@@ -277,7 +279,6 @@ class WorkspaceCommand : Callable<Int> {
                 return CommandSupport.EXIT_IO_ERROR
             }
 
-            tokenWriter(exchanged)
             store.write(SelectedWorkspace(tenantId = tenantId, slug = slug, tenantHubIssuer = tenantHub))
 
             CommandSupport.emitValue(

@@ -12,18 +12,20 @@ import kotlin.io.path.exists
 /**
  * SSO-1552 — records which workspace the CLI is "switched into".
  *
- * Unlike the web console, the CLI has no browser session: a workspace switch is
- * fundamentally a re-authentication against the tenant's hub subdomain (the
- * `loginUrl` the hub returns is a console-relative OIDC path the CLI cannot
- * drive). `thoryn workspace switch <slug>` therefore (a) validates the
- * workspace exists, (b) persists the selected workspace here, and (c) prints the
- * exact `thoryn login --issuer <tenant-hub>` line to mint a token carrying the
- * new `tnt`.
+ * `thoryn workspace switch <slug>` (a) validates the workspace exists and that
+ * we are an active member (via a throwaway token exchange), then (b) persists the
+ * selected workspace here. It does NOT touch the token store.
+ *
+ * SSO-2863 — this record is load-bearing: `CommandSupport.gatewayClient` reads it
+ * and, when a workspace is selected, mints a token FOR that tenant by exchanging
+ * the *refreshable base session* token on demand (per command, re-exchanging on a
+ * 401). That keeps the switched session alive as long as the base login (8h/7d)
+ * instead of dying at the ~15-minute, non-refreshable exchanged token that the old
+ * clobber-the-session-token approach produced.
  *
  * This file carries NO secret — only the chosen `tenantId` / `slug` / derived
- * tenant-hub issuer. It is informational state (so a later command can show
- * "you last switched to …"), not an auth artefact; the token store remains the
- * source of truth for the active bearer.
+ * tenant-hub issuer. The token store remains the source of truth for the
+ * refreshable base bearer; this names which tenant to exchange into.
  *
  * Stored next to the plaintext token file (`~/.config/thoryn/workspace.json` on
  * Linux/macOS, `%APPDATA%/thoryn/workspace.json` on Windows). Override with
@@ -52,6 +54,15 @@ internal class SelectedWorkspaceStore(
             StandardOpenOption.TRUNCATE_EXISTING,
             StandardOpenOption.WRITE,
         )
+    }
+
+    /**
+     * SSO-2863 — drop any active workspace selection. Called on `thoryn login` (a fresh login resets
+     * the base tenant, so a stale selection must not silently re-exchange into an old workspace).
+     * Best-effort: a missing file or unreadable path is a no-op.
+     */
+    fun clear() {
+        runCatching { Files.deleteIfExists(path) }
     }
 
     companion object {

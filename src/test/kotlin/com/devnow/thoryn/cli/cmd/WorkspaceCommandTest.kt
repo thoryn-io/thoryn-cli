@@ -99,7 +99,7 @@ class WorkspaceCommandTest : CommandTestBase() {
     }
 
     @Test
-    fun `switch silently exchanges the current token for the target tenant and records the selection`() {
+    fun `switch validates membership and records the selection without replacing the session token`() {
         // 1) workspace-list validation call.
         server.enqueue(
             jsonResponse(
@@ -140,9 +140,13 @@ class WorkspaceCommandTest : CommandTestBase() {
         assertThat(Files.exists(workspaceFile)).isTrue()
         assertThat(Files.readString(workspaceFile)).contains("acme")
 
-        // The exchanged token becomes the active bearer.
+        // SSO-2863 — the switch must NOT replace the session bearer. The refreshable base login
+        // token stays put (the exchanged, non-refreshable token is discarded after validating
+        // membership); gatewayClient re-mints the switched token per command from the base session.
         val tokenFile = tempHome.resolve(".config/thoryn/tokens.json")
-        assertThat(Files.readString(tokenFile)).contains("acme-tenant-token")
+        val storedToken = Files.readString(tokenFile)
+        assertThat(storedToken).contains("AT-test")
+        assertThat(storedToken).doesNotContain("acme-tenant-token")
     }
 
     @Test

@@ -215,6 +215,9 @@ class LoginCommand : Callable<Int> {
         return try {
             val tokens = flow.run(expandedScope())
             tokenStore.write(withSession(tokens))
+            // SSO-2863 — a fresh login resets the base tenant; drop any stale `workspace switch`
+            // selection so later commands don't silently re-exchange into an old workspace.
+            SelectedWorkspaceStore().clear()
             println("Signed in (client-credentials / service account '$clientId').")
             tokens.scope?.let { println("Scopes: $it") }
             EXIT_OK
@@ -254,6 +257,9 @@ class LoginCommand : Callable<Int> {
                 println("Waiting for sign-in (expires in ${authorization.expiresIn / 60} minutes)…")
             }
             tokenStore.write(withSession(tokens))
+            // SSO-2863 — a fresh login resets the base tenant; drop any stale `workspace switch`
+            // selection so later commands don't silently re-exchange into an old workspace.
+            SelectedWorkspaceStore().clear()
             println()
             println("Signed in.")
             0
@@ -340,6 +346,9 @@ class LoginCommand : Callable<Int> {
             )
             val tokens = flow.exchange(code)
             tokenStore.write(withSession(tokens))
+            // SSO-2863 — a fresh login resets the base tenant; drop any stale `workspace switch`
+            // selection so later commands don't silently re-exchange into an old workspace.
+            SelectedWorkspaceStore().clear()
             println()
             println("Signed in.")
             tokens.scope?.let { println("Scopes: $it") }

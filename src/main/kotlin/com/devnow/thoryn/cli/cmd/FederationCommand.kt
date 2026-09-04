@@ -66,7 +66,7 @@ class FederationCommand : Callable<Int> {
             val format = CommandSupport.parseFormat(outputRaw) ?: return CommandSupport.EXIT_USAGE
             val tokens = CommandSupport.readTokens() ?: return CommandSupport.EXIT_NOT_SIGNED_IN
             gateway = CommandSupport.resolveGateway(gateway, tokens) // SSO-2827 — default to the gateway you signed into
-            val client = CommandSupport.client(gateway, tokens)
+            val client = CommandSupport.gatewayClient(gateway, tokens)
             return try {
                 val body = client.listFederationMembers()
                 CommandSupport.emitList(format, body, LIST_HEADERS, ::memberRow)
@@ -133,7 +133,7 @@ class FederationCommand : Callable<Int> {
 
             val tokens = CommandSupport.readTokens() ?: return CommandSupport.EXIT_NOT_SIGNED_IN
             gateway = CommandSupport.resolveGateway(gateway, tokens) // SSO-2827 — default to the gateway you signed into
-            val client = CommandSupport.client(gateway, tokens)
+            val client = CommandSupport.gatewayClient(gateway, tokens)
 
             val body = linkedMapOf<String, Any?>(
                 "providerType" to providerType,
@@ -191,7 +191,7 @@ class FederationCommand : Callable<Int> {
             val format = CommandSupport.parseFormat(outputRaw) ?: return CommandSupport.EXIT_USAGE
             val tokens = CommandSupport.readTokens() ?: return CommandSupport.EXIT_NOT_SIGNED_IN
             gateway = CommandSupport.resolveGateway(gateway, tokens) // SSO-2827 — default to the gateway you signed into
-            val client = CommandSupport.client(gateway, tokens)
+            val client = CommandSupport.gatewayClient(gateway, tokens)
             return try {
                 client.deleteFederationMember(memberId, confirm)
                 CommandSupport.emitValue(

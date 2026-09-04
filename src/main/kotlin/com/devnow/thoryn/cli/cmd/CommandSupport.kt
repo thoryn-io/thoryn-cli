@@ -5,6 +5,7 @@ import com.devnow.thoryn.cli.api.ProductApiException
 import com.devnow.thoryn.cli.auth.HttpSender
 import com.devnow.thoryn.cli.auth.RefreshTokenFlow
 import com.devnow.thoryn.cli.auth.ScopeRegistry
+import com.devnow.thoryn.cli.auth.TokenExchangeFlow
 import com.devnow.thoryn.cli.auth.TokenStoreFactory
 import com.devnow.thoryn.cli.auth.Tokens
 import com.devnow.thoryn.cli.config.ThorynConfig
@@ -83,6 +84,57 @@ internal object CommandSupport {
             // clock skew, a token the hub invalidated early).
             reauthenticate = { forceRefresh() },
         )
+
+    /**
+     * SSO-2863 — build a gateway (tenant-scoped) client that honours an active `workspace switch`.
+     *
+     * When a workspace is selected, mint a token FOR that tenant by token-exchanging (RFC 8693) the
+     * *freshened* base session token on demand — the refreshable login token stays in the store and
+     * keeps its 8h/7d refresh ability, so a switched session lives as long as the login instead of
+     * dying at the ~15-minute, non-refreshable exchanged token (the SSO-2863 bug, where `switch`
+     * persisted the exchanged token as the session). On a 401 the client refreshes the base and
+     * re-exchanges. With no active switch this is exactly [client].
+     *
+     * If the base session can no longer mint a switched token (expired login, lost membership), a
+     * one-line hint is printed and the returned client fails auth rather than silently operating on
+     * the base tenant — a switched command must never run against the wrong tenant.
+     */
+    fun gatewayClient(
+        gateway: String,
+        baseTokens: Tokens,
+        selectedWorkspace: SelectedWorkspaceStore = SelectedWorkspaceStore(),
+        err: PrintStream = System.err,
+    ): ProductApiClient {
+        val selected = runCatching { selectedWorkspace.read() }.getOrNull()
+            ?: return client(gateway, baseTokens)
+
+        fun mint(): Tokens? {
+            val base = ensureFresh(baseTokens, err)
+            val issuer = base.issuer?.takeIf { it.isNotBlank() } ?: return null
+            return runCatching {
+                TokenExchangeFlow(
+                    issuer = issuer,
+                    clientId = ThorynConfig.DEFAULT_CLIENT_ID,
+                    clientSecret = ThorynConfig.resolveClientSecret(),
+                    subjectToken = base.accessToken,
+                    targetResource = selected.tenantHubIssuer,
+                    sender = realHttpSender(),
+                ).run()
+            }.getOrNull()
+        }
+
+        val initial = mint()
+        if (initial == null) {
+            err.println("Could not enter workspace '${selected.slug}' — your session may have expired. Run `thoryn login`.")
+        }
+        return ProductApiClient(
+            gateway = gateway,
+            // A blank bearer guarantees a 401 (surfacing the hint above) rather than a silent
+            // base-tenant call; the reauthenticator retries the exchange once the base recovers.
+            tokens = initial ?: Tokens(accessToken = ""),
+            reauthenticate = { mint() },
+        )
+    }
 
     /** Seconds before expiry at which [ensureFresh] proactively refreshes the access token. */
     private const val REFRESH_SKEW_SECONDS: Long = 60

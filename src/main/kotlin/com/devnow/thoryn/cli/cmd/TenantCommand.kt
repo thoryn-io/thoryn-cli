@@ -219,7 +219,7 @@ class TenantCommand : Callable<Int> {
                 resolved
             }
 
-            val client = CommandSupport.client(gateway, tokens)
+            val client = CommandSupport.gatewayClient(gateway, tokens)
             val result = SeedResult()
 
             // ── Step 1: register tenant in product-api (optional) ───────────
