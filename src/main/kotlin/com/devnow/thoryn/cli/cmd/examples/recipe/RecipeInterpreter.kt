@@ -2,13 +2,19 @@ package com.devnow.thoryn.cli.cmd.examples.recipe
 
 import com.devnow.thoryn.cli.api.ProductApiClient
 import com.devnow.thoryn.cli.api.ProductApiException
+import com.devnow.thoryn.cli.auth.JwtClaims
 import com.devnow.thoryn.cli.cmd.examples.ExampleContext
 import com.devnow.thoryn.cli.cmd.examples.ExampleState
 import com.devnow.thoryn.cli.config.ThorynConfig
 import tools.jackson.databind.JsonNode
 import tools.jackson.databind.json.JsonMapper
 import tools.jackson.module.kotlin.kotlinModule
+import java.time.Instant
 import java.util.UUID
+
+/** SSO-2875 — the result of applying a recipe: the [ExampleState] the `run`/RP flow reads, plus the
+ *  portable [Receipt] recording exactly what was provisioned. */
+internal data class RecipeRun(val state: ExampleState, val receipt: Receipt)
 
 /** SSO-2873 — a recipe could not be applied (bad shape, unresolved reference, or a step failure). */
 internal open class RecipeException(message: String) : RuntimeException(message)
@@ -54,14 +60,36 @@ internal class RecipeInterpreter(
     private var createdClientId: String? = null
     private var createdRedirectUri: String? = null
 
+    // SSO-2875 — accumulated as the run proceeds, folded into the receipt on success.
+    private val resources = mutableListOf<ResourceRef>()
+    private val verifyResults = mutableListOf<VerifyResult>()
+
     private val placeholder = Regex("""\{\{\s*([a-zA-Z0-9_.]+)\s*}}""")
 
-    /** Provision the recipe: resolve params, run steps in order, then verify. Returns the run's [ExampleState]. */
-    fun setup(): ExampleState {
+    /** Provision the recipe: resolve params, run steps in order, verify. Returns the [RecipeRun]. */
+    fun setup(): RecipeRun {
         resolveParams()
         recipe.steps.forEachIndexed { i, step -> executeStep(i + 1, step) }
         runVerify()
-        return buildState()
+        return RecipeRun(buildState(), buildReceipt())
+    }
+
+    /**
+     * SSO-2875 — re-check a receipt's `verify` assertions against the LIVE product state (does the
+     * provisioned config still exist and match?). Returns fresh [VerifyResult]s; never throws.
+     */
+    fun verifyReceipt(receipt: Receipt): List<VerifyResult> {
+        workspace = WorkspaceCtx(receipt.workspace.slug ?: "", receipt.workspace.tenantId ?: "", null)
+        return receipt.verify.map { vr ->
+            when (vr.assert) {
+                "applications.get" -> {
+                    val app = runCatching { tenantClient().getApplication(vr.id ?: "") }.getOrNull()
+                    val passed = app != null && vr.expect.all { (field, expected) -> app[field]?.asString() == expected }
+                    vr.copy(passed = passed)
+                }
+                else -> vr.copy(passed = false)
+            }
+        }
     }
 
     /** Best-effort teardown in reverse declaration order; a failure is warned, not fatal. */
@@ -149,6 +177,11 @@ internal class RecipeInterpreter(
         val clientId = (app["clientId"] ?: app["client_id"])?.asString()
             ?: throw RecipeException("applications.create returned no clientId")
         createdClientId = clientId
+        resources += ResourceRef(
+            kind = "application",
+            id = clientId,
+            attributes = buildMap { createdRedirectUri?.let { put("redirectUri", it) } },
+        )
         ctx.info("client: clientId=$clientId")
         return mapOf("clientId" to clientId)
     }
@@ -157,6 +190,7 @@ internal class RecipeInterpreter(
         val member = retryUntilTenantTrusted { tenantClient().createFederationMember(with) }
         val memberId = (member["memberId"] ?: member["id"])?.asString()
             ?: throw RecipeException("federation.create returned no memberId")
+        resources += ResourceRef(kind = "federationMember", id = memberId)
         return mapOf("memberId" to memberId)
     }
 
@@ -167,12 +201,12 @@ internal class RecipeInterpreter(
             when (val assertion = v["assert"].asString()) {
                 "applications.get" -> {
                     val id = substitute(v["id"].asString())
+                    val expect = expectations(v)
                     val app = tenantClient().getApplication(id)
-                    expectations(v).forEach { (field, expected) ->
-                        val actual = app[field]?.asString()
-                        if (actual != expected) {
-                            throw RecipeException("verify applications.get: expected $field='$expected' but was '$actual'")
-                        }
+                    val mismatch = expect.entries.firstOrNull { (field, expected) -> app[field]?.asString() != expected }
+                    verifyResults += VerifyResult("applications.get", id, expect, passed = mismatch == null)
+                    if (mismatch != null) {
+                        throw RecipeException("verify applications.get: expected ${mismatch.key}='${mismatch.value}' but was '${app[mismatch.key]?.asString()}'")
                     }
                 }
                 else -> throw RecipeUnsupportedActionException(assertion)
@@ -257,6 +291,18 @@ internal class RecipeInterpreter(
             redirectUri = createdRedirectUri,
             tenantIssuer = slug?.let { ThorynConfig.tenantIssuer(ctx.hub, it) },
             identityHost = slug?.let { ThorynConfig.tenantIdentityHost(ctx.hub, it) },
+        )
+    }
+
+    private fun buildReceipt(): Receipt {
+        val w = workspace
+        return Receipt(
+            recipe = RecipeRef(recipe.id, recipe.version, recipe.digest),
+            appliedAt = Instant.now().toString(),
+            subject = JwtClaims.of(ctx.tokens.accessToken)["sub"]?.takeIf { !it.isNull }?.asString(),
+            workspace = WorkspaceRef(slug = w?.slug ?: scope["workspaceSlug"], tenantId = w?.tenantId),
+            resources = resources.toList(),
+            verify = verifyResults.toList(),
         )
     }
 }

@@ -17,6 +17,7 @@ import com.devnow.thoryn.cli.cmd.examples.ExampleContext
 internal class RecipeExample(
     private val recipe: Recipe,
     private val runDelegate: Example,
+    private val receiptStore: ReceiptStore = ReceiptStore(),
 ) : Example {
 
     override val name: String = recipe.id
@@ -29,15 +30,17 @@ internal class RecipeExample(
             return CommandSupport.EXIT_OK
         }
         return try {
-            val state = RecipeInterpreter(ctx, recipe).setup()
-            ctx.state.write(state)
+            val run = RecipeInterpreter(ctx, recipe).setup()
+            ctx.state.write(run.state)
+            receiptStore.write(run.receipt) // SSO-2875 — a portable, verifiable record of the run.
             ctx.out.println()
             ctx.out.println("Setup complete (recipe ${recipe.id} v${recipe.version}). Live state:")
-            ctx.info("workspace slug : ${state.workspaceSlug}")
-            state.tenantIssuer?.let { ctx.info("tenant issuer  : $it") }
-            state.identityHost?.let { ctx.info("sign-in host   : $it") }
-            state.clientId?.let { ctx.info("app client id  : $it") }
+            ctx.info("workspace slug : ${run.state.workspaceSlug}")
+            run.state.tenantIssuer?.let { ctx.info("tenant issuer  : $it") }
+            run.state.identityHost?.let { ctx.info("sign-in host   : $it") }
+            run.state.clientId?.let { ctx.info("app client id  : $it") }
             ctx.out.println()
+            ctx.out.println("Receipt written. See it with:  thoryn examples receipt $name")
             ctx.out.println("Next:  thoryn examples run $name")
             CommandSupport.EXIT_OK
         } catch (ex: RecipeException) {
@@ -59,6 +62,7 @@ internal class RecipeExample(
         }
         RecipeInterpreter(ctx, recipe).teardown(state)
         ctx.state.clear(name)
+        receiptStore.clear(name)
         ctx.out.println()
         ctx.info("Removed what the recipe created (best-effort). Recipe: ${recipe.id} v${recipe.version}.")
         return CommandSupport.EXIT_OK

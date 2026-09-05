@@ -39,12 +39,22 @@ class RecipeInterpreterTest : CommandTestBase() {
         // 4) verify applications.get
         server.enqueue(jsonResponse(200, """{"clientId":"app-9","status":"active"}"""))
 
-        val state = RecipeInterpreter(ctx, Recipe.load("simple-signin"), trustPropagationBudgetMs = 2_000).setup()
+        val run = RecipeInterpreter(ctx, Recipe.load("simple-signin"), trustPropagationBudgetMs = 2_000).setup()
+        val state = run.state
 
         assertThat(state.example).isEqualTo("simple-signin")
         assertThat(state.tenantId).isEqualTo("t-1")
         assertThat(state.clientId).isEqualTo("app-9")
         assertThat(state.workspaceSlug).startsWith("ex-signin-")
+
+        // SSO-2875 — the run produced a receipt recording exactly what was provisioned.
+        val receipt = run.receipt
+        assertThat(receipt.recipe.id).isEqualTo("simple-signin")
+        assertThat(receipt.recipe.digest).startsWith("sha256:")
+        assertThat(receipt.workspace.tenantId).isEqualTo("t-1")
+        assertThat(receipt.resources).anyMatch { it.kind == "application" && it.id == "app-9" }
+        assertThat(receipt.verify).anyMatch { it.assert == "applications.get" && it.passed }
+        assertThat(receipt.attestation).isNull() // Phase 3b adds the platform signature.
 
         assertThat(server.takeRequest().path).isEqualTo("/account/workspace")
         assertThat(server.takeRequest().path).isEqualTo("/api/v1/tenants")
