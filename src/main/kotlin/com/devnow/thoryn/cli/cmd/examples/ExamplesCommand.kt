@@ -1,7 +1,13 @@
 package com.devnow.thoryn.cli.cmd.examples
 
 import com.devnow.thoryn.cli.cmd.CommandSupport
+import com.devnow.thoryn.cli.cmd.examples.recipe.Recipe
+import com.devnow.thoryn.cli.cmd.examples.recipe.RecipeException
+import com.devnow.thoryn.cli.cmd.examples.recipe.RecipeInterpreter
+import com.devnow.thoryn.cli.cmd.examples.recipe.ReceiptStore
 import com.devnow.thoryn.cli.config.ThorynConfig
+import com.devnow.thoryn.cli.output.OutputFormat
+import com.devnow.thoryn.cli.output.Printers
 import picocli.CommandLine.Command
 import picocli.CommandLine.Option
 import picocli.CommandLine.Parameters
@@ -30,6 +36,8 @@ import java.util.concurrent.Callable
         ExamplesCommand.SetupSubcommand::class,
         ExamplesCommand.RunSubcommand::class,
         ExamplesCommand.TeardownSubcommand::class,
+        ExamplesCommand.ReceiptSubcommand::class,
+        ExamplesCommand.VerifySubcommand::class,
     ],
 )
 class ExamplesCommand : Callable<Int> {
@@ -65,6 +73,87 @@ class ExamplesCommand : Callable<Int> {
 
     @Command(name = "teardown", description = ["Remove what an example's setup created (best-effort)."], mixinStandardHelpOptions = true)
     class TeardownSubcommand : LifecycleSubcommand({ ex, ctx -> ex.teardown(ctx) })
+
+    /**
+     * SSO-2875 — `thoryn examples receipt [name]` — show the portable receipt a recipe run wrote
+     * (what was provisioned, the recipe id/version/digest, verify results). Offline; no sign-in needed.
+     */
+    @Command(name = "receipt", description = ["Show the receipt written by an example's setup."], mixinStandardHelpOptions = true)
+    class ReceiptSubcommand : Callable<Int> {
+        @Parameters(index = "0", arity = "0..1", description = ["Example name (optional when only one exists)."])
+        var name: String? = null
+
+        @Option(names = ["--output"], description = ["Output format: json|yaml (default: yaml)."])
+        var outputRaw: String? = null
+
+        override fun call(): Int {
+            val exampleName = name ?: singleExampleName() ?: return CommandSupport.EXIT_USAGE
+            val format = CommandSupport.parseFormat(outputRaw) ?: return CommandSupport.EXIT_USAGE
+            val receipt = ReceiptStore().read(exampleName)
+                ?: run {
+                    System.err.println("No receipt for '$exampleName'. Run `thoryn examples setup $exampleName` first.")
+                    return CommandSupport.EXIT_USAGE
+                }
+            when (format) {
+                OutputFormat.JSON -> Printers.json(receipt)
+                else -> Printers.yaml(receipt)
+            }
+            return CommandSupport.EXIT_OK
+        }
+    }
+
+    /**
+     * SSO-2875 — `thoryn examples verify [name]` — re-check that the config a recipe run provisioned
+     * still exists and matches, using the receipt's recorded resource ids. Exits non-zero on any drift.
+     */
+    @Command(name = "verify", description = ["Re-check that an example's provisioned config still matches its receipt."], mixinStandardHelpOptions = true)
+    class VerifySubcommand : Callable<Int> {
+        @Parameters(index = "0", arity = "0..1", description = ["Example name (optional when only one exists)."])
+        var name: String? = null
+
+        @Option(names = ["--hub"], description = ["Override the hub base URL."])
+        var hub: String = ThorynConfig.DEFAULT_HUB
+
+        @Option(names = ["--gateway"], description = ["Override the gateway base URL."])
+        var gateway: String = ThorynConfig.DEFAULT_GATEWAY
+
+        override fun call(): Int {
+            val exampleName = name ?: singleExampleName() ?: return CommandSupport.EXIT_USAGE
+            val receipt = ReceiptStore().read(exampleName)
+                ?: run {
+                    System.err.println("No receipt for '$exampleName'. Run `thoryn examples setup $exampleName` first.")
+                    return CommandSupport.EXIT_USAGE
+                }
+            val recipe = try {
+                Recipe.load(exampleName)
+            } catch (ex: RecipeException) {
+                System.err.println("`verify` is only available for recipe-backed examples (${ex.message}).")
+                return CommandSupport.EXIT_USAGE
+            }
+            val tokens = CommandSupport.readTokens() ?: return CommandSupport.EXIT_NOT_SIGNED_IN
+            val ctx = ExampleContext(
+                hub = CommandSupport.resolveHub(hub, tokens),
+                gateway = CommandSupport.resolveGateway(gateway, tokens),
+                tokens = tokens,
+                state = ExampleStateStore(),
+            )
+            val results = RecipeInterpreter(ctx, recipe).verifyReceipt(receipt)
+            if (results.isEmpty()) {
+                println("Recipe '$exampleName' has no verify assertions.")
+                return CommandSupport.EXIT_OK
+            }
+            results.forEach { println("  ${if (it.passed) "PASS" else "FAIL"}  ${it.assert} ${it.id ?: ""}") }
+            val allPassed = results.all { it.passed }
+            println()
+            println(if (allPassed) "All ${results.size} check(s) passed." else "Some checks failed — the provisioned config has drifted.")
+            return if (allPassed) CommandSupport.EXIT_OK else CommandSupport.EXIT_HTTP_ERROR
+        }
+    }
+
+    internal companion object {
+        /** The sole example's name when exactly one is bundled, else null (caller prints usage). */
+        fun singleExampleName(): String? = ExampleRegistry.all().singleOrNull()?.name
+    }
 
     /**
      * Shared plumbing for the setup/run/teardown subcommands: resolve the session

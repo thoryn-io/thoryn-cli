@@ -3,6 +3,7 @@ package com.devnow.thoryn.cli.cmd.examples.recipe
 import tools.jackson.databind.JsonNode
 import tools.jackson.databind.json.JsonMapper
 import tools.jackson.module.kotlin.kotlinModule
+import java.security.MessageDigest
 
 /**
  * SSO-2871 Phase 1 (SSO-2873) — a parsed recipe.
@@ -13,10 +14,15 @@ import tools.jackson.module.kotlin.kotlinModule
  * wrapper (no data-class deserialization) so the native image needs no reflection config for a recipe
  * model.
  */
-internal class Recipe(val root: JsonNode) {
+internal class Recipe(val root: JsonNode, rawBytes: ByteArray = root.toString().toByteArray()) {
     val id: String get() = root["id"].asString()
     val summary: String get() = root["summary"].asString()
     val version: String get() = root["version"].asString()
+
+    /** SSO-2875 — `sha256:<hex>` over the recipe's bytes, recorded in a run's receipt to pin exactly
+     *  which recipe (and version) was applied. */
+    val digest: String = "sha256:" + MessageDigest.getInstance("SHA-256").digest(rawBytes)
+        .joinToString("") { "%02x".format(it) }
     val params: List<JsonNode> get() = root["params"]?.toList().orEmpty()
     val steps: List<JsonNode> get() = root["steps"]?.toList().orEmpty()
     val verify: List<JsonNode> get() = root["verify"]?.toList().orEmpty()
@@ -28,9 +34,9 @@ internal class Recipe(val root: JsonNode) {
         /** Load a bundled recipe by id, or throw [RecipeException] if none is packaged. */
         fun load(id: String): Recipe {
             val path = "/examples/recipes/$id/recipe.json"
-            val stream = Recipe::class.java.getResourceAsStream(path)
+            val bytes = Recipe::class.java.getResourceAsStream(path)?.use { it.readBytes() }
                 ?: throw RecipeException("no bundled recipe '$id' ($path)")
-            return stream.use { Recipe(mapper.readTree(it)) }
+            return Recipe(mapper.readTree(bytes), bytes)
         }
     }
 }
