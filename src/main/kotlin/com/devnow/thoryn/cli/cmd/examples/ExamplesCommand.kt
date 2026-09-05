@@ -137,16 +137,27 @@ class ExamplesCommand : Callable<Int> {
                 tokens = tokens,
                 state = ExampleStateStore(),
             )
-            val results = RecipeInterpreter(ctx, recipe).verifyReceipt(receipt)
-            if (results.isEmpty()) {
-                println("Recipe '$exampleName' has no verify assertions.")
-                return CommandSupport.EXIT_OK
-            }
+            val interpreter = RecipeInterpreter(ctx, recipe)
+            val results = interpreter.verifyReceipt(receipt)
             results.forEach { println("  ${if (it.passed) "PASS" else "FAIL"}  ${it.assert} ${it.id ?: ""}") }
-            val allPassed = results.all { it.passed }
+
+            // SSO-2878 — also verify the platform attestation signature offline (if the receipt is signed).
+            val signature = interpreter.verifyAttestation(receipt)
+            signature?.let { println("  ${it.name}  attestation signature (${receipt.attestation?.kid})") }
+
+            val resourcesOk = results.all { it.passed }
+            val signatureBad = signature == com.devnow.thoryn.cli.cmd.examples.recipe.Es256JwsVerifier.Status.INVALID
+            val ok = resourcesOk && !signatureBad
             println()
-            println(if (allPassed) "All ${results.size} check(s) passed." else "Some checks failed — the provisioned config has drifted.")
-            return if (allPassed) CommandSupport.EXIT_OK else CommandSupport.EXIT_HTTP_ERROR
+            println(
+                when {
+                    results.isEmpty() && signature == null -> "Recipe '$exampleName' has no verify assertions and the receipt is unsigned."
+                    ok -> "All checks passed."
+                    signatureBad -> "The attestation signature is INVALID — the receipt was altered after signing."
+                    else -> "Some checks failed — the provisioned config has drifted."
+                },
+            )
+            return if (ok) CommandSupport.EXIT_OK else CommandSupport.EXIT_HTTP_ERROR
         }
     }
 

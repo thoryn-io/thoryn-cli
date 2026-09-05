@@ -38,6 +38,8 @@ class RecipeInterpreterTest : CommandTestBase() {
         server.enqueue(jsonResponse(201, """{"clientId":"app-9","status":"active"}"""))
         // 4) verify applications.get
         server.enqueue(jsonResponse(200, """{"clientId":"app-9","status":"active"}"""))
+        // 5) SSO-2878 — best-effort platform attestation of the receipt.
+        server.enqueue(jsonResponse(200, """{"kid":"receipt-attestation-t-1-local-v1","signature":"h..s","canonicalPayload":"e30","attestedAt":"2026-01-01T00:00:00Z"}"""))
 
         val run = RecipeInterpreter(ctx, Recipe.load("simple-signin"), trustPropagationBudgetMs = 2_000).setup()
         val state = run.state
@@ -54,7 +56,9 @@ class RecipeInterpreterTest : CommandTestBase() {
         assertThat(receipt.workspace.tenantId).isEqualTo("t-1")
         assertThat(receipt.resources).anyMatch { it.kind == "application" && it.id == "app-9" }
         assertThat(receipt.verify).anyMatch { it.assert == "applications.get" && it.passed }
-        assertThat(receipt.attestation).isNull() // Phase 3b adds the platform signature.
+        // SSO-2878 — the platform-signed attestation was folded into the receipt.
+        assertThat(receipt.attestation).isNotNull
+        assertThat(receipt.attestation!!.kid).isEqualTo("receipt-attestation-t-1-local-v1")
 
         assertThat(server.takeRequest().path).isEqualTo("/account/workspace")
         assertThat(server.takeRequest().path).isEqualTo("/api/v1/tenants")

@@ -66,12 +66,33 @@ internal class RecipeInterpreter(
 
     private val placeholder = Regex("""\{\{\s*([a-zA-Z0-9_.]+)\s*}}""")
 
-    /** Provision the recipe: resolve params, run steps in order, verify. Returns the [RecipeRun]. */
+    /** Provision the recipe: resolve params, run steps in order, verify, then attest. Returns the [RecipeRun]. */
     fun setup(): RecipeRun {
         resolveParams()
         recipe.steps.forEachIndexed { i, step -> executeStep(i + 1, step) }
         runVerify()
-        return RecipeRun(buildState(), buildReceipt())
+        return RecipeRun(buildState(), attest(buildReceipt()))
+    }
+
+    /**
+     * SSO-2878 — best-effort platform attestation (the receipt's signed layer, "when reachable"): POST
+     * the receipt so the platform re-verifies its resources and signs it, and fold the signature into
+     * the receipt. Never fatal — an unreachable or refusing platform leaves a valid, unsigned local
+     * receipt (the always-on layer).
+     */
+    private fun attest(receipt: Receipt): Receipt = try {
+        val resp = tenantClient().attestReceipt(receipt)
+        val attestation = Attestation(
+            kid = resp["kid"].asString(),
+            signature = resp["signature"].asString(),
+            canonicalPayload = resp["canonicalPayload"].asString(),
+            attestedAt = resp["attestedAt"].asString(),
+        )
+        ctx.info("attestation: platform-signed (kid ${attestation.kid})")
+        receipt.copy(attestation = attestation)
+    } catch (ex: Exception) {
+        ctx.warn("platform attestation unavailable (${ex.message}); the local receipt is unsigned.")
+        receipt
     }
 
     /**
@@ -89,6 +110,21 @@ internal class RecipeInterpreter(
                 }
                 else -> vr.copy(passed = false)
             }
+        }
+    }
+
+    /**
+     * SSO-2878 — verify a receipt's platform attestation OFFLINE: fetch the JWKS and check the detached
+     * JWS over the canonical payload. `null` when the receipt carries no attestation.
+     */
+    fun verifyAttestation(receipt: Receipt): Es256JwsVerifier.Status? {
+        val att = receipt.attestation ?: return null
+        workspace = WorkspaceCtx(receipt.workspace.slug ?: "", receipt.workspace.tenantId ?: "", null)
+        return try {
+            val jwks = tenantClient().attestationJwks()
+            Es256JwsVerifier.verify(jwks, att.kid, att.signature, att.canonicalPayload)
+        } catch (_: Exception) {
+            Es256JwsVerifier.Status.UNVERIFIABLE
         }
     }
 

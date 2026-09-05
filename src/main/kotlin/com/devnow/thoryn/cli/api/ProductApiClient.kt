@@ -137,6 +137,18 @@ class ProductApiClient(
     fun reactivateEnvironment(id: String): JsonNode =
         post("/api/v1/environments/${encode(id)}/reactivate", emptyMap<String, Any?>())
 
+    // ── Attestations (SSO-2878; product-api verify-then-sign) ──────────────────
+    //
+    // POST a receipt to have the platform re-verify its resources against live tenant
+    // state and, only if all verify, return a per-tenant ES256 detached-JWS attestation
+    // ({kid, signature, canonicalPayload, attestedAt}). GET the JWKS for offline verify.
+
+    fun attestReceipt(receipt: Any): JsonNode =
+        post("/api/v1/attestations", receipt)
+
+    fun attestationJwks(): JsonNode =
+        get("/api/v1/attestations/jwks")
+
     // ── Federation members (SSO-1552; product-api SSO-1034 / SSO-1548 oidc) ────
     //
     // product-api mounts the controller at the UNVERSIONED `/federation-members`,
