@@ -75,9 +75,10 @@ class RecipeSchemaConformanceTest {
             if (action == null || action !in teardownActions) v += "teardown action '$action' not in $teardownActions"
         }
 
-        // Every {{placeholder}} must reference a declared param or a (prior) step id.
+        // Every {{placeholder}} must reference a declared param, a (prior) step id, or the reserved
+        // `generate` namespace the interpreter resolves ({{generate.slug8}} / {{generate.uuid}}, SSO-2873).
         val params = recipe["params"]?.toList()?.mapNotNull { it["name"]?.asString() }?.toSet() ?: emptySet()
-        val knownRoots = params + stepIds.toSet()
+        val knownRoots = params + stepIds.toSet() + "generate"
         placeholder.findAll(recipe.toString()).forEach { m ->
             val root = m.groupValues[1].substringBefore('.')
             if (root !in knownRoots) v += "placeholder '{{${m.groupValues[1]}}}' references unknown '$root' (params=$params steps=$stepIds)"
