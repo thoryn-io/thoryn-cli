@@ -2,6 +2,8 @@ package com.devnow.thoryn.cli.cmd.examples
 
 import com.devnow.thoryn.cli.api.ProductApiClient
 import com.devnow.thoryn.cli.auth.HttpSender
+import com.devnow.thoryn.cli.cmd.examples.recipe.Recipe
+import com.devnow.thoryn.cli.cmd.examples.recipe.RecipeExample
 import com.devnow.thoryn.cli.auth.TokenExchangeFlow
 import com.devnow.thoryn.cli.auth.Tokens
 import com.devnow.thoryn.cli.cmd.CommandSupport
@@ -109,11 +111,26 @@ internal class ExampleContext(
 
 /** SSO-2830 — the in-repo registry of runnable examples. Add new examples here. */
 internal object ExampleRegistry {
-    private val examples: List<Example> = listOf(
-        SimpleSigninExample(),
-    )
 
-    fun all(): List<Example> = examples
+    /**
+     * SSO-2873 — when the recipe engine is enabled, `simple-signin` is provisioned by the declarative
+     * recipe interpreter (reading `examples/recipes/simple-signin/recipe.json`) instead of the
+     * compiled [SimpleSigninExample.setup]. Behind a flag so the compiled path stays the default until
+     * the recipe path has soaked; the browser `run` flow is delegated to the compiled example either
+     * way. Enable with `THORYN_RECIPE_ENGINE=1` (or `-Dthoryn.recipeEngine=1`).
+     */
+    private fun recipeEngineEnabled(): Boolean =
+        System.getenv("THORYN_RECIPE_ENGINE")?.isNotBlank() == true ||
+            System.getProperty("thoryn.recipeEngine")?.isNotBlank() == true
 
-    fun byName(name: String): Example? = examples.firstOrNull { it.name == name }
+    private fun examples(): List<Example> =
+        if (recipeEngineEnabled()) {
+            listOf(RecipeExample(Recipe.load("simple-signin"), SimpleSigninExample()))
+        } else {
+            listOf(SimpleSigninExample())
+        }
+
+    fun all(): List<Example> = examples()
+
+    fun byName(name: String): Example? = examples().firstOrNull { it.name == name }
 }

@@ -8,6 +8,14 @@
       {
         "pattern": "^osxkeychain\\.so$",
         "comment": "java-keyring 1.0.4 ships its macOS Keychain JNI helper at the JAR root as osxkeychain.so (not under com/github/javakeyring). The static path keeps native-image from stripping it during the resource scan."
+      },
+      {
+        "pattern": "^examples/recipes/.*/recipe\\.json$",
+        "comment": "SSO-2873 — bundled example recipes the RecipeInterpreter reads from the classpath at runtime (examples/recipes/<id>/recipe.json). native-image strips un-referenced resources, so list them explicitly. JSON (not YAML) is shipped so the runtime needs no YAML parser."
+      },
+      {
+        "pattern": "^examples/recipe\\.schema\\.json$",
+        "comment": "SSO-2872 — the recipe schema, bundled for reference/validation."
       }
     ]
   }

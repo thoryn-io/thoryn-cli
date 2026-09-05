@@ -1,0 +1,84 @@
+{
+  "apiVersion": "thoryn.io/examples/v1",
+  "id": "simple-signin",
+  "version": "1.0.0",
+  "summary": "Provision a workspace + app, then register & sign a user in to a protected page.",
+  "requires": {
+    "scopes": [
+      "tenant:applications.write"
+    ],
+    "minCliVersion": "0.9.0"
+  },
+  "params": [
+    {
+      "name": "workspaceSlug",
+      "prompt": "Workspace slug for the example (a fresh one is created)",
+      "default": "ex-signin-{{generate.slug8}}",
+      "validate": "^[a-z0-9]([a-z0-9-]{1,61}[a-z0-9])$"
+    },
+    {
+      "name": "displayName",
+      "prompt": "Workspace display name",
+      "default": "Sign-in Example"
+    }
+  ],
+  "steps": [
+    {
+      "id": "workspace",
+      "action": "hub.createWorkspace",
+      "description": "Create a dedicated example workspace (clones the tenant's default identity member).",
+      "with": {
+        "slug": "{{workspaceSlug}}",
+        "displayName": "{{displayName}}"
+      }
+    },
+    {
+      "id": "tenant",
+      "action": "productApi.registerTenant",
+      "description": "Best-effort product-api tenant registration (idempotent).",
+      "with": {
+        "tenantId": "{{workspace.tenantId}}",
+        "slug": "{{workspaceSlug}}"
+      }
+    },
+    {
+      "id": "app",
+      "action": "applications.create",
+      "description": "Register a public loopback authorization-code client UNDER the new workspace.",
+      "with": {
+        "displayName": "Sign-in Example App",
+        "clientType": "public",
+        "grantTypes": [
+          "authorization_code"
+        ],
+        "scopes": [
+          "openid",
+          "profile",
+          "email"
+        ],
+        "redirectUris": [
+          "http://127.0.0.1/callback"
+        ]
+      }
+    }
+  ],
+  "verify": [
+    {
+      "assert": "applications.get",
+      "id": "{{app.clientId}}",
+      "expect": {
+        "status": "active"
+      }
+    }
+  ],
+  "teardown": [
+    {
+      "action": "applications.delete",
+      "id": "{{app.clientId}}"
+    }
+  ],
+  "assets": {
+    "rp": "./apps/loopback-rp",
+    "docs": "./README.md"
+  }
+}

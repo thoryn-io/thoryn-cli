@@ -18,6 +18,8 @@ requires:
 params:
   - name: workspaceSlug
     prompt: "Workspace slug for the example (a fresh one is created)"
+    # A fresh slug per run by default; {{generate.slug8}} expands to 8 random hex chars.
+    default: "ex-signin-{{generate.slug8}}"
     validate: "^[a-z0-9]([a-z0-9-]{1,61}[a-z0-9])$"
   - name: displayName
     prompt: "Workspace display name"
