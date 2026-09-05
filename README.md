@@ -67,7 +67,9 @@ thoryn examples setup    <name>              # e.g. simple-signin
 thoryn examples run      <name>              # opens your browser
 thoryn examples teardown <name>
 thoryn examples receipt  <name>              # SSO-2875 — show the receipt setup wrote (what it provisioned)
-thoryn examples verify   <name>              # SSO-2875 — re-check the provisioned config still matches
+thoryn examples verify   <name>              # SSO-2875 — re-check the provisioned config still matches (+ attestation signature, SSO-2878)
+thoryn examples catalog  [--remote] [--tag]  # SSO-2874 — list recipes (bundled, or --remote from the signed public release)
+thoryn examples update   [--tag]             # SSO-2874 — fetch + verify (Ed25519) + cache the public recipe catalog
 ```
 
 > The supply-chain / verifiable-credential command tree was **removed** when the

@@ -2,6 +2,8 @@ package com.devnow.thoryn.cli.cmd.examples
 
 import com.devnow.thoryn.cli.cmd.CommandSupport
 import com.devnow.thoryn.cli.cmd.examples.recipe.Recipe
+import com.devnow.thoryn.cli.cmd.examples.recipe.RecipeCatalog
+import com.devnow.thoryn.cli.cmd.examples.recipe.RecipeCatalogException
 import com.devnow.thoryn.cli.cmd.examples.recipe.RecipeException
 import com.devnow.thoryn.cli.cmd.examples.recipe.RecipeInterpreter
 import com.devnow.thoryn.cli.cmd.examples.recipe.ReceiptStore
@@ -38,6 +40,8 @@ import java.util.concurrent.Callable
         ExamplesCommand.TeardownSubcommand::class,
         ExamplesCommand.ReceiptSubcommand::class,
         ExamplesCommand.VerifySubcommand::class,
+        ExamplesCommand.CatalogSubcommand::class,
+        ExamplesCommand.UpdateSubcommand::class,
     ],
 )
 class ExamplesCommand : Callable<Int> {
@@ -158,6 +162,66 @@ class ExamplesCommand : Callable<Int> {
                 },
             )
             return if (ok) CommandSupport.EXIT_OK else CommandSupport.EXIT_HTTP_ERROR
+        }
+    }
+
+    /**
+     * SSO-2874 — `thoryn examples catalog [--remote] [--tag <tag>]` — list the recipe catalog. Bundled
+     * by default (offline, reproducible per CLI version); `--remote` fetches the public
+     * thoryn-examples release and lists it ONLY after verifying its Ed25519 signature against the
+     * pinned key.
+     */
+    @Command(name = "catalog", description = ["List the recipe catalog (bundled, or --remote from the signed release)."], mixinStandardHelpOptions = true)
+    class CatalogSubcommand : Callable<Int> {
+        @Option(names = ["--remote"], description = ["Fetch + verify the catalog from the public thoryn-examples release."])
+        var remote: Boolean = false
+
+        @Option(names = ["--tag"], description = ["Release tag to fetch (default: latest). Only with --remote."])
+        var tag: String? = null
+
+        override fun call(): Int {
+            if (!remote) {
+                val bundled = ExampleRegistry.all()
+                println("Bundled recipes (this CLI version):")
+                bundled.forEach { println("  ${it.name}  —  ${it.summary}") }
+                println()
+                println("Fetch the signed public catalog with:  thoryn examples catalog --remote")
+                return CommandSupport.EXIT_OK
+            }
+            return try {
+                val info = RecipeCatalog().update(tag)
+                println("Verified catalog @ ${info.tag} (Ed25519 signature OK against the pinned key):")
+                info.recipes.forEach { println("  ${it.id}  v${it.version}  —  ${it.summary}") }
+                println()
+                println("Cached at ${info.dir}. (This CLI applies its bundled recipes; a later phase runs a fetched one.)")
+                CommandSupport.EXIT_OK
+            } catch (ex: RecipeCatalogException) {
+                System.err.println("Could not load the remote catalog: ${ex.message}")
+                CommandSupport.EXIT_HTTP_ERROR
+            } catch (ex: Exception) {
+                System.err.println("Could not reach the remote catalog (${CommandSupport.describeThrowable(ex)}).")
+                CommandSupport.EXIT_IO_ERROR
+            }
+        }
+    }
+
+    /** SSO-2874 — `thoryn examples update [--tag <tag>]` — fetch + verify + cache the signed catalog. */
+    @Command(name = "update", description = ["Fetch, verify, and cache the signed recipe catalog from thoryn-examples."], mixinStandardHelpOptions = true)
+    class UpdateSubcommand : Callable<Int> {
+        @Option(names = ["--tag"], description = ["Release tag to fetch (default: latest)."])
+        var tag: String? = null
+
+        override fun call(): Int = try {
+            val info = RecipeCatalog().update(tag)
+            println("Updated: fetched + verified ${info.recipes.size} recipe(s) at ${info.tag}.")
+            println("Cached at ${info.dir}.")
+            CommandSupport.EXIT_OK
+        } catch (ex: RecipeCatalogException) {
+            System.err.println("Update refused: ${ex.message}")
+            CommandSupport.EXIT_HTTP_ERROR
+        } catch (ex: Exception) {
+            System.err.println("Update failed (${CommandSupport.describeThrowable(ex)}).")
+            CommandSupport.EXIT_IO_ERROR
         }
     }
 
