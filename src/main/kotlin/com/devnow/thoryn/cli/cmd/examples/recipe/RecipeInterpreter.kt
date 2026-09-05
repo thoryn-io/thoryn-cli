@@ -43,6 +43,8 @@ internal class RecipeInterpreter(
     private val ctx: ExampleContext,
     private val recipe: Recipe,
     private val overrides: Map<String, String> = emptyMap(),
+    /** SSO-2876 — the environment the recipe's resources are provisioned into (X-Thoryn-Environment); null = production plane. */
+    private val environmentSlug: String? = null,
     /** Test seam for the random slug suffix. */
     private val randomSuffix: () -> String = { UUID.randomUUID().toString().replace("-", "").substring(0, 8) },
     /** Deadline budget for the post-create tenant-trust propagation retry (ms). */
@@ -260,10 +262,11 @@ internal class RecipeInterpreter(
 
     private fun tenantClient(): ProductApiClient {
         val w = workspace ?: throw RecipeException("this step requires a prior hub.createWorkspace step")
-        return w.provisioningToken?.let { ctx.provisioningGatewayClient(it) }
+        return w.provisioningToken?.let { ctx.provisioningGatewayClient(it, environmentSlug) }
             ?: ctx.tenantGatewayClient(
                 ThorynConfig.tenantIssuer(ctx.hub, w.slug)
                     ?: throw RecipeException("could not derive the tenant issuer for workspace '${w.slug}'"),
+                environmentSlug,
             )
     }
 
@@ -337,6 +340,7 @@ internal class RecipeInterpreter(
             appliedAt = Instant.now().toString(),
             subject = JwtClaims.of(ctx.tokens.accessToken)["sub"]?.takeIf { !it.isNull }?.asString(),
             workspace = WorkspaceRef(slug = w?.slug ?: scope["workspaceSlug"], tenantId = w?.tenantId),
+            environment = environmentSlug,
             resources = resources.toList(),
             verify = verifyResults.toList(),
         )

@@ -68,14 +68,16 @@ internal class ExampleContext(
      * public-client / membership / refresh-clobber friction of the switch. Resources are created
      * UNDER the workspace, exactly as with the switch.
      */
-    fun provisioningGatewayClient(provisioningToken: String): ProductApiClient =
+    fun provisioningGatewayClient(provisioningToken: String, environmentSlug: String? = null): ProductApiClient =
         // SSO-2841: construct the client DIRECTLY with the provisioning token — do NOT route through
         // CommandSupport.client, whose ensureFresh() "prefers the store as the source of truth"
         // (SSO-2834) and would DISCARD this token, replacing it with the logged-in SESSION token
         // (tnt=default) from the keychain. That silently registered the workspace's OAuth client under
         // the `default` tenant, so sign-in at the workspace issuer 400'd. This token is a distinct,
         // one-shot, non-refreshable provisioning credential; it must be sent verbatim.
-        ProductApiClient(gateway = gateway, tokens = Tokens(accessToken = provisioningToken))
+        // SSO-2876: [environmentSlug] rides as X-Thoryn-Environment so a recipe provisions into the
+        // caller-chosen environment (e.g. a sandbox) rather than the production plane.
+        ProductApiClient(gateway = gateway, tokens = Tokens(accessToken = provisioningToken), environmentSlug = environmentSlug)
 
     /**
      * SSO-2831 — a gateway client scoped to the target workspace named by [tenantIssuer]
@@ -89,7 +91,7 @@ internal class ExampleContext(
      * [provisioningGatewayClient] is the preferred route. This token-exchange path stays as the
      * fallback for a hub that predates the provisioning token (the field is absent on the response).
      */
-    fun tenantGatewayClient(tenantIssuer: String): ProductApiClient {
+    fun tenantGatewayClient(tenantIssuer: String, environmentSlug: String? = null): ProductApiClient {
         val exchanged = TokenExchangeFlow(
             issuer = hub,
             clientId = ThorynConfig.DEFAULT_CLIENT_ID,
@@ -98,7 +100,10 @@ internal class ExampleContext(
             targetResource = tenantIssuer,
             sender = HttpSender { request, handler -> HttpClient.newHttpClient().send(request, handler) },
         ).run()
-        return CommandSupport.client(gateway, exchanged)
+        // SSO-2876 — send the exchanged workspace token VERBATIM (as the provisioning path does; do NOT
+        // route through ensureFresh, which would read the base session token from the store and discard
+        // this one — the SSO-2841 trap) and ride the caller-chosen environment as X-Thoryn-Environment.
+        return ProductApiClient(gateway = gateway, tokens = exchanged, environmentSlug = environmentSlug)
     }
 
     /** Emit a numbered step heading so the walkthrough reads as a sequence. */
