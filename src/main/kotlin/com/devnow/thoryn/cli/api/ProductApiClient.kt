@@ -56,6 +56,14 @@ class ProductApiClient(
      * refresh" — the pre-SSO-2861 behaviour.
      */
     private val reauthenticate: (() -> Tokens?)? = null,
+    /**
+     * SSO-2870 — the selected environment slug (a sandbox, or `production`). When non-blank it rides on
+     * EVERY request as the `X-Thoryn-Environment` header, so the whole customer-plane surface (clients,
+     * users, federation, …) targets the caller-selected environment rather than the token's default
+     * (production) plane. `null`/blank ⇒ no header, i.e. the pre-SSO-2870 behaviour. product-api honors
+     * the header only for a tenant-admin token and only for an environment the caller's own `tnt` owns.
+     */
+    private val environmentSlug: String? = null,
 ) {
 
     /** Current bearer material; swapped in place by the reactive refresh-on-401 retry. */
@@ -103,6 +111,31 @@ class ProductApiClient(
      */
     fun rotateApplicationSecret(clientId: String, confirmSlug: String? = null): JsonNode =
         post("/api/v1/applications/${encode(clientId)}/secret/rotate", emptyMap<String, Any?>(), confirmSlug)
+
+    // ── Environments (SSO-2870; product-api SSO-2410 `/api/v1/environments`) ────
+    //
+    // A workspace (tenant) holds N durable sandbox environments + one platform-
+    // managed production environment. These reads/writes are NOT environment-scoped
+    // themselves — they manage the environment registry — so they carry no
+    // X-Thoryn-Environment header dependency (a client built with or without a
+    // selected environment lists the same set). Scopes: read → tenant:environments.read,
+    // write → tenant:environments.write (already granted to thoryn-cli, hub V119).
+
+    fun listEnvironments(): JsonNode =
+        get("/api/v1/environments")
+
+    fun createEnvironment(body: Map<String, Any?>): JsonNode =
+        post("/api/v1/environments", body)
+
+    fun renameEnvironment(id: String, body: Map<String, Any?>): JsonNode =
+        patch("/api/v1/environments/${encode(id)}", body)
+
+    /** POST /api/v1/environments/{id}/suspend — [confirmSlug] clears the production-confirmation gate. */
+    fun suspendEnvironment(id: String, confirmSlug: String? = null): JsonNode =
+        post("/api/v1/environments/${encode(id)}/suspend", emptyMap<String, Any?>(), confirmSlug)
+
+    fun reactivateEnvironment(id: String): JsonNode =
+        post("/api/v1/environments/${encode(id)}/reactivate", emptyMap<String, Any?>())
 
     // ── Federation members (SSO-1552; product-api SSO-1034 / SSO-1548 oidc) ────
     //
@@ -514,9 +547,12 @@ class ProductApiClient(
 
     private fun baseRequest(path: String): HttpRequest.Builder {
         val uri = URI.create("${gateway.trimEnd('/')}$path")
-        return HttpRequest.newBuilder()
+        val builder = HttpRequest.newBuilder()
             .uri(uri)
             .timeout(Duration.ofSeconds(30))
+        // SSO-2870 — select the caller's environment for the whole customer-plane surface in one place.
+        environmentSlug?.takeIf { it.isNotBlank() }?.let { builder.header(ENVIRONMENT_HEADER, it) }
+        return builder
     }
 
     /** Attach the bearer for [accessToken] — applied per-send so a refreshed token is used on retry. */
@@ -544,6 +580,14 @@ class ProductApiClient(
          * verbs. Value is the caller's own workspace slug.
          */
         const val CONFIRM_HEADER: String = "X-Thoryn-Confirm"
+
+        /**
+         * SSO-2870 — the admin environment-selector header product-api's `EnvironmentClaimFilter`
+         * resolves (within the caller's own tenant) to the request's `environment.id`. Value is an
+         * environment slug (a sandbox, or `production`). Mirrors product-api's
+         * `EnvironmentContext.ENVIRONMENT_HEADER`.
+         */
+        const val ENVIRONMENT_HEADER: String = "X-Thoryn-Environment"
 
         fun defaultClient(): HttpClient = HttpClient.newBuilder()
             .connectTimeout(Duration.ofSeconds(10))

@@ -88,7 +88,11 @@ class StatusCommand : Callable<Int> {
             claims?.get("sub")?.asString()?.let { put("subject", it) }
             claims?.get("tnt")?.asString()?.let { put("tenant", it) }
             // SSO-2867 — the workspace an active `switch` operates on (base `tenant` is the login tenant).
-            runCatching { SelectedWorkspaceStore().read() }.getOrNull()?.slug?.let { put("activeWorkspace", it) }
+            // SSO-2870 — and the environment targeted inside it (X-Thoryn-Environment on every request).
+            runCatching { SelectedWorkspaceStore().read() }.getOrNull()?.let { sel ->
+                put("activeWorkspace", sel.slug)
+                sel.environmentSlug?.let { put("activeEnvironment", it) }
+            }
             if (tokens != null) put("authAccepted", authAccepted)
             put("tokenStatus", tokenStatus)
         }
@@ -106,6 +110,7 @@ class StatusCommand : Callable<Int> {
                 "subject" to n["subject"]?.asString(),
                 "tenant" to n["tenant"]?.asString(),
                 "activeWorkspace" to n["activeWorkspace"]?.asString(),
+                "activeEnvironment" to n["activeEnvironment"]?.asString(),
                 "authAccepted" to n["authAccepted"]?.asBoolean(),
                 "tokenStatus" to n["tokenStatus"]?.asString(),
             ).filter { it.second != null }

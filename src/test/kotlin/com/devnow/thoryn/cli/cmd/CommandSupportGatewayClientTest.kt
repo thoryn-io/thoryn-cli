@@ -45,6 +45,48 @@ class CommandSupportGatewayClientTest : CommandTestBase() {
     }
 
     @Test
+    fun `SSO-2870 - a selected environment rides on the switched call as X-Thoryn-Environment`() {
+        val base = Tokens(accessToken = "AT-base", refreshToken = "RT", issuer = baseUrl(), gateway = baseUrl())
+        seedTokens(base)
+        val selectedStore = SelectedWorkspaceStore(path = tempHome.resolve("ws.json"))
+        selectedStore.write(
+            SelectedWorkspace(
+                tenantId = "t-1", slug = "acme",
+                tenantHubIssuer = "https://acme.hub.example.org", environmentSlug = "sandbox-alpha",
+            ),
+        )
+        server.enqueue(jsonResponse(200, """{"access_token":"switched-token","token_type":"Bearer","expires_in":900}"""))
+        server.enqueue(jsonResponse(200, """{"items":[],"total":0}"""))
+
+        CommandSupport.gatewayClient(baseUrl(), base, selectedStore).listApplications()
+
+        server.takeRequest() // the token exchange
+        val gatewayCall = server.takeRequest()
+        assertThat(gatewayCall.getHeader("Authorization")).isEqualTo("Bearer switched-token")
+        assertThat(gatewayCall.getHeader("X-Thoryn-Environment")).isEqualTo("sandbox-alpha")
+    }
+
+    @Test
+    fun `SSO-2870 - applyEnvironment=false omits the environment header (env-management path)`() {
+        val base = Tokens(accessToken = "AT-base", refreshToken = "RT", issuer = baseUrl(), gateway = baseUrl())
+        seedTokens(base)
+        val selectedStore = SelectedWorkspaceStore(path = tempHome.resolve("ws.json"))
+        selectedStore.write(
+            SelectedWorkspace(
+                tenantId = "t-1", slug = "acme",
+                tenantHubIssuer = "https://acme.hub.example.org", environmentSlug = "sandbox-alpha",
+            ),
+        )
+        server.enqueue(jsonResponse(200, """{"access_token":"switched-token","token_type":"Bearer","expires_in":900}"""))
+        server.enqueue(jsonResponse(200, """{"environments":[]}"""))
+
+        CommandSupport.gatewayClient(baseUrl(), base, selectedStore, applyEnvironment = false).listEnvironments()
+
+        server.takeRequest() // the token exchange
+        assertThat(server.takeRequest().getHeader("X-Thoryn-Environment")).isNull()
+    }
+
+    @Test
     fun `with no selected workspace it uses the base token directly (no exchange)`() {
         val base = Tokens(accessToken = "AT-base", refreshToken = "RT", issuer = baseUrl(), gateway = baseUrl())
         seedTokens(base)

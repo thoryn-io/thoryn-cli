@@ -40,12 +40,17 @@ class WhoamiCommand : Callable<Int> {
         // SSO-2867 — since SSO-2863 a `workspace switch` no longer rewrites the base token (its `tnt`
         // stays the login tenant); it records a SelectedWorkspace that commands exchange into per call.
         // Surface it so `tenant` (the base token) and the workspace you're actually operating in agree.
-        val activeWorkspace = runCatching { SelectedWorkspaceStore().read() }.getOrNull()?.slug
+        val selectedWorkspace = runCatching { SelectedWorkspaceStore().read() }.getOrNull()
+        val activeWorkspace = selectedWorkspace?.slug
+        // SSO-2870 — the environment the CLI is targeting inside that workspace (a sandbox, or
+        // production when unset). Rides on every request as X-Thoryn-Environment.
+        val activeEnvironment = selectedWorkspace?.environmentSlug
 
         val node: JsonNode = mapper.createObjectNode().apply {
             put("subject", claims["sub"]?.asString())
             put("tenant", claims["tnt"]?.asString())
             activeWorkspace?.let { put("activeWorkspace", it) }
+            activeEnvironment?.let { put("activeEnvironment", it) }
             put("clientId", claims["client_id"]?.asString() ?: claims["azp"]?.asString())
             claims["name"]?.asString()?.let { put("name", it) }
             claims["email"]?.asString()?.let { put("email", it) }
@@ -61,6 +66,7 @@ class WhoamiCommand : Callable<Int> {
                 "subject" to n["subject"]?.asString(),
                 "tenant" to n["tenant"]?.asString(),
                 "activeWorkspace" to n["activeWorkspace"]?.asString(),
+                "activeEnvironment" to n["activeEnvironment"]?.asString(),
                 "clientId" to n["clientId"]?.asString(),
                 "name" to n["name"]?.asString(),
                 "email" to n["email"]?.asString(),

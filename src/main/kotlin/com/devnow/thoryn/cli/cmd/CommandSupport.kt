@@ -104,9 +104,16 @@ internal object CommandSupport {
         baseTokens: Tokens,
         selectedWorkspace: SelectedWorkspaceStore = SelectedWorkspaceStore(),
         err: PrintStream = System.err,
+        // SSO-2870 — apply the selected environment as the `X-Thoryn-Environment` header on every
+        // request (so clients/users/… hit the right environment). The `thoryn env` MANAGEMENT commands
+        // pass `false`: they manage the environment registry itself and must keep working even when the
+        // current selection is stale/suspended (a suspended selection would otherwise 403 the very
+        // `env list` you'd run to fix it).
+        applyEnvironment: Boolean = true,
     ): ProductApiClient {
         val selected = runCatching { selectedWorkspace.read() }.getOrNull()
             ?: return client(gateway, baseTokens)
+        val environmentSlug = selected.environmentSlug?.takeIf { applyEnvironment }
 
         fun mint(): Tokens? {
             val base = ensureFresh(baseTokens, err)
@@ -133,6 +140,7 @@ internal object CommandSupport {
             // base-tenant call; the reauthenticator retries the exchange once the base recovers.
             tokens = initial ?: Tokens(accessToken = ""),
             reauthenticate = { mint() },
+            environmentSlug = environmentSlug, // SSO-2870 — ride the selected environment on every request.
         )
     }
 

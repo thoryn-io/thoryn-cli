@@ -41,6 +41,17 @@ thoryn workspace switch <slug>               # prints the `thoryn login --issuer
 thoryn workspace archive <slug> --confirm <slug>   # SSO-2831 — archive (reversible); name-confirmed
 thoryn workspace reactivate <slug>           # SSO-2831 — clear the archive flag
 
+# Environments (SSO-2870) — select & manage the sandboxes + production of your workspace.
+# The customer plane is environment-scoped: a client/user created in a sandbox is invisible
+# to a request that resolves to a different environment. `env use` records the target and every
+# later command rides it as `X-Thoryn-Environment` — so `clients list` finally hits the right one.
+thoryn env list                              # environments (product-api /api/v1/environments); marks the active one
+thoryn env use <slug>                        # target an environment (e.g. a sandbox) for subsequent commands
+thoryn env create <slug> --name <name>       # create a sandbox
+thoryn env rename <slug> --name <name>       # rename (display name only; slug immutable)
+thoryn env suspend <slug> [--confirm <slug>] # suspend a sandbox (production cannot be suspended)
+thoryn env reactivate <slug>                 # clear a sandbox suspension
+
 # Tenant seeding (SSO-1553) — one-shot, zero-interaction provisioner for CI.
 thoryn tenant seed --non-interactive --secret-dir <dir> \
                    [--clients <N>] [--skip-federation] \
@@ -120,9 +131,10 @@ or land in shell history:
 ```bash
 # Default scopes (SSO-1552): openid offline_access plus the tenant-config set
 # (tenant:applications.{read,write}, tenant:federation.{read,write},
-# tenant:audit.read) so `clients`, `federation`, and `audit` work out of the
-# box. `workspace` rides on SCOPE_openid (the hub /account surface). The hub
-# drops any scope the tenant admin doesn't actually hold.
+# tenant:audit.read, tenant:environments.{read,write}) so `clients`, `federation`,
+# `audit`, and `env` (SSO-2870) work out of the box. `workspace` rides on
+# SCOPE_openid (the hub /account surface). The hub drops any scope the tenant
+# admin doesn't actually hold.
 thoryn login
 
 # Grab the whole tenant-config scope set explicitly.

@@ -3,6 +3,7 @@ package com.devnow.thoryn.cli
 import com.devnow.thoryn.cli.cmd.AuditCommand
 import com.devnow.thoryn.cli.cmd.AuditReplayCommand
 import com.devnow.thoryn.cli.cmd.ClientsCommand
+import com.devnow.thoryn.cli.cmd.EnvironmentCommand
 import com.devnow.thoryn.cli.cmd.FederationCommand
 import com.devnow.thoryn.cli.cmd.LoginCommand
 import com.devnow.thoryn.cli.cmd.LogoutCommand
@@ -35,6 +36,7 @@ import kotlin.system.exitProcess
         ClientsCommand::class,
         FederationCommand::class,
         WorkspaceCommand::class,
+        EnvironmentCommand::class,
         TenantCommand::class,
         AuditCommand::class,
         AuditReplayCommand::class,

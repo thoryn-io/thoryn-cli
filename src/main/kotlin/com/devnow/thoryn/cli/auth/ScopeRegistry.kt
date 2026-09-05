@@ -49,6 +49,9 @@ object ScopeRegistry {
         "tenant:federation.write",
         // audit events (product-api /audit/events — tenant:audit.read)
         "tenant:audit.read",
+        // environments (product-api /api/v1/environments — SSO-2870; select & manage sandboxes)
+        "tenant:environments.read",
+        "tenant:environments.write",
     )
 
     /**

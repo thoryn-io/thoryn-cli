@@ -88,4 +88,12 @@ data class SelectedWorkspace(
     val slug: String,
     /** Tenant hub issuer derived as `{slug}.{hubHost}` — the `--issuer` for re-auth. */
     val tenantHubIssuer: String,
+    /**
+     * SSO-2870 — the selected ENVIRONMENT within this workspace (a sandbox slug, or `production`).
+     * Rides on every customer-plane request as the `X-Thoryn-Environment` header so the CLI reaches
+     * the right environment partition (the SSO-2408 model). `null` ⇒ no explicit selection: the token's
+     * default (production plane) applies, exactly as before this field existed. Reset to `null` on
+     * `workspace switch` (a different workspace has different environments) and on `login`.
+     */
+    val environmentSlug: String? = null,
 )

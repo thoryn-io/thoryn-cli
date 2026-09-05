@@ -29,6 +29,13 @@ object ThorynConfig {
      * `THORYN_CLIENT_SECRET` / `--client-secret-file` (see [resolveClientSecret]).
      */
     const val DEFAULT_CLIENT_ID = "thoryn-cli"
+
+    /**
+     * SSO-2870 — the reserved slug of a workspace's platform-managed PRODUCTION environment (mirrors
+     * `core` `TrustedTenantIssuers.PRODUCTION_ENV_SLUG`). A CLI session with no explicit `env use`
+     * selection resolves to this production plane, so `env list` marks it active by default.
+     */
+    const val PRODUCTION_ENV_SLUG = "production"
     const val DEFAULT_GATEWAY = "http://localhost:8991"
 
     /** Convenience constant — pass to `--issuer` to point the CLI at the staging hub. */
@@ -126,6 +133,9 @@ object ThorynConfig {
             "tenant:applications.read tenant:applications.write " +
             "tenant:federation.read tenant:federation.write " +
             "tenant:audit.read " +
+            // SSO-2870 — the environment select/manage surface (`thoryn env`). Granted to the
+            // thoryn-cli client in hub V119; the hub drops it for an admin who doesn't hold it.
+            "tenant:environments.read tenant:environments.write " +
             "tenant:clients.read tenant:users.read"
 
     /**

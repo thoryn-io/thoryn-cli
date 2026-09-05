@@ -25,6 +25,9 @@ class ScopeRegistryTest {
             .contains("tenant:applications.write")
             .contains("tenant:federation.write")
             .contains("tenant:audit.read")
+            // SSO-2870 — `env` select/manage surface.
+            .contains("tenant:environments.read")
+            .contains("tenant:environments.write")
     }
 
     @Test
