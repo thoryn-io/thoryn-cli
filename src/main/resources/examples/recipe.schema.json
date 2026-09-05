@@ -1,0 +1,126 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://thoryn.io/examples/recipe.schema.json",
+  "title": "Thoryn example recipe",
+  "description": "SSO-2871 (Phase 0, SSO-2872) — a declarative, in-boundary product example the CLI applies to the caller's own account using only supported product workflows. Recipes are DATA, not code: the CLI is the only executor. The `action`/`assert` enums are a CLOSED allowlist mapping to supported product APIs — this is what structurally enforces the CLAUDE.md product-boundary rule (a recipe cannot express a DB seed, a demo endpoint, or any unsupported shortcut).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["apiVersion", "id", "version", "summary", "steps"],
+  "properties": {
+    "apiVersion": {
+      "description": "Recipe schema version.",
+      "const": "thoryn.io/examples/v1"
+    },
+    "id": {
+      "description": "Stable recipe identifier used on the command line (e.g. simple-signin).",
+      "type": "string",
+      "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"
+    },
+    "version": {
+      "description": "Semantic version of this recipe.",
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+    },
+    "summary": {
+      "description": "One-line description shown by `thoryn examples catalog`.",
+      "type": "string",
+      "minLength": 1
+    },
+    "requires": {
+      "description": "Preconditions the CLI checks before applying the recipe.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "scopes": {
+          "type": "array",
+          "items": { "type": "string", "pattern": "^tenant:[a-z-]+\\.[a-z-]+$" },
+          "uniqueItems": true
+        },
+        "minCliVersion": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$" }
+      }
+    },
+    "params": {
+      "description": "Typed parameters resolved (interactively in guided mode) before execution and referenced by `{{name}}` placeholders in step inputs.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "prompt"],
+        "properties": {
+          "name": { "type": "string", "pattern": "^[a-zA-Z][a-zA-Z0-9_]*$" },
+          "prompt": { "type": "string", "minLength": 1 },
+          "default": { "type": "string" },
+          "validate": { "description": "A regex the resolved value must match.", "type": "string" },
+          "secret": { "description": "If true, the value is never echoed or written to a receipt.", "type": "boolean" }
+        }
+      }
+    },
+    "steps": {
+      "description": "Ordered provisioning actions. Each maps to a supported product API; results are addressable as {{<step id>.<field>}} in later steps.",
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "action"],
+        "properties": {
+          "id": { "type": "string", "pattern": "^[a-zA-Z][a-zA-Z0-9_]*$" },
+          "action": {
+            "description": "CLOSED allowlist — supported product APIs only. Widening this is a deliberate product decision, never a convenience.",
+            "enum": [
+              "hub.createWorkspace",
+              "productApi.registerTenant",
+              "env.create",
+              "env.use",
+              "applications.create",
+              "applications.delete",
+              "federation.create",
+              "federation.delete"
+            ]
+          },
+          "with": { "type": "object" },
+          "description": { "type": "string" }
+        }
+      }
+    },
+    "verify": {
+      "description": "Read-only assertions run after the steps; each must pass for the run to succeed and be recorded in the receipt.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["assert"],
+        "properties": {
+          "assert": {
+            "enum": ["applications.get", "federation.get", "env.get"]
+          },
+          "id": { "type": "string" },
+          "expect": { "type": "object" }
+        }
+      }
+    },
+    "teardown": {
+      "description": "Best-effort removal of what the steps created (reverse order).",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["action"],
+        "properties": {
+          "action": { "enum": ["applications.delete", "federation.delete"] },
+          "id": { "type": "string" },
+          "with": { "type": "object" }
+        }
+      }
+    },
+    "assets": {
+      "description": "Recipe-relative asset paths (a runnable loopback relying-party app, docs).",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "rp": { "type": "string" },
+        "docs": { "type": "string" }
+      }
+    }
+  }
+}

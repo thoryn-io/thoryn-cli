@@ -114,6 +114,19 @@
             <artifactId>mockwebserver</artifactId>
             <scope>test</scope>
         </dependency>
+        <!--
+            SSO-2872 (Phase 0) — Jackson 3 YAML dataformat, TEST scope only: the recipe-schema
+            conformance test loads examples/recipes/**/recipe.yaml. Version is managed by the
+            tools.jackson:jackson-bom (jackson3.version) already imported in bom/pom.xml, so no
+            explicit version here. Kept test-scoped deliberately: the CLI is a GraalVM native
+            binary and the runtime recipe interpreter (Phase 1, SSO-2873) will add its own YAML
+            parsing + native-image reflection config; Phase 0 must not enlarge the native image.
+        -->
+        <dependency>
+            <groupId>tools.jackson.dataformat</groupId>
+            <artifactId>jackson-dataformat-yaml</artifactId>
+            <scope>test</scope>
+        </dependency>
     </dependencies>
 
     <build>

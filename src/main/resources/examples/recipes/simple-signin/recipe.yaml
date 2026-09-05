@@ -1,0 +1,63 @@
+# SSO-2871 (Phase 0, SSO-2872) — the `simple-signin` example re-expressed as a declarative recipe,
+# to pressure-test the recipe schema against a real example. This mirrors what the compiled
+# SimpleSigninExample provisions today (a dedicated workspace + a public loopback OAuth client, the
+# hub auto-attaches the tenant's identity provider), using only supported product APIs.
+#
+# Phase 0 ships this recipe + the schema + a conformance test ONLY. The CLI still runs the compiled
+# SimpleSigninExample; the recipe interpreter that executes this file arrives in Phase 1 (SSO-2873).
+apiVersion: thoryn.io/examples/v1
+id: simple-signin
+version: 1.0.0
+summary: Provision a workspace + app, then register & sign a user in to a protected page.
+
+requires:
+  scopes:
+    - tenant:applications.write
+  minCliVersion: 0.9.0
+
+params:
+  - name: workspaceSlug
+    prompt: "Workspace slug for the example (a fresh one is created)"
+    validate: "^[a-z0-9]([a-z0-9-]{1,61}[a-z0-9])$"
+  - name: displayName
+    prompt: "Workspace display name"
+    default: "Sign-in Example"
+
+steps:
+  - id: workspace
+    action: hub.createWorkspace
+    description: Create a dedicated example workspace (clones the tenant's default identity member).
+    with:
+      slug: "{{workspaceSlug}}"
+      displayName: "{{displayName}}"
+
+  - id: tenant
+    action: productApi.registerTenant
+    description: Best-effort product-api tenant registration (idempotent).
+    with:
+      tenantId: "{{workspace.tenantId}}"
+      slug: "{{workspaceSlug}}"
+
+  - id: app
+    action: applications.create
+    description: Register a public loopback authorization-code client UNDER the new workspace.
+    with:
+      displayName: "Sign-in Example App"
+      clientType: public
+      grantTypes: ["authorization_code"]
+      scopes: ["openid", "profile", "email"]
+      redirectUris: ["http://127.0.0.1/callback"]
+
+verify:
+  - assert: applications.get
+    id: "{{app.clientId}}"
+    expect:
+      status: active
+
+teardown:
+  - action: applications.delete
+    id: "{{app.clientId}}"
+
+assets:
+  rp: ./apps/loopback-rp
+  docs: ./README.md
