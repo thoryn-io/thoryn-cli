@@ -13,6 +13,8 @@ import com.devnow.thoryn.cli.output.Printers
 import picocli.CommandLine.Command
 import picocli.CommandLine.Option
 import picocli.CommandLine.Parameters
+import tools.jackson.module.kotlin.jacksonObjectMapper
+import java.io.File
 import java.util.concurrent.Callable
 
 /**
@@ -42,6 +44,8 @@ import java.util.concurrent.Callable
         ExamplesCommand.VerifySubcommand::class,
         ExamplesCommand.CatalogSubcommand::class,
         ExamplesCommand.UpdateSubcommand::class,
+        ExamplesCommand.ApplySubcommand::class,
+        ExamplesCommand.ShareSubcommand::class,
     ],
 )
 class ExamplesCommand : Callable<Int> {
@@ -222,6 +226,162 @@ class ExamplesCommand : Callable<Int> {
         } catch (ex: Exception) {
             System.err.println("Update failed (${CommandSupport.describeThrowable(ex)}).")
             CommandSupport.EXIT_IO_ERROR
+        }
+    }
+
+    /**
+     * SSO-2876 — `thoryn examples apply [name]` — the GUIDED entry point: prompt for the recipe's
+     * params, resolve a target environment (a sandbox by default when the recipe operates in an
+     * existing workspace), show a dry-run plan, confirm, then provision. `--set k=v` and `--yes` make
+     * it non-interactive (CI). Writes the same state + receipt as `setup`.
+     */
+    @Command(name = "apply", description = ["Guided: provision a recipe interactively (params, environment, dry-run, confirm)."], mixinStandardHelpOptions = true)
+    class ApplySubcommand : Callable<Int> {
+        @Parameters(index = "0", arity = "0..1", description = ["Recipe name (optional when only one exists)."])
+        var name: String? = null
+
+        @Option(names = ["--set"], description = ["Pre-set a parameter (repeatable): --set name=value. Skips its prompt."])
+        var sets: Array<String> = emptyArray()
+
+        @Option(names = ["--environment"], description = ["Target environment slug (skips the prompt)."])
+        var environment: String? = null
+
+        @Option(names = ["--yes"], description = ["Skip the confirmation prompt (for non-interactive use)."])
+        var yes: Boolean = false
+
+        @Option(names = ["--hub"])
+        var hub: String = ThorynConfig.DEFAULT_HUB
+
+        @Option(names = ["--gateway"])
+        var gateway: String = ThorynConfig.DEFAULT_GATEWAY
+
+        override fun call(): Int {
+            val exampleName = name ?: singleExampleName() ?: return CommandSupport.EXIT_USAGE
+            val recipe = try {
+                Recipe.load(exampleName)
+            } catch (ex: RecipeException) {
+                System.err.println("`apply` is only available for recipe-backed examples (${ex.message}).")
+                return CommandSupport.EXIT_USAGE
+            }
+            val tokens = CommandSupport.readTokens() ?: return CommandSupport.EXIT_NOT_SIGNED_IN
+            val ctx = ExampleContext(
+                hub = CommandSupport.resolveHub(hub, tokens),
+                gateway = CommandSupport.resolveGateway(gateway, tokens),
+                tokens = tokens,
+                state = ExampleStateStore(),
+            )
+            if (ctx.state.read(exampleName) != null) {
+                ctx.warn("An existing '$exampleName' setup was found. Run `thoryn examples teardown $exampleName` first.")
+                return CommandSupport.EXIT_OK
+            }
+
+            val overrides = resolveParams(recipe)
+            val env = environment ?: resolveEnvironment(recipe, ctx)
+            printPlan(recipe, overrides, env)
+            if (!yes && !Prompt.confirm("Apply this recipe now?")) {
+                println("Aborted — nothing was provisioned.")
+                return CommandSupport.EXIT_OK
+            }
+            return try {
+                val run = RecipeInterpreter(ctx, recipe, overrides = overrides, environmentSlug = env).setup()
+                ctx.state.write(run.state)
+                ReceiptStore().write(run.receipt)
+                println()
+                println("Applied. Receipt: thoryn examples receipt $exampleName   Next: thoryn examples run $exampleName")
+                CommandSupport.EXIT_OK
+            } catch (ex: RecipeException) {
+                System.err.println("Could not apply '$exampleName': ${ex.message}")
+                CommandSupport.EXIT_HTTP_ERROR
+            } catch (ex: Exception) {
+                CommandSupport.renderRequestFailure(ex, ctx.gateway, System.err)
+            }
+        }
+
+        private fun resolveParams(recipe: Recipe): Map<String, String> {
+            val preset = sets.mapNotNull { s -> s.split("=", limit = 2).takeIf { it.size == 2 }?.let { it[0] to it[1] } }.toMap()
+            val resolved = LinkedHashMap<String, String>()
+            recipe.params.forEach { p ->
+                val paramName = p["name"].asString()
+                if (preset.containsKey(paramName)) {
+                    resolved[paramName] = preset.getValue(paramName)
+                    return@forEach
+                }
+                val default = p["default"]?.takeIf { !it.isNull }?.asString()
+                val promptText = p["prompt"]?.asString() ?: paramName
+                val value = Prompt.ask(promptText, default)
+                if (value.isNotEmpty()) resolved[paramName] = value
+            }
+            return resolved
+        }
+
+        /** A sandbox by default when the recipe runs in an existing workspace; null (production plane)
+         *  when it creates its own workspace (only production exists then). */
+        private fun resolveEnvironment(recipe: Recipe, ctx: ExampleContext): String? {
+            val createsWorkspace = recipe.steps.any { it["action"]?.asString() == "hub.createWorkspace" }
+            if (createsWorkspace) {
+                ctx.info("This recipe creates its own workspace; its resources go to that workspace's production environment.")
+                return null
+            }
+            val envs = runCatching { ctx.gatewayClient().listEnvironments()["environments"]?.toList().orEmpty() }.getOrDefault(emptyList())
+            if (envs.isEmpty()) return null
+            val slugs = envs.mapNotNull { it["slug"]?.asString() }
+            val defaultEnv = envs.firstOrNull { it["kind"]?.asString() == "sandbox" && it["suspended"]?.asBoolean() != true }
+                ?.get("slug")?.asString() ?: ThorynConfig.PRODUCTION_ENV_SLUG
+            ctx.info("Environments: ${slugs.joinToString(", ")}")
+            return Prompt.ask("Target environment", defaultEnv).ifEmpty { null }
+        }
+
+        private fun printPlan(recipe: Recipe, overrides: Map<String, String>, env: String?) {
+            println()
+            println("Plan — recipe ${recipe.id} v${recipe.version}")
+            if (overrides.isNotEmpty()) {
+                println("  parameters:")
+                overrides.forEach { (k, v) -> println("    $k = $v") }
+            }
+            println("  environment: ${env ?: "production (default plane)"}")
+            println("  steps:")
+            recipe.steps.forEach { s ->
+                println("    - ${s["action"]?.asString()}${s["description"]?.takeIf { !it.isNull }?.let { " — ${it.asString()}" } ?: ""}")
+            }
+        }
+    }
+
+    /**
+     * SSO-2876 — `thoryn examples share [name] [--output <file>]` — export the run's receipt (which is
+     * already secret-free: server-minted secrets are file refs, never values) to a file or stdout, and
+     * note whether it carries a platform attestation (verifiable offline).
+     */
+    @Command(name = "share", description = ["Export a run's receipt (secret-free) to a file or stdout."], mixinStandardHelpOptions = true)
+    class ShareSubcommand : Callable<Int> {
+        @Parameters(index = "0", arity = "0..1", description = ["Recipe name (optional when only one exists)."])
+        var name: String? = null
+
+        @Option(names = ["--output"], description = ["Write to this file instead of stdout."])
+        var output: File? = null
+
+        override fun call(): Int {
+            val exampleName = name ?: singleExampleName() ?: return CommandSupport.EXIT_USAGE
+            val receipt = ReceiptStore().read(exampleName)
+                ?: run {
+                    System.err.println("No receipt for '$exampleName'. Run `thoryn examples apply $exampleName` first.")
+                    return CommandSupport.EXIT_USAGE
+                }
+            val json = jacksonObjectMapper().writerWithDefaultPrettyPrinter().writeValueAsString(receipt)
+            val out = output
+            if (out != null) {
+                out.writeText(json + "\n")
+                println("Wrote receipt to ${out.path}.")
+            } else {
+                println(json)
+            }
+            System.err.println(
+                if (receipt.attestation != null) {
+                    "This receipt is platform-signed (kid ${receipt.attestation.kid}); a recipient can verify it offline."
+                } else {
+                    "Note: this receipt is NOT platform-signed (the platform was unreachable at apply time)."
+                },
+            )
+            return CommandSupport.EXIT_OK
         }
     }
 
