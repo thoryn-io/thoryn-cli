@@ -36,6 +36,24 @@ object ThorynConfig {
      * selection resolves to this production plane, so `env list` marks it active by default.
      */
     const val PRODUCTION_ENV_SLUG = "production"
+
+    /**
+     * SSO-2874 — the public example-recipe catalog (`thoryn examples catalog --remote` / `update`).
+     * [EXAMPLES_RELEASE_API] is the GitHub REST base for its releases (a seam tests point at a stub);
+     * a signed release attaches `catalog.zip` + `catalog.zip.sig`.
+     */
+    const val EXAMPLES_REPO = "thoryn-io/thoryn-examples"
+    const val EXAMPLES_RELEASE_API = "https://api.github.com"
+
+    /**
+     * SSO-2874 — the CLI's pinned TRUST ANCHOR for the recipe catalog: the Ed25519 release-signing
+     * PUBLIC key (X.509 SubjectPublicKeyInfo, base64). A fetched `catalog.zip` is used only if its
+     * detached signature verifies against this key, so a tampered or unsigned catalog is refused. The
+     * private half is held only as the `THORYN_EXAMPLES_SIGNING_KEY` secret in the thoryn-examples repo
+     * (the release workflow signs with it) — never in this repo. Rotating the key is a CLI release.
+     */
+    const val EXAMPLES_SIGNING_PUBLIC_KEY_SPKI_B64 =
+        "MCowBQYDK2VwAyEAs8l5WV3Oi7Tl46e8NrGEHqeni4e5KsUW+H/3m3w/rgU="
     const val DEFAULT_GATEWAY = "http://localhost:8991"
 
     /** Convenience constant — pass to `--issuer` to point the CLI at the staging hub. */
