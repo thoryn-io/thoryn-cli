@@ -56,6 +56,36 @@ object ThorynConfig {
         "MCowBQYDK2VwAyEAs8l5WV3Oi7Tl46e8NrGEHqeni4e5KsUW+H/3m3w/rgU="
     const val DEFAULT_GATEWAY = "http://localhost:8991"
 
+    /**
+     * SSO-2879 (epic SSO-2871) — defaults for `thoryn login --workload-identity`, the secret-less
+     * sign-in the thoryn-examples recipe-conformance CI uses (GitHub Actions OIDC -> hub WIF
+     * token-exchange, replacing the static `THORYN_CI_CLIENT_SECRET`). The values match hub
+     * migration V143's seeded `ci-conformance` tenant + `conformance-ci-github-wif` exchange client.
+     */
+    const val DEFAULT_WIF_CLIENT_ID = "conformance-ci-github-wif"
+
+    /** The workspace slug whose tenant-subdomain token endpoint the WIF request is POSTed to (V143). */
+    const val DEFAULT_WIF_TENANT_SLUG = "ci-conformance"
+
+    /** The `kid` of the CI signing key — matches the inline public JWKS seeded in hub V143. */
+    const val DEFAULT_WIF_KEY_ID = "ci-conformance-wif-v1"
+
+    /** Env var holding the PKCS#8 PEM of the CI private_key_jwt signing key (the GitHub secret). */
+    const val WIF_SIGNING_KEY_ENV = "THORYN_CI_WIF_SIGNING_KEY"
+
+    /** Optional env override for the GitHub OIDC subject token (local testing without a runner). */
+    const val WIF_SUBJECT_TOKEN_ENV = "THORYN_CI_WIF_SUBJECT_TOKEN"
+
+    /**
+     * The scope set requested by `--workload-identity` — EXACTLY the `conformance-ci-github-wif`
+     * client's registered scopes (V143). It must be a subset of the client's registered set: the
+     * WIF exchange bounds the minted token to `requested ∩ client-registered` and rejects
+     * `invalid_scope` when the request exceeds it (a WIF subject token carries no scope of its own).
+     */
+    const val DEFAULT_WIF_SCOPE =
+        "openid tenant:applications.read tenant:applications.write " +
+            "tenant:federation.read tenant:federation.write"
+
     /** Convenience constant — pass to `--issuer` to point the CLI at the staging hub. */
     const val STAGING_ISSUER = "https://hub.stg.thoryn.org"
 
@@ -183,4 +213,23 @@ object ThorynConfig {
     fun resolveClientSecret(): String? =
         System.getProperty("THORYN_CLIENT_SECRET")?.takeIf { it.isNotBlank() }
             ?: System.getenv("THORYN_CLIENT_SECRET")?.takeIf { it.isNotBlank() }
+
+    /**
+     * SSO-2879 — resolve the WIF private_key_jwt signing key (PKCS#8 PEM) for `login --workload-identity`.
+     *
+     * Resolution order (first non-blank wins), keeping the key out of argv:
+     *   1. `--wif-signing-key-file <path>` — a file (typical when a CI step writes the secret to disk).
+     *   2. `THORYN_CI_WIF_SIGNING_KEY` system property — used by tests / `-D` invocations.
+     *   3. `THORYN_CI_WIF_SIGNING_KEY` environment variable — the canonical GitHub-secret knob.
+     */
+    fun readWifSigningKey(file: java.io.File?): String? {
+        file?.takeIf { it.isFile }?.readText()?.takeIf { it.isNotBlank() }?.let { return it }
+        return System.getProperty(WIF_SIGNING_KEY_ENV)?.takeIf { it.isNotBlank() }
+            ?: System.getenv(WIF_SIGNING_KEY_ENV)?.takeIf { it.isNotBlank() }
+    }
+
+    /** SSO-2879 — optional off-runner subject-token override (system property then env). */
+    fun readWifSubjectTokenOverride(): String? =
+        System.getProperty(WIF_SUBJECT_TOKEN_ENV)?.takeIf { it.isNotBlank() }
+            ?: System.getenv(WIF_SUBJECT_TOKEN_ENV)?.takeIf { it.isNotBlank() }
 }

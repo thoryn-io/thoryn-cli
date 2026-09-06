@@ -6,6 +6,7 @@ import com.devnow.thoryn.cli.auth.ClientCredentialsException
 import com.devnow.thoryn.cli.auth.ClientCredentialsFlow
 import com.devnow.thoryn.cli.auth.DeviceCodeException
 import com.devnow.thoryn.cli.auth.DeviceCodeFlow
+import com.devnow.thoryn.cli.auth.EcPrivateKeyJwtSigner
 import com.devnow.thoryn.cli.auth.HttpSender
 import com.devnow.thoryn.cli.auth.IssuerUrlValidationException
 import com.devnow.thoryn.cli.auth.IssuerUrlValidator
@@ -16,6 +17,8 @@ import com.devnow.thoryn.cli.auth.ScopeRegistry
 import com.devnow.thoryn.cli.auth.TokenStore
 import com.devnow.thoryn.cli.auth.TokenStoreFactory
 import com.devnow.thoryn.cli.auth.Tokens
+import com.devnow.thoryn.cli.auth.WorkloadIdentityException
+import com.devnow.thoryn.cli.auth.WorkloadIdentityFlow
 import com.devnow.thoryn.cli.config.ThorynConfig
 import picocli.CommandLine.Command
 import picocli.CommandLine.Option
@@ -112,6 +115,69 @@ class LoginCommand : Callable<Int> {
     )
     var clientSecretFile: File? = null
 
+    /**
+     * SSO-2879 — secret-less sign-in for the thoryn-examples recipe-conformance CI: exchange the
+     * GitHub Actions OIDC token for a hub access token via Workload Identity Federation, with the
+     * exchange client authenticating by `private_key_jwt` (no shared secret). See [runWorkloadIdentityFlow].
+     */
+    @Option(
+        names = ["--workload-identity", "--github-oidc"],
+        description = ["Sign in via GitHub Actions OIDC -> hub Workload Identity Federation (RFC 8693). Non-interactive, secret-less; for CI. Requires the CI signing key (THORYN_CI_WIF_SIGNING_KEY / --wif-signing-key-file)."],
+    )
+    var useWorkloadIdentity: Boolean = false
+
+    @Option(
+        names = ["--tenant"],
+        description = ["Workspace slug whose tenant the WIF token targets (default: \${DEFAULT-VALUE})."],
+        defaultValue = ThorynConfig.DEFAULT_WIF_TENANT_SLUG,
+    )
+    var wifTenantSlug: String = ThorynConfig.DEFAULT_WIF_TENANT_SLUG
+
+    @Option(
+        names = ["--wif-client-id"],
+        description = ["OAuth client id of the private_key_jwt exchange client (default: \${DEFAULT-VALUE})."],
+        defaultValue = ThorynConfig.DEFAULT_WIF_CLIENT_ID,
+    )
+    var wifClientId: String = ThorynConfig.DEFAULT_WIF_CLIENT_ID
+
+    @Option(
+        names = ["--wif-key-id"],
+        description = ["kid of the CI signing key, matching the hub-registered public JWKS (default: \${DEFAULT-VALUE})."],
+        defaultValue = ThorynConfig.DEFAULT_WIF_KEY_ID,
+    )
+    var wifKeyId: String = ThorynConfig.DEFAULT_WIF_KEY_ID
+
+    /**
+     * SSO-2879 — the PKCS#8 PEM private key for the client assertion, read from a file. Falls back to
+     * the `THORYN_CI_WIF_SIGNING_KEY` env var (the canonical CI knob). Never a flag value — a key in
+     * argv lands in shell history and `ps aux`.
+     */
+    @Option(
+        names = ["--wif-signing-key-file"],
+        description = ["Read the WIF private_key_jwt signing key (PKCS#8 PEM) from this file. Falls back to THORYN_CI_WIF_SIGNING_KEY. Never pass the key as an argument."],
+    )
+    var wifSigningKeyFile: File? = null
+
+    /**
+     * SSO-2879 — the OIDC token `audience` requested from GitHub (== the hub's registered
+     * `allowed_audience`). Defaults to `--issuer`. Also the base for the client-assertion `aud`.
+     */
+    @Option(
+        names = ["--audience"],
+        description = ["Audience requested for the GitHub OIDC token (WIF). Default: the --issuer value."],
+    )
+    var wifAudience: String? = null
+
+    /**
+     * SSO-2879 — supply the subject token explicitly instead of fetching it from the GitHub Actions
+     * runner (local testing off-runner). Falls back to the `THORYN_CI_WIF_SUBJECT_TOKEN` env var.
+     */
+    @Option(
+        names = ["--subject-token"],
+        description = ["Use this GitHub OIDC token as the WIF subject_token instead of fetching it from the runner (testing). Falls back to THORYN_CI_WIF_SUBJECT_TOKEN."],
+    )
+    var wifSubjectToken: String? = null
+
     @Option(
         names = ["--status"],
         description = ["Print sign-in status and exit. Does not initiate a new flow."],
@@ -163,9 +229,13 @@ class LoginCommand : Callable<Int> {
             System.err.println("Error: ${e.message}")
             return EXIT_USAGE
         }
-        if (useClientCredentials && useDeviceCode) {
-            System.err.println("Error: --client-credentials and --device-code are mutually exclusive.")
+        val exclusiveModes = listOf(useClientCredentials, useDeviceCode, useWorkloadIdentity).count { it }
+        if (exclusiveModes > 1) {
+            System.err.println("Error: --client-credentials, --device-code and --workload-identity are mutually exclusive.")
             return EXIT_USAGE
+        }
+        if (useWorkloadIdentity) {
+            return runWorkloadIdentityFlow()
         }
         if (useClientCredentials) {
             return runClientCredentialsFlow()
@@ -224,6 +294,64 @@ class LoginCommand : Callable<Int> {
         } catch (e: ClientCredentialsException) {
             System.err.println("Sign-in failed: ${e.message}")
             EXIT_CLIENT_CREDENTIALS_FAILED
+        }
+    }
+
+    /**
+     * SSO-2879 — the secret-less WIF sign-in. Resolves the CI signing key (env / file), signs a
+     * `private_key_jwt` client assertion, and exchanges the GitHub Actions OIDC token for a hub
+     * access token via [WorkloadIdentityFlow].
+     *
+     * Two hub URLs (see [WorkloadIdentityFlow]): the request is POSTed to the TENANT-SUBDOMAIN token
+     * endpoint (`{slug}.hub…/oauth2/token`, so the hub resolves the ci-conformance tenant) while the
+     * assertion `aud` is the DEFAULT-issuer token endpoint (`--issuer`/oauth2/token). The requested
+     * scope defaults to the client's exact registered set ([ThorynConfig.DEFAULT_WIF_SCOPE]) unless
+     * the caller overrode `--scope`.
+     */
+    private fun runWorkloadIdentityFlow(): Int {
+        val signingKeyPem = ThorynConfig.readWifSigningKey(wifSigningKeyFile)
+        if (signingKeyPem == null) {
+            System.err.println(
+                "No WIF signing key available. Set ${ThorynConfig.WIF_SIGNING_KEY_ENV} (PKCS#8 PEM) " +
+                    "or pass --wif-signing-key-file <path>.",
+            )
+            return EXIT_USAGE
+        }
+        val signer = try {
+            EcPrivateKeyJwtSigner(privateKeyPem = signingKeyPem, keyId = wifKeyId)
+        } catch (e: IllegalArgumentException) {
+            System.err.println("Sign-in failed: invalid WIF signing key — ${e.message}")
+            return EXIT_WORKLOAD_IDENTITY_FAILED
+        }
+
+        val base = issuer.trimEnd('/')
+        val oidcAudience = wifAudience?.takeIf { it.isNotBlank() } ?: base
+        val subjectToken = wifSubjectToken?.takeIf { it.isNotBlank() }
+            ?: ThorynConfig.readWifSubjectTokenOverride()
+        // Request the client's exact registered scope set by default; honour an explicit --scope.
+        val requestedScope = if (scope == ThorynConfig.DEFAULT_SCOPE) ThorynConfig.DEFAULT_WIF_SCOPE else expandedScope()
+
+        val flow = WorkloadIdentityFlow(
+            tokenEndpoint = "${ThorynConfig.tenantIssuer(base, wifTenantSlug)}/oauth2/token",
+            assertionAudience = "$base/oauth2/token",
+            clientId = wifClientId,
+            signer = signer,
+            oidcAudience = oidcAudience,
+            sender = realHttpSender(),
+            explicitSubjectToken = subjectToken,
+        )
+
+        return try {
+            val tokens = flow.run(requestedScope)
+            tokenStore.write(withSession(tokens))
+            SelectedWorkspaceStore().clear()
+            println("Signed in (workload-identity / '$wifClientId' in tenant '$wifTenantSlug').")
+            tokens.scope?.let { println("Scopes: $it") }
+            EXIT_OK
+        } catch (e: WorkloadIdentityException) {
+            System.err.println("Sign-in failed: ${e.message}")
+            e.bodySnippet?.takeIf { e.oauthError == "unknown" }?.let { System.err.println("  hub response: $it") }
+            EXIT_WORKLOAD_IDENTITY_FAILED
         }
     }
 
@@ -409,6 +537,9 @@ class LoginCommand : Callable<Int> {
 
         /** SSO-2820 — the interactive loopback flow failed (timeout, state mismatch, error redirect, bad code). */
         const val EXIT_LOOPBACK_FAILED = 72
+
+        /** SSO-2879 — the workload-identity (GitHub OIDC -> WIF) sign-in failed. */
+        const val EXIT_WORKLOAD_IDENTITY_FAILED = 73
 
         /** SSO-2820 — how long to wait for the browser sign-in redirect on the loopback listener. */
         private val LOOPBACK_TIMEOUT: Duration = Duration.ofMinutes(5)
