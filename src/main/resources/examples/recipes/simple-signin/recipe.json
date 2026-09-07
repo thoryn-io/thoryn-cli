@@ -63,6 +63,18 @@
           "http://127.0.0.1/"
         ]
       }
+    },
+    {
+      "id": "user",
+      "action": "identity.registerUser",
+      "description": "Register a verified, sign-in-able tenant user UNDER the new workspace (SSO-2908).",
+      "with": {
+        "email": "{{workspaceSlug}}@example.com",
+        "password": "Example-Signin-Pw1!",
+        "givenName": "Demo",
+        "familyName": "User",
+        "emailVerified": true
+      }
     }
   ],
   "verify": [

@@ -20,10 +20,12 @@ class ExamplesApplyShareTest : CommandTestBase() {
     @Test
     fun `apply provisions non-interactively with --set and --yes, and writes a receipt`() {
         seedTokens(Tokens(accessToken = "AT-test", refreshToken = "RT", issuer = baseUrl(), gateway = baseUrl()))
-        // The interpreter's setup drives: createWorkspace → registerTenant → applications.create → verify → attest.
+        // The interpreter's setup drives: createWorkspace → registerTenant → applications.create →
+        // identity.registerUser (SSO-2908) → verify → attest.
         server.enqueue(jsonResponse(201, """{"tenantId":"t-1","slug":"srv","provisioningToken":"PT-1"}"""))
         server.enqueue(jsonResponse(200, """{"ok":true}"""))
         server.enqueue(jsonResponse(201, """{"clientId":"app-9","status":"active"}"""))
+        server.enqueue(jsonResponse(201, """{"id":"usr-7","email":"[email protected]","emailVerified":true,"status":"ACTIVE"}"""))
         server.enqueue(jsonResponse(200, """{"clientId":"app-9","status":"active"}"""))
         server.enqueue(jsonResponse(200, """{"kid":"receipt-attestation-t-1-local-v1","signature":"h..s","canonicalPayload":"e30","attestedAt":"2026-01-01T00:00:00Z"}"""))
 

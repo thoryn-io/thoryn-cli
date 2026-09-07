@@ -53,6 +53,22 @@ steps:
       # post_logout_redirect_uri on this loopback host (port-agnostic, like redirectUris).
       postLogoutRedirectUris: ["http://127.0.0.1/"]
 
+  - id: user
+    action: identity.registerUser
+    description: Register a verified, sign-in-able tenant user UNDER the new workspace (SSO-2908).
+    with:
+      # Field names match product-api's CreateUserRequest (POST /api/v1/users, tenant:users.write).
+      # The email is tied to the fresh per-run workspace slug (each run creates a NEW tenant, so the
+      # account never collides with a prior run) — no randomness primitive needed at the step level.
+      email: "{{workspaceSlug}}@example.com"
+      # A `password` sets an initial credential so the user can sign in immediately, and
+      # `emailVerified: true` marks the account verified so the sign-up→login leg proceeds WITHOUT an
+      # email round-trip. Rotate this before any real use — it is a published example value.
+      password: "Example-Signin-Pw1!"
+      givenName: "Demo"
+      familyName: "User"
+      emailVerified: true
+
 verify:
   - assert: applications.get
     id: "{{app.clientId}}"

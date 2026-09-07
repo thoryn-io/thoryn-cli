@@ -37,9 +37,11 @@ class RecipeInterpreterTest : CommandTestBase() {
         server.enqueue(jsonResponse(200, """{"ok":true}"""))
         // 3) applications.create (under the workspace)
         server.enqueue(jsonResponse(201, """{"clientId":"app-9","status":"active"}"""))
-        // 4) verify applications.get
+        // 4) SSO-2908 — identity.registerUser → POST /api/v1/users (a verified, sign-in-able user)
+        server.enqueue(jsonResponse(201, """{"id":"usr-7","email":"[email protected]","emailVerified":true,"status":"ACTIVE"}"""))
+        // 5) verify applications.get
         server.enqueue(jsonResponse(200, """{"clientId":"app-9","status":"active"}"""))
-        // 5) SSO-2878 — best-effort platform attestation of the receipt.
+        // 6) SSO-2878 — best-effort platform attestation of the receipt.
         server.enqueue(jsonResponse(200, """{"kid":"receipt-attestation-t-1-local-v1","signature":"h..s","canonicalPayload":"e30","attestedAt":"2026-01-01T00:00:00Z"}"""))
 
         val run = RecipeInterpreter(ctx, Recipe.load("simple-signin"), trustPropagationBudgetMs = 2_000).setup()
@@ -56,6 +58,8 @@ class RecipeInterpreterTest : CommandTestBase() {
         assertThat(receipt.recipe.digest).startsWith("sha256:")
         assertThat(receipt.workspace.tenantId).isEqualTo("t-1")
         assertThat(receipt.resources).anyMatch { it.kind == "application" && it.id == "app-9" }
+        // SSO-2908 — the provisioned sign-in-able user is recorded on the receipt too.
+        assertThat(receipt.resources).anyMatch { it.kind == "user" && it.id == "usr-7" }
         assertThat(receipt.verify).anyMatch { it.assert == "applications.get" && it.passed }
         // SSO-2878 — the platform-signed attestation was folded into the receipt.
         assertThat(receipt.attestation).isNotNull
@@ -77,6 +81,15 @@ class RecipeInterpreterTest : CommandTestBase() {
         assertThat(appReq.body.readUtf8())
             .contains("\"postLogoutRedirectUris\"")
             .contains("http://127.0.0.1/")
+        // SSO-2908 — the registerUser step posts the CreateUserRequest to product-api, under the workspace.
+        val userReq = server.takeRequest()
+        assertThat(userReq.method).isEqualTo("POST")
+        assertThat(userReq.path).isEqualTo("/api/v1/users")
+        assertThat(userReq.getHeader("Authorization")).isEqualTo("Bearer PT-1")
+        assertThat(userReq.body.readUtf8())
+            .contains("\"email\":\"ex-signin-")
+            .contains("\"password\":\"Example-Signin-Pw1!\"")
+            .contains("\"emailVerified\":true")
         assertThat(server.takeRequest().path).isEqualTo("/api/v1/applications/app-9")
     }
 
@@ -132,6 +145,8 @@ class RecipeInterpreterTest : CommandTestBase() {
         server.enqueue(jsonResponse(201, """{"tenantId":"t-1","slug":"x","provisioningToken":"PT-1"}"""))
         server.enqueue(jsonResponse(200, """{"ok":true}"""))
         server.enqueue(jsonResponse(201, """{"clientId":"app-9"}"""))
+        // SSO-2908 — identity.registerUser step runs before verify.
+        server.enqueue(jsonResponse(201, """{"id":"usr-7","email":"[email protected]","status":"ACTIVE"}"""))
         // verify expects status=active, but the app comes back suspended.
         server.enqueue(jsonResponse(200, """{"clientId":"app-9","status":"suspended"}"""))
 
