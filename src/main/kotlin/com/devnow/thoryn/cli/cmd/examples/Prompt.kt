@@ -21,4 +21,13 @@ internal object Prompt {
         val line = System.console()?.readLine("%s [y/N]: ", message)?.trim()?.lowercase()
         return line == "y" || line == "yes"
     }
+
+    /**
+     * SSO-2880 — block until the user presses Enter. Returns immediately when there is no interactive
+     * console (piped / CI / EOF) so a non-interactive run tears down cleanly rather than hanging.
+     */
+    fun awaitEnter() {
+        val console = System.console() ?: return
+        runCatching { console.readLine() }
+    }
 }

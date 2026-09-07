@@ -4,20 +4,20 @@ import com.devnow.thoryn.cli.api.ProductApiException
 import com.devnow.thoryn.cli.cmd.CommandSupport
 import com.devnow.thoryn.cli.cmd.examples.Example
 import com.devnow.thoryn.cli.cmd.examples.ExampleContext
+import com.devnow.thoryn.cli.cmd.examples.NodeRelyingParty
 
 /**
- * SSO-2871 Phase 1 (SSO-2873) — an [Example] whose `setup` / `teardown` are driven by a declarative
- * [Recipe] via [RecipeInterpreter] instead of hand-written Kotlin. `run` (the interactive loopback
- * relying-party flow) is delegated to [runDelegate] — Phase 1 reuses the existing compiled RP runner;
- * a recipe cannot yet express the browser interaction (a later phase carries the RP as a recipe asset).
- *
- * Enabled behind a flag (see `ExampleRegistry`): the compiled example remains the default until the
- * recipe path has soaked.
+ * SSO-2871 — an [Example] whose `setup` / `teardown` are driven by a declarative [Recipe] via
+ * [RecipeInterpreter] instead of hand-written Kotlin, and whose `run` launches the **Node** relying
+ * party that ships as a signed catalog asset (`recipes/<id>/apps/loopback-rp/server.js`, Part 1 of
+ * SSO-2880). The RP logic lives in exactly one place — the readable Node app in `thoryn-examples` —
+ * not in the CLI; `run` only obtains the verified asset and orchestrates the browser flow via
+ * [NodeRelyingParty]. The in-process Kotlin RP was retired with SSO-2880.
  */
 internal class RecipeExample(
     private val recipe: Recipe,
-    private val runDelegate: Example,
     private val receiptStore: ReceiptStore = ReceiptStore(),
+    private val relyingParty: NodeRelyingParty = NodeRelyingParty(),
 ) : Example {
 
     override val name: String = recipe.id
@@ -52,8 +52,40 @@ internal class RecipeExample(
         }
     }
 
-    /** The browser interaction is unchanged (reads the same ExampleState the interpreter wrote). */
-    override fun run(ctx: ExampleContext): Int = runDelegate.run(ctx)
+    /**
+     * Launch the Node relying party against the config the interpreter provisioned. Reads the same
+     * [com.devnow.thoryn.cli.cmd.examples.ExampleState] `setup` wrote (tenant issuer + client id) and
+     * the RP asset path the recipe declares under `assets.rp`.
+     */
+    override fun run(ctx: ExampleContext): Int {
+        val state = ctx.state.read(name)
+            ?: run {
+                ctx.warn("No '$name' setup found. Run `thoryn examples setup $name` first.")
+                return CommandSupport.EXIT_USAGE
+            }
+        val tenantIssuer = state.tenantIssuer
+            ?: run { ctx.warn("Stored state is missing the tenant issuer; re-run setup."); return CommandSupport.EXIT_USAGE }
+        val clientId = state.clientId
+            ?: run { ctx.warn("Stored state is missing the client id; re-run setup."); return CommandSupport.EXIT_USAGE }
+        val assetDir = recipe.root["assets"]?.get("rp")?.takeIf { !it.isNull }?.asString()
+            ?.removePrefix("./")?.trimEnd('/')
+            ?: NodeRelyingParty.DEFAULT_ASSET_DIR
+        return relyingParty.run(
+            ctx = ctx,
+            tenantIssuer = tenantIssuer,
+            clientId = clientId,
+            recipeId = name,
+            assetDir = assetDir,
+            scopes = requestedScopes(),
+        )
+    }
+
+    /** The space-separated scopes the recipe's `applications.create` step requests, or null. */
+    private fun requestedScopes(): String? =
+        recipe.steps.firstOrNull { it["action"]?.asString() == "applications.create" }
+            ?.get("with")?.get("scopes")?.takeIf { !it.isNull }
+            ?.toList()?.mapNotNull { it.asString() }?.takeIf { it.isNotEmpty() }
+            ?.joinToString(" ")
 
     override fun teardown(ctx: ExampleContext): Int {
         val state = ctx.state.read(name) ?: run {

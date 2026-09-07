@@ -247,11 +247,20 @@ thoryn examples teardown simple-signin   # remove what setup created (best-effor
 
 **`simple-signin`** creates a dedicated workspace (via the real
 `workspace create` workflow, which attaches the tenant's identity provider) and
-a public **loopback** OAuth client, then `run` stands up a tiny **ephemeral local
-relying party** (a localhost app with a public + a protected page) and opens your
-browser. You register a new user and sign in on the real hosted screens and land
-on the protected page, which shows your ID-token claims. Nothing is added to
-oathy's deployed services — the demo app lives only for the duration of `run`.
+a public **loopback** OAuth client, then `run` launches the **Node relying
+party** that ships as a signed catalog asset (`recipes/simple-signin/apps/loopback-rp/server.js`
+in the public `thoryn-examples` repo — a readable, zero-dependency Node OIDC
+Authorization-Code + PKCE app) and opens your browser. You register a new user and
+sign in on the real hosted screens and land on the protected page, which shows your
+ID-token claims. Nothing is added to oathy's deployed services — the app runs only
+for the duration of `run`.
+
+`run` therefore **requires Node 18+** on your `PATH` and the **verified signed
+catalog** on disk (the RP code lives in exactly one place — the Node asset — not
+baked into the CLI). If Node is missing, or the catalog has not been fetched, `run`
+fails with an actionable message: fetch + verify the catalog once with
+`thoryn examples update`, install Node 18+, then re-run. (The catalog is Ed25519-signed;
+the CLI refuses an unsigned or tampered bundle.)
 
 **Teardown is partial by design.** It deletes the OAuth client it created, but
 there is no customer-plane API yet to delete the example workspace or the user

@@ -38,7 +38,14 @@ internal class RecipeCatalog(
     private val apiBase: String = ThorynConfig.EXAMPLES_RELEASE_API,
     private val repo: String = ThorynConfig.EXAMPLES_REPO,
     private val publicKeySpkiB64: String = ThorynConfig.EXAMPLES_SIGNING_PUBLIC_KEY_SPKI_B64,
-    private val http: HttpClient = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(15)).build(),
+    // followRedirects(NORMAL) is REQUIRED: GitHub release-asset download URLs always 302 to a
+    // signed storage host (objects.githubusercontent.com). The java.net.http default is
+    // Redirect.NEVER, which surfaces the 302 as a failed download. NORMAL follows HTTPS->HTTPS
+    // redirects but refuses an HTTPS->HTTP downgrade. (SSO-2881)
+    private val http: HttpClient = HttpClient.newBuilder()
+        .connectTimeout(Duration.ofSeconds(15))
+        .followRedirects(HttpClient.Redirect.NORMAL)
+        .build(),
     private val mapper: ObjectMapper = JsonMapper.builder().build(),
     private val cacheDir: Path = defaultCacheDir(),
 ) {
@@ -62,6 +69,43 @@ internal class RecipeCatalog(
         val dir = cacheDir.resolve(sanitize(tagName))
         extractZip(zipBytes, dir)
         return CatalogInfo(tagName, dir, listRecipes(dir))
+    }
+
+    /**
+     * SSO-2880 — resolve a verified recipe **asset** (e.g. the Node relying party's `server.js`) to a
+     * path on disk. Prefers an already-cached, previously-verified catalog; when nothing is cached it
+     * fetches + verifies the latest signed release ONCE (the same signature-gated path as [update]) and
+     * resolves from that. Throws [RecipeCatalogException] when no catalog can be obtained (offline / no
+     * published release) or when the verified catalog does not carry the asset.
+     */
+    fun ensureAsset(recipeId: String, relativePath: String): Path {
+        cachedAsset(recipeId, relativePath)?.let { return it }
+        // Nothing cached — fetch + verify once. Propagates RecipeCatalogException on offline / no release.
+        update(null)
+        return cachedAsset(recipeId, relativePath)
+            ?: throw RecipeCatalogException(
+                "the verified catalog has no asset 'recipes/$recipeId/${relativePath.trimStart('/')}'",
+            )
+    }
+
+    /**
+     * The newest cached, already-verified copy of a recipe asset, or `null` when no cached catalog
+     * holds it. Only files under a previously-extracted (hence signature-verified) catalog dir are
+     * returned — nothing here fetches or trusts unverified bytes.
+     */
+    fun cachedAsset(recipeId: String, relativePath: String): Path? {
+        if (!Files.isDirectory(cacheDir)) return null
+        val rel = "recipes/$recipeId/${relativePath.trimStart('/')}"
+        return Files.list(cacheDir).use { stream ->
+            stream.filter { Files.isDirectory(it) }
+                .map { it.resolve(rel).normalize() }
+                .filter { it.startsWith(cacheDir) && Files.isRegularFile(it) }
+                .sorted(
+                    compareBy { runCatching { Files.getLastModifiedTime(it).toMillis() }.getOrDefault(0L) },
+                )
+                .toList()
+                .lastOrNull()
+        }
     }
 
     // ── GitHub release API ──────────────────────────────────────────────────────────────────────

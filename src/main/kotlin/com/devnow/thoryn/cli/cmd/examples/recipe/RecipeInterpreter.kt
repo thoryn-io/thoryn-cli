@@ -273,7 +273,7 @@ internal class RecipeInterpreter(
     /**
      * A freshly-created workspace's issuer is not yet in the gateway's tenant-trust snapshot
      * (`TrustedTenantSlugRegistry`, refreshed ~45s), so the first tenant-scoped calls can be rejected.
-     * Retry within a budget — the same pattern `SimpleSigninExample.createClientInNewWorkspace` uses.
+     * Retry within a budget while the gateway's tenant-trust snapshot catches up.
      */
     private fun <T> retryUntilTenantTrusted(call: () -> T): T {
         val deadline = System.currentTimeMillis() + trustPropagationBudgetMs

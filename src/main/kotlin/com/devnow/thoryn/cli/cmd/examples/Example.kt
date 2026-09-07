@@ -118,22 +118,14 @@ internal class ExampleContext(
 internal object ExampleRegistry {
 
     /**
-     * SSO-2873 — when the recipe engine is enabled, `simple-signin` is provisioned by the declarative
-     * recipe interpreter (reading `examples/recipes/simple-signin/recipe.json`) instead of the
-     * compiled [SimpleSigninExample.setup]. Behind a flag so the compiled path stays the default until
-     * the recipe path has soaked; the browser `run` flow is delegated to the compiled example either
-     * way. Enable with `THORYN_RECIPE_ENGINE=1` (or `-Dthoryn.recipeEngine=1`).
+     * `simple-signin` is provisioned by the declarative recipe interpreter (reading
+     * `examples/recipes/simple-signin/recipe.json`) and `run` launches the Node relying-party asset
+     * from the signed catalog (SSO-2880). This is the sole path: the compiled `SimpleSigninExample`
+     * and its in-process Kotlin RP were retired with SSO-2880, and the former `THORYN_RECIPE_ENGINE`
+     * flag with them.
      */
-    private fun recipeEngineEnabled(): Boolean =
-        System.getenv("THORYN_RECIPE_ENGINE")?.isNotBlank() == true ||
-            System.getProperty("thoryn.recipeEngine")?.isNotBlank() == true
-
     private fun examples(): List<Example> =
-        if (recipeEngineEnabled()) {
-            listOf(RecipeExample(Recipe.load("simple-signin"), SimpleSigninExample()))
-        } else {
-            listOf(SimpleSigninExample())
-        }
+        listOf(RecipeExample(Recipe.load("simple-signin")))
 
     fun all(): List<Example> = examples()
 
