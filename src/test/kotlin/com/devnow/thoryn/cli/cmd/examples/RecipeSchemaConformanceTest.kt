@@ -100,6 +100,25 @@ class RecipeSchemaConformanceTest {
     }
 
     @Test
+    fun `identity registerUser is a supported step action and a recipe using it conforms`() {
+        // SSO-2907 — the create-user action is in the closed allowlist…
+        assertThat(allowlist("steps", "action")).contains("identity.registerUser")
+        // …and a recipe that provisions a user under a workspace is structurally conformant.
+        val recipe = yaml.readTree(
+            """
+            apiVersion: thoryn.io/examples/v1
+            id: register-user
+            version: 1.0.0
+            summary: provision a sign-in-able user
+            steps:
+              - { id: ws, action: hub.createWorkspace, with: { slug: "ex-{{generate.slug8}}" } }
+              - { id: user, action: identity.registerUser, with: { email: "u@{{ws.slug}}.example", password: pw, emailVerified: true } }
+            """.trimIndent(),
+        )
+        assertThat(violations(recipe)).isEmpty()
+    }
+
+    @Test
     fun `a recipe using an action outside the allowlist is rejected`() {
         val bad = yaml.readTree(
             """

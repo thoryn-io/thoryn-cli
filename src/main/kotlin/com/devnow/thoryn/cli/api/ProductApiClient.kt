@@ -112,6 +112,17 @@ class ProductApiClient(
     fun rotateApplicationSecret(clientId: String, confirmSlug: String? = null): JsonNode =
         post("/api/v1/applications/${encode(clientId)}/secret/rotate", emptyMap<String, Any?>(), confirmSlug)
 
+    // ── Tenant users (SSO-2907; product-api SSO-1884 `/api/v1/users`) ──────────
+    //
+    // The tenant user-management facade, gated by `tenant:users.write`. In the
+    // default set-password mode a `password` in the body provisions a sign-in-able
+    // credential and `emailVerified:true` marks the account verified without an
+    // email round-trip — the pieces a full sign-up→login example recipe needs.
+    // Returns the created `UserResponse` ({id, email, emailVerified, status, …}).
+
+    fun createUser(body: Map<String, Any?>): JsonNode =
+        post("/api/v1/users", body)
+
     // ── Environments (SSO-2870; product-api SSO-2410 `/api/v1/environments`) ────
     //
     // A workspace (tenant) holds N durable sandbox environments + one platform-
