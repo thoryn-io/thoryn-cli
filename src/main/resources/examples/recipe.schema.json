@@ -78,7 +78,10 @@
               "federation.delete"
             ]
           },
-          "with": { "type": "object" },
+          "with": {
+            "description": "Per-action inputs, forwarded to the supported product API. For `applications.create` (register-app) these are `displayName`, `clientType`, `grantTypes`, `scopes`, `redirectUris` (array of redirect URI strings) and the optional `postLogoutRedirectUris` (array of OIDC RP-Initiated-Logout post-logout redirect URI strings, same shape as `redirectUris`; SSO-2897).",
+            "type": "object"
+          },
           "description": { "type": "string" }
         }
       }

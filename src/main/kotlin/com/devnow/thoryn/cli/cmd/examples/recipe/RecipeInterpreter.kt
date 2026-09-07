@@ -61,6 +61,7 @@ internal class RecipeInterpreter(
 
     private var createdClientId: String? = null
     private var createdRedirectUri: String? = null
+    private var createdPostLogoutRedirectUri: String? = null
 
     // SSO-2875 — accumulated as the run proceeds, folded into the receipt on success.
     private val resources = mutableListOf<ResourceRef>()
@@ -210,6 +211,10 @@ internal class RecipeInterpreter(
 
     private fun createApplication(with: Map<String, Any?>): Map<String, String> {
         createdRedirectUri = (with["redirectUris"] as? List<*>)?.firstOrNull()?.toString()
+        // SSO-2897 — OIDC RP-Initiated-Logout post-logout redirect URI. The full `with` map (including
+        // `postLogoutRedirectUris`) is forwarded verbatim to product-api's create-application request,
+        // which persists it on the hub's RegisteredClient (SSO-2553); captured here only for the receipt.
+        createdPostLogoutRedirectUri = (with["postLogoutRedirectUris"] as? List<*>)?.firstOrNull()?.toString()
         val client = tenantClient()
         val app = retryUntilTenantTrusted { client.createApplication(with) }
         val clientId = (app["clientId"] ?: app["client_id"])?.asString()
@@ -218,7 +223,10 @@ internal class RecipeInterpreter(
         resources += ResourceRef(
             kind = "application",
             id = clientId,
-            attributes = buildMap { createdRedirectUri?.let { put("redirectUri", it) } },
+            attributes = buildMap {
+                createdRedirectUri?.let { put("redirectUri", it) }
+                createdPostLogoutRedirectUri?.let { put("postLogoutRedirectUri", it) }
+            },
         )
         ctx.info("client: clientId=$clientId")
         return mapOf("clientId" to clientId)

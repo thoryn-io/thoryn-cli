@@ -58,6 +58,9 @@
         ],
         "redirectUris": [
           "http://127.0.0.1/callback"
+        ],
+        "postLogoutRedirectUris": [
+          "http://127.0.0.1/"
         ]
       }
     }

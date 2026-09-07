@@ -49,6 +49,9 @@ steps:
       grantTypes: ["authorization_code"]
       scopes: ["openid", "profile", "email"]
       redirectUris: ["http://127.0.0.1/callback"]
+      # SSO-2897 — OIDC RP-Initiated Logout: the loopback RP posts to end_session with a
+      # post_logout_redirect_uri on this loopback host (port-agnostic, like redirectUris).
+      postLogoutRedirectUris: ["http://127.0.0.1/"]
 
 verify:
   - assert: applications.get

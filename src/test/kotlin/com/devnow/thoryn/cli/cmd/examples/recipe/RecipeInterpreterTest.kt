@@ -60,6 +60,10 @@ class RecipeInterpreterTest : CommandTestBase() {
         assertThat(receipt.attestation).isNotNull
         assertThat(receipt.attestation!!.kid).isEqualTo("receipt-attestation-t-1-local-v1")
 
+        // SSO-2897 — the run recorded the post-logout redirect URI on the application resource.
+        assertThat(receipt.resources)
+            .anyMatch { it.kind == "application" && it.attributes["postLogoutRedirectUri"] == "http://127.0.0.1/" }
+
         assertThat(server.takeRequest().path).isEqualTo("/account/workspace")
         assertThat(server.takeRequest().path).isEqualTo("/api/v1/tenants")
         val appReq = server.takeRequest()
@@ -67,6 +71,11 @@ class RecipeInterpreterTest : CommandTestBase() {
         assertThat(appReq.method).isEqualTo("POST")
         // The app is created UNDER the workspace, authenticated with the provisioning token.
         assertThat(appReq.getHeader("Authorization")).isEqualTo("Bearer PT-1")
+        // SSO-2897 — the recipe's postLogoutRedirectUris is forwarded verbatim to product-api's
+        // create-application request (which persists it on the hub RegisteredClient for RP-Initiated Logout).
+        assertThat(appReq.body.readUtf8())
+            .contains("\"postLogoutRedirectUris\"")
+            .contains("http://127.0.0.1/")
         assertThat(server.takeRequest().path).isEqualTo("/api/v1/applications/app-9")
     }
 
