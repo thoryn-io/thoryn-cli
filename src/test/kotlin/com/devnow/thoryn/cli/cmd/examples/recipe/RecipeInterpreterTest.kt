@@ -7,6 +7,7 @@ import com.devnow.thoryn.cli.cmd.examples.ExampleState
 import com.devnow.thoryn.cli.cmd.examples.ExampleStateStore
 import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.api.Test
+import tools.jackson.databind.json.JsonMapper
 
 /**
  * SSO-2873 — the recipe interpreter applies `simple-signin` end-to-end against the REAL product-API
@@ -77,6 +78,52 @@ class RecipeInterpreterTest : CommandTestBase() {
             .contains("\"postLogoutRedirectUris\"")
             .contains("http://127.0.0.1/")
         assertThat(server.takeRequest().path).isEqualTo("/api/v1/applications/app-9")
+    }
+
+    @Test
+    fun `identity registerUser provisions a user via product-api and records it on the receipt`() {
+        val ctx = context()
+        val recipeJson = """
+            {
+              "apiVersion": "thoryn.io/examples/v1",
+              "id": "register-user-test",
+              "version": "1.0.0",
+              "summary": "provision a sign-in-able user",
+              "steps": [
+                { "id": "ws", "action": "hub.createWorkspace",
+                  "with": { "slug": "ex-signin-{{generate.slug8}}", "displayName": "T" } },
+                { "id": "user", "action": "identity.registerUser",
+                  "with": { "email": "[email protected]", "password": "S3cret-pw", "emailVerified": true } }
+              ]
+            }
+        """.trimIndent()
+        val recipe = Recipe(JsonMapper.builder().build().readTree(recipeJson))
+
+        // 1) createWorkspace → provisioning token (so the create-user call skips token-exchange)
+        server.enqueue(jsonResponse(201, """{"tenantId":"t-1","slug":"srv-ignored","provisioningToken":"PT-1"}"""))
+        // 2) identity.registerUser → POST /api/v1/users returns the created UserResponse
+        server.enqueue(jsonResponse(201, """{"id":"usr-7","email":"[email protected]","emailVerified":true,"status":"ACTIVE"}"""))
+        // 3) best-effort platform attestation of the receipt
+        server.enqueue(jsonResponse(200, """{"kid":"k","signature":"s","canonicalPayload":"e30","attestedAt":"2026-01-01T00:00:00Z"}"""))
+
+        val run = RecipeInterpreter(ctx, recipe, trustPropagationBudgetMs = 2_000).setup()
+
+        // The user is recorded on the receipt (parity with the app/workspace capture).
+        assertThat(run.receipt.resources)
+            .anyMatch { it.kind == "user" && it.id == "usr-7" && it.attributes["email"] == "[email protected]" }
+
+        server.takeRequest() // createWorkspace
+        val userReq = server.takeRequest()
+        assertThat(userReq.method).isEqualTo("POST")
+        assertThat(userReq.path).isEqualTo("/api/v1/users")
+        // Created UNDER the workspace, authenticated with the provisioning token.
+        assertThat(userReq.getHeader("Authorization")).isEqualTo("Bearer PT-1")
+        // The recipe's `with` map is forwarded verbatim: a password (sign-in-able) + verified email.
+        val body = userReq.body.readUtf8()
+        assertThat(body)
+            .contains("\"email\":\"[email protected]\"")
+            .contains("\"password\":\"S3cret-pw\"")
+            .contains("\"emailVerified\":true")
     }
 
     @Test

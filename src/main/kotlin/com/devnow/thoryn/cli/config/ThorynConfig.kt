@@ -78,13 +78,17 @@ object ThorynConfig {
 
     /**
      * The scope set requested by `--workload-identity` — EXACTLY the `conformance-ci-github-wif`
-     * client's registered scopes (V143). It must be a subset of the client's registered set: the
-     * WIF exchange bounds the minted token to `requested ∩ client-registered` and rejects
-     * `invalid_scope` when the request exceeds it (a WIF subject token carries no scope of its own).
+     * client's registered scopes (V143, + `tenant:users.*` from V146/SSO-2907). It must be a subset
+     * of the client's registered set: the WIF exchange bounds the minted token to
+     * `requested ∩ client-registered` and rejects `invalid_scope` when the request exceeds it (a WIF
+     * subject token carries no scope of its own). ORDERING (project_console_scope_grant_ordering): the
+     * hub grant (V146) MUST deploy before a CLI requesting the added scope runs, else this request is
+     * an `invalid_scope` — the migration ships in the same PR and deploys ahead of any CLI re-release.
      */
     const val DEFAULT_WIF_SCOPE =
         "openid tenant:applications.read tenant:applications.write " +
-            "tenant:federation.read tenant:federation.write"
+            "tenant:federation.read tenant:federation.write " +
+            "tenant:users.read tenant:users.write"
 
     /** Convenience constant — pass to `--issuer` to point the CLI at the staging hub. */
     const val STAGING_ISSUER = "https://hub.stg.thoryn.org"

@@ -198,6 +198,7 @@ internal class RecipeInterpreter(
             "hub.createWorkspace" -> createWorkspace(with)
             "productApi.registerTenant" -> registerTenant(with)
             "applications.create" -> createApplication(with)
+            "identity.registerUser" -> registerUser(with)
             "federation.create" -> createFederation(with)
             "applications.delete" -> { tenantClient().deleteApplication(with["id"].toString(), workspace?.slug); emptyMap() }
             "federation.delete" -> { tenantClient().deleteFederationMember(with["id"].toString()); emptyMap() }
@@ -248,6 +249,33 @@ internal class RecipeInterpreter(
         )
         ctx.info("client: clientId=$clientId")
         return mapOf("clientId" to clientId)
+    }
+
+    /**
+     * SSO-2907 — provision a sign-in-able tenant user through the SUPPORTED product workflow
+     * (product-api `POST /api/v1/users`, `tenant:users.write`; SSO-1884). The recipe's `with` map
+     * (`email`, `password`, optional `givenName`/`familyName`/`locale`, `emailVerified`) is forwarded
+     * verbatim as the create-user body — a `password` sets an initial credential and
+     * `emailVerified:true` marks the account verified, so the example's sign-up→login leg can proceed
+     * without an email round-trip. The created user's `id`/`email` are recorded on the receipt (parity
+     * with the app/workspace capture) and exposed as `{{<step id>.id}}` / `{{<step id>.email}}`.
+     */
+    private fun registerUser(with: Map<String, Any?>): Map<String, String> {
+        val user = retryUntilTenantTrusted { tenantClient().createUser(with) }
+        val userId = (user["id"] ?: user["userId"])?.takeIf { !it.isNull }?.asString()
+            ?: throw RecipeException("identity.registerUser returned no user id")
+        val email = user["email"]?.takeIf { !it.isNull }?.asString() ?: (with["email"] as? String)
+        resources += ResourceRef(
+            kind = "user",
+            id = userId,
+            attributes = buildMap { email?.let { put("email", it) } },
+        )
+        ctx.info("user: id=$userId${email?.let { " email=$it" } ?: ""}")
+        return buildMap {
+            put("id", userId)
+            put("userId", userId)
+            email?.let { put("email", it) }
+        }
     }
 
     private fun createFederation(with: Map<String, Any?>): Map<String, String> {
