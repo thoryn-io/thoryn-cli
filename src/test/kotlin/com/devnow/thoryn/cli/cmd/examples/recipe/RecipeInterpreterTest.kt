@@ -95,7 +95,7 @@ class RecipeInterpreterTest : CommandTestBase() {
     }
 
     @Test
-    fun `teardown deletes the created application`() {
+    fun `teardown deletes the app then hard-deletes the workspace`() {
         val ctx = context()
         val state = ExampleState(
             example = "simple-signin",
@@ -103,15 +103,23 @@ class RecipeInterpreterTest : CommandTestBase() {
             tenantId = "t-1",
             clientId = "app-9",
         )
-        // teardown re-enters the workspace via token-exchange (no provisioning token persisted), then deletes.
+        // teardown re-enters the workspace via token-exchange (no provisioning token persisted), then
+        // deletes the app, then hard-deletes the workspace (SSO-2901 — stop the ex-signin-* tenant sprawl).
         server.enqueue(jsonResponse(200, """{"access_token":"switched","token_type":"Bearer","expires_in":900}"""))
         server.enqueue(noContent())
+        server.enqueue(jsonResponse(202, """{"tenantId":"t-1","slug":"ex-signin-abc12345","archived":true}"""))
 
         RecipeInterpreter(ctx, Recipe.load("simple-signin")).teardown(state)
 
         server.takeRequest() // the token exchange
+        // Child-first: the app is deleted BEFORE the workspace it lives in.
         val del = server.takeRequest()
         assertThat(del.method).isEqualTo("DELETE")
         assertThat(del.path).isEqualTo("/api/v1/applications/app-9")
+        // Then the workspace hard-delete on the HUB surface, name-confirmation guarded by the slug.
+        val hardDelete = server.takeRequest()
+        assertThat(hardDelete.method).isEqualTo("POST")
+        assertThat(hardDelete.path).isEqualTo("/account/workspace/t-1/hard-delete")
+        assertThat(hardDelete.getHeader("X-Thoryn-Confirm")).isEqualTo("ex-signin-abc12345")
     }
 }

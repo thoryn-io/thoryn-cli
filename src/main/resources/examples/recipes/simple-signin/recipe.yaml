@@ -59,9 +59,16 @@ verify:
     expect:
       status: active
 
+# Teardown runs in declared (child-first) order: delete the app, THEN hard-delete the workspace it
+# lives in. SSO-2901 — without the hub.deleteWorkspace step every run leaked its `ex-signin-*`
+# workspace/tenant (20 accumulated on staging). hub.deleteWorkspace is IRREVERSIBLE and
+# name-confirmation guarded (the CLI echoes the workspace slug back in X-Thoryn-Confirm); it targets
+# the hub /account/workspace/{tenantId}/hard-delete surface.
 teardown:
   - action: applications.delete
     id: "{{app.clientId}}"
+  - action: hub.deleteWorkspace
+    id: "{{workspace.tenantId}}"
 
 assets:
   rp: ./apps/loopback-rp

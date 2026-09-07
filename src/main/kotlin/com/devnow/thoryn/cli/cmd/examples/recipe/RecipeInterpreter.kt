@@ -131,18 +131,36 @@ internal class RecipeInterpreter(
         }
     }
 
-    /** Best-effort teardown in reverse declaration order; a failure is warned, not fatal. */
+    /**
+     * Best-effort teardown in DECLARED (child-first) order; a failure is warned, not fatal.
+     *
+     * SSO-2901 — the recipe lists teardown removals in the order they must run: delete the app FIRST,
+     * then `hub.deleteWorkspace` hard-deletes the workspace it lived in (which stops the `ex-signin-*`
+     * tenant sprawl — a run that only deleted the app left its workspace/tenant behind forever). The
+     * workspace hard-delete is IRREVERSIBLE and name-confirmation guarded: the CLI echoes the workspace
+     * slug back in the `X-Thoryn-Confirm` header (the hub 422s a mismatch), and it targets the HUB
+     * `/account/workspace/{tenantId}/hard-delete` surface with the founder's session token — NOT the
+     * tenant-scoped gateway client used for the app/federation deletes.
+     */
     fun teardown(state: ExampleState) {
         // Rebuild the minimal scope teardown references from the persisted state.
         state.clientId?.let { scope["app.clientId"] = it }
         state.workspaceSlug?.let { scope["workspaceSlug"] = it }
+        state.tenantId?.let { scope["workspace.tenantId"] = it }
         state.tenantId?.let { workspace = WorkspaceCtx(state.workspaceSlug ?: "", it, null) }
-        recipe.teardown.asReversed().forEach { t ->
+        recipe.teardown.forEach { t ->
             val action = t["action"].asString()
             try {
                 when (action) {
                     "applications.delete" -> tenantClient().deleteApplication(substitute(t["id"].asString()), state.workspaceSlug)
                     "federation.delete" -> tenantClient().deleteFederationMember(substitute(t["id"].asString()))
+                    "hub.deleteWorkspace" -> {
+                        val tenantId = substitute(t["id"].asString())
+                        // Confirmation MUST equal the workspace slug (the hub's name-confirmation guard).
+                        val confirmSlug = workspace?.slug?.takeIf { it.isNotBlank() } ?: state.workspaceSlug
+                        ctx.hubClient().hardDeleteWorkspace(tenantId, confirmSlug)
+                        ctx.info("workspace hard-deleted: tenantId=$tenantId")
+                    }
                     else -> throw RecipeUnsupportedActionException(action)
                 }
             } catch (ex: Exception) {

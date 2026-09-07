@@ -103,14 +103,14 @@
       }
     },
     "teardown": {
-      "description": "Best-effort removal of what the steps created (reverse order).",
+      "description": "Best-effort removal of what the steps created, executed in declared order (child-first: delete the app, then the workspace it lives in — SSO-2901).",
       "type": "array",
       "items": {
         "type": "object",
         "additionalProperties": false,
         "required": ["action"],
         "properties": {
-          "action": { "enum": ["applications.delete", "federation.delete"] },
+          "action": { "enum": ["applications.delete", "federation.delete", "hub.deleteWorkspace"] },
           "id": { "type": "string" },
           "with": { "type": "object" }
         }
