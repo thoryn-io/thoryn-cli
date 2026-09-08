@@ -1,0 +1,43 @@
+# Maven build output
+target/
+!**/src/main/**/target/
+!**/src/test/**/target/
+HELP.md
+.flattened-pom.xml
+
+# Maven wrapper (only-script): keep mvnw / mvnw.cmd / maven-wrapper.properties;
+# the downloaded distribution lives under ~/.m2/wrapper and is never committed.
+
+# GraalVM native-image build artifacts
+*.build_artifacts.txt
+/thoryn
+/thoryn.exe
+
+### Python (recipe/native-image tooling) ###
+__pycache__/
+*.pyc
+
+### IntelliJ IDEA ###
+.idea
+*.iws
+*.iml
+*.ipr
+
+### Eclipse / STS ###
+.apt_generated
+.classpath
+.factorypath
+.project
+.settings
+.springBeans
+.sts4-cache
+
+### VS Code ###
+.vscode/
+
+### macOS ###
+.DS_Store
+
+### OS package / distribution scratch ###
+/dist/
+/nbdist/

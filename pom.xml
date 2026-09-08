@@ -2,18 +2,31 @@
 <project xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns="http://maven.apache.org/POM/4.0.0"
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
     <modelVersion>4.0.0</modelVersion>
-    <parent>
-        <groupId>com.devnow</groupId>
-        <artifactId>tools</artifactId>
-        <version>0.0.1-SNAPSHOT</version>
-        <relativePath>../pom.xml</relativePath>
-    </parent>
-    <groupId>com.devnow.oathy</groupId>
+    <!--
+        Standalone (SSO-2935): the thoryn CLI was carved out of the oathy monorepo
+        (git history preserved via `git filter-repo`) into thoryn-io/thoryn-cli. It
+        previously inherited coordinates + dependency versions + the Kotlin build from
+        the oathy parent POMs (`tools/pom.xml` → root `pom.xml` → `bom/pom.xml`). Those
+        are now inlined below so the module builds on its own. Versions were lifted
+        verbatim from the oathy bom/pom.xml at the extraction commit; do not guess-bump.
+    -->
+    <groupId>io.thoryn</groupId>
     <artifactId>thoryn-cli</artifactId>
+    <version>0.0.1-SNAPSHOT</version>
     <name>thoryn-cli</name>
     <description>thoryn — Thoryn customer-plane CLI (SSO-731). Authorization Code + PKCE with loopback redirect (RFC 8252 §7.3); native-image build under SSO-733, OS-package distribution under SSO-734.</description>
 
     <properties>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <!-- Inlined from oathy root pom.xml / bom/pom.xml (extraction commit). -->
+        <java.version>21</java.version>
+        <maven.compiler.release>21</maven.compiler.release>
+        <kotlin.version>2.4.10</kotlin.version>
+        <!-- BOM-import versions (from oathy bom/pom.xml): jackson3 (tools.jackson.*),
+             okhttp (mockwebserver), and spring-boot-dependencies for junit/assertj. -->
+        <jackson3.version>3.2.2</jackson3.version>
+        <okhttp.version>5.5.0</okhttp.version>
+        <spring-boot.version>4.1.0</spring-boot.version>
         <picocli.version>4.7.7</picocli.version>
         <!--
             com.github.javakeyring:java-keyring — wraps macOS Security.framework,
@@ -41,6 +54,48 @@
         -->
         <thoryn.commandClass>com.devnow.thoryn.cli.ThorynMain</thoryn.commandClass>
     </properties>
+
+    <!--
+        Dependency-version management, inlined from the oathy bom/pom.xml import chain.
+        Import ORDER is load-bearing (Maven first-declared-wins): jackson3 BOM is imported
+        BEFORE spring-boot-dependencies so tools.jackson.* resolves at ${jackson3.version},
+        matching oathy's bom. okhttp-bom pins the whole okhttp3 family (mockwebserver +
+        the okhttp-jvm KMP-stub core). spring-boot-dependencies supplies junit-jupiter +
+        assertj-core versions only — no Spring artifact is declared as a dependency, so
+        nothing Spring lands on the CLI classpath.
+    -->
+    <dependencyManagement>
+        <dependencies>
+            <dependency>
+                <groupId>org.jetbrains.kotlin</groupId>
+                <artifactId>kotlin-bom</artifactId>
+                <version>${kotlin.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+            <dependency>
+                <groupId>tools.jackson</groupId>
+                <artifactId>jackson-bom</artifactId>
+                <version>${jackson3.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+            <dependency>
+                <groupId>com.squareup.okhttp3</groupId>
+                <artifactId>okhttp-bom</artifactId>
+                <version>${okhttp.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+            <dependency>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-dependencies</artifactId>
+                <version>${spring-boot.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
 
     <dependencies>
         <dependency>
@@ -131,7 +186,34 @@
 
     <build>
         <finalName>thoryn</finalName>
+        <!-- Kotlin source layout, inlined from the oathy root pom.xml. -->
+        <sourceDirectory>src/main/kotlin</sourceDirectory>
+        <testSourceDirectory>src/test/kotlin</testSourceDirectory>
         <plugins>
+            <!-- Kotlin compiler, inlined from the oathy root pom.xml pluginManagement.
+                 The oathy build additionally wired the `spring` compiler plugin (allopen)
+                 for its Spring services; the CLI has no Spring runtime, so that is
+                 intentionally omitted here. -->
+            <plugin>
+                <groupId>org.jetbrains.kotlin</groupId>
+                <artifactId>kotlin-maven-plugin</artifactId>
+                <version>${kotlin.version}</version>
+                <executions>
+                    <execution>
+                        <id>compile</id>
+                        <goals>
+                            <goal>compile</goal>
+                            <goal>test-compile</goal>
+                        </goals>
+                    </execution>
+                </executions>
+                <configuration>
+                    <jvmTarget>${java.version}</jvmTarget>
+                    <args>
+                        <arg>-Xjsr305=strict</arg>
+                    </args>
+                </configuration>
+            </plugin>
             <!-- Pin maven-surefire-plugin to a JUnit-5/Platform-aware version.
                  thoryn-web-parent imports the spring-boot BOM (versions only) rather
                  than inheriting spring-boot-starter-parent, so surefire is NOT managed
