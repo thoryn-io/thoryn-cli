@@ -314,6 +314,31 @@ name-confirmation guard); those artifacts remain in your account until that
 lands. A `--headless` mode that drives register + sign-in programmatically is a
 planned follow-up (it needs privileged provisioning credentials).
 
+## Provisioning GitHub Action (SSO-2938)
+
+`.github/actions/provision` is a reusable **composite Action** that configures the
+product as a real customer against **shared staging**, using ONLY the product APIs
+via this CLI and a signed recipe (no DB seeding, no demo endpoints — the
+product-boundary rule applied to CI). It:
+
+1. **builds the CLI from source** (`./mvnw -q -DskipTests package` → `target/thoryn.jar`;
+   switches to a `gh release download --pattern thoryn.jar` once a `cli-v*` release
+   exists, SSO-2936),
+2. **signs in non-interactively** with a client-credentials API key —
+   `thoryn login --client-credentials --issuer <hub>`, credential from
+   `THORYN_API_KEY=<client-id>:<client-secret>` (never echoed, never an argv flag),
+3. **provisions** with `thoryn examples apply <recipe> --yes` (default `simple-signin`:
+   a fresh workspace + tenant + a public loopback OAuth client),
+4. **exposes** `workspace-slug` / `tenant-id` / `client-id` / `issuer` as Action outputs
+   (read from the run's receipt), and
+5. **hard-deletes the workspace on exit** in an `if: always()` step
+   (`thoryn examples teardown <recipe>` → delete client, then `hub.deleteWorkspace`),
+   so a failed run never leaks a staging tenant.
+
+The demo caller is `.github/workflows/provision-e2e.yml` (manual `workflow_dispatch`).
+A green run needs oauthy#3459 (SSO-2937 — the `thoryn-cli-ci` seed carrying
+`tenant:workspace.write`) deployed to staging and a `THORYN_API_KEY` repo secret.
+
 ## Build
 
 Requires a JDK 21+ on `PATH`. The Maven wrapper (`./mvnw`) pins Maven, so no
