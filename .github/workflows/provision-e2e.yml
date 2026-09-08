@@ -1,0 +1,63 @@
+name: provision-e2e
+
+# SSO-2938 (epic SSO-2934) — demo caller for the reusable provisioning Action
+# (.github/actions/provision). It configures the product as a real customer against
+# SHARED STAGING using only the real product APIs via the `thoryn` CLI, then hard-
+# deletes what it created.
+#
+# Manual only (workflow_dispatch): it mutates shared staging and needs the
+# THORYN_API_KEY secret, so it must not fire on push/PR. A nightly schedule can be
+# added once the prerequisites below are live.
+#
+# PREREQUISITES for a green run (see the PR's "Live validation pending" section):
+#   * oauthy#3459 (SSO-2937) DEPLOYED to staging — seeds the `thoryn-cli-ci`
+#     client-credentials client WITH the `tenant:workspace.write` scope, so the
+#     recipe's hub.createWorkspace step succeeds for a machine key.
+#   * The `THORYN_API_KEY` repository secret set to `thoryn-cli-ci:<secret>`.
+#
+# Until both are in place this workflow is expected to fail at the sign-in / apply
+# step. Do NOT wire it into a required gate before it is verified green once by hand.
+
+on:
+  workflow_dispatch:
+    inputs:
+      issuer:
+        description: "Hub issuer to provision against."
+        required: false
+        default: "https://hub.stg.thoryn.org"
+      recipe:
+        description: "Bundled recipe to apply."
+        required: false
+        default: "simple-signin"
+
+# Serialize: never let two provisioning runs race on shared staging.
+concurrency:
+  group: provision-e2e
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  provision:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out thoryn-cli
+        uses: actions/checkout@v4
+
+      - name: Provision as a real customer (build + sign in + apply + teardown)
+        id: provision
+        uses: ./.github/actions/provision
+        with:
+          api-key: ${{ secrets.THORYN_API_KEY }}
+          issuer: ${{ inputs.issuer }}
+          recipe: ${{ inputs.recipe }}
+
+      # Downstream consumers use the Action's outputs. The teardown inside the Action
+      # runs on exit regardless, so these ids are only valid for the life of the job.
+      - name: Show provisioned identifiers
+        run: |
+          echo "workspace-slug = ${{ steps.provision.outputs.workspace-slug }}"
+          echo "tenant-id      = ${{ steps.provision.outputs.tenant-id }}"
+          echo "client-id      = ${{ steps.provision.outputs.client-id }}"
+          echo "issuer         = ${{ steps.provision.outputs.issuer }}"
