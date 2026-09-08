@@ -35,12 +35,16 @@ import java.util.concurrent.Callable
  *    redirect on a single-shot literal-loopback listener, and redeems the code for tokens.
  *  - **Device-code (RFC 8628)** via `--device-code` — interactive, but on a
  *    second device; useful on headless-but-human machines.
- *  - **Client-credentials (RFC 6749 §4.4)** via `--client-credentials`
- *    (SSO-1553) — fully NON-interactive (no browser, no second device), for
- *    CI / automation / service accounts. Exchanges `client_id` +
- *    `client_secret` for a machine token. The secret is sourced from
- *    `THORYN_CLIENT_SECRET` (env / `-D`), `--client-secret-file <path>`, or a
- *    no-echo prompt — NEVER an argv flag (SSO-1553 secret-safety rule).
+ *  - **Client-credentials / API-key (RFC 6749 §4.4)** via `--client-credentials`
+ *    (SSO-1553; API-key ergonomics + re-mint SSO-2941) — fully NON-interactive
+ *    (no browser, no second device), for CI / automation / service accounts.
+ *    Exchanges `client_id` + `client_secret` for a machine token. Credentials are
+ *    sourced from `THORYN_API_KEY=<client-id>:<client-secret>` (the single-knob CI
+ *    key), or `--client-id` + the secret from `THORYN_CLIENT_SECRET` (env / `-D`),
+ *    `--client-secret-file <path>`, or a no-echo prompt — NEVER an argv flag
+ *    (SSO-1553 secret-safety rule). A client-credentials token carries no refresh
+ *    token, so on expiry the CLI RE-MINTS from the stored client id + the
+ *    env-supplied secret (SSO-2941, see [CommandSupport.forceRefresh]).
  */
 @Command(
     name = "login",
@@ -99,7 +103,11 @@ class LoginCommand : Callable<Int> {
      */
     @Option(
         names = ["--client-credentials"],
-        description = ["Use the client-credentials grant (RFC 6749 §4.4) — non-interactive, for CI/automation/service accounts. No browser."],
+        description = [
+            "Use the client-credentials grant (RFC 6749 §4.4) — non-interactive, for CI/automation/service accounts. " +
+                "No browser. Credentials from THORYN_API_KEY=<client-id>:<client-secret>, or --client-id + " +
+                "THORYN_CLIENT_SECRET / --client-secret-file. Auto re-mints on expiry (no refresh token).",
+        ],
     )
     var useClientCredentials: Boolean = false
 
@@ -266,35 +274,77 @@ class LoginCommand : Callable<Int> {
     }
 
     private fun runClientCredentialsFlow(): Int {
-        val secret = resolveClientSecret("Client secret for '$clientId': ")
-        if (secret == null) {
-            System.err.println(
-                "No client secret available for --client-credentials. Set THORYN_CLIENT_SECRET, " +
-                    "pass --client-secret-file <path>, or run interactively to be prompted.",
-            )
-            return EXIT_USAGE
-        }
+        val creds = resolveClientCredentials() ?: return EXIT_USAGE
 
         val flow = ClientCredentialsFlow(
             issuer = issuer,
-            clientId = clientId,
-            clientSecret = secret,
+            clientId = creds.clientId,
+            clientSecret = creds.secret,
             sender = realHttpSender(),
         )
 
         return try {
             val tokens = flow.run(expandedScope())
-            tokenStore.write(withSession(tokens))
+            // SSO-2941 — stamp the session as an API-key / client-credentials session and record the
+            // client id (NOT the secret) so `CommandSupport.forceRefresh` can re-mint a fresh token
+            // on expiry from the env-supplied secret, rather than a refresh_token redemption (a
+            // client_credentials grant returns no refresh token — RFC 6749 §4.4.3).
+            tokenStore.write(
+                withSession(tokens).copy(
+                    authMode = Tokens.AUTH_MODE_CLIENT_CREDENTIALS,
+                    clientId = creds.clientId,
+                ),
+            )
             // SSO-2863 — a fresh login resets the base tenant; drop any stale `workspace switch`
             // selection so later commands don't silently re-exchange into an old workspace.
             SelectedWorkspaceStore().clear()
-            println("Signed in (client-credentials / service account '$clientId').")
+            println("Signed in (client-credentials / service account '${creds.clientId}').")
             tokens.scope?.let { println("Scopes: $it") }
             EXIT_OK
         } catch (e: ClientCredentialsException) {
             System.err.println("Sign-in failed: ${e.message}")
             EXIT_CLIENT_CREDENTIALS_FAILED
         }
+    }
+
+    /** SSO-2941 — a resolved API-key credential pair for the client-credentials grant. */
+    private data class ClientCredentials(val clientId: String, val secret: String)
+
+    /**
+     * SSO-2941 — resolve the client-credentials `client_id` + `client_secret` WITHOUT the secret
+     * ever appearing in argv.
+     *
+     * Precedence:
+     *  1. `THORYN_API_KEY=<client-id>:<client-secret>` — the single-knob CI credential. It carries
+     *     BOTH halves; the `--client-id` flag then only needs to match (a mismatch is a hard error
+     *     rather than a silent guess).
+     *  2. `--client-id` (default `thoryn-cli`) + the secret resolved by [resolveClientSecret]
+     *     (`THORYN_CLIENT_SECRET` env/`-D`, then `--client-secret-file`, then a no-echo prompt).
+     *
+     * Returns null (after printing guidance) when no usable credential could be obtained.
+     */
+    private fun resolveClientCredentials(): ClientCredentials? {
+        ThorynConfig.resolveApiKey()?.let { apiKey ->
+            val explicitId = clientId.takeIf { it != ThorynConfig.DEFAULT_CLIENT_ID }
+            if (explicitId != null && explicitId != apiKey.clientId) {
+                System.err.println(
+                    "Error: --client-id '$explicitId' conflicts with the client id carried by " +
+                        "${ThorynConfig.API_KEY_ENV} ('${apiKey.clientId}'). Pass one or the other.",
+                )
+                return null
+            }
+            return ClientCredentials(apiKey.clientId, apiKey.clientSecret)
+        }
+        val secret = resolveClientSecret("Client secret for '$clientId': ")
+        if (secret == null) {
+            System.err.println(
+                "No client secret available for --client-credentials. Set ${ThorynConfig.API_KEY_ENV} " +
+                    "(<client-id>:<client-secret>) or THORYN_CLIENT_SECRET, pass --client-secret-file <path>, " +
+                    "or run interactively to be prompted.",
+            )
+            return null
+        }
+        return ClientCredentials(clientId, secret)
     }
 
     /**

@@ -2,6 +2,8 @@ package com.devnow.thoryn.cli.cmd
 
 import com.devnow.thoryn.cli.api.ProductApiClient
 import com.devnow.thoryn.cli.api.ProductApiException
+import com.devnow.thoryn.cli.auth.ClientCredentialsException
+import com.devnow.thoryn.cli.auth.ClientCredentialsFlow
 import com.devnow.thoryn.cli.auth.HttpSender
 import com.devnow.thoryn.cli.auth.RefreshTokenFlow
 import com.devnow.thoryn.cli.auth.ScopeRegistry
@@ -192,7 +194,20 @@ internal object CommandSupport {
      */
     internal fun forceRefresh(err: PrintStream = System.err): Tokens? {
         val current = runCatching { TokenStoreFactory.default().read() }.getOrNull() ?: return null
-        val refreshToken = current.refreshToken?.takeIf { it.isNotBlank() } ?: return null
+        // Interactive logins (auth-code / device-code) carry a refresh token — RFC 6749 §6.
+        current.refreshToken?.takeIf { it.isNotBlank() }?.let { refreshToken ->
+            return refreshViaRefreshToken(current, refreshToken, err)
+        }
+        // SSO-2941 — an API-key / client-credentials session has NO refresh token (RFC 6749 §4.4.3);
+        // re-mint a fresh access token from the stored client id + the env-supplied secret instead.
+        if (current.authMode == Tokens.AUTH_MODE_CLIENT_CREDENTIALS) {
+            return reMintClientCredentials(current, err)
+        }
+        return null
+    }
+
+    /** SSO-2834 — redeem the stored refresh token (RFC 6749 §6). Null when there is no issuer or the redemption fails. */
+    private fun refreshViaRefreshToken(current: Tokens, refreshToken: String, err: PrintStream): Tokens? {
         val issuer = current.issuer?.takeIf { it.isNotBlank() } ?: return null
         return try {
             val refreshed = RefreshTokenFlow(issuer = issuer, sender = realHttpSender())
@@ -203,6 +218,55 @@ internal object CommandSupport {
             refreshed
         } catch (e: Exception) {
             err.println("Could not refresh the session token (${e.message}); run `thoryn login` if the command fails.")
+            null
+        }
+    }
+
+    /**
+     * SSO-2941 — re-mint an expired API-key / client-credentials session by re-running the
+     * RFC 6749 §4.4 grant with the stored [Tokens.clientId] and the env-supplied secret
+     * ([ThorynConfig.resolveApiKeySecret]) — the same [ClientCredentialsFlow] the login used.
+     * The secret is NEVER persisted, so it must still be present in the environment
+     * (`THORYN_API_KEY` / `THORYN_CLIENT_SECRET`) — exactly how CI supplies it. The re-minted
+     * bundle keeps the CLI-local session hosts and the API-key markers and is written back to the
+     * store so the next invocation reuses it.
+     *
+     * Returns null (with a one-line hint) when the client id / issuer is missing, no secret is
+     * available to re-mint with, or the grant is rejected — the caller then surfaces the original
+     * `401` and the operator re-runs `thoryn login --client-credentials`.
+     */
+    private fun reMintClientCredentials(current: Tokens, err: PrintStream): Tokens? {
+        val issuer = current.issuer?.takeIf { it.isNotBlank() } ?: return null
+        val clientId = current.clientId?.takeIf { it.isNotBlank() } ?: return null
+        val secret = ThorynConfig.resolveApiKeySecret()
+        if (secret == null) {
+            err.println(
+                "The API-key session for '$clientId' has expired and no secret is available to re-mint it. " +
+                    "Set ${ThorynConfig.API_KEY_ENV} or THORYN_CLIENT_SECRET, or run `thoryn login --client-credentials`.",
+            )
+            return null
+        }
+        return try {
+            val minted = ClientCredentialsFlow(
+                issuer = issuer,
+                clientId = clientId,
+                clientSecret = secret,
+                sender = realHttpSender(),
+            ).run(current.scope.orEmpty())
+                // Preserve the CLI-local session hosts + the API-key markers (absent from the token response).
+                .copy(
+                    issuer = current.issuer,
+                    gateway = current.gateway,
+                    authMode = Tokens.AUTH_MODE_CLIENT_CREDENTIALS,
+                    clientId = clientId,
+                )
+            runCatching { TokenStoreFactory.default().write(minted) }
+            minted
+        } catch (e: ClientCredentialsException) {
+            err.println(
+                "Could not re-mint the API-key session (${e.oauthError}); check the credentials, " +
+                    "or run `thoryn login --client-credentials`.",
+            )
             null
         }
     }
