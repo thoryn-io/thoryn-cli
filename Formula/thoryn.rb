@@ -11,10 +11,12 @@
 # It installs the prebuilt GraalVM native-image binary from the matching GitHub
 # Release (tag `cli-v#{version}`, published by .github/workflows/release.yml).
 #
-# The `version` line and the four `sha256` lines below are rewritten on every
-# tagged release by scripts/release/bump-formula.sh, which the release workflow
-# runs and commits back to the default branch. Do NOT hand-edit them — bump by
-# cutting a `cli-v*` tag.
+# The `version` line and the `sha256` lines below are rewritten on every tagged
+# release by scripts/release/bump-formula.sh, which the release workflow runs and
+# commits back to the default branch. Native binaries are best-effort per runner
+# availability, so a platform whose binary was not produced is omitted rather than
+# pointed at a missing download. Do NOT hand-edit them — bump by cutting a
+# `cli-v*` tag.
 class Thoryn < Formula
   desc "Thoryn customer-plane CLI (OAuth 2.0 / OIDC identity broker)"
   homepage "https://github.com/thoryn-io/thoryn-cli"

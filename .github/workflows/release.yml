@@ -3,15 +3,21 @@ name: release
 # Tag-driven release for the thoryn CLI (SSO-2936, epic SSO-2934).
 #
 # On a `cli-v*` tag it builds and publishes, as GitHub Release assets:
-#   * the GraalVM native-image binaries, one per OS/arch
+#   * the GraalVM native-image binaries, one per OS/arch — BEST-EFFORT, per
+#     runner availability (SSO-2936):
 #       thoryn-darwin-arm64  thoryn-darwin-amd64
 #       thoryn-linux-amd64   thoryn-linux-arm64
 #       thoryn-windows-amd64.exe
-#   * the fat jar `thoryn.jar` — the SAME asset name the thoryn-examples
-#     conformance / example-e2e workflows download (`gh release download ...
-#     --pattern 'thoryn.jar'`). Keep that name stable.
+#     Each native leg is best-effort: an unavailable/slow/broken platform runner
+#     (e.g. the retiring Intel-macOS `macos-13`) is tolerated and simply omitted
+#     from the release, rather than failing or blocking it.
+#   * the fat jar `thoryn.jar` — ALWAYS published; the SAME asset name the
+#     thoryn-examples conformance / example-e2e workflows download
+#     (`gh release download ... --pattern 'thoryn.jar'`). Keep that name stable.
+#     This is the one required build; the release fails only if the jar is absent.
 # and then bumps the in-repo Homebrew formula (Formula/thoryn.rb) to the new
-# version + the released binaries' sha256 and commits it back.
+# version + the released binaries' sha256 (only for the binaries that built) and
+# commits it back.
 #
 # Ported from oauthy's .github/workflows/cli-release.yml, with the SSO-2928 fix:
 # the original resolved the tag as `${GITHUB_REF_NAME:-inputs.tag}`, so a
@@ -66,8 +72,18 @@ jobs:
           echo "version=${tag#cli-v}" >> "$GITHUB_OUTPUT"
 
   # ── GraalVM native-image binaries, one per OS/arch. ────────────────────────
+  #
+  # BEST-EFFORT (SSO-2936 resilience): every native leg is `continue-on-error`
+  # and `fail-fast: false`, so one platform's runner being unavailable, slow, or
+  # broken (e.g. GitHub retiring the Intel-macOS `macos-13` runner, which sat
+  # `queued` for ~52 min on the first cli-v0.2.0 attempt) can NOT fail or block
+  # the whole release. The `release` job does not hard-require this job's success
+  # — it publishes whichever binaries actually built plus the always-required
+  # `thoryn.jar`. `timeout-minutes` bounds a leg whose build hangs once running.
   native:
     needs: resolve
+    continue-on-error: true
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -75,6 +91,12 @@ jobs:
           - os: macos-14
             asset: thoryn-darwin-arm64
             march: default
+          # Intel macOS. GitHub is retiring the `macos-13` runner, so this leg
+          # may sit `queued` and never start. Kept in the matrix so Intel-mac
+          # binaries resume automatically once a runner is available again; its
+          # absence is tolerated (best-effort, see the job comment above). There
+          # is no other GitHub-hosted Intel-macOS label to swap in — macos-14+
+          # are arm64.
           - os: macos-13
             asset: thoryn-darwin-amd64
             march: compatibility
@@ -146,8 +168,16 @@ jobs:
           if-no-files-found: error
 
   # ── Publish the release + bump the Homebrew formula. ───────────────────────
+  #
+  # Requires resolve + jar to succeed (the jar is the asset thoryn-examples CI
+  # consumes, so it is non-negotiable). It does NOT require `native` to succeed:
+  # `if: always()` lets publish proceed once the native matrix has SETTLED to any
+  # terminal state, and it uploads whichever native binaries actually built. A
+  # platform that failed / was skipped / never produced an artifact is simply
+  # absent from the release, not a release-blocking failure.
   release:
     needs: [resolve, native, jar]
+    if: ${{ always() && needs.resolve.result == 'success' && needs.jar.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
       # Check out the DEFAULT branch (not the tag) so the formula bump commit
@@ -184,18 +214,36 @@ jobs:
           TAG: ${{ needs.resolve.outputs.tag }}
         run: |
           set -euo pipefail
+          # The jar is the consumed asset and is always required.
+          if [ ! -f assets/thoryn.jar ]; then
+            echo "::error::assets/thoryn.jar is missing — the jar build is required and must not be absent."
+            exit 1
+          fi
+          # Publish WHATEVER native binaries actually built. A best-effort leg
+          # that failed / was skipped / never got a runner uploaded no artifact,
+          # so its file is simply absent from assets/ — skip it, don't fail.
+          files=(assets/thoryn.jar)
+          for asset in \
+            thoryn-darwin-arm64 \
+            thoryn-darwin-amd64 \
+            thoryn-linux-amd64 \
+            thoryn-linux-arm64 \
+            thoryn-windows-amd64.exe; do
+            if [ -f "assets/$asset" ]; then
+              files+=("assets/$asset")
+            else
+              echo "::warning::native asset '$asset' was not produced — omitting it from the release (best-effort per runner availability)."
+            fi
+          done
+          echo "Publishing ${#files[@]} asset(s): ${files[*]}"
           gh release create "$TAG" \
-            assets/thoryn.jar \
-            assets/thoryn-darwin-arm64 \
-            assets/thoryn-darwin-amd64 \
-            assets/thoryn-linux-amd64 \
-            assets/thoryn-linux-arm64 \
-            assets/thoryn-windows-amd64.exe \
+            "${files[@]}" \
             --repo "${{ github.repository }}" \
             --title "thoryn CLI $TAG" \
             --notes "The \`thoryn\` customer-plane CLI.
 
           Native binaries (per OS/arch) and the \`thoryn.jar\` fat jar (run with \`java -jar thoryn.jar\`) are attached below.
+          Native binaries are best-effort per runner availability — the \`thoryn.jar\` is always published; a given platform's binary may be absent if its runner was unavailable at build time.
 
           Homebrew:
 
