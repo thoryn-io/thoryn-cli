@@ -83,12 +83,13 @@ inputs:
     default: ""
   scope:
     description: >-
-      OAuth scope to request at sign-in. EMPTY (the default) omits the `scope` parameter, so the hub
-      mints the client-credentials token with the API key's FULL registered scope set (whatever the
-      operator granted it — must include tenant:applications.write + tenant:applications.read). Pin an
-      explicit space-separated set only if you need to narrow it.
+      Space-separated OAuth scopes to request at sign-in. The hub grants a client-credentials token
+      ONLY the scopes explicitly requested — an empty request yields a token with NO scopes (it does
+      NOT default to the API key's registered set), which 403s every scoped call. So this defaults to
+      exactly what the `ci-signin` recipe needs. Override it if you point `recipe` at something that
+      needs a different set (it must be a subset of what the API key was granted).
     required: false
-    default: ""
+    default: "tenant:applications.write tenant:applications.read"
   java-version:
     description: "Temurin JDK version used to build the CLI fat jar."
     required: false
@@ -169,9 +170,10 @@ runs:
         tenant_issuer="$(printf '%s' "$ISSUER" | sed -E "s#://hub\.#://${WORKSPACE_SLUG}.hub.#")"
         gateway="$(printf '%s' "$ISSUER" | sed -E "s#://hub\.#://api.#")"
         echo "Signing in at tenant issuer $tenant_issuer (gateway $gateway)."
-        # Pass --scope explicitly (even when empty) to OVERRIDE the CLI's interactive default scope. An
-        # empty --scope tells the hub to mint the API key's full registered scope set (which the
-        # operator granted tenant:applications.write + tenant:applications.read).
+        # Request the scopes explicitly. The hub mints a client-credentials token with ONLY the
+        # requested scopes and does NOT fall back to the API key's registered set, so an empty
+        # --scope yields a scope-less token that 403s applications.create. `inputs.scope` defaults to
+        # the recipe's required set (tenant:applications.write + tenant:applications.read).
         java -jar target/thoryn.jar login --client-credentials \
           --issuer "$tenant_issuer" --gateway "$gateway" --scope "$SCOPE"
         java -jar target/thoryn.jar login --status
