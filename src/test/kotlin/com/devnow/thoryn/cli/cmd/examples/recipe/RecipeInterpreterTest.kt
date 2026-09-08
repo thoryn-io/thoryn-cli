@@ -204,6 +204,100 @@ class RecipeInterpreterTest : CommandTestBase() {
     }
 
     @Test
+    fun `simple-signin configure-email-provider PUTs a typed BYO-SMTP body when smtp params are set`() {
+        val ctx = context()
+        // The example-e2e passes real SMTP params via --set; here as interpreter overrides.
+        val overrides = mapOf(
+            "smtpHost" to "smtp.sink.local",
+            "smtpPort" to "1025",
+            "smtpUsername" to "mailer",
+            "smtpPassword" to "sink-pw",
+            "smtpTransport" to "none",
+            "smtpAllowInsecure" to "true",
+            "smtpFromAddress" to "[email protected]",
+        )
+        // ws → tenant → app → user → email PUT → verify GET → attest
+        server.enqueue(jsonResponse(201, """{"tenantId":"t-1","slug":"srv-ignored","provisioningToken":"PT-1"}"""))
+        server.enqueue(jsonResponse(200, """{"ok":true}"""))
+        server.enqueue(jsonResponse(201, """{"clientId":"app-9","status":"active"}"""))
+        server.enqueue(jsonResponse(201, """{"id":"usr-7","email":"[email protected]","status":"ACTIVE"}"""))
+        server.enqueue(
+            jsonResponse(
+                200,
+                """{"providerType":"byo_smtp","enabled":true,"configured":true,"smtpHost":"smtp.sink.local",
+                    "smtpPort":1025,"smtpUsername":"mailer","hasPassword":true,"transportSecurity":"none",
+                    "insecureTransportAcknowledged":true,"fromAddress":"[email protected]","fromName":null,"replyTo":null,
+                    "supportedProviderTypes":["byo_smtp"],"supportedTransportSecurity":["none","starttls","tls"],
+                    "configVersion":1,"updatedAt":"2026-09-01T10:00:00Z"}""".trimIndent(),
+            ),
+        )
+        server.enqueue(jsonResponse(200, """{"clientId":"app-9","status":"active"}"""))
+        server.enqueue(jsonResponse(200, """{"kid":"k","signature":"s","canonicalPayload":"e30","attestedAt":"2026-01-01T00:00:00Z"}"""))
+
+        val run = RecipeInterpreter(
+            ctx, Recipe.load("simple-signin"), overrides = overrides, trustPropagationBudgetMs = 2_000,
+        ).setup()
+
+        // The provider is recorded on the receipt — the non-secret shape only, NEVER the password.
+        val providerRef = run.receipt.resources.firstOrNull { it.kind == "emailProvider" }
+        assertThat(providerRef).isNotNull
+        assertThat(providerRef!!.id).isEqualTo("byo_smtp")
+        assertThat(providerRef.attributes["smtpHost"]).isEqualTo("smtp.sink.local")
+        assertThat(providerRef.attributes).doesNotContainKey("smtpPassword")
+        // The password never appears anywhere on the receipt.
+        assertThat(run.receipt.resources.flatMap { it.attributes.values }).doesNotContain("sink-pw")
+
+        server.takeRequest() // createWorkspace
+        server.takeRequest() // registerTenant
+        server.takeRequest() // applications.create
+        server.takeRequest() // identity.registerUser
+        val emailReq = server.takeRequest()
+        assertThat(emailReq.method).isEqualTo("PUT")
+        assertThat(emailReq.path).isEqualTo("/api/v1/email-provider")
+        assertThat(emailReq.getHeader("Authorization")).isEqualTo("Bearer PT-1")
+        val body = emailReq.body.readUtf8()
+        // String params coerced to the JSON types PutEmailProviderRequest expects.
+        assertThat(body)
+            .contains("\"smtpHost\":\"smtp.sink.local\"")
+            .contains("\"smtpPort\":1025")                       // string "1025" → JSON int
+            .contains("\"allowInsecureTransport\":true")          // string "true" → JSON boolean
+            .contains("\"enabled\":true")                         // literal "true" → JSON boolean
+            .contains("\"transportSecurity\":\"none\"")
+            .contains("\"smtpPassword\":\"sink-pw\"")
+        // The port/booleans are NOT sent as strings.
+        assertThat(body)
+            .doesNotContain("\"smtpPort\":\"1025\"")
+            .doesNotContain("\"allowInsecureTransport\":\"true\"")
+    }
+
+    @Test
+    fun `simple-signin configure-email-provider is a no-op when smtpHost is empty`() {
+        val ctx = context()
+        // No smtp overrides → smtpHost defaults to "" → the email step must skip the PUT entirely.
+        // ws → tenant → app → user → verify GET → attest (NO email PUT enqueued).
+        server.enqueue(jsonResponse(201, """{"tenantId":"t-1","slug":"srv-ignored","provisioningToken":"PT-1"}"""))
+        server.enqueue(jsonResponse(200, """{"ok":true}"""))
+        server.enqueue(jsonResponse(201, """{"clientId":"app-9","status":"active"}"""))
+        server.enqueue(jsonResponse(201, """{"id":"usr-7","email":"[email protected]","status":"ACTIVE"}"""))
+        server.enqueue(jsonResponse(200, """{"clientId":"app-9","status":"active"}"""))
+        server.enqueue(jsonResponse(200, """{"kid":"k","signature":"s","canonicalPayload":"e30","attestedAt":"2026-01-01T00:00:00Z"}"""))
+
+        val run = RecipeInterpreter(ctx, Recipe.load("simple-signin"), trustPropagationBudgetMs = 2_000).setup()
+
+        // No BYO-SMTP was configured — nothing recorded on the receipt for it.
+        assertThat(run.receipt.resources).noneMatch { it.kind == "emailProvider" }
+
+        server.takeRequest() // createWorkspace
+        server.takeRequest() // registerTenant
+        server.takeRequest() // applications.create
+        server.takeRequest() // identity.registerUser
+        // The very next request is the verify GET — proving the email step issued NO PUT.
+        val next = server.takeRequest()
+        assertThat(next.method).isEqualTo("GET")
+        assertThat(next.path).isEqualTo("/api/v1/applications/app-9")
+    }
+
+    @Test
     fun `a failed verify assertion surfaces as a RecipeException`() {
         val ctx = context()
         server.enqueue(jsonResponse(201, """{"tenantId":"t-1","slug":"x","provisioningToken":"PT-1"}"""))

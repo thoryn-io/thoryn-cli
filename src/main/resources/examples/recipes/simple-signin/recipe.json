@@ -20,6 +20,42 @@
       "name": "displayName",
       "prompt": "Workspace display name",
       "default": "Sign-in Example"
+    },
+    {
+      "name": "smtpHost",
+      "prompt": "BYO-SMTP host (empty \u21d2 keep the platform sender; no BYO-SMTP is configured)",
+      "default": ""
+    },
+    {
+      "name": "smtpPort",
+      "prompt": "BYO-SMTP port",
+      "default": ""
+    },
+    {
+      "name": "smtpUsername",
+      "prompt": "BYO-SMTP username",
+      "default": ""
+    },
+    {
+      "name": "smtpPassword",
+      "prompt": "BYO-SMTP password",
+      "default": "",
+      "secret": true
+    },
+    {
+      "name": "smtpTransport",
+      "prompt": "BYO-SMTP transport security (none | starttls | tls)",
+      "default": "starttls"
+    },
+    {
+      "name": "smtpAllowInsecure",
+      "prompt": "Acknowledge plaintext transport (true only with transport=none)",
+      "default": "false"
+    },
+    {
+      "name": "smtpFromAddress",
+      "prompt": "BYO-SMTP from-address",
+      "default": ""
     }
   ],
   "steps": [
@@ -74,6 +110,21 @@
         "givenName": "Demo",
         "familyName": "User",
         "emailVerified": true
+      }
+    },
+    {
+      "id": "email",
+      "action": "tenant.configureEmailProvider",
+      "description": "OPTIONAL (SSO-2927) \u2014 point the workspace's bring-your-own SMTP transport at a sink. NO-OP for a real customer run: with an empty smtpHost the PUT is skipped and the platform sender is left unchanged. The example-e2e supplies real `--set smtp*` values so it can capture the sign-in email from the freshly-provisioned workspace using the live provisioning token.",
+      "with": {
+        "smtpHost": "{{smtpHost}}",
+        "smtpPort": "{{smtpPort}}",
+        "smtpUsername": "{{smtpUsername}}",
+        "smtpPassword": "{{smtpPassword}}",
+        "transportSecurity": "{{smtpTransport}}",
+        "allowInsecureTransport": "{{smtpAllowInsecure}}",
+        "fromAddress": "{{smtpFromAddress}}",
+        "enabled": "true"
       }
     }
   ],
