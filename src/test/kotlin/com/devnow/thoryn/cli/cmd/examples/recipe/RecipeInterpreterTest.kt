@@ -315,6 +315,61 @@ class RecipeInterpreterTest : CommandTestBase() {
     }
 
     @Test
+    fun `ci-signin provisions the app with the callers own token and creates no workspace`() {
+        // SSO-2944 — the workspace-less recipe operates inside a STANDING workspace the caller's API key
+        // already owns. There is NO hub.createWorkspace step, so the interpreter authenticates every
+        // tenant-scoped call with the caller's own bearer (AT-test) — no provisioning token, no exchange.
+        val ctx = context()
+        // 1) applications.create (under the standing workspace, with the caller's own token)
+        server.enqueue(jsonResponse(201, """{"clientId":"app-ci","status":"active"}"""))
+        // 2) verify applications.get
+        server.enqueue(jsonResponse(200, """{"clientId":"app-ci","status":"active"}"""))
+        // 3) best-effort platform attestation of the receipt
+        server.enqueue(jsonResponse(200, """{"kid":"k","signature":"s","canonicalPayload":"e30","attestedAt":"2026-01-01T00:00:00Z"}"""))
+
+        val run = RecipeInterpreter(
+            ctx,
+            Recipe.load("ci-signin"),
+            overrides = mapOf("workspaceSlug" to "ci-standing"),
+            trustPropagationBudgetMs = 2_000,
+        ).setup()
+
+        assertThat(run.state.example).isEqualTo("ci-signin")
+        assertThat(run.state.clientId).isEqualTo("app-ci")
+        // The standing slug flows into the state (and the derived tenant issuer) without a create step.
+        assertThat(run.state.workspaceSlug).isEqualTo("ci-standing")
+        assertThat(run.state.tenantId).isNull()
+        assertThat(run.receipt.resources).anyMatch { it.kind == "application" && it.id == "app-ci" }
+        assertThat(run.receipt.workspace.slug).isEqualTo("ci-standing")
+
+        // The FIRST request is the app create — no /account/workspace call precedes it.
+        val appReq = server.takeRequest()
+        assertThat(appReq.method).isEqualTo("POST")
+        assertThat(appReq.path).isEqualTo("/api/v1/applications")
+        // Authenticated with the caller's OWN token — NOT a provisioning token, NOT an exchanged token.
+        assertThat(appReq.getHeader("Authorization")).isEqualTo("Bearer AT-test")
+        assertThat(server.takeRequest().path).isEqualTo("/api/v1/applications/app-ci")
+    }
+
+    @Test
+    fun `ci-signin teardown deletes only the app and touches no workspace`() {
+        // SSO-2944 — teardown removes only the ephemeral app; the standing workspace survives. It uses
+        // the caller's own token (workspace-less recipe), so there is no token-exchange first.
+        val ctx = context()
+        val state = ExampleState(example = "ci-signin", workspaceSlug = "ci-standing", clientId = "app-ci")
+        server.enqueue(noContent())
+
+        RecipeInterpreter(ctx, Recipe.load("ci-signin")).teardown(state)
+
+        val del = server.takeRequest()
+        assertThat(del.method).isEqualTo("DELETE")
+        assertThat(del.path).isEqualTo("/api/v1/applications/app-ci")
+        assertThat(del.getHeader("Authorization")).isEqualTo("Bearer AT-test")
+        // No further requests — no hub.deleteWorkspace, no token exchange.
+        assertThat(server.requestCount).isEqualTo(1)
+    }
+
+    @Test
     fun `teardown deletes the app then hard-deletes the workspace`() {
         val ctx = context()
         val state = ExampleState(

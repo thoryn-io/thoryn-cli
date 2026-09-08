@@ -60,6 +60,24 @@ internal class ExampleContext(
     fun gatewayClient(): ProductApiClient = CommandSupport.client(gateway, tokens)
 
     /**
+     * SSO-2944 — a gateway client authenticated with the caller's OWN session token, for a
+     * WORKSPACE-LESS recipe (one with no `hub.createWorkspace` step). The caller's API key is already
+     * `tnt`-scoped to a STANDING workspace it owns, so resources are created directly under that
+     * workspace — no provisioning token (there is no create step to mint one) and no token-exchange to
+     * a freshly-created tenant. Mirrors [CommandSupport.client]'s proactive refresh + reactive on-401
+     * re-mint (an API-key session re-mints via client-credentials; SSO-2941), and rides the
+     * caller-chosen [environmentSlug] as `X-Thoryn-Environment` for parity with the workspace-creating
+     * paths.
+     */
+    fun callerGatewayClient(environmentSlug: String? = null): ProductApiClient =
+        ProductApiClient(
+            gateway = gateway,
+            tokens = CommandSupport.ensureFresh(tokens),
+            reauthenticate = { CommandSupport.forceRefresh() },
+            environmentSlug = environmentSlug,
+        )
+
+    /**
      * SSO-2836 — a gateway client authenticated with the **workspace-scoped provisioning token**
      * that `POST /account/workspace` returns for a just-created workspace (ADR
      * `2026-09-01-workspace-create-returns-scoped-provisioning-token`). Preferred over
@@ -123,9 +141,18 @@ internal object ExampleRegistry {
      * from the signed catalog (SSO-2880). This is the sole path: the compiled `SimpleSigninExample`
      * and its in-process Kotlin RP were retired with SSO-2880, and the former `THORYN_RECIPE_ENGINE`
      * flag with them.
+     *
+     * `ci-signin` (SSO-2944) is the WORKSPACE-LESS sibling: it provisions an ephemeral loopback OAuth
+     * client inside a STANDING workspace the caller already owns (no `hub.createWorkspace` /
+     * `hub.deleteWorkspace`). It exists because a customer-plane `client_credentials` API key is
+     * tenant-scoped and cannot create workspaces — so CI (the reusable provisioning Action) targets a
+     * standing workspace rather than minting a fresh one per run.
      */
     private fun examples(): List<Example> =
-        listOf(RecipeExample(Recipe.load("simple-signin")))
+        listOf(
+            RecipeExample(Recipe.load("simple-signin")),
+            RecipeExample(Recipe.load("ci-signin")),
+        )
 
     fun all(): List<Example> = examples()
 
