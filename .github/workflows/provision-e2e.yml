@@ -1,22 +1,30 @@
 name: provision-e2e
 
-# SSO-2938 (epic SSO-2934) — demo caller for the reusable provisioning Action
+# SSO-2944 (epic SSO-2934) — demo caller for the reusable provisioning Action
 # (.github/actions/provision). It configures the product as a real customer against
-# SHARED STAGING using only the real product APIs via the `thoryn` CLI, then hard-
-# deletes what it created.
+# SHARED STAGING using only the real product APIs via the `thoryn` CLI, then deletes
+# what it created.
 #
-# Manual only (workflow_dispatch): it mutates shared staging and needs the
+# THE PIVOT (SSO-2944): CI authenticates with a CUSTOMER-PLANE, TENANT-SCOPED
+# client-credentials API key the operator mints themselves. Such a key CANNOT create
+# workspaces, so the run provisions an EPHEMERAL OAuth client inside a STANDING
+# workspace the operator owns (not a fresh workspace per run). The ephemeral client is
+# the sole per-run resource; it is deleted on exit.
+#
+# Manual only (workflow_dispatch): it mutates a shared-staging workspace and needs the
 # THORYN_API_KEY secret, so it must not fire on push/PR. A nightly schedule can be
 # added once the prerequisites below are live.
 #
-# PREREQUISITES for a green run (see the PR's "Live validation pending" section):
-#   * oauthy#3459 (SSO-2937) DEPLOYED to staging — seeds the `thoryn-cli-ci`
-#     client-credentials client WITH the `tenant:workspace.write` scope, so the
-#     recipe's hub.createWorkspace step succeeds for a machine key.
-#   * The `THORYN_API_KEY` repository secret set to `thoryn-cli-ci:<secret>`.
+# ONE-TIME OPERATOR SETUP (see the repo README "CI provisioning setup" section):
+#   * A STANDING workspace on staging the operator owns (e.g. `ci-standing`).
+#   * A STANDING test user in that workspace (for the downstream sign-in leg).
+#   * A CUSTOMER-PLANE `client_credentials` API key scoped to that workspace, granted
+#     `tenant:applications.write` + `tenant:applications.read`.
+#   * The `THORYN_API_KEY` repository secret set to `<client-id>:<client-secret>`.
+#   * The `workspace-slug` input / `CI_WORKSPACE_SLUG` var set to the standing slug.
 #
-# Until both are in place this workflow is expected to fail at the sign-in / apply
-# step. Do NOT wire it into a required gate before it is verified green once by hand.
+# Until the standing workspace + key exist this workflow is expected to fail at sign-in
+# / apply. Do NOT wire it into a required gate before it is verified green once by hand.
 
 on:
   workflow_dispatch:
@@ -26,11 +34,14 @@ on:
         required: false
         default: "https://hub.stg.thoryn.org"
       recipe:
-        description: "Bundled recipe to apply."
+        description: "Bundled workspace-less recipe to apply."
         required: false
-        default: "simple-signin"
+        default: "ci-signin"
+      workspace-slug:
+        description: "Standing workspace slug the API key is scoped to (provisions into it; not created)."
+        required: true
 
-# Serialize: never let two provisioning runs race on shared staging.
+# Serialize: never let two provisioning runs race on the shared standing workspace.
 concurrency:
   group: provision-e2e
   cancel-in-progress: false
@@ -50,14 +61,15 @@ jobs:
         uses: ./.github/actions/provision
         with:
           api-key: ${{ secrets.THORYN_API_KEY }}
+          workspace-slug: ${{ inputs.workspace-slug }}
           issuer: ${{ inputs.issuer }}
           recipe: ${{ inputs.recipe }}
 
       # Downstream consumers use the Action's outputs. The teardown inside the Action
-      # runs on exit regardless, so these ids are only valid for the life of the job.
+      # runs on exit regardless, so the ephemeral client id is only valid for the life
+      # of the job (the standing workspace + issuer persist).
       - name: Show provisioned identifiers
         run: |
           echo "workspace-slug = ${{ steps.provision.outputs.workspace-slug }}"
-          echo "tenant-id      = ${{ steps.provision.outputs.tenant-id }}"
           echo "client-id      = ${{ steps.provision.outputs.client-id }}"
           echo "issuer         = ${{ steps.provision.outputs.issuer }}"

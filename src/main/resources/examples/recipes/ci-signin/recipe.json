@@ -1,0 +1,69 @@
+{
+  "apiVersion": "thoryn.io/examples/v1",
+  "id": "ci-signin",
+  "version": "1.0.0",
+  "summary": "Provision an ephemeral loopback OAuth client inside a standing workspace (no workspace create).",
+  "requires": {
+    "scopes": [
+      "tenant:applications.write",
+      "tenant:applications.read"
+    ],
+    "minCliVersion": "0.9.0"
+  },
+  "params": [
+    {
+      "name": "workspaceSlug",
+      "prompt": "Standing workspace slug (the workspace your API key is scoped to; NOT created)",
+      "validate": "^[a-z0-9]([a-z0-9-]{1,61}[a-z0-9])$"
+    },
+    {
+      "name": "appName",
+      "prompt": "Display name for the ephemeral OAuth client",
+      "default": "CI Sign-in App {{generate.slug8}}"
+    }
+  ],
+  "steps": [
+    {
+      "id": "app",
+      "action": "applications.create",
+      "description": "Register an ephemeral public loopback authorization-code client in the standing workspace.",
+      "with": {
+        "displayName": "{{appName}}",
+        "clientType": "public",
+        "grantTypes": [
+          "authorization_code"
+        ],
+        "scopes": [
+          "openid",
+          "profile",
+          "email"
+        ],
+        "redirectUris": [
+          "http://127.0.0.1/callback"
+        ],
+        "postLogoutRedirectUris": [
+          "http://127.0.0.1/"
+        ]
+      }
+    }
+  ],
+  "verify": [
+    {
+      "assert": "applications.get",
+      "id": "{{app.clientId}}",
+      "expect": {
+        "status": "active"
+      }
+    }
+  ],
+  "teardown": [
+    {
+      "action": "applications.delete",
+      "id": "{{app.clientId}}"
+    }
+  ],
+  "assets": {
+    "rp": "./apps/loopback-rp",
+    "docs": "./README.md"
+  }
+}

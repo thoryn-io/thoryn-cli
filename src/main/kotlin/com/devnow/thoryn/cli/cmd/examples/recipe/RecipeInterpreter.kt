@@ -52,6 +52,17 @@ internal class RecipeInterpreter(
 ) {
     private val mapper = JsonMapper.builder().addModule(kotlinModule()).build()
 
+    /**
+     * SSO-2944 — does this recipe create its OWN workspace (a `hub.createWorkspace` step)? When it does
+     * NOT (a workspace-less recipe like `ci-signin`), the caller's session token is ALREADY tenant-
+     * scoped to a standing workspace, so the interpreter provisions with that token directly — there is
+     * no provisioning token to prefer and no token-exchange to a freshly-created tenant. This flag is
+     * fixed by the recipe shape, so every tenant-scoped call (steps, verify, teardown, attest) resolves
+     * its client the same way. See [tenantClient].
+     */
+    private val createsWorkspace: Boolean =
+        recipe.steps.any { it["action"]?.asString() == "hub.createWorkspace" }
+
     /** Flat resolution scope: a param name, or `"<stepId>.<field>"` for a step output. */
     private val scope = mutableMapOf<String, String>()
 
@@ -394,6 +405,13 @@ internal class RecipeInterpreter(
     // ── tenant client selection + trust-propagation retry ───────────────────────────────────────
 
     private fun tenantClient(): ProductApiClient {
+        // SSO-2944 — a workspace-less recipe operates inside a STANDING workspace the caller's API key
+        // is already scoped to (its `tnt` claim). Use the caller's own tenant-scoped bearer directly:
+        // there is no hub.createWorkspace step to mint a provisioning token, and no token-exchange to a
+        // just-created tenant. The decision is on the recipe SHAPE, so steps, verify, and teardown all
+        // resolve the client identically (teardown/verify set `workspace` from the receipt/state, but
+        // for a workspace-less recipe that context is informational — the caller token still applies).
+        if (!createsWorkspace) return ctx.callerGatewayClient(environmentSlug)
         val w = workspace ?: throw RecipeException("this step requires a prior hub.createWorkspace step")
         return w.provisioningToken?.let { ctx.provisioningGatewayClient(it, environmentSlug) }
             ?: ctx.tenantGatewayClient(

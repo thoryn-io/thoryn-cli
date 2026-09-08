@@ -49,6 +49,36 @@ class ExamplesApplyShareTest : CommandTestBase() {
     }
 
     @Test
+    fun `apply provisions the workspace-less ci-signin recipe with the callers own token`() {
+        // SSO-2944 — a customer-plane API key is tenant-scoped and cannot create workspaces, so ci-signin
+        // provisions an ephemeral app inside the STANDING workspace the key owns. `--environment` is set
+        // so the guided apply skips the environment listing; `workspaceSlug` names the standing workspace.
+        seedTokens(Tokens(accessToken = "AT-test", refreshToken = "RT", issuer = baseUrl(), gateway = baseUrl()))
+        // applications.create → verify applications.get → attest. NO createWorkspace / registerTenant.
+        server.enqueue(jsonResponse(201, """{"clientId":"app-ci","status":"active"}"""))
+        server.enqueue(jsonResponse(200, """{"clientId":"app-ci","status":"active"}"""))
+        server.enqueue(jsonResponse(200, """{"kid":"k","signature":"s","canonicalPayload":"e30","attestedAt":"2026-01-01T00:00:00Z"}"""))
+
+        val (exit, out, _) = runCli(
+            "examples", "apply", "ci-signin",
+            "--set", "workspaceSlug=ci-standing",
+            "--environment", "production",
+            "--yes",
+            "--hub", baseUrl(), "--gateway", baseUrl(),
+        )
+
+        assertThat(exit).isEqualTo(0)
+        assertThat(out).contains("Plan — recipe ci-signin").contains("Applied")
+        val receipt = ReceiptStore().read("ci-signin")
+        assertThat(receipt).isNotNull
+        assertThat(receipt!!.resources).anyMatch { it.id == "app-ci" }
+        // The FIRST request is the app create, under the caller's OWN tenant-scoped bearer.
+        val appReq = server.takeRequest()
+        assertThat(appReq.path).isEqualTo("/api/v1/applications")
+        assertThat(appReq.getHeader("Authorization")).isEqualTo("Bearer AT-test")
+    }
+
+    @Test
     fun `share prints the secret-free receipt and notes it is unsigned`() {
         ReceiptStore().write(
             Receipt(
