@@ -199,6 +199,7 @@ internal class RecipeInterpreter(
             "productApi.registerTenant" -> registerTenant(with)
             "applications.create" -> createApplication(with)
             "identity.registerUser" -> registerUser(with)
+            "tenant.configureEmailProvider" -> configureEmailProvider(with)
             "federation.create" -> createFederation(with)
             "applications.delete" -> { tenantClient().deleteApplication(with["id"].toString(), workspace?.slug); emptyMap() }
             "federation.delete" -> { tenantClient().deleteFederationMember(with["id"].toString()); emptyMap() }
@@ -275,6 +276,41 @@ internal class RecipeInterpreter(
             put("id", userId)
             put("userId", userId)
             email?.let { put("email", it) }
+        }
+    }
+
+    /**
+     * SSO-2917 — configure the workspace's bring-your-own SMTP transport through the SUPPORTED product
+     * workflow (product-api `PUT /api/v1/email-provider`, `tenant:email.write`; PR #3448). The recipe's
+     * `with` map (`smtpHost`, `smtpPort`, `smtpUsername`, `smtpPassword`, `transportSecurity`,
+     * `fromAddress`, `fromName`, `replyTo`, `enabled`, `providerType`) is forwarded verbatim as the
+     * merge-upsert body. The SMTP password is WRITE-ONLY: the response never carries it back, and it is
+     * NEVER recorded on the receipt (a recipe author marks its param `secret:true`) — only the
+     * non-secret provider shape (type / host / from-address / configVersion / enabled) is attested.
+     * The resulting `providerType` / `configVersion` / `enabled` are exposed as
+     * `{{<step id>.providerType}}` / `{{<step id>.configVersion}}` / `{{<step id>.enabled}}`.
+     */
+    private fun configureEmailProvider(with: Map<String, Any?>): Map<String, String> {
+        val resp = retryUntilTenantTrusted { tenantClient().putEmailProvider(with) }
+        val providerType = resp["providerType"]?.takeIf { !it.isNull }?.asString() ?: "email-provider"
+        val configVersion = resp["configVersion"]?.takeIf { !it.isNull }?.asString()
+        val enabled = resp["enabled"]?.takeIf { !it.isNull }?.asString()
+        resources += ResourceRef(
+            kind = "emailProvider",
+            id = providerType,
+            // NEVER the password — only the non-secret provider shape.
+            attributes = buildMap {
+                configVersion?.let { put("configVersion", it) }
+                enabled?.let { put("enabled", it) }
+                resp["smtpHost"]?.takeIf { !it.isNull }?.asString()?.let { put("smtpHost", it) }
+                resp["fromAddress"]?.takeIf { !it.isNull }?.asString()?.let { put("fromAddress", it) }
+            },
+        )
+        ctx.info("email provider: type=$providerType${enabled?.let { " enabled=$it" } ?: ""}")
+        return buildMap {
+            put("providerType", providerType)
+            configVersion?.let { put("configVersion", it) }
+            enabled?.let { put("enabled", it) }
         }
     }
 

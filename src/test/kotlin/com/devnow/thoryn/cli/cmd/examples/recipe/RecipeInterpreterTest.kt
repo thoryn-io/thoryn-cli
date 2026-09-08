@@ -140,6 +140,70 @@ class RecipeInterpreterTest : CommandTestBase() {
     }
 
     @Test
+    fun `tenant configureEmailProvider PUTs the merge-upsert body and records a password-free receipt`() {
+        val ctx = context()
+        val recipeJson = """
+            {
+              "apiVersion": "thoryn.io/examples/v1",
+              "id": "configure-email-test",
+              "version": "1.0.0",
+              "summary": "configure a BYO-SMTP provider",
+              "params": [
+                { "name": "smtpPassword", "prompt": "SMTP password", "default": "s3cr3t-smtp", "secret": true }
+              ],
+              "steps": [
+                { "id": "ws", "action": "hub.createWorkspace",
+                  "with": { "slug": "ex-signin-{{generate.slug8}}", "displayName": "T" } },
+                { "id": "email", "action": "tenant.configureEmailProvider",
+                  "with": { "enabled": true, "smtpHost": "smtp.example.com", "smtpPort": 587,
+                            "smtpUsername": "mailer", "smtpPassword": "{{smtpPassword}}",
+                            "transportSecurity": "starttls", "fromAddress": "[email protected]" } }
+              ]
+            }
+        """.trimIndent()
+        val recipe = Recipe(JsonMapper.builder().build().readTree(recipeJson))
+
+        // 1) createWorkspace → provisioning token (so the email-provider call skips token-exchange)
+        server.enqueue(jsonResponse(201, """{"tenantId":"t-1","slug":"srv-ignored","provisioningToken":"PT-1"}"""))
+        // 2) tenant.configureEmailProvider → PUT /api/v1/email-provider returns the saved state (never a password)
+        server.enqueue(
+            jsonResponse(
+                200,
+                """{"providerType":"byo_smtp","enabled":true,"configured":true,"smtpHost":"smtp.example.com",
+                    "smtpPort":587,"smtpUsername":"mailer","hasPassword":true,"transportSecurity":"starttls",
+                    "fromAddress":"[email protected]","fromName":null,"replyTo":null,
+                    "supportedProviderTypes":["byo_smtp"],"supportedTransportSecurity":["none","starttls","tls"],
+                    "configVersion":1,"updatedAt":"2026-09-01T10:00:00Z"}""".trimIndent(),
+            ),
+        )
+        // 3) best-effort platform attestation of the receipt
+        server.enqueue(jsonResponse(200, """{"kid":"k","signature":"s","canonicalPayload":"e30","attestedAt":"2026-01-01T00:00:00Z"}"""))
+
+        val run = RecipeInterpreter(ctx, recipe, trustPropagationBudgetMs = 2_000).setup()
+
+        // The provider is recorded on the receipt — the non-secret shape only, NEVER the password.
+        val providerRef = run.receipt.resources.firstOrNull { it.kind == "emailProvider" }
+        assertThat(providerRef).isNotNull
+        assertThat(providerRef!!.id).isEqualTo("byo_smtp")
+        assertThat(providerRef.attributes["configVersion"]).isEqualTo("1")
+        assertThat(providerRef.attributes["smtpHost"]).isEqualTo("smtp.example.com")
+        assertThat(providerRef.attributes).doesNotContainKey("smtpPassword")
+
+        server.takeRequest() // createWorkspace
+        val emailReq = server.takeRequest()
+        assertThat(emailReq.method).isEqualTo("PUT")
+        assertThat(emailReq.path).isEqualTo("/api/v1/email-provider")
+        // Created UNDER the workspace, authenticated with the provisioning token.
+        assertThat(emailReq.getHeader("Authorization")).isEqualTo("Bearer PT-1")
+        // The recipe's `with` map is forwarded verbatim, with the {{smtpPassword}} param resolved.
+        val body = emailReq.body.readUtf8()
+        assertThat(body)
+            .contains("\"smtpHost\":\"smtp.example.com\"")
+            .contains("\"enabled\":true")
+            .contains("\"smtpPassword\":\"s3cr3t-smtp\"")
+    }
+
+    @Test
     fun `a failed verify assertion surfaces as a RecipeException`() {
         val ctx = context()
         server.enqueue(jsonResponse(201, """{"tenantId":"t-1","slug":"x","provisioningToken":"PT-1"}"""))

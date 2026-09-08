@@ -148,6 +148,31 @@ class ProductApiClient(
     fun reactivateEnvironment(id: String): JsonNode =
         post("/api/v1/environments/${encode(id)}/reactivate", emptyMap<String, Any?>())
 
+    // ── Email provider (SSO-2917; product-api /api/v1/email-provider) ──────────
+    //
+    // The tenant's bring-your-own SMTP transport config (the activation, per tenant,
+    // of the SSO-76 / SSO-2049 BYO-SMTP send path). read → tenant:email.read,
+    // write → tenant:email.write (granted to thoryn-cli by hub V149). The SMTP
+    // password is WRITE-ONLY: it rides the PUT body once (identity encrypts it at
+    // rest) and is NEVER present on the response — the read view carries only
+    // `hasPassword`. PUT is a normalising merge-upsert (a null field keeps the
+    // stored value). DELETE resets the tenant to the platform sender (204).
+
+    fun getEmailProvider(): JsonNode =
+        get("/api/v1/email-provider")
+
+    fun putEmailProvider(body: Map<String, Any?>): JsonNode =
+        put("/api/v1/email-provider", body)
+
+    /**
+     * `DELETE /api/v1/email-provider` — reset to the platform sender (204 No Content);
+     * surfaces non-2xx as [ProductApiException]. [confirmSlug] (SSO-2413) — a
+     * production-plane reset is gated by product-api's `ProductionConfirmationInterceptor`
+     * (`@ProductionConfirmationRequired`); pass the workspace slug to clear it.
+     */
+    fun deleteEmailProvider(confirmSlug: String? = null): Unit =
+        deleteNoContent("/api/v1/email-provider", confirmSlug)
+
     // ── Attestations (SSO-2878; product-api verify-then-sign) ──────────────────
     //
     // POST a receipt to have the platform re-verify its resources against live tenant

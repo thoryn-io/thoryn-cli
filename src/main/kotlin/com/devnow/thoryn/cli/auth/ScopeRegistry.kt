@@ -52,6 +52,10 @@ object ScopeRegistry {
         // environments (product-api /api/v1/environments — SSO-2870; select & manage sandboxes)
         "tenant:environments.read",
         "tenant:environments.write",
+        // email provider — BYO-SMTP config (product-api /api/v1/email-provider — SSO-2917;
+        // granted to thoryn-cli by hub V149). read gates the get; write gates the upsert + reset.
+        "tenant:email.read",
+        "tenant:email.write",
     )
 
     /**
