@@ -48,13 +48,15 @@ import java.util.concurrent.Callable
         WorkspaceCommand.ArchiveSubcommand::class,
         WorkspaceCommand.ReactivateSubcommand::class,
         WorkspaceCommand.HardDeleteSubcommand::class,
+        // SSO-2917 — per-workspace bring-your-own SMTP config (gateway-routed, tenant-scoped).
+        EmailProviderCommand::class,
     ],
 )
 class WorkspaceCommand : Callable<Int> {
 
     override fun call(): Int {
         System.err.println("Usage: thoryn workspace <subcommand>")
-        System.err.println("Subcommands: create | list | switch | archive | reactivate | hard-delete")
+        System.err.println("Subcommands: create | list | switch | archive | reactivate | hard-delete | email-provider")
         return CommandSupport.EXIT_USAGE
     }
 
