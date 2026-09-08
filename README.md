@@ -43,7 +43,7 @@ it is the stable asset name the `thoryn-examples` conformance CI consumes.
 
 ```
 thoryn login                                 # Auth code + PKCE (loopback) or --device-code
-thoryn login --client-credentials --client-id <id>   # SSO-1553 — non-interactive (CI/automation)
+thoryn login --client-credentials [--client-id <id>] # SSO-1553/2941 — non-interactive API key (CI); THORYN_API_KEY=<id>:<secret>, auto re-mints on expiry
 thoryn login --status
 thoryn logout
 
@@ -185,14 +185,22 @@ wildcard — it's a CLI ergonomic.
 When a command rejects with `insufficient_scope`, the CLI prints the
 exact `thoryn login --scope <required>` line to fix it.
 
-## Non-interactive auth & tenant seeding (SSO-1553)
+## Non-interactive auth & tenant seeding (SSO-1553 / API-key SSO-2941)
 
 For CI / automation there is a fully non-interactive path — no browser, no
 second device:
 
 ```bash
-# Service-account login (RFC 6749 §4.4 client-credentials). Secret from env,
-# NEVER argv. --issuer MUST be the tenant subdomain so the hub mints `tnt`.
+# Service-account / API-key login (RFC 6749 §4.4 client-credentials). Credentials
+# from env, NEVER argv. --issuer MUST be the tenant subdomain so the hub mints `tnt`.
+
+# SSO-2941 — single-knob API key: one secret carries id + secret as "<id>:<secret>".
+export THORYN_API_KEY="ci-bot:$CI_SERVICE_ACCOUNT_SECRET"
+thoryn login --client-credentials \
+  --issuer https://acme.hub.stg.thoryn.org \
+  --scope "tenant:applications.write tenant:federation.write"
+
+# Or split form — --client-id + THORYN_CLIENT_SECRET (or --client-secret-file <path>):
 export THORYN_CLIENT_SECRET="$CI_SERVICE_ACCOUNT_SECRET"
 thoryn login --client-credentials --client-id ci-bot \
   --issuer https://acme.hub.stg.thoryn.org \
@@ -220,6 +228,16 @@ A client-credentials token carries no user; its `tnt` claim is minted by the hub
 from the tenant subdomain the token is requested against. Point `--issuer` at
 `https://<slug>.hub.<env>.thoryn.org` or product-api rejects the seed with `401
 missing_tnt_claim`.
+
+**Re-mint on expiry (SSO-2941).** A client-credentials token has no refresh token
+(RFC 6749 §4.4.3), so instead of the refresh-token grant the CLI re-mints a fresh
+token when the stored one nears expiry (or on a `401`), re-running the same grant
+with the stored client id and the secret still in the environment
+(`THORYN_API_KEY` / `THORYN_CLIENT_SECRET`). The secret is **never persisted** —
+only the short-lived access token, the (public) client id, and an auth-mode marker
+are stored — so re-mint works for the whole life of a CI job where the secret env
+var is set. If the secret is no longer in the environment, re-mint prints a hint and
+the operator re-runs `thoryn login --client-credentials`.
 
 Full user docs: `docs/modules/ROOT/pages/cli/non-interactive-automation.adoc`.
 

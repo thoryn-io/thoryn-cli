@@ -219,6 +219,49 @@ object ThorynConfig {
             ?: System.getenv("THORYN_CLIENT_SECRET")?.takeIf { it.isNotBlank() }
 
     /**
+     * SSO-2941 — the single-knob API-key env var for non-interactive `thoryn login
+     * --client-credentials`, holding `<client-id>:<client-secret>` so CI can supply
+     * both halves with one secret. The client id is everything before the FIRST
+     * colon; the secret is the rest (so a secret may itself contain a colon).
+     *
+     * As with every other secret knob it is read from a `-D` system property first
+     * (tests / `java -jar -D…`) then the environment variable — and never from argv.
+     */
+    const val API_KEY_ENV: String = "THORYN_API_KEY"
+
+    /** SSO-2941 — a parsed [API_KEY_ENV] value: a service-account client id + its secret. */
+    data class ApiKey(val clientId: String, val clientSecret: String)
+
+    /**
+     * SSO-2941 — resolve [API_KEY_ENV] into an [ApiKey], or null when it is unset or
+     * malformed. A well-formed value is `<client-id>:<client-secret>` with a non-empty
+     * id and a non-empty secret; anything else (no colon, empty half) returns null so
+     * the caller can print actionable guidance rather than sending a broken grant.
+     */
+    fun resolveApiKey(): ApiKey? {
+        val raw = System.getProperty(API_KEY_ENV)?.takeIf { it.isNotBlank() }
+            ?: System.getenv(API_KEY_ENV)?.takeIf { it.isNotBlank() }
+            ?: return null
+        val idx = raw.indexOf(':')
+        if (idx <= 0 || idx >= raw.length - 1) return null
+        return ApiKey(clientId = raw.substring(0, idx), clientSecret = raw.substring(idx + 1))
+    }
+
+    /**
+     * SSO-2941 — resolve the client secret used to RE-MINT an expired API-key session
+     * (see [com.devnow.thoryn.cli.cmd.CommandSupport.forceRefresh]). The secret half of
+     * [API_KEY_ENV] wins, else `THORYN_CLIENT_SECRET`.
+     *
+     * Re-mint runs deep inside a command with no access to the login command's
+     * per-invocation `--client-secret-file` / no-echo prompt, so it resolves from the
+     * environment ONLY — which is exactly how CI already supplies the credential (set
+     * once in the pipeline env). An interactive operator whose secret was only ever a
+     * file / prompt simply re-runs `thoryn login --client-credentials` on expiry.
+     */
+    fun resolveApiKeySecret(): String? =
+        resolveApiKey()?.clientSecret ?: resolveClientSecret()
+
+    /**
      * SSO-2879 — resolve the WIF private_key_jwt signing key (PKCS#8 PEM) for `login --workload-identity`.
      *
      * Resolution order (first non-blank wins), keeping the key out of argv:
