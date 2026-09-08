@@ -91,15 +91,15 @@ jobs:
           - os: macos-14
             asset: thoryn-darwin-arm64
             march: default
-          # Intel macOS. GitHub is retiring the `macos-13` runner, so this leg
-          # may sit `queued` and never start. Kept in the matrix so Intel-mac
-          # binaries resume automatically once a runner is available again; its
-          # absence is tolerated (best-effort, see the job comment above). There
-          # is no other GitHub-hosted Intel-macOS label to swap in — macos-14+
-          # are arm64.
-          - os: macos-13
-            asset: thoryn-darwin-amd64
-            march: compatibility
+          # Intel macOS (thoryn-darwin-amd64) is intentionally NOT in the matrix:
+          # GitHub is retiring the `macos-13` runner, so the leg sits `queued` and
+          # never starts — and `release` needs `[native]`, so a queued (never-
+          # assigned) leg blocks publish until GitHub's unassignable-job timeout
+          # (the best-effort tolerance bounds a *running* hang, not a *queued*
+          # one). Dropped so releases publish promptly. Re-add
+          # `- {os: macos-13, asset: thoryn-darwin-amd64, march: compatibility}`
+          # once a working Intel-macOS runner exists; publish + formula already
+          # tolerate its presence/absence.
           - os: ubuntu-24.04
             asset: thoryn-linux-amd64
             march: compatibility
