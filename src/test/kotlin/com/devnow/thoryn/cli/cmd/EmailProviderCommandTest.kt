@@ -124,6 +124,56 @@ class EmailProviderCommandTest : CommandTestBase() {
     }
 
     @Test
+    fun `verify renders success and exits 0`() {
+        server.enqueue(jsonResponse(200, """{"success":true,"reason":null,"outcome":"ok"}"""))
+
+        val (exit, out, _) = runCli("workspace", "email-provider", "verify", "--gateway", baseUrl())
+
+        assertThat(exit).isEqualTo(0)
+        assertThat(out).contains("OK").contains("ok")
+        val req = server.takeRequest()
+        assertThat(req.path).isEqualTo("/api/v1/email-provider/verify")
+        assertThat(req.method).isEqualTo("POST")
+        // A connect-only check sends no recipient.
+        assertThat(req.body.readUtf8()).doesNotContain("\"to\"")
+    }
+
+    @Test
+    fun `verify with --to sends the recipient and a failing check exits non-zero`() {
+        server.enqueue(
+            jsonResponse(
+                200,
+                """{"success":false,"reason":"The SMTP server rejected the configured credentials (authentication failed).","outcome":"auth_failed"}""",
+            ),
+        )
+
+        val (exit, out, _) = runCli(
+            "workspace", "email-provider", "verify", "--to", "admin@example.com", "--gateway", baseUrl(),
+        )
+
+        assertThat(exit).isEqualTo(CommandSupport.EXIT_CHECK_FAILED)
+        assertThat(out).contains("FAILED").contains("authentication failed").contains("auth_failed")
+        val req = server.takeRequest()
+        assertThat(req.method).isEqualTo("POST")
+        assertThat(req.body.readUtf8()).contains("\"to\":\"admin@example.com\"")
+    }
+
+    @Test
+    fun `verify surfaces an insufficient-scope error with the login hint`() {
+        server.enqueue(
+            jsonResponse(
+                403,
+                """{"type":"about:blank","status":403,"title":"Forbidden","errorCode":"insufficient_scope","detail":"missing scope"}""",
+            ),
+        )
+
+        val (exit, _, err) = runCli("workspace", "email-provider", "verify", "--gateway", baseUrl())
+
+        assertThat(exit).isEqualTo(CommandSupport.EXIT_HTTP_ERROR)
+        assertThat(err).contains("tenant:email.write")
+    }
+
+    @Test
     fun `reset DELETEs the provider config`() {
         server.enqueue(noContent())
 

@@ -42,6 +42,7 @@ import java.util.concurrent.Callable
     subcommands = [
         EmailProviderCommand.GetSubcommand::class,
         EmailProviderCommand.SetSubcommand::class,
+        EmailProviderCommand.VerifySubcommand::class,
         EmailProviderCommand.ResetSubcommand::class,
     ],
 )
@@ -49,7 +50,7 @@ class EmailProviderCommand : Callable<Int> {
 
     override fun call(): Int {
         System.err.println("Usage: thoryn workspace email-provider <subcommand>")
-        System.err.println("Subcommands: get | set | reset")
+        System.err.println("Subcommands: get | set | verify | reset")
         return CommandSupport.EXIT_USAGE
     }
 
@@ -193,6 +194,53 @@ class EmailProviderCommand : Callable<Int> {
                 val response = client.putEmailProvider(body)
                 CommandSupport.emitRecord(format, response, ::providerRecordFields)
                 CommandSupport.EXIT_OK
+            } catch (ex: ProductApiException) {
+                CommandSupport.renderError(format, ex, requiredScope = "tenant:email.write")
+            } catch (ex: Exception) {
+                CommandSupport.renderRequestFailure(ex, gateway)
+            }
+        }
+    }
+
+    /**
+     * `thoryn workspace email-provider verify [--to <address>]` (SSO-2923) — dial the
+     * configured BYO-SMTP transport and report whether it works, so a mistyped relay is caught
+     * before a real password-reset or invitation depends on it.
+     *
+     * Without `--to` it runs a connect/handshake+auth probe (no mail is sent). With `--to
+     * <address>` it sends a real test message to that address through YOUR OWN SMTP server. The
+     * exit code is 0 when the transport verifies, and non-zero ([CommandSupport.EXIT_CHECK_FAILED])
+     * when it does not — so `thoryn ... verify && ...` gates on a working transport.
+     */
+    @Command(name = "verify", description = ["Verify the workspace's configured BYO-SMTP transport (optionally send a test email)."], mixinStandardHelpOptions = true)
+    class VerifySubcommand : Callable<Int> {
+
+        @Option(names = ["--to"], description = ["Send a real test email to this address (through your own SMTP server). Omit for a connect-only check."])
+        var to: String? = null
+
+        @Option(names = ["--gateway"], description = ["Override the gateway base URL (default: \${DEFAULT-VALUE})."], defaultValue = ThorynConfig.DEFAULT_GATEWAY)
+        var gateway: String = ThorynConfig.DEFAULT_GATEWAY
+
+        @Option(names = ["--output"], description = ["Output format: json|yaml|table (default: table)."])
+        var outputRaw: String? = null
+
+        override fun call(): Int {
+            val format = CommandSupport.parseFormat(outputRaw) ?: return CommandSupport.EXIT_USAGE
+            val tokens = CommandSupport.readTokens() ?: return CommandSupport.EXIT_NOT_SIGNED_IN
+            gateway = CommandSupport.resolveGateway(gateway, tokens) // SSO-2827 — default to the gateway you signed into
+            val client = CommandSupport.gatewayClient(gateway, tokens)
+            return try {
+                val body = client.verifyEmailProvider(to?.trim()?.ifBlank { null })
+                val success = body["success"]?.asBoolean() ?: false
+                val reason = body["reason"]?.takeUnless { it.isNull }?.asString()
+                val outcome = body["outcome"]?.asString() ?: "unknown"
+                val tableLine = if (success) {
+                    "OK: the configured BYO-SMTP transport verified successfully (outcome=$outcome)."
+                } else {
+                    "FAILED: ${reason ?: "the BYO-SMTP transport did not verify."} (outcome=$outcome)"
+                }
+                CommandSupport.emitValue(format, body, tableLine)
+                if (success) CommandSupport.EXIT_OK else CommandSupport.EXIT_CHECK_FAILED
             } catch (ex: ProductApiException) {
                 CommandSupport.renderError(format, ex, requiredScope = "tenant:email.write")
             } catch (ex: Exception) {

@@ -39,6 +39,14 @@ internal object CommandSupport {
     const val EXIT_NOT_SIGNED_IN: Int = 1
     const val EXIT_HTTP_ERROR: Int = 2
     const val EXIT_IO_ERROR: Int = 3
+
+    /**
+     * SSO-2923 — the HTTP call succeeded (2xx) but a check the command performed determined a
+     * NEGATIVE result (e.g. `email-provider verify` returned `success:false`). Distinct from
+     * [EXIT_HTTP_ERROR] (a non-2xx response) so scripts can tell "the server rejected the call"
+     * from "the call worked and the checked condition failed".
+     */
+    const val EXIT_CHECK_FAILED: Int = 4
     const val EXIT_USAGE: Int = 64
 
     /**
