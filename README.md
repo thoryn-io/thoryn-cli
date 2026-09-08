@@ -14,6 +14,31 @@ RFC 7636 + RFC 8628.
 > user-facing product docs are published from oathy's `docs/` to
 > thoryn.org/docs; this README is the developer-facing entry point.
 
+## Install
+
+Releases are cut by tagging `cli-v*` (SSO-2936). The `release` workflow
+(`.github/workflows/release.yml`) builds the GraalVM native binaries and the
+`thoryn.jar` fat jar and attaches them to the matching
+[GitHub Release](https://github.com/thoryn-io/thoryn-cli/releases).
+
+**Homebrew** — the repo doubles as its own tap:
+
+```bash
+brew tap thoryn-io/thoryn-cli
+brew install thoryn
+thoryn --version
+```
+
+`brew install thoryn` pulls the prebuilt native binary for your OS/arch from the
+latest `cli-v*` release; the release workflow bumps `Formula/thoryn.rb` (version +
+per-binary `sha256`) on every tag.
+
+**Direct download** — grab a native binary from the release assets
+(`thoryn-darwin-arm64`, `thoryn-darwin-amd64`, `thoryn-linux-amd64`,
+`thoryn-linux-arm64`, `thoryn-windows-amd64.exe`), `chmod +x`, and put it on
+`PATH`. The `thoryn.jar` fat jar is also attached (`java -jar thoryn.jar ...`);
+it is the stable asset name the `thoryn-examples` conformance CI consumes.
+
 ## Command tree
 
 ```

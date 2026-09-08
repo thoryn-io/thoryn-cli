@@ -1,0 +1,203 @@
+name: release
+
+# Tag-driven release for the thoryn CLI (SSO-2936, epic SSO-2934).
+#
+# On a `cli-v*` tag it builds and publishes, as GitHub Release assets:
+#   * the GraalVM native-image binaries, one per OS/arch
+#       thoryn-darwin-arm64  thoryn-darwin-amd64
+#       thoryn-linux-amd64   thoryn-linux-arm64
+#       thoryn-windows-amd64.exe
+#   * the fat jar `thoryn.jar` — the SAME asset name the thoryn-examples
+#     conformance / example-e2e workflows download (`gh release download ...
+#     --pattern 'thoryn.jar'`). Keep that name stable.
+# and then bumps the in-repo Homebrew formula (Formula/thoryn.rb) to the new
+# version + the released binaries' sha256 and commits it back.
+#
+# Ported from oauthy's .github/workflows/cli-release.yml, with the SSO-2928 fix:
+# the original resolved the tag as `${GITHUB_REF_NAME:-inputs.tag}`, so a
+# workflow_dispatch run (GITHUB_REF_NAME = the branch `main`) minted a bogus
+# `main` release. Here the tag is resolved and VALIDATED to be a `cli-v*` tag —
+# a branch name can never become a release (see the `resolve` job).
+
+on:
+  push:
+    tags:
+      - "cli-v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing cli-v* tag to (re)build a release for, e.g. cli-v0.1.0"
+        required: true
+
+permissions:
+  contents: write # create the release, upload assets, commit the formula bump
+
+jobs:
+  # ── SSO-2928 fix: resolve the tag from the tag ref (push) or the required
+  #    dispatch input, and REFUSE anything that is not a cli-v* tag. There is no
+  #    branch fallback, so a `main` release can no longer be minted. ───────────
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      version: ${{ steps.tag.outputs.version }}
+    steps:
+      - name: Resolve and validate the release tag
+        id: tag
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            tag="$INPUT_TAG"
+          else
+            tag="$REF_NAME"
+          fi
+          case "$tag" in
+            cli-v*) ;;
+            *)
+              echo "::error::refusing to release from '$tag' — the release tag must match cli-v* (SSO-2928); a branch name is never a release."
+              exit 1
+              ;;
+          esac
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#cli-v}" >> "$GITHUB_OUTPUT"
+
+  # ── GraalVM native-image binaries, one per OS/arch. ────────────────────────
+  native:
+    needs: resolve
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            asset: thoryn-darwin-arm64
+            march: default
+          - os: macos-13
+            asset: thoryn-darwin-amd64
+            march: compatibility
+          - os: ubuntu-24.04
+            asset: thoryn-linux-amd64
+            march: compatibility
+          - os: ubuntu-24.04-arm
+            asset: thoryn-linux-arm64
+            march: default
+          - os: windows-2022
+            asset: thoryn-windows-amd64.exe
+            march: compatibility
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.tag }}
+      - uses: graalvm/setup-graalvm@v1
+        with:
+          java-version: "21"
+          distribution: graalvm
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build the native image
+        shell: bash
+        run: |
+          set -euo pipefail
+          # arm64 GraalVM does not support -march=compatibility; the pom activates
+          # the -march flag only when -Dnative-march=compatibility is passed.
+          if [ "${{ matrix.march }}" = "compatibility" ]; then
+            ./mvnw -q -Pnative -Dnative-march=compatibility -DskipTests package
+          else
+            ./mvnw -q -Pnative -DskipTests package
+          fi
+      - name: Stage the binary under its release-asset name
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp target/thoryn.exe "dist/${{ matrix.asset }}"
+          else
+            cp target/thoryn "dist/${{ matrix.asset }}"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+          if-no-files-found: error
+
+  # ── Fat jar — the stable `thoryn.jar` asset the examples CI consumes. ──────
+  jar:
+    needs: resolve
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.tag }}
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+      - name: Build the thoryn CLI fat jar
+        run: ./mvnw -q -DskipTests package
+      - uses: actions/upload-artifact@v4
+        with:
+          name: thoryn.jar
+          path: target/thoryn.jar
+          if-no-files-found: error
+
+  # ── Publish the release + bump the Homebrew formula. ───────────────────────
+  release:
+    needs: [resolve, native, jar]
+    runs-on: ubuntu-latest
+    steps:
+      # Check out the DEFAULT branch (not the tag) so the formula bump commit
+      # lands on main rather than on a detached tag ref.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+      - name: Download all release assets
+        uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+      - name: List downloaded assets
+        run: ls -la assets
+      - name: Bump the Homebrew formula
+        run: bash scripts/release/bump-formula.sh "${{ needs.resolve.outputs.version }}" assets
+      - name: Commit the bumped formula to the default branch
+        env:
+          TAG: ${{ needs.resolve.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- Formula/thoryn.rb; then
+            echo "Formula/thoryn.rb already up to date — nothing to commit."
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add Formula/thoryn.rb
+            git commit -m "ci(release): SSO-2936 bump Homebrew formula to ${TAG}"
+            git push origin "HEAD:${{ github.event.repository.default_branch }}"
+          fi
+      - name: Create the GitHub Release and upload assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" \
+            assets/thoryn.jar \
+            assets/thoryn-darwin-arm64 \
+            assets/thoryn-darwin-amd64 \
+            assets/thoryn-linux-amd64 \
+            assets/thoryn-linux-arm64 \
+            assets/thoryn-windows-amd64.exe \
+            --repo "${{ github.repository }}" \
+            --title "thoryn CLI $TAG" \
+            --notes "The \`thoryn\` customer-plane CLI.
+
+          Native binaries (per OS/arch) and the \`thoryn.jar\` fat jar (run with \`java -jar thoryn.jar\`) are attached below.
+
+          Homebrew:
+
+              brew tap thoryn-io/thoryn-cli
+              brew install thoryn"
