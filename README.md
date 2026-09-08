@@ -8,9 +8,11 @@ Built with picocli + GraalVM native image per
 ADR 2026-04-25-customer-plane-product-api § 4 / § 8 / and RFC 8252 § 7.3 +
 RFC 7636 + RFC 8628.
 
-> **Authoritative docs live in Antora**: see `docs/modules/ROOT/pages/cli/`
-> for the user-facing pages — this README is the developer-facing entry
-> point.
+> **Standalone repo (SSO-2935).** This CLI lives in its own repository
+> (`thoryn-io/thoryn-cli`), carved out of the `oathy` monorepo with its git
+> history preserved. It builds on its own — no oathy checkout required. The
+> user-facing product docs are published from oathy's `docs/` to
+> thoryn.org/docs; this README is the developer-facing entry point.
 
 ## Command tree
 
@@ -271,23 +273,28 @@ planned follow-up (it needs privileged provisioning credentials).
 
 ## Build
 
+Requires a JDK 21+ on `PATH`. The Maven wrapper (`./mvnw`) pins Maven, so no
+system Maven install is needed.
+
 ```bash
 # Compile + tests
-./mvnw -pl tools/cli test
+./mvnw test
 
 # Shaded fat jar (run via java -jar)
-./mvnw -pl tools/cli package
-java -jar tools/cli/target/thoryn.jar login --status
+./mvnw -DskipTests package
+java -jar target/thoryn.jar login --status
 
-# GraalVM native image (SSO-733; per-OS/arch matrix on CI)
-./mvnw -pl tools/cli -Pnative -DskipTests package
-./tools/cli/target/thoryn workspace list --hub https://hub.stg.thoryn.org
+# GraalVM native image (SSO-733; per-OS/arch matrix on CI).
+# Requires GRAALVM_HOME (or JAVA_HOME) to point at a GraalVM distribution
+# with `native-image` installed.
+./mvnw -Pnative -DskipTests package
+./target/thoryn workspace list --hub https://hub.stg.thoryn.org
 ```
 
 ## Module layout
 
 ```
-tools/cli/
+thoryn-cli/
 ├── pom.xml
 ├── README.md                                                # this file
 └── src/
