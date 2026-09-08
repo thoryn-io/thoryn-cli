@@ -291,7 +291,35 @@ internal class RecipeInterpreter(
      * `{{<step id>.providerType}}` / `{{<step id>.configVersion}}` / `{{<step id>.enabled}}`.
      */
     private fun configureEmailProvider(with: Map<String, Any?>): Map<String, String> {
-        val resp = retryUntilTenantTrusted { tenantClient().putEmailProvider(with) }
+        // SSO-2927 — OPTIONAL step. With no SMTP host supplied (the shipped recipe's empty default),
+        // configuring a BYO-SMTP transport would be wrong for a real customer, so SKIP the PUT entirely
+        // and leave the platform sender unchanged. The example-e2e passes real `--set smtp*` values to
+        // point the freshly-provisioned workspace at a sink using the live provisioning token.
+        val host = with["smtpHost"]?.toString()?.trim().orEmpty()
+        if (host.isBlank()) {
+            ctx.info("email provider: no SMTP host supplied — leaving the platform sender unchanged (no BYO-SMTP)")
+            return mapOf("configured" to "false")
+        }
+
+        // Build a TYPED merge-upsert body: recipe params arrive as strings (from {{…}} substitution),
+        // but product-api's PutEmailProviderRequest wants a numeric `smtpPort` and boolean `enabled` /
+        // `allowInsecureTransport`. Coerce those; forward the write-only `smtpPassword` verbatim (NEVER
+        // logged or receipted). Only non-blank fields are sent (merge-upsert keeps stored values).
+        val body = linkedMapOf<String, Any?>()
+        body["smtpHost"] = host
+        with["providerType"].nonBlankString()?.let { body["providerType"] = it }
+        with["smtpPort"]?.let { coerceInt(it)?.let { p -> body["smtpPort"] = p } }
+        with["smtpUsername"].nonBlankString()?.let { body["smtpUsername"] = it }
+        // Write-only credential — passed through to the PUT, never trimmed, never logged/receipted.
+        (with["smtpPassword"]?.toString())?.takeIf { it.isNotEmpty() }?.let { body["smtpPassword"] = it }
+        with["transportSecurity"].nonBlankString()?.let { body["transportSecurity"] = it }
+        with["allowInsecureTransport"]?.let { body["allowInsecureTransport"] = coerceBool(it) }
+        with["fromAddress"].nonBlankString()?.let { body["fromAddress"] = it }
+        with["fromName"].nonBlankString()?.let { body["fromName"] = it }
+        with["replyTo"].nonBlankString()?.let { body["replyTo"] = it }
+        with["enabled"]?.let { body["enabled"] = coerceBool(it) }
+
+        val resp = retryUntilTenantTrusted { tenantClient().putEmailProvider(body) }
         val providerType = resp["providerType"]?.takeIf { !it.isNull }?.asString() ?: "email-provider"
         val configVersion = resp["configVersion"]?.takeIf { !it.isNull }?.asString()
         val enabled = resp["enabled"]?.takeIf { !it.isNull }?.asString()
@@ -312,6 +340,21 @@ internal class RecipeInterpreter(
             configVersion?.let { put("configVersion", it) }
             enabled?.let { put("enabled", it) }
         }
+    }
+
+    /** A `with` value coerced to a non-blank trimmed String, or null (skip the field). */
+    private fun Any?.nonBlankString(): String? = this?.toString()?.trim()?.takeIf { it.isNotEmpty() }
+
+    /** Coerce a `with` value (a real JSON boolean or the string "true"/"false") to Boolean. */
+    private fun coerceBool(v: Any?): Boolean = when (v) {
+        is Boolean -> v
+        else -> v?.toString()?.trim().equals("true", ignoreCase = true)
+    }
+
+    /** Coerce a `with` value (a real JSON number or a numeric string) to Int, or null if not numeric. */
+    private fun coerceInt(v: Any?): Int? = when (v) {
+        is Number -> v.toInt()
+        else -> v?.toString()?.trim()?.toIntOrNull()
     }
 
     private fun createFederation(with: Map<String, Any?>): Map<String, String> {

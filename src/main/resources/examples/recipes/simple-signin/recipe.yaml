@@ -24,6 +24,34 @@ params:
   - name: displayName
     prompt: "Workspace display name"
     default: "Sign-in Example"
+  # SSO-2927 — OPTIONAL bring-your-own-SMTP params. ALL default to empty (except transport/insecure),
+  # so a real customer run configures NO BYO-SMTP and the platform sender is left unchanged. The
+  # example-e2e passes real values via `--set smtp*` to point the fresh workspace at a sink using the
+  # live provisioning token (the standalone `workspace email-provider` command can't reach a
+  # provisioned workspace in CI — WIF can't re-auth to its issuer).
+  - name: smtpHost
+    prompt: "BYO-SMTP host (empty ⇒ keep the platform sender; no BYO-SMTP is configured)"
+    default: ""
+  - name: smtpPort
+    prompt: "BYO-SMTP port"
+    default: ""
+  - name: smtpUsername
+    prompt: "BYO-SMTP username"
+    default: ""
+  - name: smtpPassword
+    prompt: "BYO-SMTP password"
+    default: ""
+    # Write-only credential — never echoed to the console nor written to the receipt.
+    secret: true
+  - name: smtpTransport
+    prompt: "BYO-SMTP transport security (none | starttls | tls)"
+    default: "starttls"
+  - name: smtpAllowInsecure
+    prompt: "Acknowledge plaintext transport (true only with transport=none)"
+    default: "false"
+  - name: smtpFromAddress
+    prompt: "BYO-SMTP from-address"
+    default: ""
 
 steps:
   - id: workspace
@@ -68,6 +96,23 @@ steps:
       givenName: "Demo"
       familyName: "User"
       emailVerified: true
+
+  - id: email
+    action: tenant.configureEmailProvider
+    description: >-
+      OPTIONAL (SSO-2927) — point the workspace's bring-your-own SMTP transport at a sink. NO-OP for a
+      real customer run: with an empty smtpHost the PUT is skipped and the platform sender is left
+      unchanged. The example-e2e supplies real `--set smtp*` values so it can capture the sign-in
+      email from the freshly-provisioned workspace using the live provisioning token.
+    with:
+      smtpHost: "{{smtpHost}}"
+      smtpPort: "{{smtpPort}}"
+      smtpUsername: "{{smtpUsername}}"
+      smtpPassword: "{{smtpPassword}}"
+      transportSecurity: "{{smtpTransport}}"
+      allowInsecureTransport: "{{smtpAllowInsecure}}"
+      fromAddress: "{{smtpFromAddress}}"
+      enabled: "true"
 
 verify:
   - assert: applications.get
