@@ -116,8 +116,14 @@ class EmailProviderCommand : Callable<Int> {
         @Option(names = ["--clear-password"], description = ["Clear the stored SMTP password (sends a blank value)."])
         var clearPassword: Boolean = false
 
-        @Option(names = ["--transport-security"], description = ["Transport security token, e.g. starttls, tls, none."])
+        @Option(names = ["--transport-security"], description = ["Transport security token: starttls (default), ssl, or none."])
         var transportSecurity: String? = null
+
+        @Option(
+            names = ["--allow-insecure"],
+            description = ["Acknowledge plaintext SMTP. REQUIRED together with --transport-security none, which sends mail without transport security."],
+        )
+        var allowInsecure: Boolean = false
 
         @Option(names = ["--from-address"], description = ["From: address for outbound mail."])
         var fromAddress: String? = null
@@ -136,6 +142,16 @@ class EmailProviderCommand : Callable<Int> {
 
         override fun call(): Int {
             val format = CommandSupport.parseFormat(outputRaw) ?: return CommandSupport.EXIT_USAGE
+
+            // SSO-2921: plaintext SMTP (--transport-security none) is opt-in. Fail before any
+            // network call unless the operator explicitly acknowledges with --allow-insecure.
+            if (transportSecurity?.trim()?.equals("none", ignoreCase = true) == true && !allowInsecure) {
+                System.err.println(
+                    "Error: --transport-security none sends mail in plaintext. " +
+                        "Re-run with --allow-insecure to acknowledge, or choose starttls / ssl.",
+                )
+                return CommandSupport.EXIT_USAGE
+            }
 
             // Resolve the write-only SMTP password without it ever appearing in argv.
             val passwordSources = listOf(promptPassword, smtpPasswordFile != null, clearPassword).count { it }
@@ -166,6 +182,9 @@ class EmailProviderCommand : Callable<Int> {
             smtpUsername?.let { body["smtpUsername"] = it }
             smtpPassword?.let { body["smtpPassword"] = it }
             transportSecurity?.let { body["transportSecurity"] = it }
+            // Only send the acknowledgement when the operator asked for it (merge-upsert;
+            // omitted ⇒ identity keeps the stored acknowledgement).
+            if (allowInsecure) body["allowInsecureTransport"] = true
             fromAddress?.let { body["fromAddress"] = it }
             fromName?.let { body["fromName"] = it }
             replyTo?.let { body["replyTo"] = it }
@@ -231,6 +250,7 @@ class EmailProviderCommand : Callable<Int> {
             "smtpUsername" to node["smtpUsername"]?.asString(),
             "hasPassword" to node["hasPassword"]?.asString(),
             "transportSecurity" to node["transportSecurity"]?.asString(),
+            "insecureTransportAcknowledged" to node["insecureTransportAcknowledged"]?.asString(),
             "fromAddress" to node["fromAddress"]?.asString(),
             "fromName" to node["fromName"]?.asString(),
             "replyTo" to node["replyTo"]?.asString(),

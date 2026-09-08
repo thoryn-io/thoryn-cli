@@ -73,6 +73,41 @@ class EmailProviderCommandTest : CommandTestBase() {
     }
 
     @Test
+    fun `set with transport-security none requires --allow-insecure and errors before any call`() {
+        val (exit, _, err) = runCli(
+            "workspace", "email-provider", "set",
+            "--transport-security", "none",
+            "--enabled", "false",
+            "--gateway", baseUrl(),
+        )
+
+        assertThat(exit).isEqualTo(CommandSupport.EXIT_USAGE)
+        assertThat(err).contains("--allow-insecure")
+        // The guard fires before the network call — nothing was sent.
+        assertThat(server.requestCount).isEqualTo(0)
+    }
+
+    @Test
+    fun `set with transport-security none and --allow-insecure PUTs the acknowledgement`() {
+        server.enqueue(jsonResponse(200, readView))
+
+        val (exit, _, _) = runCli(
+            "workspace", "email-provider", "set",
+            "--transport-security", "none",
+            "--allow-insecure",
+            "--enabled", "false",
+            "--gateway", baseUrl(),
+        )
+
+        assertThat(exit).isEqualTo(0)
+        val req = server.takeRequest()
+        assertThat(req.method).isEqualTo("PUT")
+        val body = req.body.readUtf8()
+        assertThat(body).contains("\"transportSecurity\":\"none\"")
+        assertThat(body).contains("\"allowInsecureTransport\":true")
+    }
+
+    @Test
     fun `set rejects more than one password source`() {
         val pwFile = tempHome.resolve("smtp-pw.txt").toFile()
         pwFile.writeText("x\n")
