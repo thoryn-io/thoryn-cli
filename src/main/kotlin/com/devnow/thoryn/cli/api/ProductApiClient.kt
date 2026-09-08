@@ -165,6 +165,16 @@ class ProductApiClient(
         put("/api/v1/email-provider", body)
 
     /**
+     * `POST /api/v1/email-provider/verify` (SSO-2923) — dial the tenant's configured BYO-SMTP
+     * transport and return `{success, reason?, outcome}`. [to] (optional) sends a real test
+     * message to that address through the tenant's own SMTP server; omitted ⇒ a connect-only
+     * probe. A reachable-but-failed check is a `200` with `success=false` (the caller inspects
+     * the body); only transport/validation errors surface as [ProductApiException].
+     */
+    fun verifyEmailProvider(to: String? = null): JsonNode =
+        post("/api/v1/email-provider/verify", buildMap { to?.let { put("to", it) } })
+
+    /**
      * `DELETE /api/v1/email-provider` — reset to the platform sender (204 No Content);
      * surfaces non-2xx as [ProductApiException]. [confirmSlug] (SSO-2413) — a
      * production-plane reset is gated by product-api's `ProductionConfirmationInterceptor`
