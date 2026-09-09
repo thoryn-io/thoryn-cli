@@ -12,12 +12,28 @@
     -->
     <groupId>io.thoryn</groupId>
     <artifactId>thoryn-cli</artifactId>
-    <version>0.0.1-SNAPSHOT</version>
+    <!--
+        CI-friendly version (SSO-2953): the project version is the ${revision}
+        property below. Local/dev builds inherit its 0.0.1-SNAPSHOT default; the
+        tag-driven release workflow injects the real release version with
+        `-Drevision=<version>` so the built binary's version flag reflects the
+        release, not the SNAPSHOT default. This artifact is only ever built as
+        the shaded application jar (never install/deploy'd or consumed as a
+        Maven dependency), so no flatten-maven-plugin is needed: Maven resolves
+        ${revision} into project.version at build time, which is all the version
+        stamping (manifest + the filtered version.properties resource) relies on.
+    -->
+    <version>${revision}</version>
     <name>thoryn-cli</name>
     <description>thoryn — Thoryn customer-plane CLI (SSO-731). Authorization Code + PKCE with loopback redirect (RFC 8252 §7.3); native-image build under SSO-733, OS-package distribution under SSO-734.</description>
 
     <properties>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <!--
+            CI-friendly revision (SSO-2953). Default = local/dev SNAPSHOT; the
+            release workflow overrides it with `-Drevision=<version>`.
+        -->
+        <revision>0.0.1-SNAPSHOT</revision>
         <!-- Inlined from oathy root pom.xml / bom/pom.xml (extraction commit). -->
         <java.version>21</java.version>
         <maven.compiler.release>21</maven.compiler.release>
@@ -189,6 +205,22 @@
         <!-- Kotlin source layout, inlined from the oathy root pom.xml. -->
         <sourceDirectory>src/main/kotlin</sourceDirectory>
         <testSourceDirectory>src/test/kotlin</testSourceDirectory>
+        <!--
+            Resources (SSO-2953). The main resource tree stays UN-filtered (it
+            holds JSON schemas + native-image config that must be copied
+            verbatim). A separate, filtered tree holds only version.properties,
+            where Maven substitutes ${project.version} so the CLI's
+            IVersionProvider can read the build-stamped version at runtime.
+        -->
+        <resources>
+            <resource>
+                <directory>src/main/resources</directory>
+            </resource>
+            <resource>
+                <directory>src/main/resources-filtered</directory>
+                <filtering>true</filtering>
+            </resource>
+        </resources>
         <plugins>
             <!-- Kotlin compiler, inlined from the oathy root pom.xml pluginManagement.
                  The oathy build additionally wired the `spring` compiler plugin (allopen)

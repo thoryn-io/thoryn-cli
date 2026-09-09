@@ -13,11 +13,14 @@ import java.io.PrintStream
 class ThorynMainTest {
 
     @Test
-    fun `version flag prints the version and exits zero`() {
+    fun `version flag prints the build-stamped version and exits zero`() {
         val (exitCode, out, _) = run("--version")
         assertThat(exitCode).isEqualTo(0)
-        assertThat(out).contains("thoryn")
-        assertThat(out).contains("0.0.1-SNAPSHOT")
+        // SSO-2953 — the flag now reflects the build-stamped version (the same
+        // value VersionProvider reads), not a hardcoded literal. Assert on the
+        // provider's output so the test holds for any injected -Drevision.
+        assertThat(out.trim()).isEqualTo(VersionProvider.render(VersionProvider.readVersion()))
+        assertThat(out).startsWith("thoryn ")
     }
 
     @Test
