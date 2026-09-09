@@ -27,7 +27,10 @@ import kotlin.system.exitProcess
 @Command(
     name = "thoryn",
     description = ["Thoryn customer-plane CLI."],
-    version = ["thoryn 0.0.1-SNAPSHOT"],
+    // SSO-2953: version is build-stamped via VersionProvider (reads the filtered
+    // version.properties resource), not a hardcoded literal — so a release binary
+    // reports its release version instead of 0.0.1-SNAPSHOT.
+    versionProvider = VersionProvider::class,
     mixinStandardHelpOptions = true,
     subcommands = [
         LoginCommand::class,

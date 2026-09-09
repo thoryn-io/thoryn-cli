@@ -125,10 +125,12 @@ jobs:
           set -euo pipefail
           # arm64 GraalVM does not support -march=compatibility; the pom activates
           # the -march flag only when -Dnative-march=compatibility is passed.
+          # -Drevision stamps the release version into the binary (SSO-2953) so
+          # `thoryn --version` reports the release, not the 0.0.1-SNAPSHOT default.
           if [ "${{ matrix.march }}" = "compatibility" ]; then
-            ./mvnw -q -Pnative -Dnative-march=compatibility -DskipTests package
+            ./mvnw -q -Pnative -Dnative-march=compatibility -Drevision="${{ needs.resolve.outputs.version }}" -DskipTests package
           else
-            ./mvnw -q -Pnative -DskipTests package
+            ./mvnw -q -Pnative -Drevision="${{ needs.resolve.outputs.version }}" -DskipTests package
           fi
       - name: Stage the binary under its release-asset name
         shell: bash
@@ -160,7 +162,9 @@ jobs:
           java-version: "21"
           cache: maven
       - name: Build the thoryn CLI fat jar
-        run: ./mvnw -q -DskipTests package
+        # -Drevision stamps the release version into the jar (SSO-2953) so
+        # `java -jar thoryn.jar --version` reports the release version.
+        run: ./mvnw -q -Drevision="${{ needs.resolve.outputs.version }}" -DskipTests package
       - uses: actions/upload-artifact@v4
         with:
           name: thoryn.jar

@@ -24,6 +24,10 @@
       {
         "pattern": "^provision/ci-identity\\.json$",
         "comment": "SSO-2952 — the declarative ci-identity machine-client spec read at runtime by `thoryn provision ci-identity` (MachineClientSpec.load). native-image strips un-referenced resources, so list it explicitly."
+      },
+      {
+        "pattern": "^version\\.properties$",
+        "comment": "SSO-2953 — the build-stamped version resource read at runtime by VersionProvider to answer `thoryn --version`. native-image strips un-referenced resources, so list it explicitly or the binary reports 'unknown'."
       }
     ]
   }
