@@ -49,6 +49,7 @@ the stable asset name the `thoryn-examples` conformance CI consumes.
 ```
 thoryn login                                 # Auth code + PKCE (loopback) or --device-code
 thoryn login --client-credentials [--client-id <id>] # SSO-1553/2941 — non-interactive API key (CI); THORYN_API_KEY=<id>:<secret>, auto re-mints on expiry
+thoryn login --connection <file>             # SSO-2948 — sign in from a declarative connection contract (connection.schema.json)
 thoryn login --status
 thoryn logout
 
@@ -102,7 +103,7 @@ thoryn examples receipt  <name>              # SSO-2875 — show the receipt set
 thoryn examples verify   <name>              # SSO-2875 — re-check the provisioned config still matches (+ attestation signature, SSO-2878)
 thoryn examples catalog  [--remote] [--tag]  # SSO-2874 — list recipes (bundled, or --remote from the signed public release)
 thoryn examples update   [--tag]             # SSO-2874 — fetch + verify (Ed25519) + cache the public recipe catalog
-thoryn examples apply    <name> [--set k=v]… [--environment <slug>] [--yes]   # SSO-2876 — guided: prompt params + env, dry-run, confirm, provision
+thoryn examples apply    <name> [--set k=v]… [--environment <slug>] [--secret-file <path>] [--yes]   # SSO-2876/2950 — guided provision; --secret-file sinks a clients.createMachine secret
 thoryn examples share    <name> [--output <file>]   # SSO-2876 — export the secret-free receipt (notes if platform-signed)
 ```
 
@@ -246,6 +247,147 @@ the operator re-runs `thoryn login --client-credentials`.
 
 Full user docs: `docs/modules/ROOT/pages/cli/non-interactive-automation.adoc`.
 
+## Connection contract — sign-in as code (SSO-2948)
+
+A **connection contract** is your CLI's sign-in configuration expressed as a
+schema-backed file, so *how* the CLI binds to a workspace and a machine identity
+is versioned data — not flags typed by hand or scattered across CI bash. It is a
+first-class, general end-user feature (the CLI's own CI merely dogfoods it); the
+design is fixed in
+[ADR 2026-09-09-thoryn-cli-as-code-ci-connection-contract](https://github.com/thoryn-io/oauthy/blob/main/adrs/2026-09-09-thoryn-cli-as-code-ci-connection-contract.md)
+(epic SSO-2947).
+
+You point `thoryn login` at the file:
+
+```bash
+thoryn login --connection .thoryn/connection.json
+```
+
+The file is validated against the bundled `connection.schema.json`
+(`apiVersion: thoryn.io/connection/v1`). Its shape:
+
+```jsonc
+// .thoryn/connection.json
+{
+  "apiVersion": "thoryn.io/connection/v1",
+  "workspace": {
+    "slug": "thoryn",             // derives the per-tenant issuer https://<slug>.hub.<env>
+    "hubBaseUrlEnv": "THORYN_HUB" // NAME of the env var holding the hub base URL (default THORYN_HUB)
+  },
+  "auth": {
+    "method": "client_credentials",             // the only connection method today
+    "clientId": "thoryn-cli-ci-…",              // PUBLIC — a client id is not a secret; safe to commit
+    "secretEnv": "THORYN_CLI_CI_CLIENT_SECRET", // NAME of the env var carrying the secret, never the value
+    "scopes": [                                  // the EXACT scope set requested — ceiling AND floor
+      "tenant:applications.write", "tenant:applications.read"
+    ]
+  }
+}
+```
+
+What `login --connection` does (all in the CLI — the derivation moved out of any
+CI bash and into `ThorynConfig.tenantIssuer`):
+
+- **Validates** the file against `connection.schema.json`; a malformed file is
+  refused with an aggregated, human-readable list of violations.
+- **Derives the per-tenant issuer** `https://<slug>.hub.<env>` and the matching
+  gateway from `workspace.slug` + the hub base. The hub base comes from the env
+  var *named* by `workspace.hubBaseUrlEnv` (default `THORYN_HUB`); when that var
+  is unset the CLI's baked-in default hub is used.
+- **Reads the secret** from the env var *named* by `auth.secretEnv` and **fails
+  closed** if it is unset or empty — the secret is never in the file, only the
+  name of the variable that carries it (a GitHub secret in CI, a locally-exported
+  var for a developer).
+- **Requests exactly `auth.scopes`.** The hub grants only the scopes requested,
+  so the contract's scope list is both the ceiling and the floor — there is no
+  `ScopeRegistry` wildcard expansion on this path.
+- **Stamps the session** (SSO-2827) so later commands need no `--issuer` /
+  `--gateway` flags.
+
+`--connection` is **mutually exclusive** with `--issuer`, `--gateway`,
+`--scope`, `--client-id`, `--client-credentials`, `--device-code`, and
+`--workload-identity` — the contract is the single source of the binding, and
+mixing it with a manual override is rejected with a usage error.
+
+Because the connection is just a file passed per sign-in, you can keep **as many
+connection files as you have use cases** — e.g. `prod.connection.json`,
+`sandbox.connection.json`, one per workspace or environment — and select one at
+login. (This is the file-level substrate under the future named-profile
+convenience tracked in the CLI-maturity program.)
+
+### One-time founder bootstrap of the machine client
+
+The machine client the connection binds to is created through the customer
+plane — the same product workflow a real customer follows, no DB seed and no
+Workload Identity Federation. A **founder** runs the bundled bootstrap recipe
+**once**, signed into the target workspace via browser OIDC:
+
+```bash
+# 1) Sign in interactively as a founder of the target (e.g. `thoryn`) workspace.
+thoryn login --issuer https://hub.stg.thoryn.org
+
+# 2) Mint the confidential client_credentials machine client (customer plane only).
+#    The secret is written to an owner-only file via the SecretIo channel, never printed to a log.
+thoryn examples apply provision-ci-identity --secret-file ci.secret
+```
+
+`provision-ci-identity` runs a single allowlisted `clients.createMachine`
+action, which maps to the existing `POST /api/v1/applications` (confidential,
+`grant_types: [client_credentials]`) — the same call `thoryn clients create`
+makes. It grants the broad machine scope set the CI identity needs
+(`tenant:applications.write/read`, `tenant:federation.write/read`,
+`tenant:users.write/read`, `tenant:env.write/read`).
+
+The minted secret exits **only** through the `SecretIo` channel (`--secret-file`,
+or a guarded/interactive stdout — refused on a non-interactive pipe unless
+`--force-stdout`); the run's **receipt records only the non-secret shape**
+(`clientId` + granted scopes), never the secret. `clients.createMachine` is the
+*only* allowlisted recipe action permitted to surface a secret.
+
+Then wire it up:
+
+- Paste the printed `clientId` into `.thoryn/connection.json` (commit it — a
+  client id is not a secret).
+- Paste the secret from `ci.secret` into the `THORYN_CLI_CI_CLIENT_SECRET`
+  GitHub secret (the env var named by the contract's `auth.secretEnv`).
+- `shred ci.secret`.
+
+There is deliberately **no teardown** — the machine client is a standing
+credential; rotate it rather than delete-and-recreate it (see below).
+
+### Confinement — "only make changes in scope of this client id"
+
+Three independent, server-side layers bound what the connection's identity can do:
+
+1. **Tenant isolation.** The client lives in one workspace; its `tnt` claim
+   confines every call to that workspace, and cross-tenant access returns
+   **404** (the platform privacy invariant — never 403). It cannot reach another
+   workspace.
+2. **Scope ceiling.** The hub mints only the scopes the connection requests, and
+   the connection's `scopes` must be a **subset** of the client's granted set
+   (`connection.scopes ⊆ granted` — the invariant `Connection.scopesWithinGrant`
+   encodes and SSO-2951's repo test asserts). The granted set is itself bounded
+   by the founder's own active scopes at creation time (the transitive-grant
+   model — you can only delegate what you hold).
+3. **Action allowlist.** Any recipe the identity runs stays confined to the
+   closed action allowlist — no DB seed, no demo endpoint, no unsupported
+   shortcut.
+
+### Rotation and the dedicated-CI-workspace escape hatch
+
+- **Rotate, don't recreate.** Rotate the machine secret with
+  `thoryn clients rotate-secret <clientId>` (optionally `--secret-file <path>`).
+  The new secret is shown once and the previous one keeps validating for a **24h
+  graceful overlap**, so CI can pick up the new value before the old expires.
+  Update the `THORYN_CLI_CI_CLIENT_SECRET` GitHub secret within that window; the
+  committed `.thoryn/connection.json` is unchanged (it names the env var, not the
+  value).
+- **Escape hatch: a dedicated CI workspace.** The bootstrap binds to the primary
+  workspace by default, which is a broad-scoped standing credential there. If
+  that standing privilege is uncomfortable, mint the machine client in — and
+  point `workspace.slug` at — a dedicated `thoryn-cli-ci` workspace instead,
+  isolating CI's blast radius entirely.
+
 ## Token storage
 
 Tokens are stored in the OS keychain per ADR 2026-04-25 §4 — macOS
@@ -327,109 +469,77 @@ name-confirmation guard); those artifacts remain in your account until that
 lands. A `--headless` mode that drives register + sign-in programmatically is a
 planned follow-up (it needs privileged provisioning credentials).
 
-## Provisioning GitHub Action (SSO-2938 → SSO-2944)
+## Provisioning GitHub Action (SSO-2938 → SSO-2947)
 
 `.github/actions/provision` is a reusable **composite Action** that configures the
 product as a real customer against **shared staging**, using ONLY the product APIs
 via this CLI and a signed recipe (no DB seeding, no demo endpoints — the
 product-boundary rule applied to CI).
 
-**The pivot (SSO-2944).** CI authenticates with a **customer-plane
-`client_credentials` API key the operator mints themselves** — not a seeded platform
-client. Such a key is **tenant-scoped** (bound to one workspace via its `tnt` claim)
-and **cannot create workspaces** (workspace-create needs a machine scope a tenant
-admin can't delegate — the SSO-2943 gap). So the Action no longer creates a fresh
-workspace per run; it provisions an **ephemeral OAuth client inside a STANDING
-workspace** the operator owns, and deletes only that client on exit. It:
+Authentication in this Action is **as code, owned by the CLI** — it is the first
+consumer of the [connection contract](#connection-contract--sign-in-as-code-sso-2948)
+above, dogfooding the same feature a real end-user uses. The binding — which
+workspace, which client, which scopes — lives in the committed
+`.thoryn/connection.json`, not in workflow inputs or bash. The Action:
 
 1. **builds the CLI from source** (`./mvnw -q -DskipTests package` → `target/thoryn.jar`;
    switches to a `gh release download --pattern thoryn.jar` once a `cli-v*` release
    exists, SSO-2936),
-2. **signs in non-interactively** with the tenant-scoped client-credentials API key at
-   the **per-tenant issuer** `https://<slug>.hub.<env>` (derived from the hub base +
-   `workspace-slug`; the shared `api.<env>` gateway is set explicitly), credential from
-   `THORYN_API_KEY=<client-id>:<client-secret>` (never echoed, never an argv flag),
-3. **provisions** with the workspace-less recipe
-   `thoryn examples apply ci-signin --set workspaceSlug=<slug> --yes` — an ephemeral
-   public loopback OAuth client registered UNDER the standing workspace with the
-   caller's own bearer (no `hub.createWorkspace`, no token-exchange),
-4. **exposes** `workspace-slug` / `client-id` / `issuer` as Action outputs (read from
-   the run's receipt), and
-5. **deletes the ephemeral client on exit** in an `if: always()` step
-   (`thoryn examples teardown ci-signin` → `applications.delete` only; the standing
-   workspace and standing user are never touched), so a failed run leaks nothing.
+2. **signs in from the connection contract** —
+   `thoryn login --connection .thoryn/connection.json` — which derives the
+   per-tenant issuer `https://<slug>.hub.<env>` and the gateway from the contract's
+   `workspace.slug`, reads the secret from the GitHub secret named by the contract's
+   `auth.secretEnv` (`THORYN_CLI_CI_CLIENT_SECRET`), and requests exactly the
+   contract's scopes; then
+3. **provisions** with a signed recipe run against the bound identity's own bearer,
+   confined by tenant isolation, the scope ceiling, and the recipe action allowlist.
 
 The demo caller is `.github/workflows/provision-e2e.yml` (manual `workflow_dispatch`).
 
+> **Not yet on `main` (SSO-2951).** The committed `.thoryn/connection.json` and the
+> Action/`provision-e2e.yml` rewire from the earlier imperative bash sign-in
+> (`sed`-derived issuer + `THORYN_API_KEY=<id>:<secret>`) to
+> `thoryn login --connection` land under **SSO-2951**. The connection contract, the
+> `thoryn login --connection` verb, and the `provision-ci-identity` bootstrap
+> (`clients.createMachine` + `examples apply --secret-file`) documented here are all
+> already merged (SSO-2948, SSO-2950). This section describes the end-state flow; the
+> `.thoryn/connection.json` file does not exist on `main` until SSO-2951 commits it.
+
 ### CI provisioning setup (one-time, per environment)
 
-The Action assumes a **standing workspace**, a **standing test user**, and a
-**tenant-scoped API key** already exist. Create them once as a tenant admin (the
-commands below target staging; adjust the issuer for another environment):
+The Action assumes the CI's machine identity and its connection contract already
+exist. Set them up once:
 
-```bash
-# 0) Sign in interactively as a tenant admin (authorization-code + PKCE, opens a browser).
-thoryn login --issuer https://hub.stg.thoryn.org
+1. **Mint the machine client** — run the founder bootstrap recipe once, signed into
+   the target workspace via browser OIDC (see
+   [One-time founder bootstrap](#one-time-founder-bootstrap-of-the-machine-client) above):
 
-# 1) Create the STANDING workspace the CI runs will provision into (skip if it exists).
-thoryn workspace create --slug ci-standing --display-name "CI Standing Workspace"
+   ```bash
+   thoryn login --issuer https://hub.stg.thoryn.org           # interactive, as a founder
+   thoryn examples apply provision-ci-identity --secret-file ci.secret
+   ```
 
-# 2) Enter it, so the following resources are created UNDER that tenant.
-thoryn workspace switch ci-standing
+2. **Commit the connection contract** — put the printed `clientId` (public) into
+   `.thoryn/connection.json` with the workspace slug and the exact scope set the CI
+   needs (a subset of the client's granted scopes), and commit it.
 
-# 3) Mint the CUSTOMER-PLANE client_credentials API key, scoped to exactly what the
-#    recipe needs. The secret is written to a file (never printed to the CI log).
-#    NOTE (SSO-2943 friction): `clients create` REQUIRES --redirect-uri even for a
-#    machine (client_credentials) client that never redirects — pass a throwaway.
-thoryn clients create \
-  --display-name "CI provisioning key (ci-standing)" \
-  --client-type confidential \
-  --grant-type client_credentials \
-  --scope tenant:applications.write \
-  --scope tenant:applications.read \
-  --redirect-uri https://ci.invalid/unused \
-  --secret-file ci-key.secret
-# → prints the client-id; the secret is in ci-key.secret. Set the repo secret:
-#   THORYN_API_KEY = "<client-id>:<contents of ci-key.secret>"
-```
+3. **Set the GitHub secret** — paste the secret from `ci.secret` into the
+   `THORYN_CLI_CI_CLIENT_SECRET` Actions secret (the env var named by the contract's
+   `auth.secretEnv`), then `shred ci.secret`.
 
-**Standing test user** — there is no `thoryn users create` command yet (another
-SSO-2943 gap), so create the standing sign-in user through the product API with your
-tenant-admin bearer (or the console's Users screen). Against the standing tenant:
+That's the whole binding — customer plane only, no DB seeds, no Workload Identity
+Federation, no per-run `THORYN_API_KEY` plumbing. Rotate the credential by
+re-running the bootstrap or `thoryn clients rotate-secret` and updating the GitHub
+secret within the 24h overlap; the committed contract is unchanged.
 
-```bash
-# $ADMIN_BEARER = a tenant-admin access token for the STANDING tenant (carrying
-# tenant:users.write). Obtain it from your interactive session; it must have iss
-# https://ci-standing.hub.stg.thoryn.org (the standing tenant), i.e. minted after the
-# `workspace switch ci-standing` above.
-curl -sS -X POST https://api.stg.thoryn.org/api/v1/users \
-  -H "Authorization: Bearer $ADMIN_BEARER" \
-  -H "Content-Type: application/json" \
-  -H "X-Thoryn-Environment: production" \
-  -d '{"email":"[email protected]","password":"<strong-password>",
-       "givenName":"CI","familyName":"Tester","emailVerified":true}'
-```
+**Standing test user** — there is still no `thoryn users create` command, so a
+standing sign-in user (for sign-in examples) is created through the product API with
+a tenant-admin bearer or the console's Users screen. Tracked as an SSO-2943 gap.
 
-Then, in the thoryn-cli repo's **Actions secrets/vars**:
-
-- secret `THORYN_API_KEY` = `<client-id>:<client-secret>` from step 3,
-- (the standing workspace slug is passed as the workflow's `workspace-slug` input).
-
-**SSO-2943 gaps to close / validate live** (this story is CLI-only and does NOT touch
-oauthy):
-
-- Confirm the hub **issues a usable tenant-scoped token** for a customer-plane
-  `client_credentials` client registered in a non-default tenant, authenticating at
-  `https://<slug>.hub.<env>` — the whole design turns on this. If it is refused, the
-  fallback is a product-API-minted machine credential; record the gap on SSO-2943.
-- `thoryn clients create` requires `--redirect-uri` even for a `client_credentials`
-  client — a throwaway works, but it is friction worth removing.
-- There is no `thoryn users create`; the standing user is created via product-API
-  `POST /api/v1/users` (or the console) until a CLI verb exists.
-
-Live validation is **pending operator setup** — the standing workspace + key don't
-exist yet, so the flow is validated locally only (build, unit tests, recipe/YAML
-parse, `--help` of every invoked command).
+Live validation is **pending operator setup** — the machine client + connection
+contract are provisioned by a founder per environment, so the flow is validated
+locally otherwise (build, unit tests, connection/recipe/YAML schema parse, `--help`
+of every invoked command).
 
 ## Build
 
