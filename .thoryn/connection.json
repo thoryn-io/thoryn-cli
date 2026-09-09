@@ -15,8 +15,8 @@
       "tenant:federation.read",
       "tenant:users.write",
       "tenant:users.read",
-      "tenant:env.write",
-      "tenant:env.read"
+      "tenant:environments.write",
+      "tenant:environments.read"
     ]
   }
 }

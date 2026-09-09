@@ -298,80 +298,17 @@ class RecipeInterpreterTest : CommandTestBase() {
     }
 
     @Test
-    fun `clients createMachine mints a confidential client, routes the secret to SecretIo, and keeps it off the receipt`() {
-        // SSO-2950 — the machine-client bootstrap. A workspace-less recipe (no hub.createWorkspace), so
-        // the interpreter authenticates the create with the caller's own token (AT-test). The minted
-        // secret must reach ONLY the SecretIo sink — never the receipt, the step-output map, or a log.
+    fun `clients createMachine is no longer an example-recipe action`() {
+        // SSO-2952 — secret-bearing machine-client provisioning was relocated to `thoryn provision
+        // ci-identity` (see ProvisionCiIdentityTest). A recipe still naming the reverted action is
+        // rejected by the interpreter as an unsupported action — no network call is made.
         val ctx = context()
         val recipe = Recipe(
             JsonMapper.builder().build().readTree(
                 """
                 {
                   "apiVersion": "thoryn.io/examples/v1",
-                  "id": "provision-ci-identity-test",
-                  "version": "1.0.0",
-                  "summary": "mint a machine client",
-                  "steps": [
-                    { "id": "machineClient", "action": "clients.createMachine",
-                      "with": { "displayName": "CI", "clientType": "confidential",
-                                "grantTypes": ["client_credentials"],
-                                "scopes": ["tenant:applications.write", "tenant:env.read"] } }
-                  ]
-                }
-                """.trimIndent(),
-            ),
-        )
-
-        // 1) applications.create → the server mints a clientId + a one-shot clientSecret.
-        server.enqueue(jsonResponse(201, """{"clientId":"mc-1","clientSecret":"sek-ret-value","status":"active","scopes":["tenant:applications.write","tenant:env.read"]}"""))
-        // 2) best-effort platform attestation of the receipt.
-        server.enqueue(jsonResponse(200, """{"kid":"k","signature":"s","canonicalPayload":"e30","attestedAt":"2026-01-01T00:00:00Z"}"""))
-
-        // Capturing sink standing in for the --secret-file / SecretIo channel.
-        val captured = mutableListOf<Pair<String, String>>()
-        val sink = SecretSink { clientId, secret -> captured += clientId to secret; true }
-
-        val run = RecipeInterpreter(ctx, recipe, trustPropagationBudgetMs = 2_000, secretSink = sink).setup()
-
-        // (a) the clientId is recorded on the receipt (as the non-secret machineClient shape + scopes).
-        val ref = run.receipt.resources.firstOrNull { it.kind == "machineClient" }
-        assertThat(ref).isNotNull
-        assertThat(ref!!.id).isEqualTo("mc-1")
-        assertThat(ref.attributes["scopes"]).isEqualTo("tenant:applications.write,tenant:env.read")
-
-        // (b) the secret was routed to the SecretIo sink — exactly once, keyed by the clientId.
-        assertThat(captured).containsExactly("mc-1" to "sek-ret-value")
-
-        // (c) the secret is ABSENT from the receipt AND the step-output-derived state (serialise both).
-        val mapper = tools.jackson.module.kotlin.jacksonObjectMapper()
-        assertThat(mapper.writeValueAsString(run.receipt)).doesNotContain("sek-ret-value")
-        assertThat(mapper.writeValueAsString(run.state)).doesNotContain("sek-ret-value")
-        // The machineClient resource carries no secret-shaped attribute at all.
-        assertThat(ref.attributes.keys).doesNotContain("clientSecret", "secret", "client_secret")
-
-        // The create request carried the confidential + client_credentials machine shape and the scopes,
-        // authenticated with the caller's own token (no workspace was created).
-        val appReq = server.takeRequest()
-        assertThat(appReq.method).isEqualTo("POST")
-        assertThat(appReq.path).isEqualTo("/api/v1/applications")
-        assertThat(appReq.getHeader("Authorization")).isEqualTo("Bearer AT-test")
-        assertThat(appReq.body.readUtf8())
-            .contains("\"clientType\":\"confidential\"")
-            .contains("\"client_credentials\"")
-            .contains("tenant:applications.write")
-    }
-
-    @Test
-    fun `clients createMachine fails the run when the secret sink refuses the secret`() {
-        // SSO-2950 — if the secret cannot be delivered (e.g. no --secret-file on a non-interactive
-        // stdout), the run FAILS so the operator notices the credential was not surfaced.
-        val ctx = context()
-        val recipe = Recipe(
-            JsonMapper.builder().build().readTree(
-                """
-                {
-                  "apiVersion": "thoryn.io/examples/v1",
-                  "id": "provision-ci-identity-refuse",
+                  "id": "createmachine-gone",
                   "version": "1.0.0",
                   "summary": "mint a machine client",
                   "steps": [
@@ -382,46 +319,11 @@ class RecipeInterpreterTest : CommandTestBase() {
                 """.trimIndent(),
             ),
         )
-        server.enqueue(jsonResponse(201, """{"clientId":"mc-1","clientSecret":"sek-ret-value","status":"active"}"""))
-
-        val refusingSink = SecretSink { _, _ -> false }
         val ex = runCatching {
-            RecipeInterpreter(ctx, recipe, trustPropagationBudgetMs = 2_000, secretSink = refusingSink).setup()
+            RecipeInterpreter(ctx, recipe, trustPropagationBudgetMs = 2_000).setup()
         }.exceptionOrNull()
-
-        assertThat(ex).isInstanceOf(RecipeException::class.java)
-        assertThat(ex!!.message).contains("mc-1").contains("secret could not be delivered")
-        // The client WAS created (the secret is minted server-side before the sink runs).
-        assertThat(server.takeRequest().path).isEqualTo("/api/v1/applications")
-    }
-
-    @Test
-    fun `clients createMachine rejects a non-confidential client type before any network call`() {
-        // SSO-2950 — the ADR fixes the shape: a machine client is confidential + client_credentials.
-        // A hand-edited recipe asking for a public (secret-less) client is rejected structurally.
-        val ctx = context()
-        val recipe = Recipe(
-            JsonMapper.builder().build().readTree(
-                """
-                {
-                  "apiVersion": "thoryn.io/examples/v1",
-                  "id": "provision-ci-identity-bad",
-                  "version": "1.0.0",
-                  "summary": "mint a machine client",
-                  "steps": [
-                    { "id": "machineClient", "action": "clients.createMachine",
-                      "with": { "clientType": "public", "grantTypes": ["client_credentials"] } }
-                  ]
-                }
-                """.trimIndent(),
-            ),
-        )
-        val ex = runCatching {
-            RecipeInterpreter(ctx, recipe, trustPropagationBudgetMs = 2_000, secretSink = SecretSink { _, _ -> true }).setup()
-        }.exceptionOrNull()
-        assertThat(ex).isInstanceOf(RecipeException::class.java)
-        assertThat(ex!!.message).contains("confidential")
-        // No product-api call was made — the shape is rejected before any request.
+        assertThat(ex).isInstanceOf(RecipeUnsupportedActionException::class.java)
+        assertThat(ex!!.message).contains("clients.createMachine")
         assertThat(server.requestCount).isEqualTo(0)
     }
 

@@ -105,55 +105,25 @@ class RecipeSchemaConformanceTest {
     }
 
     @Test
-    fun `the bundled provision-ci-identity recipe conforms to the schema`() {
-        // SSO-2950 — the founder-run machine-client bootstrap is structurally conformant: its only step
-        // (clients.createMachine) is in the closed step allowlist, and it declares no workspace/teardown.
-        val recipe = yaml.readTree(readResource("/examples/recipes/provision-ci-identity/recipe.yaml"))
-        assertThat(violations(recipe)).isEmpty()
-        val actions = recipe["steps"].toList().map { it["action"].asString() }
-        assertThat(actions).containsExactly("clients.createMachine")
-        // No teardown — the machine credential is standing (rotate, don't delete-and-recreate).
-        assertThat(recipe["teardown"]).isNull()
-    }
-
-    @Test
-    fun `clients createMachine is a supported step action and a recipe using it conforms`() {
-        // SSO-2950 — the machine-client bootstrap action is in the closed STEP allowlist…
-        assertThat(allowlist("steps", "action")).contains("clients.createMachine")
-        // …and a recipe minting a confidential client_credentials machine client is structurally conformant.
-        val recipe = yaml.readTree(
-            """
-            apiVersion: thoryn.io/examples/v1
-            id: mint-machine
-            version: 1.0.0
-            summary: mint a machine client
-            steps:
-              - { id: mc, action: clients.createMachine, with: { clientType: confidential, grantTypes: ["client_credentials"], scopes: ["tenant:applications.write"] } }
-            """.trimIndent(),
-        )
-        assertThat(violations(recipe)).isEmpty()
-    }
-
-    @Test
-    fun `clients createMachine is NOT a verify assert or a teardown action`() {
-        // SSO-2950 — createMachine is a STEP-only action; it must not leak into the verify/teardown
-        // allowlists (a secret-bearing action has no read-only 'assert' or delete-by shape). A recipe
-        // that tries to use it as a verify assertion is rejected.
+    fun `clients createMachine is NOT an example-recipe step action`() {
+        // SSO-2952 — secret-bearing machine-client provisioning was relocated OFF the example-recipe
+        // surface into the dedicated `thoryn provision ci-identity` operator command, reverting the
+        // SSO-2950 allowlist widening. A recipe that tries to mint a machine client is now rejected —
+        // the closed allowlist keeps every recipe DATA producing a secret-free receipt.
+        assertThat(allowlist("steps", "action")).doesNotContain("clients.createMachine")
         assertThat(allowlist("verify", "assert")).doesNotContain("clients.createMachine")
         assertThat(allowlist("teardown", "action")).doesNotContain("clients.createMachine")
         val bad = yaml.readTree(
             """
             apiVersion: thoryn.io/examples/v1
-            id: rogue-verify
+            id: rogue-machine
             version: 1.0.0
-            summary: misuses createMachine as a verify assertion
+            summary: tries to mint a secret-bearing machine client from a recipe
             steps:
               - { id: mc, action: clients.createMachine, with: { clientType: confidential, grantTypes: ["client_credentials"] } }
-            verify:
-              - { assert: clients.createMachine, id: "{{mc.clientId}}" }
             """.trimIndent(),
         )
-        assertThat(violations(bad)).anyMatch { it.contains("clients.createMachine") }
+        assertThat(violations(bad)).anyMatch { it.contains("clients.createMachine") && it.contains("allowlist") }
     }
 
     @Test

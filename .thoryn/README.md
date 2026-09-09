@@ -20,9 +20,9 @@ customer plane, the same way a real customer would — no DB seed, no shortcut. 
 
 1. Sign in to the `thoryn` workspace interactively (browser OIDC):
    `thoryn login --issuer https://hub.stg.thoryn.org` then `thoryn workspace switch thoryn`.
-2. Mint the CI machine client via the bootstrap recipe (SSO-2950), which routes the secret through
-   the `SecretIo` channel (`--secret-file`, never stdout/argv/receipt):
-   `thoryn examples apply provision-ci-identity --secret-file ci.secret`.
+2. Mint the CI machine client via the dedicated operator command (SSO-2952), which routes the secret
+   through the `SecretIo` channel (`--secret-file`, never stdout/argv):
+   `thoryn provision ci-identity --secret-file ci.secret`.
 3. **Paste the printed `clientId`** into `auth.clientId` below — it currently ships the marker
    **`REPLACE_AFTER_BOOTSTRAP`** — and commit.
 4. **Set the GitHub Actions secret** `THORYN_CLI_CI_CLIENT_SECRET` (the name in `auth.secretEnv`) to
@@ -32,10 +32,11 @@ After that, every CI run just does `thoryn login --connection .thoryn/connection
 
 ## Why the scopes are what they are
 
-`auth.scopes` is the **machine set** (`applications` + `federation` + `users` + `env`, read+write).
-The hub grants a client-credentials token **only** the scopes requested, so this list is both the
-ceiling and the floor. It must stay a **subset** of what the `provision-ci-identity` recipe grants the
-client — `CiConnectionConfinementTest` asserts exactly that (`Connection.scopesWithinGrant`).
+`auth.scopes` is the **machine set** (`applications` + `federation` + `users` + `environments`,
+read+write). The hub grants a client-credentials token **only** the scopes requested, so this list is
+both the ceiling and the floor. It must stay a **subset** of what `thoryn provision ci-identity` grants
+the client (the declarative spec `src/main/resources/provision/ci-identity.json`) —
+`CiConnectionConfinementTest` asserts exactly that (`Connection.scopesWithinGrant`).
 
 ## Confinement
 

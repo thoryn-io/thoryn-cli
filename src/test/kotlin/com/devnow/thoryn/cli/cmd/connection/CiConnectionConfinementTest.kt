@@ -11,11 +11,13 @@ import java.io.File
  * (`2026-09-09-thoryn-cli-as-code-ci-connection-contract.md`): the CI credential can request only
  * scopes its machine client was actually granted, so `connection.scopes ⊆ the granted set`.
  *
- * **Dependency handling.** The granted set is defined by the `provision-ci-identity` bootstrap recipe
- * (SSO-2950), which is NOT on `main` yet. So [grantedMachineScopes] reads the recipe's granted scopes
- * from the bundled recipe resource **if present on the classpath**, and otherwise asserts against the
- * documented [EXPECTED_MACHINE_SCOPES] constant. The test therefore passes on THIS branch (recipe
- * absent) AND stays correct once SSO-2950 lands (recipe present ⇒ the real grant is used).
+ * **Source of the granted set.** The granted scope set is defined by the declarative `ci-identity`
+ * provisioning spec (SSO-2952, `/provision/ci-identity.json`) that `thoryn provision ci-identity` mints
+ * the CI machine client from. [grantedMachineScopes] reads that spec's `machineClient.scopes` from the
+ * bundled resource, falling back to the documented [EXPECTED_MACHINE_SCOPES] constant only if the
+ * resource is somehow absent — so the connection contract is asserted against the real grant the CLI
+ * ships with. (SSO-2952 also corrected the scope names `tenant:env.*` → `tenant:environments.*`, the
+ * authoritative catalog names.)
  */
 class CiConnectionConfinementTest {
 
@@ -36,7 +38,7 @@ class CiConnectionConfinementTest {
         val granted = grantedMachineScopes()
         assertThat(Connection.scopesWithinGrant(connection.scopes.toSet(), granted))
             .withFailMessage(
-                "connection scopes %s exceed the provision-ci-identity granted set %s — the CI credential " +
+                "connection scopes %s exceed the ci-identity machine-client granted set %s — the CI credential " +
                     "cannot request a scope its machine client was not granted (ADR scope-ceiling layer).",
                 connection.scopes,
                 granted,
@@ -45,18 +47,15 @@ class CiConnectionConfinementTest {
     }
 
     /**
-     * The granted scope set the `provision-ci-identity` recipe (SSO-2950) mints the CI machine client
-     * with. Read from the bundled recipe resource when present; otherwise fall back to the documented
-     * constant so this test is correct both before and after SSO-2950 merges.
+     * The granted scope set `thoryn provision ci-identity` (SSO-2952) mints the CI machine client with.
+     * Read from the bundled `/provision/ci-identity.json` spec's `machineClient.scopes`; fall back to
+     * the documented constant only if the resource is somehow absent on the classpath.
      */
     private fun grantedMachineScopes(): Set<String> {
-        val stream = javaClass.getResourceAsStream(RECIPE_RESOURCE)
-            // TODO(SSO-2951): tighten to read the recipe resource once SSO-2950 merges (drop the fallback).
+        val stream = javaClass.getResourceAsStream(SPEC_RESOURCE)
             ?: return EXPECTED_MACHINE_SCOPES
         val root = JsonMapper.builder().build().readTree(stream.readBytes())
-        val scopes = root["steps"]?.toList().orEmpty()
-            .filter { it["action"]?.asString() == CREATE_MACHINE_ACTION }
-            .flatMap { (it["with"]?.get("scopes"))?.toList().orEmpty() }
+        val scopes = (root["machineClient"]?.get("scopes"))?.toList().orEmpty()
             .map { it.asString() }
             .toSet()
         return scopes.ifEmpty { EXPECTED_MACHINE_SCOPES }
@@ -77,16 +76,14 @@ class CiConnectionConfinementTest {
     companion object {
         private const val CONNECTION_PATH = ".thoryn/connection.json"
 
-        /** Bundled resource of the SSO-2950 bootstrap recipe (absent on this branch — see the class doc). */
-        private const val RECIPE_RESOURCE = "/examples/recipes/provision-ci-identity/recipe.json"
-
-        /** The allowlisted secret-bearing action the bootstrap recipe uses (ADR §3). */
-        private const val CREATE_MACHINE_ACTION = "clients.createMachine"
+        /** Bundled resource of the SSO-2952 declarative ci-identity machine-client spec. */
+        private const val SPEC_RESOURCE = "/provision/ci-identity.json"
 
         /**
-         * The machine scope set `provision-ci-identity` grants the CI client, per ADR
-         * `2026-09-09-thoryn-cli-as-code-ci-connection-contract.md` §3. Used as the granted ceiling
-         * until the recipe resource is on the classpath (SSO-2950).
+         * The machine scope set `thoryn provision ci-identity` grants the CI client, per ADR
+         * `2026-09-09-thoryn-cli-as-code-ci-connection-contract.md` §3 (with SSO-2952's `env.*` →
+         * `environments.*` correction to the authoritative catalog names). Used as the granted ceiling
+         * only if the spec resource is somehow absent from the classpath.
          */
         private val EXPECTED_MACHINE_SCOPES = setOf(
             "tenant:applications.write",
@@ -95,8 +92,8 @@ class CiConnectionConfinementTest {
             "tenant:federation.read",
             "tenant:users.write",
             "tenant:users.read",
-            "tenant:env.write",
-            "tenant:env.read",
+            "tenant:environments.write",
+            "tenant:environments.read",
         )
     }
 }

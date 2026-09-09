@@ -27,12 +27,6 @@ class RecipeJsonDriftTest {
         assertJsonMatchesYaml("ci-signin")
     }
 
-    /** SSO-2950 — the founder-run `provision-ci-identity` bootstrap recipe follows the same drift guard. */
-    @Test
-    fun `provision-ci-identity recipe json matches recipe yaml`() {
-        assertJsonMatchesYaml("provision-ci-identity")
-    }
-
     private fun assertJsonMatchesYaml(id: String) {
         val yaml = YAMLMapper().readTree(resource("/examples/recipes/$id/recipe.yaml"))
         val json = JsonMapper.builder().build().readTree(resource("/examples/recipes/$id/recipe.json"))
