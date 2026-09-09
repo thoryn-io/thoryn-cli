@@ -136,7 +136,15 @@ internal object CommandSupport {
                     subjectToken = base.accessToken,
                     targetResource = selected.tenantHubIssuer,
                     sender = realHttpSender(),
-                ).run()
+                    // SSO-2965 — request the base session's scopes on the exchange so the switched
+                    // token carries the login's entitlement (incl. `.write`). Without this the
+                    // exchange returns a narrowed default set, and switched product-api writes that
+                    // depend on the caller holding a scope (e.g. `clients update` granting a scope,
+                    // `env create`) fail `scope_not_grantable` even for a fully-entitled operator.
+                    // The hub still down-scopes to what the client is permitted on the target tenant,
+                    // so this only ever returns scopes the operator is genuinely entitled to. Mirrors
+                    // the client-credentials re-mint path below, which already passes `current.scope`.
+                ).run(base.scope)
             }.getOrNull()
         }
 

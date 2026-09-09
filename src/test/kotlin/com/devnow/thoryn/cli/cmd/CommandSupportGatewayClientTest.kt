@@ -87,6 +87,32 @@ class CommandSupportGatewayClientTest : CommandTestBase() {
     }
 
     @Test
+    fun `SSO-2965 - the exchange requests the base session's scopes so the switched token keeps its entitlement`() {
+        // Base login holds write scopes; the switched token must carry them or scoped writes
+        // (clients update / env create) 403 scope_not_grantable even for an entitled operator.
+        val base = Tokens(
+            accessToken = "AT-base",
+            refreshToken = "RT",
+            issuer = baseUrl(),
+            gateway = baseUrl(),
+            scope = "openid tenant:applications.write tenant:environments.write",
+        )
+        seedTokens(base)
+        val selectedStore = SelectedWorkspaceStore(path = tempHome.resolve("ws.json"))
+        selectedStore.write(
+            SelectedWorkspace(tenantId = "t-1", slug = "acme", tenantHubIssuer = "https://acme.hub.example.org"),
+        )
+        server.enqueue(jsonResponse(200, """{"access_token":"switched-token","token_type":"Bearer","expires_in":900}"""))
+        server.enqueue(jsonResponse(200, """{"items":[],"total":0}"""))
+
+        CommandSupport.gatewayClient(baseUrl(), base, selectedStore).listApplications()
+
+        val exchangeBody = server.takeRequest().body.readUtf8()
+        // RFC 8693 `scope` param carries the base entitlement (form-encoded: space -> '+', ':' -> %3A).
+        assertThat(exchangeBody).contains("scope=openid+tenant%3Aapplications.write+tenant%3Aenvironments.write")
+    }
+
+    @Test
     fun `with no selected workspace it uses the base token directly (no exchange)`() {
         val base = Tokens(accessToken = "AT-base", refreshToken = "RT", issuer = baseUrl(), gateway = baseUrl())
         seedTokens(base)
