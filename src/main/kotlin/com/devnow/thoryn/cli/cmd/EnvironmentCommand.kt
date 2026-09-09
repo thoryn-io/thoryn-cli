@@ -28,15 +28,19 @@ import java.util.concurrent.Callable
  *
  * Subcommands:
  *  - `list`        — GET  /api/v1/environments (marks the active one)
+ *  - `get <id>`    — GET  /api/v1/environments/{id} (a single record)
  *  - `use <slug>`  — record the selected environment (local; validated against the live list)
  *  - `create`      — POST /api/v1/environments  (a sandbox)
  *  - `rename`      — PATCH /api/v1/environments/{id}
  *  - `suspend`     — POST /api/v1/environments/{id}/suspend
  *  - `reactivate`  — POST /api/v1/environments/{id}/reactivate
+ *  - `delete <id>` — DELETE /api/v1/environments/{id} (SSO-2960; IRREVERSIBLE, confirm-guarded)
  *
- * There is no standalone `delete` subcommand yet. A sandbox CAN be hard-deleted through product-api's
- * `DELETE /api/v1/environments/{id}` (SSO-2960) — the example-recipe `env.delete` teardown action
- * (SSO-2961) uses it to tear down an ephemeral sandbox; a `thoryn env delete` command is future work.
+ * `delete` (SSO-2964) hard-deletes a **sandbox** and purges every environment-scoped row within it.
+ * It reuses product-api's `DELETE /api/v1/environments/{id}` (SSO-2960) — the same endpoint the
+ * example-recipe `env.delete` teardown action (SSO-2961) drives — under the SSO-2413 destructive-action
+ * confirmation contract: `--confirm <slug>` must equal the environment's OWN slug and rides as the
+ * `X-Thoryn-Confirm` header; the production plane refuses deletion outright.
  */
 @Command(
     name = "env",
@@ -44,18 +48,20 @@ import java.util.concurrent.Callable
     mixinStandardHelpOptions = true,
     subcommands = [
         EnvironmentCommand.ListSubcommand::class,
+        EnvironmentCommand.GetSubcommand::class,
         EnvironmentCommand.UseSubcommand::class,
         EnvironmentCommand.CreateSubcommand::class,
         EnvironmentCommand.RenameSubcommand::class,
         EnvironmentCommand.SuspendSubcommand::class,
         EnvironmentCommand.ReactivateSubcommand::class,
+        EnvironmentCommand.DeleteSubcommand::class,
     ],
 )
 class EnvironmentCommand : Callable<Int> {
 
     override fun call(): Int {
         System.err.println("Usage: thoryn env <subcommand>")
-        System.err.println("Subcommands: list | use | create | rename | suspend | reactivate")
+        System.err.println("Subcommands: list | get | use | create | rename | suspend | reactivate | delete")
         return CommandSupport.EXIT_USAGE
     }
 
@@ -82,6 +88,36 @@ class EnvironmentCommand : Callable<Int> {
             return try {
                 val envs = client.listEnvironments().environmentsArray()
                 CommandSupport.emitList(format, envs, LIST_HEADERS, rowMapper = { row(it, active) })
+                CommandSupport.EXIT_OK
+            } catch (ex: ProductApiException) {
+                CommandSupport.renderError(format, ex, requiredScope = "tenant:environments.read")
+            } catch (ex: Exception) {
+                CommandSupport.renderRequestFailure(ex, gateway)
+            }
+        }
+    }
+
+    /** `thoryn env get <id>` — a single environment record by its UUID id (CRUD symmetry with `list`). */
+    @Command(name = "get", description = ["Show a single environment by id."], mixinStandardHelpOptions = true)
+    class GetSubcommand : Callable<Int> {
+
+        @Parameters(index = "0", description = ["Environment id (UUID; see `thoryn env list`)."])
+        lateinit var id: String
+
+        @Option(names = ["--gateway"], description = ["Override the gateway base URL (default: \${DEFAULT-VALUE})."], defaultValue = ThorynConfig.DEFAULT_GATEWAY)
+        var gateway: String = ThorynConfig.DEFAULT_GATEWAY
+
+        @Option(names = ["--output"], description = ["Output format: json|yaml|table (default: table)."])
+        var outputRaw: String? = null
+
+        override fun call(): Int {
+            val format = CommandSupport.parseFormat(outputRaw) ?: return CommandSupport.EXIT_USAGE
+            val tokens = CommandSupport.readTokens() ?: return CommandSupport.EXIT_NOT_SIGNED_IN
+            gateway = CommandSupport.resolveGateway(gateway, tokens)
+            val client = CommandSupport.gatewayClient(gateway, tokens, applyEnvironment = false)
+            return try {
+                val env = client.getEnvironment(id.trim())
+                CommandSupport.emitRecord(format, env, ::recordFields)
                 CommandSupport.EXIT_OK
             } catch (ex: ProductApiException) {
                 CommandSupport.renderError(format, ex, requiredScope = "tenant:environments.read")
@@ -277,6 +313,75 @@ class EnvironmentCommand : Callable<Int> {
                 CommandSupport.emitRecord(format, env, ::recordFields)
                 CommandSupport.EXIT_OK
             } catch (ex: ProductApiException) {
+                CommandSupport.renderError(format, ex, requiredScope = "tenant:environments.write")
+            } catch (ex: Exception) {
+                CommandSupport.renderRequestFailure(ex, gateway)
+            }
+        }
+    }
+
+    /**
+     * `thoryn env delete <id> --confirm <slug>` — IRREVERSIBLY hard-delete a **sandbox** environment
+     * and purge every environment-scoped row within it (product-api `DELETE /api/v1/environments/{id}`,
+     * SSO-2960).
+     *
+     * SSO-2413 destructive-action confirmation, keyed to the environment (not the workspace): `--confirm`
+     * MUST equal the target environment's OWN slug and rides as the `X-Thoryn-Confirm` header. Because the
+     * action is irreversible, the CLI refuses to call the endpoint at all when `--confirm` is absent —
+     * it prints the guidance and exits non-zero without touching the server. The platform-managed
+     * production plane cannot be deleted (`409 cannot_delete_production_environment`).
+     */
+    @Command(name = "delete", description = ["Hard-delete a sandbox environment (irreversible)."], mixinStandardHelpOptions = true)
+    class DeleteSubcommand : Callable<Int> {
+
+        @Parameters(index = "0", description = ["Environment id (UUID; see `thoryn env list`)."])
+        lateinit var id: String
+
+        @Option(
+            names = ["--confirm"],
+            description = [
+                "Confirm this IRREVERSIBLE delete by passing the environment's OWN slug. " +
+                    "Required; the slug must match the target environment.",
+            ],
+        )
+        var confirm: String? = null
+
+        @Option(names = ["--gateway"], defaultValue = ThorynConfig.DEFAULT_GATEWAY)
+        var gateway: String = ThorynConfig.DEFAULT_GATEWAY
+
+        @Option(names = ["--output"])
+        var outputRaw: String? = null
+
+        override fun call(): Int {
+            val format = CommandSupport.parseFormat(outputRaw) ?: return CommandSupport.EXIT_USAGE
+            val tokens = CommandSupport.readTokens() ?: return CommandSupport.EXIT_NOT_SIGNED_IN
+            val slug = confirm?.trim()
+            if (slug.isNullOrEmpty()) {
+                System.err.println(
+                    "This is a destructive, irreversible action: it hard-deletes the environment " +
+                        "and purges every resource within it.",
+                )
+                System.err.println("Re-run with --confirm <environment-slug> to proceed.")
+                return CommandSupport.EXIT_HTTP_ERROR
+            }
+            gateway = CommandSupport.resolveGateway(gateway, tokens)
+            val client = CommandSupport.gatewayClient(gateway, tokens, applyEnvironment = false)
+            return try {
+                client.deleteEnvironment(id.trim(), slug)
+                CommandSupport.emitValue(
+                    format,
+                    mapOf("deleted" to true, "id" to id.trim()),
+                    "Deleted environment '${id.trim()}'.",
+                )
+                CommandSupport.EXIT_OK
+            } catch (ex: ProductApiException) {
+                // 409 cannot_delete_production_environment — a clearer message than the generic HTTP render.
+                if (ex.httpStatus == 409 && ex.errorCode == "cannot_delete_production_environment") {
+                    System.err.println("Error: cannot delete the production plane — it is platform-managed and permanent.")
+                    return CommandSupport.EXIT_HTTP_ERROR
+                }
+                // 428 (confirm required) / 422 (confirm mismatch) / 404 (not found) / 403 (missing scope)
+                // all route through the shared renderer (SSO-2413 confirm hints + scope-login hint).
                 CommandSupport.renderError(format, ex, requiredScope = "tenant:environments.write")
             } catch (ex: Exception) {
                 CommandSupport.renderRequestFailure(ex, gateway)

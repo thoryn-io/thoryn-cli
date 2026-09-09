@@ -117,4 +117,81 @@ class EnvironmentCommandTest : CommandTestBase() {
         assertThat(exit).isEqualTo(CommandSupport.EXIT_USAGE)
         assertThat(err).contains("workspace switch")
     }
+
+    // ── SSO-2964: `env get` + `env delete` (first-class CRUD symmetry) ────────────
+
+    @Test
+    fun `get fetches a single environment by id and renders it`() {
+        server.enqueue(
+            jsonResponse(
+                200,
+                """{"id":"$envId","slug":"staging","name":"Staging","kind":"sandbox","suspended":false,"createdAt":"2026-09-05T10:00:00Z"}""",
+            ),
+        )
+
+        val (exit, out, _) = runCli("env", "get", envId, "--gateway", baseUrl())
+
+        assertThat(exit).isEqualTo(0)
+        assertThat(out).contains("staging").contains("Staging")
+        val req = server.takeRequest()
+        assertThat(req.method).isEqualTo("GET")
+        assertThat(req.path).isEqualTo("/api/v1/environments/$envId")
+    }
+
+    @Test
+    fun `delete with --confirm sends DELETE and the X-Thoryn-Confirm header`() {
+        server.enqueue(noContent())
+
+        val (exit, out, _) = runCli("env", "delete", envId, "--confirm", "staging", "--gateway", baseUrl())
+
+        assertThat(exit).isEqualTo(0)
+        assertThat(out).contains(envId)
+        val req = server.takeRequest()
+        assertThat(req.method).isEqualTo("DELETE")
+        assertThat(req.path).isEqualTo("/api/v1/environments/$envId")
+        assertThat(req.getHeader("X-Thoryn-Confirm")).isEqualTo("staging")
+    }
+
+    @Test
+    fun `delete without --confirm refuses and makes no request`() {
+        val (exit, _, err) = runCli("env", "delete", envId, "--gateway", baseUrl())
+
+        assertThat(exit).isEqualTo(CommandSupport.EXIT_HTTP_ERROR)
+        assertThat(err).contains("destructive").contains("--confirm")
+        // The irreversible action must not touch the server when unconfirmed.
+        assertThat(server.requestCount).isEqualTo(0)
+    }
+
+    @Test
+    fun `delete of the production plane surfaces the 409 error`() {
+        server.enqueue(
+            jsonResponse(
+                409,
+                """{"errorCode":"cannot_delete_production_environment","title":"Cannot Delete Production Environment",
+                    "detail":"The production plane is platform-managed."}""".trimIndent(),
+            ),
+        )
+
+        val (exit, _, err) = runCli("env", "delete", envId, "--confirm", "production", "--gateway", baseUrl())
+
+        assertThat(exit).isEqualTo(CommandSupport.EXIT_HTTP_ERROR)
+        assertThat(err).contains("production plane")
+    }
+
+    @Test
+    fun `delete with a mismatched --confirm surfaces the 422 mismatch guidance`() {
+        server.enqueue(
+            jsonResponse(
+                422,
+                """{"errorCode":"production_confirmation_mismatch","title":"Production Confirmation Mismatch",
+                    "detail":"The X-Thoryn-Confirm header does not match the environment slug."}""".trimIndent(),
+            ),
+        )
+
+        val (exit, _, err) = runCli("env", "delete", envId, "--confirm", "wrong-slug", "--gateway", baseUrl())
+
+        assertThat(exit).isEqualTo(CommandSupport.EXIT_HTTP_ERROR)
+        assertThat(err).contains("did not match")
+        assertThat(server.takeRequest().getHeader("X-Thoryn-Confirm")).isEqualTo("wrong-slug")
+    }
 }
