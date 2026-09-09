@@ -135,6 +135,14 @@ class ProductApiClient(
     fun listEnvironments(): JsonNode =
         get("/api/v1/environments")
 
+    /**
+     * `GET /api/v1/environments/{id}` (SSO-2964) — a single environment record by its UUID `id`.
+     * A cross-tenant / unknown id is `404 not_found` (privacy-symmetric); a token without
+     * `tenant:environments.read` is `403`. Both surface as [ProductApiException].
+     */
+    fun getEnvironment(id: String): JsonNode =
+        get("/api/v1/environments/${encode(id)}")
+
     fun createEnvironment(body: Map<String, Any?>): JsonNode =
         post("/api/v1/environments", body)
 
