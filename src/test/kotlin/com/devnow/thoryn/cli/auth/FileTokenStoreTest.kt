@@ -69,4 +69,48 @@ class FileTokenStoreTest {
         val store = FileTokenStore(path)
         assertThat(store.read()).isNull()
     }
+
+    /**
+     * SSO-2956 — regression guard: the serialised [Tokens] JSON must carry every
+     * persisted field by name and must NOT be an empty object. On the GraalVM
+     * native binary a data class with no reflection metadata serialises to `{}`
+     * (the login-then-"Not signed in" bug); this JVM guard pins the expected wire
+     * shape so a dropped field name is caught cheaply, and pairs with the native
+     * proof (`thoryn __diag token-roundtrip`) that the reflect-config entry works
+     * in the native image, which a JVM test cannot observe.
+     */
+    @Test
+    fun `serialised tokens JSON carries every field name and is not an empty object`(@TempDir dir: Path) {
+        val path = dir.resolve("tokens.json")
+        FileTokenStore(path).write(
+            Tokens(
+                accessToken = "access-1",
+                refreshToken = "refresh-1",
+                idToken = "id-1",
+                tokenType = "Bearer",
+                expiresAtEpochSecond = 1_900_000_000L,
+                scope = "openid tenant:clients.read",
+                issuer = "https://acme.hub.example.test",
+                gateway = "https://api.example.test",
+                authMode = Tokens.AUTH_MODE_CLIENT_CREDENTIALS,
+                clientId = "client-1",
+            ),
+        )
+
+        val json = Files.readString(path)
+
+        assertThat(json.replace(Regex("\\s"), "")).isNotEqualTo("{}")
+        assertThat(json).contains(
+            "\"accessToken\"",
+            "\"refreshToken\"",
+            "\"idToken\"",
+            "\"tokenType\"",
+            "\"expiresAtEpochSecond\"",
+            "\"scope\"",
+            "\"issuer\"",
+            "\"gateway\"",
+            "\"authMode\"",
+            "\"clientId\"",
+        )
+    }
 }

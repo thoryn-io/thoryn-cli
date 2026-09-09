@@ -3,6 +3,7 @@ package com.devnow.thoryn.cli
 import com.devnow.thoryn.cli.cmd.AuditCommand
 import com.devnow.thoryn.cli.cmd.AuditReplayCommand
 import com.devnow.thoryn.cli.cmd.ClientsCommand
+import com.devnow.thoryn.cli.cmd.DiagCommand
 import com.devnow.thoryn.cli.cmd.EnvironmentCommand
 import com.devnow.thoryn.cli.cmd.FederationCommand
 import com.devnow.thoryn.cli.cmd.LoginCommand
@@ -46,6 +47,8 @@ import kotlin.system.exitProcess
         AuditReplayCommand::class,
         ExamplesCommand::class,
         ProvisionCommand::class,
+        // SSO-2956 — hidden internal diagnostics (native-image token round-trip check).
+        DiagCommand::class,
     ],
 )
 class ThorynMain : Runnable {
