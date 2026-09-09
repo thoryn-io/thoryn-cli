@@ -121,4 +121,28 @@ class ProductApiClientTest {
             .isInstanceOf(ProductApiException::class.java)
         assertThat(server.requestCount).isEqualTo(1)
     }
+
+    /**
+     * SSO-2958 — a body-less POST (`rotate-secret` and the other empty-body verbs) must serialise
+     * its request body to `{}`. Historically these passed a raw `emptyMap()`
+     * (`kotlin.collections.EmptyMap`), which jackson-module-kotlin reflected on and which crashed the
+     * NATIVE binary (`KotlinReflectionInternalError: Unresolved class … EmptyMap`). The fix routes
+     * empty bodies through a Jackson `ObjectNode`; this JVM guard pins the `{}` wire shape (it cannot
+     * catch the native reflection failure — the `__diag empty-post` native proof covers that).
+     */
+    @Test
+    fun `an empty-body POST serialises the request body to an empty JSON object`() {
+        server.enqueue(json(200, """{"newSecret":"s","previousSecretExpiresAt":"2026-01-01T00:00:00Z"}"""))
+
+        val client = ProductApiClient(
+            gateway = baseUrl(),
+            tokens = Tokens(accessToken = "AT"),
+        )
+
+        client.rotateApplicationSecret("client-123")
+
+        val recorded = server.takeRequest()
+        assertThat(recorded.method).isEqualTo("POST")
+        assertThat(recorded.body.readUtf8()).isEqualTo("{}")
+    }
 }
