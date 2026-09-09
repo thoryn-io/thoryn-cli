@@ -24,11 +24,11 @@
 # contract and sets the THORYN_CLI_CI_CLIENT_SECRET GitHub secret. See `.thoryn/README.md`.
 #
 # What it does, end to end:
-#   1. Builds the CLI from source in the runner (`./mvnw -q -DskipTests package` ->
-#      `target/thoryn.jar`). We build from source because no `cli-v*` release has been
-#      cut yet (SSO-2936 stood up the release workflow but no tag exists). Once a
-#      release exists this can switch to a `gh release download --pattern thoryn.jar`
-#      — see the commented block in the "Build the thoryn CLI" step below.
+#   1. Downloads the prebuilt `thoryn.jar` from the LATEST `cli-v*` release of
+#      thoryn-io/thoryn-cli (`gh release download <tag> --pattern thoryn.jar --dir .` ->
+#      `./thoryn.jar`). Releases now exist (SSO-2936 stood up the release workflow and
+#      cli-v* tags are cut), so CI validates the actually-shipped artifact instead of
+#      rebuilding from source — faster, and it exercises exactly what customers get.
 #   2. Signs in NON-INTERACTIVELY from the connection contract:
 #      `thoryn login --connection <file>`. The secret is supplied as the env var the
 #      contract names (THORYN_CLI_CI_CLIENT_SECRET); the hub base is supplied as the env
@@ -48,14 +48,15 @@
 #      workspace and standing user are the operator's and are never touched. Guaranteed on
 #      failure so a broken run never leaks an ephemeral client.
 #
-# Scope: this Action builds the CLI from the CHECKED-OUT copy of THIS repo, so the
-# caller must `actions/checkout` thoryn-cli before `uses:`-ing it (the demo caller
-# `.github/workflows/provision-e2e.yml` does). Making it consumable from a foreign
-# repo (checkout thoryn-cli internally, or download a released jar) is a follow-up.
+# Scope: the CLI jar is DOWNLOADED from the release (no longer built from the checked-out
+# source), but the caller must still `actions/checkout` thoryn-cli before `uses:`-ing it —
+# the Action reads the committed connection contract `.thoryn/connection.json` and is itself
+# a local composite Action in this repo (the demo caller `.github/workflows/provision-e2e.yml`
+# checks out first). Making it consumable from a foreign repo is a follow-up.
 
 name: "Provision Thoryn (as a real customer)"
 description: >-
-  Build the thoryn CLI from source, sign in from the committed connection contract
+  Download the latest released thoryn CLI jar, sign in from the committed connection contract
   (.thoryn/connection.json), provision an ephemeral OAuth client inside the contract's workspace via a
   signed recipe, expose its ids as outputs, and delete the ephemeral client on exit. Product APIs only
   — no DB seeding, no demo endpoints, no imperative sign-in.
@@ -90,7 +91,7 @@ inputs:
     required: false
     default: ""
   java-version:
-    description: "Temurin JDK version used to build the CLI fat jar."
+    description: "Temurin JDK version used to run the released CLI jar."
     required: false
     default: "21"
 
@@ -113,24 +114,27 @@ runs:
       with:
         distribution: temurin
         java-version: ${{ inputs.java-version }}
-        cache: maven
 
-    # Build the CLI from source. No `cli-v*` release is cut yet, so we cannot
-    # `gh release download` a jar. Once SSO-2936 cuts one, this step can become:
-    #
-    #   gh release download --repo thoryn-io/thoryn-cli --pattern 'thoryn.jar' \
-    #     --dir "$GITHUB_WORKSPACE/target"
-    #
-    # (the release publishes `thoryn.jar` under that stable asset name), dropping
-    # the JDK + Maven build entirely. Until then, build the same fat jar the
-    # release workflow's `jar` job builds.
-    - name: Build the thoryn CLI (fat jar from source)
+    # Download the prebuilt `thoryn.jar` from the LATEST `cli-v*` release of this repo,
+    # rather than rebuilding from source: faster CI, and it validates the actually-shipped
+    # artifact. The release workflow publishes the fat jar under the stable asset name
+    # `thoryn.jar` on every `cli-v*` tag; `--dir .` lands it at `./thoryn.jar`. `github.token`
+    # is sufficient — this is a same-repo release read.
+    - name: Download the released thoryn CLI (latest cli-v* release)
       shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
       run: |
         set -euo pipefail
-        ./mvnw -q -DskipTests package
-        test -f target/thoryn.jar
-        echo "Built target/thoryn.jar ($(du -h target/thoryn.jar | cut -f1))."
+        tag="$(gh release list --repo thoryn-io/thoryn-cli --limit 40 --json tagName -q '.[].tagName' | grep '^cli-v' | head -1)"
+        if [ -z "$tag" ]; then
+          echo "::error::no cli-v* release found in thoryn-io/thoryn-cli — run its release workflow (SSO-2936) first." >&2
+          exit 1
+        fi
+        echo "Using CLI release $tag"
+        gh release download "$tag" --repo thoryn-io/thoryn-cli --pattern 'thoryn.jar' --dir .
+        test -f thoryn.jar
+        echo "Downloaded thoryn.jar ($(du -h thoryn.jar | cut -f1)) from release $tag."
 
     # Sign in from the connection contract. The CLI derives the per-tenant issuer, the gateway and the
     # requested scopes from the contract (workspace.slug + THORYN_HUB), reads the secret from the env
@@ -160,8 +164,8 @@ runs:
           exit 1
         fi
         echo "Signing in from connection contract $CONNECTION (hub base $THORYN_HUB)."
-        java -jar target/thoryn.jar login --connection "$CONNECTION"
-        java -jar target/thoryn.jar login --status
+        java -jar thoryn.jar login --connection "$CONNECTION"
+        java -jar thoryn.jar login --status
 
     # Provision via the workspace-less recipe, then read the run's receipt to expose ids as outputs.
     # The standing workspace is the contract's `workspace.slug` (single-sourced — read from the contract
@@ -189,10 +193,10 @@ runs:
         if [ -n "${ENVIRONMENT:-}" ]; then
           apply_args+=(--environment "$ENVIRONMENT")
         fi
-        java -jar target/thoryn.jar "${apply_args[@]}"
+        java -jar thoryn.jar "${apply_args[@]}"
 
         # The receipt is the portable, secret-free record of what was provisioned.
-        java -jar target/thoryn.jar examples receipt "$RECIPE" --output json > receipt.json
+        java -jar thoryn.jar examples receipt "$RECIPE" --output json > receipt.json
         echo "----- receipt -----"
         cat receipt.json
         echo "-------------------"
@@ -228,7 +232,7 @@ runs:
         THORYN_CI_PLAINTEXT_TOKENS: "1"
       run: |
         set -euo pipefail
-        java -jar target/thoryn.jar examples teardown "$RECIPE" || {
+        java -jar thoryn.jar examples teardown "$RECIPE" || {
           echo "::warning::teardown reported an error — verify no '${RECIPE}' client leaked in the standing workspace." >&2
           exit 0
         }
