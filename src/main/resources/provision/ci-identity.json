@@ -1,0 +1,22 @@
+{
+  "apiVersion": "thoryn.io/provision/v1",
+  "id": "ci-identity",
+  "summary": "Founder-run bootstrap - mint the CI's confidential client_credentials machine client (secret via SecretIo).",
+  "machineClient": {
+    "displayName": "Thoryn CLI CI machine identity",
+    "clientType": "confidential",
+    "grantTypes": [
+      "client_credentials"
+    ],
+    "scopes": [
+      "tenant:applications.write",
+      "tenant:applications.read",
+      "tenant:federation.write",
+      "tenant:federation.read",
+      "tenant:users.write",
+      "tenant:users.read",
+      "tenant:environments.write",
+      "tenant:environments.read"
+    ]
+  }
+}

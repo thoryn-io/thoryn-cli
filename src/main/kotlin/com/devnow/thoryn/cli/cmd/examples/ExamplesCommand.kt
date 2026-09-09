@@ -249,19 +249,6 @@ class ExamplesCommand : Callable<Int> {
         @Option(names = ["--yes"], description = ["Skip the confirmation prompt (for non-interactive use)."])
         var yes: Boolean = false
 
-        /**
-         * SSO-2950 — the sink for a `clients.createMachine` step's ONE minted `client_secret`. When the
-         * recipe mints a machine credential (the `provision-ci-identity` bootstrap), the secret is
-         * written to this owner-only file — exactly as `thoryn clients create --secret-file`. Absent it,
-         * the secret falls back to the guarded/interactive stdout (a WARN on a TTY; refused on a pipe
-         * unless `--force-stdout`). It is NEVER written to the receipt, a log, or argv.
-         */
-        @Option(names = ["--secret-file"], description = ["Write a minted machine-client secret to this file (owner-only) instead of stdout."])
-        var secretFile: File? = null
-
-        @Option(names = ["--force-stdout"], description = ["Allow printing a minted machine-client secret to a non-interactive stdout. Off by default."])
-        var forceStdout: Boolean = false
-
         @Option(names = ["--hub"])
         var hub: String = ThorynConfig.DEFAULT_HUB
 
@@ -295,18 +282,8 @@ class ExamplesCommand : Callable<Int> {
                 println("Aborted — nothing was provisioned.")
                 return CommandSupport.EXIT_OK
             }
-            // SSO-2950 — route any minted machine-client secret (clients.createMachine) through the same
-            // SecretIo channel `thoryn clients create` uses: to --secret-file, else guarded stdout.
-            val secretSink = com.devnow.thoryn.cli.cmd.examples.recipe.SecretSink { _, secret ->
-                com.devnow.thoryn.cli.cmd.SecretIo.emitSecret(
-                    label = "CI machine client secret",
-                    secret = secret,
-                    secretFile = secretFile,
-                    forceStdout = forceStdout,
-                )
-            }
             return try {
-                val run = RecipeInterpreter(ctx, recipe, overrides = overrides, environmentSlug = env, secretSink = secretSink).setup()
+                val run = RecipeInterpreter(ctx, recipe, overrides = overrides, environmentSlug = env).setup()
                 ctx.state.write(run.state)
                 ReceiptStore().write(run.receipt)
                 println()

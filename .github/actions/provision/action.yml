@@ -20,7 +20,7 @@
 # The only injected secret is that one env var — never an argv flag, never echoed.
 #
 # The machine client the contract names is minted ONCE by a founder via the customer plane
-# (the `provision-ci-identity` recipe, SSO-2950); the operator pastes its clientId into the
+# (`thoryn provision ci-identity`, SSO-2952); the operator pastes its clientId into the
 # contract and sets the THORYN_CLI_CI_CLIENT_SECRET GitHub secret. See `.thoryn/README.md`.
 #
 # What it does, end to end:

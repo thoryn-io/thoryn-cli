@@ -20,6 +20,10 @@
       {
         "pattern": "^examples/connection\\.schema\\.json$",
         "comment": "SSO-2948 — the connection contract schema, bundled beside the recipe schema for reference/validation. Referenced by ConnectionSchemaConformanceTest; native-image strips un-referenced resources so it must be listed explicitly."
+      },
+      {
+        "pattern": "^provision/ci-identity\\.json$",
+        "comment": "SSO-2952 — the declarative ci-identity machine-client spec read at runtime by `thoryn provision ci-identity` (MachineClientSpec.load). native-image strips un-referenced resources, so list it explicitly."
       }
     ]
   }

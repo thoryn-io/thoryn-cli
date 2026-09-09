@@ -22,8 +22,8 @@ name: provision-e2e
 # can be added once the prerequisites below are live.
 #
 # ONE-TIME OPERATOR SETUP (see `.thoryn/README.md` "One-time bootstrap"):
-#   * A founder mints the CI machine client once via the customer plane (the
-#     `provision-ci-identity` recipe, SSO-2950) and pastes its clientId into
+#   * A founder mints the CI machine client once via the customer plane
+#     (`thoryn provision ci-identity`, SSO-2952) and pastes its clientId into
 #     `.thoryn/connection.json` (replacing the REPLACE_AFTER_BOOTSTRAP marker).
 #   * The `THORYN_CLI_CI_CLIENT_SECRET` repository secret is set to that client's secret.
 #

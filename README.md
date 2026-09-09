@@ -104,6 +104,9 @@ thoryn examples catalog  [--remote] [--tag]  # SSO-2874 — list recipes (bundle
 thoryn examples update   [--tag]             # SSO-2874 — fetch + verify (Ed25519) + cache the public recipe catalog
 thoryn examples apply    <name> [--set k=v]… [--environment <slug>] [--yes]   # SSO-2876 — guided: prompt params + env, dry-run, confirm, provision
 thoryn examples share    <name> [--output <file>]   # SSO-2876 — export the secret-free receipt (notes if platform-signed)
+
+# Operator provisioning (SSO-2952) — bootstrap the CI machine identity (founder-run, once).
+thoryn provision ci-identity [--secret-file <path>] [--force-stdout] [--gateway <url>]   # mint the confidential client_credentials machine client; secret shown once via SecretIo
 ```
 
 > The supply-chain / verifiable-credential command tree was **removed** when the
