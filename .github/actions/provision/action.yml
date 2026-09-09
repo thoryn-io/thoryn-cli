@@ -1,4 +1,5 @@
-# SSO-2944 (epic SSO-2934) — reusable "provision-as-a-real-customer" composite Action.
+# SSO-2951 (epic SSO-2947) — reusable "provision-as-a-real-customer" composite Action,
+# now bound to the CLI's CONNECTION CONTRACT (`.thoryn/connection.json`).
 #
 # Configures the Thoryn product against SHARED STAGING using ONLY the real product
 # APIs, exercised through the `thoryn` CLI + a signed recipe. There is NO DB seeding,
@@ -6,15 +7,21 @@
 # to CI: every resource is created through the same customer-plane workflow a real
 # tenant admin would use.
 #
-# THE PIVOT (SSO-2944, superseding the SSO-2938 first cut): CI authenticates with a
-# CUSTOMER-PLANE `client_credentials` API key that the operator mints THEMSELVES (not a
-# seeded platform client). Such a key is TENANT-SCOPED — bound to one workspace via its
-# `tnt` claim — and CANNOT create workspaces (workspace-create needs a machine scope a
-# tenant admin can't delegate; the SSO-2943 gap). So this Action no longer creates a
-# fresh workspace per run. Instead it provisions an EPHEMERAL app inside a STANDING
-# workspace the operator owns (the one the API key is scoped to), and deletes only that
-# app on exit. The standing workspace + a standing test user are one-time operator setup
-# (see the repo README's "CI provisioning setup" section).
+# AUTHENTICATION IS AS-CODE (SSO-2951, superseding the SSO-2944 imperative bash sign-in).
+# The binding — which workspace, which client, which scopes — lives in the committed
+# connection contract `.thoryn/connection.json` (schema: connection.schema.json, SSO-2948),
+# NOT in bash `sed` + workflow inputs. Sign-in collapses to one declarative step:
+#
+#     thoryn login --connection .thoryn/connection.json
+#
+# The CLI derives the per-tenant issuer (`https://<slug>.hub.<env>`), the gateway, and
+# the requested scopes FROM the contract; it reads the client secret from the env var the
+# contract NAMES (`auth.secretEnv` = THORYN_CLI_CI_CLIENT_SECRET), failing closed if unset.
+# The only injected secret is that one env var — never an argv flag, never echoed.
+#
+# The machine client the contract names is minted ONCE by a founder via the customer plane
+# (the `provision-ci-identity` recipe, SSO-2950); the operator pastes its clientId into the
+# contract and sets the THORYN_CLI_CI_CLIENT_SECRET GitHub secret. See `.thoryn/README.md`.
 #
 # What it does, end to end:
 #   1. Builds the CLI from source in the runner (`./mvnw -q -DskipTests package` ->
@@ -22,23 +29,24 @@
 #      cut yet (SSO-2936 stood up the release workflow but no tag exists). Once a
 #      release exists this can switch to a `gh release download --pattern thoryn.jar`
 #      — see the commented block in the "Build the thoryn CLI" step below.
-#   2. Signs in NON-INTERACTIVELY with a client-credentials API key (SSO-2941):
-#      `thoryn login --client-credentials --issuer <hub>`, credential supplied as
-#      THORYN_API_KEY=<client-id>:<client-secret> via `inputs.api-key` (never echoed,
-#      never an argv flag). The `--issuer` is stamped onto the session so the later
-#      `examples` commands target staging automatically (SSO-2827).
+#   2. Signs in NON-INTERACTIVELY from the connection contract:
+#      `thoryn login --connection <file>`. The secret is supplied as the env var the
+#      contract names (THORYN_CLI_CI_CLIENT_SECRET); the hub base is supplied as the env
+#      var the contract names for it (THORYN_HUB). Issuer/gateway/scope are derived by the
+#      CLI and stamped onto the session (SSO-2827), so later `examples` commands need no
+#      host flags.
 #   3. Provisions by APPLYING the WORKSPACE-LESS recipe:
-#      `thoryn examples apply ci-signin --set workspaceSlug=<standing-slug> --yes`. The
-#      bundled `ci-signin` recipe registers a public loopback OAuth client UNDER the
-#      standing workspace (applications.create + applications.get verify) using the
-#      caller's own tenant-scoped bearer — no hub.createWorkspace, no token-exchange.
-#   4. Exposes the standing workspace slug / ephemeral client id / per-tenant issuer as
-#      Action outputs (read from the run's receipt) for downstream steps (e.g. driving
-#      a sign-in with the STANDING test user).
-#   5. TEARS DOWN in an `if: always()` step: `thoryn examples teardown ci-signin` runs
-#      the recipe's teardown — which now deletes ONLY the ephemeral OAuth client. The
-#      standing workspace and standing user are the operator's and are never touched.
-#      Guaranteed on failure so a broken run never leaks an ephemeral client.
+#      `thoryn examples apply <recipe> --set workspaceSlug=<contract slug> --yes`. The
+#      standing workspace is the contract's `workspace.slug` (single-sourced — read from
+#      the contract, not a separate input). The bundled `ci-signin` recipe registers a
+#      public loopback OAuth client UNDER that workspace using the caller's tenant-scoped
+#      bearer — no hub.createWorkspace, no token-exchange.
+#   4. Exposes the workspace slug / ephemeral client id / per-tenant issuer as Action
+#      outputs (read from the run's receipt) for downstream steps.
+#   5. TEARS DOWN in an `if: always()` step: `thoryn examples teardown <recipe>` runs the
+#      recipe's teardown — which deletes ONLY the ephemeral OAuth client. The standing
+#      workspace and standing user are the operator's and are never touched. Guaranteed on
+#      failure so a broken run never leaks an ephemeral client.
 #
 # Scope: this Action builds the CLI from the CHECKED-OUT copy of THIS repo, so the
 # caller must `actions/checkout` thoryn-cli before `uses:`-ing it (the demo caller
@@ -47,49 +55,40 @@
 
 name: "Provision Thoryn (as a real customer)"
 description: >-
-  Build the thoryn CLI from source, sign in with a tenant-scoped client-credentials API key,
-  provision an ephemeral OAuth client inside a STANDING workspace via a signed recipe, expose its ids
-  as outputs, and delete the ephemeral client on exit. Product APIs only — no DB seeding, no demo
-  endpoints, no workspace create (the API key can't).
+  Build the thoryn CLI from source, sign in from the committed connection contract
+  (.thoryn/connection.json), provision an ephemeral OAuth client inside the contract's workspace via a
+  signed recipe, expose its ids as outputs, and delete the ephemeral client on exit. Product APIs only
+  — no DB seeding, no demo endpoints, no imperative sign-in.
 
 inputs:
-  api-key:
+  client-secret:
     description: >-
-      The CUSTOMER-PLANE client-credentials API key, in the form <client-id>:<client-secret>. It is
-      TENANT-SCOPED to the standing workspace named by `workspace-slug` and needs the
-      `tenant:applications.write` + `tenant:applications.read` scopes. Pass `secrets.THORYN_API_KEY`.
-      NEVER a literal — the repo is public. Supplied to the CLI as the THORYN_API_KEY env var; never
-      echoed, never an argv flag. See the repo README's "CI provisioning setup" for how to mint it.
+      The client SECRET of the machine client named by the connection contract's `auth.clientId`.
+      Pass `secrets.THORYN_CLI_CI_CLIENT_SECRET`. NEVER a literal — the repo is public. Supplied to the
+      CLI as the THORYN_CLI_CI_CLIENT_SECRET env var (the name the contract's `auth.secretEnv` declares);
+      never echoed, never an argv flag. See `.thoryn/README.md` for the one-time bootstrap that mints it.
     required: true
-  workspace-slug:
+  connection:
+    description: "Path to the connection contract the CLI signs in from (schema: connection.schema.json)."
+    required: false
+    default: ".thoryn/connection.json"
+  hub:
     description: >-
-      Slug of the STANDING workspace the run provisions into — the workspace the API key is scoped to
-      (its `tnt`). This workspace is NOT created and NOT deleted; only an ephemeral OAuth client is
-      created inside it and removed on exit.
-    required: true
-  issuer:
-    description: "Hub issuer URL to sign in / provision against (the staging broker)."
+      Hub BASE URL to provision against (the staging broker). Supplied to the CLI as the THORYN_HUB env
+      var — the name the contract's `workspace.hubBaseUrlEnv` declares — from which the CLI derives the
+      per-tenant issuer `https://<slug>.hub.<env>` and the shared `api.<env>` gateway.
     required: false
     default: "https://hub.stg.thoryn.org"
   recipe:
-    description: "The bundled workspace-less recipe to apply. `ci-signin` provisions an ephemeral app in the standing workspace."
+    description: "The bundled workspace-less recipe to apply. `ci-signin` provisions an ephemeral app in the contract's workspace."
     required: false
     default: "ci-signin"
   environment:
     description: >-
-      Optional target environment slug within the standing workspace (e.g. a sandbox). EMPTY (the
+      Optional target environment slug within the contract's workspace (e.g. a sandbox). EMPTY (the
       default) omits `--environment`, so resources go to the workspace's default (production) plane.
     required: false
     default: ""
-  scope:
-    description: >-
-      Space-separated OAuth scopes to request at sign-in. The hub grants a client-credentials token
-      ONLY the scopes explicitly requested — an empty request yields a token with NO scopes (it does
-      NOT default to the API key's registered set), which 403s every scoped call. So this defaults to
-      exactly what the `ci-signin` recipe needs. Override it if you point `recipe` at something that
-      needs a different set (it must be a subset of what the API key was granted).
-    required: false
-    default: "tenant:applications.write tenant:applications.read"
   java-version:
     description: "Temurin JDK version used to build the CLI fat jar."
     required: false
@@ -97,13 +96,13 @@ inputs:
 
 outputs:
   workspace-slug:
-    description: "Slug of the standing workspace the ephemeral client was created in (echoes the input)."
+    description: "Slug of the workspace the ephemeral client was created in (the connection contract's workspace.slug)."
     value: ${{ steps.apply.outputs.workspace-slug }}
   client-id:
     description: "Client id of the ephemeral OAuth application the recipe registered."
     value: ${{ steps.apply.outputs.client-id }}
   issuer:
-    description: "Per-tenant OIDC issuer for the standing workspace (https://<slug>.hub.<env>)."
+    description: "Per-tenant OIDC issuer for the workspace (https://<slug>.hub.<env>)."
     value: ${{ steps.apply.outputs.issuer }}
 
 runs:
@@ -133,71 +132,60 @@ runs:
         test -f target/thoryn.jar
         echo "Built target/thoryn.jar ($(du -h target/thoryn.jar | cut -f1))."
 
-    # Non-interactive client-credentials sign-in. THORYN_API_KEY carries BOTH halves
-    # of the credential; it is read from the env by the CLI and never appears in argv
-    # or logs.
-    #
-    # The API key is registered IN the standing workspace's tenant (that is what makes its
-    # `tnt` claim scope to that workspace), so it authenticates at the PER-TENANT issuer
-    # `https://<slug>.hub.<env>` — NOT the default hub issuer. We derive that from the hub
-    # base + workspace-slug. The customer-plane gateway is the SAME shared host for every
-    # tenant (`api.<env>`, derived hub.->api.), so we set it explicitly because the CLI's
-    # gateway auto-derivation only fires for a bare `hub.<env>` issuer host — a per-tenant
-    # `<slug>.hub.<env>` host would otherwise fall back to localhost. Both are stamped onto
-    # the session (SSO-2827) so the later `examples` commands need no host flags.
-    - name: Sign in (client-credentials API key)
+    # Sign in from the connection contract. The CLI derives the per-tenant issuer, the gateway and the
+    # requested scopes from the contract (workspace.slug + THORYN_HUB), reads the secret from the env
+    # var the contract names, and stamps issuer + gateway onto the session (SSO-2827) so the later
+    # `examples` commands need no host flags. This one step replaces the former ~20-line bash block that
+    # `sed`-derived the issuer/gateway and ran a manual `login --client-credentials --issuer … --scope …`.
+    - name: Sign in (connection contract)
       shell: bash
       env:
-        THORYN_API_KEY: ${{ inputs.api-key }}
-        ISSUER: ${{ inputs.issuer }}
-        WORKSPACE_SLUG: ${{ inputs.workspace-slug }}
-        SCOPE: ${{ inputs.scope }}
+        # The secret the contract's `auth.secretEnv` names. Read from the env by the CLI; never argv.
+        THORYN_CLI_CI_CLIENT_SECRET: ${{ inputs.client-secret }}
+        # The hub base the contract's `workspace.hubBaseUrlEnv` names; the CLI derives the issuer/gateway.
+        THORYN_HUB: ${{ inputs.hub }}
+        CONNECTION: ${{ inputs.connection }}
         # Headless GitHub runners have no OS keychain (Secret Service / D-Bus), so the CLI's default
         # KeychainTokenStore is unavailable. This is the documented CI opt-in for the plaintext file
         # token store (chmod-0600 JSON under $HOME). The token lives only on the ephemeral runner.
         THORYN_CI_PLAINTEXT_TOKENS: "1"
       run: |
         set -euo pipefail
-        if [ -z "${THORYN_API_KEY:-}" ]; then
-          echo "::error::THORYN_API_KEY is empty — pass secrets.THORYN_API_KEY as the action's api-key input." >&2
+        if [ -z "${THORYN_CLI_CI_CLIENT_SECRET:-}" ]; then
+          echo "::error::client-secret is empty — pass secrets.THORYN_CLI_CI_CLIENT_SECRET as the action's client-secret input." >&2
           exit 1
         fi
-        if [ -z "${WORKSPACE_SLUG:-}" ]; then
-          echo "::error::workspace-slug is empty — pass the standing workspace your API key is scoped to." >&2
+        if [ ! -f "$CONNECTION" ]; then
+          echo "::error::connection contract '$CONNECTION' not found — commit .thoryn/connection.json or pass the connection input." >&2
           exit 1
         fi
-        # hub.<env> -> <slug>.hub.<env> (per-tenant issuer) and hub.<env> -> api.<env> (shared gateway).
-        tenant_issuer="$(printf '%s' "$ISSUER" | sed -E "s#://hub\.#://${WORKSPACE_SLUG}.hub.#")"
-        gateway="$(printf '%s' "$ISSUER" | sed -E "s#://hub\.#://api.#")"
-        echo "Signing in at tenant issuer $tenant_issuer (gateway $gateway)."
-        # Request the scopes explicitly. The hub mints a client-credentials token with ONLY the
-        # requested scopes and does NOT fall back to the API key's registered set, so an empty
-        # --scope yields a scope-less token that 403s applications.create. `inputs.scope` defaults to
-        # the recipe's required set (tenant:applications.write + tenant:applications.read).
-        java -jar target/thoryn.jar login --client-credentials \
-          --issuer "$tenant_issuer" --gateway "$gateway" --scope "$SCOPE"
+        echo "Signing in from connection contract $CONNECTION (hub base $THORYN_HUB)."
+        java -jar target/thoryn.jar login --connection "$CONNECTION"
         java -jar target/thoryn.jar login --status
 
     # Provision via the workspace-less recipe, then read the run's receipt to expose ids as outputs.
-    # `--set workspaceSlug=<standing-slug>` names the workspace the API key is scoped to; `--yes` skips
-    # the confirmation. `--environment` is added only when a non-empty environment input is supplied.
+    # The standing workspace is the contract's `workspace.slug` (single-sourced — read from the contract
+    # with jq, not a separate input); `--yes` skips the confirmation. `--environment` is added only when
+    # a non-empty environment input is supplied.
     - name: Provision (apply recipe) and expose outputs
       id: apply
       shell: bash
       env:
         RECIPE: ${{ inputs.recipe }}
-        ISSUER: ${{ inputs.issuer }}
-        WORKSPACE_SLUG: ${{ inputs.workspace-slug }}
+        HUB: ${{ inputs.hub }}
+        CONNECTION: ${{ inputs.connection }}
         ENVIRONMENT: ${{ inputs.environment }}
         THORYN_CI_PLAINTEXT_TOKENS: "1"
       run: |
         set -euo pipefail
-        if [ -z "${WORKSPACE_SLUG:-}" ]; then
-          echo "::error::workspace-slug is empty — pass the standing workspace your API key is scoped to." >&2
+        # The workspace is the contract's — the single source of the binding.
+        slug="$(jq -r '.workspace.slug // ""' "$CONNECTION")"
+        if [ -z "$slug" ]; then
+          echo "::error::connection contract '$CONNECTION' has no workspace.slug." >&2
           exit 1
         fi
 
-        apply_args=(examples apply "$RECIPE" --set "workspaceSlug=${WORKSPACE_SLUG}" --yes)
+        apply_args=(examples apply "$RECIPE" --set "workspaceSlug=${slug}" --yes)
         if [ -n "${ENVIRONMENT:-}" ]; then
           apply_args+=(--environment "$ENVIRONMENT")
         fi
@@ -209,23 +197,23 @@ runs:
         cat receipt.json
         echo "-------------------"
 
-        slug="$(jq -r '.workspace.slug // ""' receipt.json)"
-        [ -n "$slug" ] || slug="$WORKSPACE_SLUG"
+        receipt_slug="$(jq -r '.workspace.slug // ""' receipt.json)"
+        [ -n "$receipt_slug" ] || receipt_slug="$slug"
         client="$(jq -r '[.resources[] | select(.kind=="application") | .id] | first // ""' receipt.json)"
 
         # Per-tenant issuer: hub.<env> -> <slug>.hub.<env> (mirrors ThorynConfig.tenantIssuer).
-        tenant_issuer="$ISSUER"
-        if [ -n "$slug" ]; then
-          tenant_issuer="$(printf '%s' "$ISSUER" | sed -E "s#://hub\.#://${slug}.hub.#")"
+        tenant_issuer="$HUB"
+        if [ -n "$receipt_slug" ]; then
+          tenant_issuer="$(printf '%s' "$HUB" | sed -E "s#://hub\.#://${receipt_slug}.hub.#")"
         fi
 
         {
-          echo "workspace-slug=$slug"
+          echo "workspace-slug=$receipt_slug"
           echo "client-id=$client"
           echo "issuer=$tenant_issuer"
         } >> "$GITHUB_OUTPUT"
 
-        echo "Provisioned ephemeral client '$client' in standing workspace '$slug' (issuer $tenant_issuer)."
+        echo "Provisioned ephemeral client '$client' in workspace '$receipt_slug' (issuer $tenant_issuer)."
 
     # MANDATORY teardown — runs even when a previous step failed, so a failed run never
     # leaks an ephemeral OAuth client. The recipe teardown deletes ONLY the client; the
