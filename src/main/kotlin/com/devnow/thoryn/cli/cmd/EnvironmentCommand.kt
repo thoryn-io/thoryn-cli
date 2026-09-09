@@ -34,7 +34,9 @@ import java.util.concurrent.Callable
  *  - `suspend`     — POST /api/v1/environments/{id}/suspend
  *  - `reactivate`  — POST /api/v1/environments/{id}/reactivate
  *
- * There is no `delete` — sandboxes are durable (the product API has no DELETE).
+ * There is no standalone `delete` subcommand yet. A sandbox CAN be hard-deleted through product-api's
+ * `DELETE /api/v1/environments/{id}` (SSO-2960) — the example-recipe `env.delete` teardown action
+ * (SSO-2961) uses it to tear down an ephemeral sandbox; a `thoryn env delete` command is future work.
  */
 @Command(
     name = "env",

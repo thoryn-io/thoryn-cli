@@ -145,4 +145,51 @@ class ProductApiClientTest {
         assertThat(recorded.method).isEqualTo("POST")
         assertThat(recorded.body.readUtf8()).isEqualTo("{}")
     }
+
+    // ── deleteEnvironment (SSO-2961 → product-api DELETE /api/v1/environments/{id}, SSO-2960) ─────────
+
+    @Test
+    fun `deleteEnvironment DELETEs the id path and sends the slug as the X-Thoryn-Confirm header`() {
+        server.enqueue(MockResponse().setResponseCode(204))
+
+        val client = ProductApiClient(gateway = baseUrl(), tokens = Tokens(accessToken = "AT"))
+
+        client.deleteEnvironment("env-1", confirmSlug = "sbx-alpha")
+
+        val recorded = server.takeRequest()
+        assertThat(recorded.method).isEqualTo("DELETE")
+        assertThat(recorded.path).isEqualTo("/api/v1/environments/env-1")
+        // The SSO-2413 confirm contract: the target environment's OWN slug rides as X-Thoryn-Confirm.
+        assertThat(recorded.getHeader("X-Thoryn-Confirm")).isEqualTo("sbx-alpha")
+        // A body-less DELETE — no confirmation is smuggled in a request body.
+        assertThat(recorded.body.readUtf8()).isEmpty()
+    }
+
+    @Test
+    fun `deleteEnvironment maps a 409 production refusal to a coded ProductApiException`() {
+        server.enqueue(
+            json(409, """{"errorCode":"cannot_delete_production_environment","detail":"the production plane cannot be deleted"}"""),
+        )
+
+        val client = ProductApiClient(gateway = baseUrl(), tokens = Tokens(accessToken = "AT"))
+
+        assertThatThrownBy { client.deleteEnvironment("env-prod", confirmSlug = "production") }
+            .isInstanceOfSatisfying(ProductApiException::class.java) {
+                assertThat(it.httpStatus).isEqualTo(409)
+                assertThat(it.errorCode).isEqualTo("cannot_delete_production_environment")
+            }
+    }
+
+    @Test
+    fun `deleteEnvironment classifies a 428 missing-confirmation as isProductionConfirmationRequired`() {
+        server.enqueue(json(428, """{"errorCode":"production_confirmation_required","detail":"X-Thoryn-Confirm is required"}"""))
+
+        val client = ProductApiClient(gateway = baseUrl(), tokens = Tokens(accessToken = "AT"))
+
+        assertThatThrownBy { client.deleteEnvironment("env-1") }
+            .isInstanceOfSatisfying(ProductApiException::class.java) {
+                assertThat(it.httpStatus).isEqualTo(428)
+                assertThat(it.isProductionConfirmationRequired).isTrue()
+            }
+    }
 }

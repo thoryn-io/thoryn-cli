@@ -23,6 +23,14 @@ internal data class ExampleState(
     val redirectUri: String? = null,
     val tenantIssuer: String? = null,
     val identityHost: String? = null,
+    /**
+     * SSO-2961 — the ephemeral sandbox environment an `env.create` step provisioned (its UUID `id` and
+     * its own `slug`), so a later `teardown` invocation can hard-delete it via `env.delete`
+     * (`DELETE /api/v1/environments/{id}` with `X-Thoryn-Confirm: <slug>`). Null when the recipe
+     * created no environment. Ids only — the same secret-free trust model as the rest of this state.
+     */
+    val environmentId: String? = null,
+    val environmentSlug: String? = null,
 )
 
 /**

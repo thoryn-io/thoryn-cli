@@ -148,6 +148,24 @@ class ProductApiClient(
     fun reactivateEnvironment(id: String): JsonNode =
         post("/api/v1/environments/${encode(id)}/reactivate", emptyBody())
 
+    /**
+     * `DELETE /api/v1/environments/{id}` (SSO-2960) — IRREVERSIBLY hard-deletes a **sandbox**
+     * environment and purges every environment-scoped row within it. Success is `200`/`204` (no body).
+     *
+     * Confirmation-guarded via the SSO-2413 wire contract: [confirmSlug] rides as the [CONFIRM_HEADER]
+     * (`X-Thoryn-Confirm`) and MUST equal the target environment's OWN slug — product-api answers
+     * `428 production_confirmation_required` when it is absent and `422 production_confirmation_mismatch`
+     * when it does not match. The endpoint refuses the platform-managed production plane with
+     * `409 cannot_delete_production_environment`; a cross-tenant / unknown id is `404 not_found`
+     * (privacy-symmetric); a token without `tenant:environments.write` is `403`.
+     *
+     * Every non-2xx surfaces as [ProductApiException] carrying the stable RFC 9457 `errorCode` and
+     * `detail`, so callers see a clear, code-mapped message (`isProductionConfirmationRequired` /
+     * `isProductionConfirmationMismatch` classify the 428/422 confirm-gate outcomes).
+     */
+    fun deleteEnvironment(id: String, confirmSlug: String? = null): Unit =
+        deleteNoContent("/api/v1/environments/${encode(id)}", confirmSlug)
+
     // ── Email provider (SSO-2917; product-api /api/v1/email-provider) ──────────
     //
     // The tenant's bring-your-own SMTP transport config (the activation, per tenant,
