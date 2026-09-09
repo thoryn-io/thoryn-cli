@@ -1,0 +1,44 @@
+{
+  "apiVersion": "thoryn.io/examples/v1",
+  "id": "provision-ci-identity",
+  "version": "1.0.0",
+  "summary": "Founder-run bootstrap - mint the CI's confidential client_credentials machine client (secret via SecretIo).",
+  "requires": {
+    "scopes": [
+      "tenant:applications.write",
+      "tenant:applications.read"
+    ],
+    "minCliVersion": "0.9.0"
+  },
+  "params": [
+    {
+      "name": "appName",
+      "prompt": "Display name for the CI machine client",
+      "default": "Thoryn CLI CI machine identity"
+    }
+  ],
+  "steps": [
+    {
+      "id": "machineClient",
+      "action": "clients.createMachine",
+      "description": "Mint the confidential client_credentials machine client for CI (secret emitted via SecretIo, never receipted).",
+      "with": {
+        "displayName": "{{appName}}",
+        "clientType": "confidential",
+        "grantTypes": [
+          "client_credentials"
+        ],
+        "scopes": [
+          "tenant:applications.write",
+          "tenant:applications.read",
+          "tenant:federation.write",
+          "tenant:federation.read",
+          "tenant:users.write",
+          "tenant:users.read",
+          "tenant:env.write",
+          "tenant:env.read"
+        ]
+      }
+    }
+  ]
+}

@@ -1,0 +1,60 @@
+# SSO-2950 (epic SSO-2947) — the as-code MACHINE-CLIENT BOOTSTRAP recipe.
+#
+# A FOUNDER runs this ONCE, interactively, to mint the CI's own confidential `client_credentials`
+# machine client through the customer plane — the same product workflow a real customer follows to
+# create a CI credential (ADR 2026-09-09). It provisions the identity that the CLI's connection
+# contract (SSO-2948, `thoryn login --connection`) then binds to on every CI run.
+#
+#   thoryn examples apply provision-ci-identity --secret-file ci.secret
+#
+# The single step `clients.createMachine` is the ONLY allowlisted recipe action permitted to surface a
+# secret. The minted `client_secret` is routed EXCLUSIVELY through the CLI's SecretIo channel (here,
+# the `--secret-file`) — shown once, to be pasted into the `THORYN_CLI_CI_CLIENT_SECRET` GitHub secret
+# — while the RECEIPT records only the non-secret shape (`clientId` + granted scopes). The secret is
+# never written to the receipt, a step output, a log, or argv (the security boundary the ADR exists
+# to preserve; recipes stay DATA producing secret-free receipts, ADR 2026-09-05).
+#
+# There is deliberately NO teardown: the machine client is a STANDING credential (rotate it with
+# `thoryn clients rotate-secret`, don't delete-and-recreate it). And there is no workspace step — a
+# founder runs this signed into the `thoryn` workspace via browser OIDC, so the client is minted
+# under that standing workspace's `tnt`.
+apiVersion: thoryn.io/examples/v1
+id: provision-ci-identity
+version: 1.0.0
+summary: Founder-run bootstrap - mint the CI's confidential client_credentials machine client (secret via SecretIo).
+
+requires:
+  scopes:
+    # applications.write mints the client; the founder must already hold the machine scopes below to
+    # delegate them (the transitive-grant model — you can only grant what you hold).
+    - tenant:applications.write
+    - tenant:applications.read
+  minCliVersion: 0.9.0
+
+params:
+  - name: appName
+    prompt: "Display name for the CI machine client"
+    # Cosmetic only — the clientId is server-generated. Named so the credential is identifiable in the
+    # console's client list as the CI identity.
+    default: "Thoryn CLI CI machine identity"
+
+steps:
+  - id: machineClient
+    action: clients.createMachine
+    description: Mint the confidential client_credentials machine client for CI (secret emitted via SecretIo, never receipted).
+    with:
+      displayName: "{{appName}}"
+      # Fixed by the ADR: a confidential client_credentials machine identity.
+      clientType: confidential
+      grantTypes: ["client_credentials"]
+      # The broad machine scope set the CI identity binds to (ADR 2026-09-09). The connection
+      # contract's scope list must be a subset of these granted scopes (SSO-2948 drift test).
+      scopes:
+        - tenant:applications.write
+        - tenant:applications.read
+        - tenant:federation.write
+        - tenant:federation.read
+        - tenant:users.write
+        - tenant:users.read
+        - tenant:env.write
+        - tenant:env.read
