@@ -127,6 +127,30 @@ class RecipeSchemaConformanceTest {
     }
 
     @Test
+    fun `env delete is a supported teardown action and an ephemeral-sandbox recipe conforms`() {
+        // SSO-2961 — the teardown allowlist carries `env.delete` (product-api DELETE /environments/{id},
+        // SSO-2960), and env.create stays in the step allowlist, so an ephemeral-sandbox recipe that
+        // provisions into a fresh sandbox and hard-deletes it on teardown is structurally conformant.
+        assertThat(allowlist("teardown", "action")).contains("env.delete")
+        assertThat(allowlist("steps", "action")).contains("env.create")
+        val recipe = yaml.readTree(
+            """
+            apiVersion: thoryn.io/examples/v1
+            id: ephemeral-sandbox
+            version: 1.0.0
+            summary: provision into an ephemeral sandbox and hard-delete it on teardown
+            steps:
+              - { id: env, action: env.create, with: { slug: "sbx-{{generate.slug8}}", name: Ephemeral } }
+              - { id: app, action: applications.create, with: { displayName: RP, redirectUris: ["http://127.0.0.1/cb"] } }
+            teardown:
+              - { action: applications.delete, id: "{{app.clientId}}" }
+              - { action: env.delete, id: "{{env.id}}" }
+            """.trimIndent(),
+        )
+        assertThat(violations(recipe)).isEmpty()
+    }
+
+    @Test
     fun `every step action in simple-signin is in the schema allowlist`() {
         val recipe = yaml.readTree(readResource("/examples/recipes/simple-signin/recipe.yaml"))
         val used = recipe["steps"].toList().map { it["action"].asString() }

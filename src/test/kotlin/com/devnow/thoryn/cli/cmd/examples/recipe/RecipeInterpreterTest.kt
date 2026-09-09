@@ -427,4 +427,92 @@ class RecipeInterpreterTest : CommandTestBase() {
         assertThat(hardDelete.path).isEqualTo("/account/workspace/t-1/hard-delete")
         assertThat(hardDelete.getHeader("X-Thoryn-Confirm")).isEqualTo("ex-signin-abc12345")
     }
+
+    /** SSO-2961 — an ephemeral-sandbox recipe: `env.create` a sandbox, provision INTO it, then `env.delete` it. */
+    private fun ephemeralSandboxRecipe(): Recipe = Recipe(
+        JsonMapper.builder().build().readTree(
+            """
+            {
+              "apiVersion": "thoryn.io/examples/v1",
+              "id": "ephemeral-sandbox-test",
+              "version": "1.0.0",
+              "summary": "provision into an ephemeral sandbox and hard-delete it on teardown",
+              "steps": [
+                { "id": "env", "action": "env.create",
+                  "with": { "slug": "sbx-{{generate.slug8}}", "name": "Ephemeral" } },
+                { "id": "app", "action": "applications.create",
+                  "with": { "displayName": "RP", "redirectUris": ["http://127.0.0.1/cb"] } }
+              ],
+              "teardown": [
+                { "action": "applications.delete", "id": "{{app.clientId}}" },
+                { "action": "env.delete", "id": "{{env.id}}" }
+              ]
+            }
+            """.trimIndent(),
+        ),
+    )
+
+    @Test
+    fun `env create provisions a sandbox, records its id and slug, and targets later steps at it`() {
+        // SSO-2961 — a workspace-less ephemeral-sandbox recipe (caller's own token, no create/exchange).
+        val ctx = context()
+        // 1) env.create → POST /api/v1/environments (env-registry; carries no environment header yet)
+        server.enqueue(jsonResponse(201, """{"id":"env-1","slug":"sbx-fixed001","kind":"sandbox","suspended":false}"""))
+        // 2) applications.create → provisioned INTO the freshly-created sandbox
+        server.enqueue(jsonResponse(201, """{"clientId":"app-7","status":"active"}"""))
+        // 3) best-effort platform attestation of the receipt
+        server.enqueue(jsonResponse(200, """{"kid":"k","signature":"s","canonicalPayload":"e30","attestedAt":"2026-01-01T00:00:00Z"}"""))
+
+        val run = RecipeInterpreter(ctx, ephemeralSandboxRecipe(), trustPropagationBudgetMs = 2_000).setup()
+
+        // The created sandbox id + slug are recorded on the run state so teardown can hard-delete it.
+        assertThat(run.state.environmentId).isEqualTo("env-1")
+        assertThat(run.state.environmentSlug).isEqualTo("sbx-fixed001")
+        // …and on the receipt as an `environment` resource.
+        assertThat(run.receipt.resources)
+            .anyMatch { it.kind == "environment" && it.id == "env-1" && it.attributes["slug"] == "sbx-fixed001" }
+        assertThat(run.receipt.environment).isEqualTo("sbx-fixed001")
+
+        // env.create carries the caller's own token and (being env-registry) no environment selector yet.
+        val envReq = server.takeRequest()
+        assertThat(envReq.method).isEqualTo("POST")
+        assertThat(envReq.path).isEqualTo("/api/v1/environments")
+        assertThat(envReq.getHeader("Authorization")).isEqualTo("Bearer AT-test")
+        // The app is then provisioned INTO the new sandbox: X-Thoryn-Environment = the created slug.
+        val appReq = server.takeRequest()
+        assertThat(appReq.path).isEqualTo("/api/v1/applications")
+        assertThat(appReq.getHeader("X-Thoryn-Environment")).isEqualTo("sbx-fixed001")
+    }
+
+    @Test
+    fun `env delete teardown deletes the app then hard-deletes the sandbox with the slug as X-Thoryn-Confirm`() {
+        // SSO-2961 — teardown is a SEPARATE invocation reading the persisted state; assert child-first
+        // ordering (app before its sandbox) and that the confirmation header equals the env's OWN slug.
+        val ctx = context()
+        val state = ExampleState(
+            example = "ephemeral-sandbox-test",
+            workspaceSlug = "ci-standing",
+            clientId = "app-7",
+            environmentId = "env-1",
+            environmentSlug = "sbx-fixed001",
+        )
+        server.enqueue(noContent()) // applications.delete
+        server.enqueue(noContent()) // env.delete
+
+        RecipeInterpreter(ctx, ephemeralSandboxRecipe()).teardown(state)
+
+        // Child-first: the app is deleted BEFORE the sandbox it was provisioned into.
+        val appDel = server.takeRequest()
+        assertThat(appDel.method).isEqualTo("DELETE")
+        assertThat(appDel.path).isEqualTo("/api/v1/applications/app-7")
+
+        val envDel = server.takeRequest()
+        assertThat(envDel.method).isEqualTo("DELETE")
+        assertThat(envDel.path).isEqualTo("/api/v1/environments/env-1")
+        // The confirmation header is sent, and equals the target environment's OWN slug.
+        assertThat(envDel.getHeader("X-Thoryn-Confirm")).isEqualTo("sbx-fixed001")
+        // Workspace-less recipe → caller's own token, no token-exchange, exactly two requests.
+        assertThat(envDel.getHeader("Authorization")).isEqualTo("Bearer AT-test")
+        assertThat(server.requestCount).isEqualTo(2)
+    }
 }

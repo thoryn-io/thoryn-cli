@@ -36,8 +36,10 @@ internal class RecipeUnsupportedActionException(action: String) :
  * GraalVM native image unchanged.
  *
  * Phase 1 implements the actions `simple-signin` needs (workspace + tenant registration + application
- * create, plus federation create and the delete/verify verbs). Environment actions (`env.*`) are the
- * guided-wizard phase (SSO-2876) and throw [RecipeUnsupportedActionException] until then.
+ * create, plus federation create and the delete/verify verbs). SSO-2961 adds the environment verbs an
+ * ephemeral-sandbox recipe needs: `env.create` (provision a sandbox and provision subsequent steps into
+ * it) and the `env.delete` teardown action (hard-delete that sandbox). `env.use` / `env.get` remain the
+ * guided-wizard phase (SSO-2876/SSO-2962) and throw [RecipeUnsupportedActionException] until then.
  */
 internal class RecipeInterpreter(
     private val ctx: ExampleContext,
@@ -73,6 +75,16 @@ internal class RecipeInterpreter(
     private var createdClientId: String? = null
     private var createdRedirectUri: String? = null
     private var createdPostLogoutRedirectUri: String? = null
+
+    /**
+     * SSO-2961 — the ephemeral sandbox environment an `env.create` step provisioned. Its id/slug are
+     * recorded on the run state so a later `teardown` invocation can hard-delete it via `env.delete`.
+     * When a recipe creates its own environment, subsequent steps provision INTO it: [effectiveEnvironmentSlug]
+     * starts at the constructor-supplied selection and an `env.create` step switches it to the new slug.
+     */
+    private var createdEnvironmentId: String? = null
+    private var createdEnvironmentSlug: String? = null
+    private var effectiveEnvironmentSlug: String? = environmentSlug
 
     // SSO-2875 — accumulated as the run proceeds, folded into the receipt on success.
     private val resources = mutableListOf<ResourceRef>()
@@ -159,12 +171,27 @@ internal class RecipeInterpreter(
         state.workspaceSlug?.let { scope["workspaceSlug"] = it }
         state.tenantId?.let { scope["workspace.tenantId"] = it }
         state.tenantId?.let { workspace = WorkspaceCtx(state.workspaceSlug ?: "", it, null) }
+        // SSO-2961 — the ephemeral sandbox the recipe created, so `env.delete` can resolve `{{env.id}}`.
+        state.environmentId?.let { scope["env.id"] = it }
         recipe.teardown.forEach { t ->
             val action = t["action"].asString()
             try {
                 when (action) {
                     "applications.delete" -> tenantClient().deleteApplication(substitute(t["id"].asString()), state.workspaceSlug)
                     "federation.delete" -> tenantClient().deleteFederationMember(substitute(t["id"].asString()))
+                    "env.delete" -> {
+                        // Resolve the target env id from the teardown's `id` reference (e.g. {{env.id}}),
+                        // falling back to the recorded ephemeral sandbox. Confirmation MUST equal the
+                        // environment's OWN slug (the SSO-2413 X-Thoryn-Confirm guard; 428 absent / 422 mismatch).
+                        val envId = t["id"]?.takeIf { !it.isNull }?.let { substitute(it.asString()) }
+                            ?: state.environmentId
+                        if (envId.isNullOrBlank()) {
+                            ctx.info("teardown step 'env.delete': no environment recorded to delete; skipping.")
+                        } else {
+                            tenantClient().deleteEnvironment(envId, state.environmentSlug)
+                            ctx.info("environment hard-deleted: id=$envId")
+                        }
+                    }
                     "hub.deleteWorkspace" -> {
                         val tenantId = substitute(t["id"].asString())
                         // Confirmation MUST equal the workspace slug (the hub's name-confirmation guard).
@@ -207,6 +234,7 @@ internal class RecipeInterpreter(
         ctx.step(n, step["description"]?.takeIf { !it.isNull }?.asString() ?: action)
         val outputs: Map<String, String> = when (action) {
             "hub.createWorkspace" -> createWorkspace(with)
+            "env.create" -> createEnvironment(with)
             "productApi.registerTenant" -> registerTenant(with)
             "applications.create" -> createApplication(with)
             "identity.registerUser" -> registerUser(with)
@@ -228,6 +256,30 @@ internal class RecipeInterpreter(
         workspace = WorkspaceCtx(slug, tenantId, provisioningToken)
         ctx.info("workspace: slug=$slug tenantId=$tenantId")
         return mapOf("tenantId" to tenantId, "slug" to slug)
+    }
+
+    /**
+     * SSO-2961 — create an ephemeral **sandbox** environment through the supported product workflow
+     * (product-api `POST /api/v1/environments`, `tenant:environments.write`; SSO-2410). The `with` map
+     * (`slug`, `name`) is forwarded verbatim. The created environment's `id`/`slug` are recorded on the
+     * run state so a later `env.delete` teardown can hard-delete it, and [effectiveEnvironmentSlug] is
+     * switched to the new slug so subsequent provisioning steps target this sandbox (via
+     * `X-Thoryn-Environment`). Exposed as `{{<step id>.id}}` / `{{<step id>.slug}}`.
+     */
+    private fun createEnvironment(with: Map<String, Any?>): Map<String, String> {
+        val env = retryUntilTenantTrusted { tenantClient().createEnvironment(with) }
+        val id = env["id"]?.takeIf { !it.isNull }?.asString()
+            ?: throw RecipeException("env.create returned no environment id")
+        val slug = env["slug"]?.takeIf { !it.isNull }?.asString()
+            ?: (with["slug"] as? String)
+            ?: throw RecipeException("env.create returned no environment slug")
+        createdEnvironmentId = id
+        createdEnvironmentSlug = slug
+        // Subsequent steps provision INTO the freshly-created sandbox.
+        effectiveEnvironmentSlug = slug
+        resources += ResourceRef(kind = "environment", id = id, attributes = mapOf("slug" to slug))
+        ctx.info("environment: id=$id slug=$slug")
+        return mapOf("id" to id, "slug" to slug)
     }
 
     private fun registerTenant(with: Map<String, Any?>): Map<String, String> {
@@ -411,13 +463,13 @@ internal class RecipeInterpreter(
         // just-created tenant. The decision is on the recipe SHAPE, so steps, verify, and teardown all
         // resolve the client identically (teardown/verify set `workspace` from the receipt/state, but
         // for a workspace-less recipe that context is informational — the caller token still applies).
-        if (!createsWorkspace) return ctx.callerGatewayClient(environmentSlug)
+        if (!createsWorkspace) return ctx.callerGatewayClient(effectiveEnvironmentSlug)
         val w = workspace ?: throw RecipeException("this step requires a prior hub.createWorkspace step")
-        return w.provisioningToken?.let { ctx.provisioningGatewayClient(it, environmentSlug) }
+        return w.provisioningToken?.let { ctx.provisioningGatewayClient(it, effectiveEnvironmentSlug) }
             ?: ctx.tenantGatewayClient(
                 ThorynConfig.tenantIssuer(ctx.hub, w.slug)
                     ?: throw RecipeException("could not derive the tenant issuer for workspace '${w.slug}'"),
-                environmentSlug,
+                effectiveEnvironmentSlug,
             )
     }
 
@@ -481,6 +533,9 @@ internal class RecipeInterpreter(
             redirectUri = createdRedirectUri,
             tenantIssuer = slug?.let { ThorynConfig.tenantIssuer(ctx.hub, it) },
             identityHost = slug?.let { ThorynConfig.tenantIdentityHost(ctx.hub, it) },
+            // SSO-2961 — the ephemeral sandbox this recipe created, so teardown can hard-delete it.
+            environmentId = createdEnvironmentId,
+            environmentSlug = createdEnvironmentSlug,
         )
     }
 
@@ -491,7 +546,7 @@ internal class RecipeInterpreter(
             appliedAt = Instant.now().toString(),
             subject = JwtClaims.of(ctx.tokens.accessToken)["sub"]?.takeIf { !it.isNull }?.asString(),
             workspace = WorkspaceRef(slug = w?.slug ?: scope["workspaceSlug"], tenantId = w?.tenantId),
-            environment = environmentSlug,
+            environment = effectiveEnvironmentSlug,
             resources = resources.toList(),
             verify = verifyResults.toList(),
         )

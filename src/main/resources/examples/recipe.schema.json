@@ -105,14 +105,14 @@
       }
     },
     "teardown": {
-      "description": "Best-effort removal of what the steps created, executed in declared order (child-first: delete the app, then the workspace it lives in — SSO-2901).",
+      "description": "Best-effort removal of what the steps created, executed in declared order (child-first: delete the child resources, then the container they live in — the app before the workspace it lives in (SSO-2901), or a resource before the `env.delete` that hard-deletes the ephemeral sandbox it was provisioned into (SSO-2961)). `env.delete` (SSO-2960 — product-api `DELETE /api/v1/environments/{id}`, `tenant:environments.write`) targets the environment created by an `env.create` step: its `id` is the env id (reference it as `{{<env-create step id>.id}}`, which the interpreter records on the run state so a later `teardown` invocation can resolve it), and the confirmation slug the interpreter sends as `X-Thoryn-Confirm` is the environment's OWN slug (absent → 428, mismatch → 422). It refuses the production plane (409 `cannot_delete_production_environment`); a cross-tenant/unknown id is 404.",
       "type": "array",
       "items": {
         "type": "object",
         "additionalProperties": false,
         "required": ["action"],
         "properties": {
-          "action": { "enum": ["applications.delete", "federation.delete", "hub.deleteWorkspace"] },
+          "action": { "enum": ["applications.delete", "federation.delete", "env.delete", "hub.deleteWorkspace"] },
           "id": { "type": "string" },
           "with": { "type": "object" }
         }
