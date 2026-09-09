@@ -110,7 +110,7 @@ class ProductApiClient(
      * rotation is gated the same way.
      */
     fun rotateApplicationSecret(clientId: String, confirmSlug: String? = null): JsonNode =
-        post("/api/v1/applications/${encode(clientId)}/secret/rotate", emptyMap<String, Any?>(), confirmSlug)
+        post("/api/v1/applications/${encode(clientId)}/secret/rotate", emptyBody(), confirmSlug)
 
     // ── Tenant users (SSO-2907; product-api SSO-1884 `/api/v1/users`) ──────────
     //
@@ -143,10 +143,10 @@ class ProductApiClient(
 
     /** POST /api/v1/environments/{id}/suspend — [confirmSlug] clears the production-confirmation gate. */
     fun suspendEnvironment(id: String, confirmSlug: String? = null): JsonNode =
-        post("/api/v1/environments/${encode(id)}/suspend", emptyMap<String, Any?>(), confirmSlug)
+        post("/api/v1/environments/${encode(id)}/suspend", emptyBody(), confirmSlug)
 
     fun reactivateEnvironment(id: String): JsonNode =
-        post("/api/v1/environments/${encode(id)}/reactivate", emptyMap<String, Any?>())
+        post("/api/v1/environments/${encode(id)}/reactivate", emptyBody())
 
     // ── Email provider (SSO-2917; product-api /api/v1/email-provider) ──────────
     //
@@ -237,11 +237,11 @@ class ProductApiClient(
      * Reversible via [reactivateWorkspace]. Hub-routed (not the gateway).
      */
     fun archiveWorkspace(tenantId: String, confirmSlug: String? = null): JsonNode =
-        post("/account/workspace/${encode(tenantId)}/archive", emptyMap<String, Any?>(), confirmSlug)
+        post("/account/workspace/${encode(tenantId)}/archive", emptyBody(), confirmSlug)
 
     /** SSO-2831 — `POST /account/workspace/{tenantId}/reactivate` — clears the archive flag. */
     fun reactivateWorkspace(tenantId: String): JsonNode =
-        post("/account/workspace/${encode(tenantId)}/reactivate", emptyMap<String, Any?>())
+        post("/account/workspace/${encode(tenantId)}/reactivate", emptyBody())
 
     /**
      * SSO-2859 — `POST /account/workspace/{tenantId}/hard-delete` — IRREVERSIBLY deletes a
@@ -252,7 +252,7 @@ class ProductApiClient(
      * workspace slug, or the hub replies 428 (required) / 422 (mismatch).
      */
     fun hardDeleteWorkspace(tenantId: String, confirmSlug: String? = null): JsonNode =
-        post("/account/workspace/${encode(tenantId)}/hard-delete", emptyMap<String, Any?>(), confirmSlug)
+        post("/account/workspace/${encode(tenantId)}/hard-delete", emptyBody(), confirmSlug)
 
     /**
      * `POST /api/v1/tenants` on product-api (gateway-routed) — registers a
@@ -515,6 +515,22 @@ class ProductApiClient(
     }
 
     // ── Generic verbs ───────────────────────────────────────────────────────
+
+    /**
+     * SSO-2958 — a native-image-safe empty request body.
+     *
+     * A raw kotlin `emptyMap()` / `mapOf()` is the `kotlin.collections.EmptyMap`
+     * singleton. When jackson-module-kotlin serialises it, its
+     * `KotlinNamesAnnotationIntrospector.findPreferredCreator` reflects on
+     * `EmptyMap`'s constructor via kotlin-reflect — and `EmptyMap` carries no
+     * native-image reflection metadata, so the native binary throws
+     * `KotlinReflectionInternalError: Unresolved class: class kotlin.collections.EmptyMap`
+     * (the fat jar works because it has full runtime reflection). A Jackson
+     * [tools.jackson.databind.node.ObjectNode] serialises to `{}` with zero
+     * kotlin-reflection, so it is safe on the native hot path. Every body-less
+     * POST below routes through this rather than passing `emptyMap()`.
+     */
+    private fun emptyBody(): JsonNode = mapper.createObjectNode()
 
     private fun get(path: String): JsonNode = executeJson { at ->
         baseRequest(path).authed(at)

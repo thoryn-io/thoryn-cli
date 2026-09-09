@@ -1,5 +1,6 @@
 package com.devnow.thoryn.cli.cmd
 
+import com.devnow.thoryn.cli.api.ProductApiClient
 import com.devnow.thoryn.cli.auth.FileTokenStore
 import com.devnow.thoryn.cli.auth.Tokens
 import picocli.CommandLine.Command
@@ -25,11 +26,14 @@ import java.util.concurrent.Callable
     name = "__diag",
     description = ["Internal diagnostics (hidden)."],
     hidden = true,
-    subcommands = [DiagCommand.TokenRoundtripSubcommand::class],
+    subcommands = [
+        DiagCommand.TokenRoundtripSubcommand::class,
+        DiagCommand.EmptyPostSubcommand::class,
+    ],
 )
 class DiagCommand : Callable<Int> {
     override fun call(): Int {
-        System.err.println("Usage: thoryn __diag <subcommand>  (subcommands: token-roundtrip)")
+        System.err.println("Usage: thoryn __diag <subcommand>  (subcommands: token-roundtrip, empty-post)")
         return CommandSupport.EXIT_USAGE
     }
 
@@ -91,6 +95,63 @@ class DiagCommand : Callable<Int> {
                 }
             } finally {
                 runCatching { Files.deleteIfExists(tmp) }
+            }
+        }
+    }
+
+    /**
+     * `thoryn __diag empty-post` — SSO-2958. Exercise the exact body-less-POST
+     * serialization path that crashed the native binary: serialise an empty
+     * request body with the same jackson mapper [ProductApiClient] uses
+     * ([ProductApiClient.defaultMapper], `kotlinModule` installed) and assert it
+     * emits `{}` without throwing.
+     *
+     * Two representations are serialised:
+     *  1. The **fix** — a Jackson `ObjectNode` (what [ProductApiClient.emptyBody]
+     *     now sends). This must serialise to `{}` with no kotlin-reflection.
+     *  2. The **old** raw `emptyMap()` (the `kotlin.collections.EmptyMap`
+     *     singleton). Before the fix this threw
+     *     `KotlinReflectionInternalError: Unresolved class: class kotlin.collections.EmptyMap`
+     *     in the native image; with the SSO-2958 `reflect-config.json` entry it now
+     *     serialises to `{}` too (defense in depth). A JVM run can't catch the
+     *     native failure — this proof matters only on the native binary.
+     *
+     * Exits 0 when both emit `{}`; non-zero if either throws or emits something else.
+     */
+    @Command(
+        name = "empty-post",
+        description = ["Serialise an empty POST body with the ProductApiClient mapper and assert it emits {}."],
+        hidden = true,
+    )
+    class EmptyPostSubcommand : Callable<Int> {
+        override fun call(): Int {
+            val mapper = ProductApiClient.defaultMapper()
+            val problems = mutableListOf<String>()
+
+            // (1) The fix: a Jackson ObjectNode — the representation ProductApiClient.emptyBody() now sends.
+            val objectNodeJson = runCatching { mapper.writeValueAsString(mapper.createObjectNode()) }
+                .onFailure { problems += "ObjectNode empty body threw ${it::class.qualifiedName}: ${it.message}" }
+                .getOrNull()
+            println("empty ObjectNode body -> ${objectNodeJson ?: "<threw>"}")
+            if (objectNodeJson != null && objectNodeJson.replace(Regex("\\s"), "") != "{}") {
+                problems += "ObjectNode empty body serialised to '$objectNodeJson', expected '{}'"
+            }
+
+            // (2) Defense-in-depth: the raw kotlin EmptyMap singleton that used to crash the native image.
+            val emptyMapJson = runCatching { mapper.writeValueAsString(emptyMap<String, Any?>()) }
+                .onFailure { problems += "kotlin.collections.EmptyMap threw ${it::class.qualifiedName}: ${it.message}" }
+                .getOrNull()
+            println("raw kotlin EmptyMap body -> ${emptyMapJson ?: "<threw>"}")
+            if (emptyMapJson != null && emptyMapJson.replace(Regex("\\s"), "") != "{}") {
+                problems += "kotlin EmptyMap serialised to '$emptyMapJson', expected '{}'"
+            }
+
+            return if (problems.isEmpty()) {
+                println("OK: empty POST body serialises to {} without throwing.")
+                CommandSupport.EXIT_OK
+            } else {
+                problems.forEach { System.err.println("FAIL: $it") }
+                CommandSupport.EXIT_IO_ERROR
             }
         }
     }
