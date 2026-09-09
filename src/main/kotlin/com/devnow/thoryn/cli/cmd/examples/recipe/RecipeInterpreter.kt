@@ -3,6 +3,7 @@ package com.devnow.thoryn.cli.cmd.examples.recipe
 import com.devnow.thoryn.cli.api.ProductApiClient
 import com.devnow.thoryn.cli.api.ProductApiException
 import com.devnow.thoryn.cli.auth.JwtClaims
+import com.devnow.thoryn.cli.cmd.SecretIo
 import com.devnow.thoryn.cli.cmd.examples.ExampleContext
 import com.devnow.thoryn.cli.cmd.examples.ExampleState
 import com.devnow.thoryn.cli.config.ThorynConfig
@@ -22,6 +23,37 @@ internal open class RecipeException(message: String) : RuntimeException(message)
 /** An action that the schema allows but the CLI interpreter does not yet implement (a later phase). */
 internal class RecipeUnsupportedActionException(action: String) :
     RecipeException("recipe action '$action' is not yet supported by this CLI (a later SSO-2871 phase adds it)")
+
+/**
+ * SSO-2950 — the single channel through which the `clients.createMachine` step's ONE minted
+ * `client_secret` leaves the CLI. It is the recipe-interpreter seam over the same [SecretIo] emission
+ * `thoryn clients create` uses (a `--secret-file`, or a guarded/interactive stdout). The secret is
+ * routed here and NOWHERE else — never to the receipt, a step output (`{{...}}`), a log, or argv.
+ *
+ * [emit] returns `true` when the secret was delivered, `false` when it was refused (e.g. no
+ * `--secret-file` and a non-interactive stdout) — the interpreter then fails the run so the operator
+ * notices the secret was NOT surfaced.
+ */
+internal fun interface SecretSink {
+    fun emit(clientId: String, secret: String): Boolean
+
+    companion object {
+        /**
+         * The production default when no explicit sink is wired: emit through [SecretIo] with no
+         * `--secret-file` and `forceStdout=false` — i.e. print to an interactive TTY (with a WARN),
+         * and REFUSE a non-interactive pipe. This mirrors `thoryn clients create`'s default exactly,
+         * so a `clients.createMachine` step is as secret-safe by default as the imperative command.
+         */
+        fun default(): SecretSink = SecretSink { _, secret ->
+            SecretIo.emitSecret(
+                label = "CI machine client secret",
+                secret = secret,
+                secretFile = null,
+                forceStdout = false,
+            )
+        }
+    }
+}
 
 /**
  * SSO-2871 Phase 1 (SSO-2873) — the recipe **runner**: interprets a declarative recipe by executing
@@ -49,6 +81,12 @@ internal class RecipeInterpreter(
     private val randomSuffix: () -> String = { UUID.randomUUID().toString().replace("-", "").substring(0, 8) },
     /** Deadline budget for the post-create tenant-trust propagation retry (ms). */
     private val trustPropagationBudgetMs: Long = 75_000,
+    /**
+     * SSO-2950 — where a `clients.createMachine` step routes its ONE minted `client_secret`. Defaults
+     * to the same [SecretIo] behaviour as `thoryn clients create` (interactive TTY, refuse a pipe); the
+     * `examples apply` command overrides it with a `--secret-file`-configured sink.
+     */
+    private val secretSink: SecretSink = SecretSink.default(),
 ) {
     private val mapper = JsonMapper.builder().addModule(kotlinModule()).build()
 
@@ -209,6 +247,7 @@ internal class RecipeInterpreter(
             "hub.createWorkspace" -> createWorkspace(with)
             "productApi.registerTenant" -> registerTenant(with)
             "applications.create" -> createApplication(with)
+            "clients.createMachine" -> createMachineClient(with)
             "identity.registerUser" -> registerUser(with)
             "tenant.configureEmailProvider" -> configureEmailProvider(with)
             "federation.create" -> createFederation(with)
@@ -261,6 +300,77 @@ internal class RecipeInterpreter(
         )
         ctx.info("client: clientId=$clientId")
         return mapOf("clientId" to clientId)
+    }
+
+    /**
+     * SSO-2950 — the as-code machine-client bootstrap. Provision a CONFIDENTIAL `client_credentials`
+     * client through the SUPPORTED product workflow — the SAME product-api `POST /api/v1/applications`
+     * call `thoryn clients create` makes (`tenant:applications.write`) — and route the ONE server-minted
+     * `client_secret` through the CLI's [SecretIo] channel via [secretSink].
+     *
+     * **Security boundary (the reason ADR 2026-09-09 exists).** `clients.createMachine` is the only
+     * allowlisted action permitted to surface a secret, and it preserves the recipe trust model
+     * (recipes are DATA producing SECRET-FREE receipts, ADR 2026-09-05): the minted secret exits
+     * EXCLUSIVELY through [secretSink] (a `--secret-file` / guarded stdout). It is NEVER:
+     *  - written to the [Receipt] (only the non-secret `machineClient` shape — `clientId` + granted
+     *    `scopes` — is recorded), nor
+     *  - exposed as a step output / `{{...}}` binding (only `clientId` is returned to [scope]), nor
+     *  - logged (only the `clientId` is printed) or placed on argv.
+     * If the sink refuses the secret (no `--secret-file`, non-interactive stdout), the run FAILS so the
+     * operator notices the credential was not surfaced.
+     */
+    private fun createMachineClient(with: Map<String, Any?>): Map<String, String> {
+        // Enforce the machine-client shape the ADR fixes (the schema documents these as required; we
+        // re-check here so a hand-edited recipe cannot mint a differently-shaped secret-bearing client).
+        val clientType = (with["clientType"] as? String)?.trim().orEmpty().ifEmpty { "confidential" }
+        if (clientType != "confidential") {
+            throw RecipeException("clients.createMachine requires clientType 'confidential' (was '$clientType')")
+        }
+        val grantTypes = stringList(with["grantTypes"])
+        if ("client_credentials" !in grantTypes) {
+            throw RecipeException("clients.createMachine requires grantTypes to include 'client_credentials' (was $grantTypes)")
+        }
+        val requestedScopes = stringList(with["scopes"])
+
+        val body = linkedMapOf<String, Any?>("clientType" to clientType, "grantTypes" to grantTypes)
+        (with["displayName"] as? String)?.takeIf { it.isNotBlank() }?.let { body["displayName"] = it }
+        if (requestedScopes.isNotEmpty()) body["scopes"] = requestedScopes
+
+        val app = retryUntilTenantTrusted { tenantClient().createApplication(body) }
+        val clientId = (app["clientId"] ?: app["client_id"])?.takeIf { !it.isNull }?.asString()
+            ?: throw RecipeException("clients.createMachine returned no clientId")
+        // Prefer the granted scopes echoed by the server; fall back to what the recipe requested.
+        val grantedScopes = stringList(app["scopes"]).ifEmpty { requestedScopes }
+
+        // The receipt records ONLY the non-secret shape — clientId + granted scopes. NEVER the secret.
+        resources += ResourceRef(
+            kind = "machineClient",
+            id = clientId,
+            attributes = buildMap { if (grantedScopes.isNotEmpty()) put("scopes", grantedScopes.joinToString(",")) },
+        )
+
+        // Route the ONE minted secret through SecretIo and NOWHERE else. Read it into a local, hand it
+        // to the sink, and never let it reach [scope], the receipt, or a log line.
+        val secret = (app["clientSecret"] ?: app["client_secret"])?.takeIf { !it.isNull }?.asString()
+        if (!secret.isNullOrEmpty()) {
+            val delivered = secretSink.emit(clientId, secret)
+            if (!delivered) {
+                throw RecipeException(
+                    "the machine client '$clientId' was created but its secret could not be delivered — " +
+                        "re-run `thoryn examples apply` with --secret-file <path> (or --force-stdout).",
+                )
+            }
+        }
+        // clientId ONLY — the secret is deliberately absent from the step-output map.
+        ctx.info("machine client: clientId=$clientId (secret via SecretIo — not recorded on the receipt)")
+        return mapOf("clientId" to clientId)
+    }
+
+    /** Read a JSON/`with` value that should be a string array into a `List<String>` (empty when absent). */
+    private fun stringList(value: Any?): List<String> = when (value) {
+        is List<*> -> value.mapNotNull { it?.toString() }
+        is JsonNode -> if (value.isArray) value.mapNotNull { it.asString() } else emptyList()
+        else -> emptyList()
     }
 
     /**
