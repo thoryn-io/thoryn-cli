@@ -19,6 +19,8 @@ import com.devnow.thoryn.cli.auth.TokenStoreFactory
 import com.devnow.thoryn.cli.auth.Tokens
 import com.devnow.thoryn.cli.auth.WorkloadIdentityException
 import com.devnow.thoryn.cli.auth.WorkloadIdentityFlow
+import com.devnow.thoryn.cli.cmd.connection.Connection
+import com.devnow.thoryn.cli.cmd.connection.ConnectionException
 import com.devnow.thoryn.cli.config.ThorynConfig
 import picocli.CommandLine.Command
 import picocli.CommandLine.Option
@@ -193,6 +195,23 @@ class LoginCommand : Callable<Int> {
     var statusOnly: Boolean = false
 
     /**
+     * SSO-2948 (epic SSO-2947) — sign in from a declarative **connection contract**
+     * (`connection.schema.json`): a schema-backed JSON file describing the workspace + the machine
+     * client to authenticate as. The CLI owns the derivation the CI Action used to hand-roll in bash:
+     * it derives the per-tenant issuer (`https://<slug>.hub.<env>`) and gateway from `workspace.slug`
+     * + the hub base (the env var named by `workspace.hubBaseUrlEnv`, default THORYN_HUB), reads the
+     * client secret from the env var named by `auth.secretEnv` (failing closed if unset/empty),
+     * requests EXACTLY `auth.scopes`, and stamps the session. Mutually exclusive with the manual
+     * `--issuer` / `--gateway` / `--scope` / `--client-credentials` (and other-mode) flags — the
+     * contract is the single source of the binding.
+     */
+    @Option(
+        names = ["--connection"],
+        description = ["Sign in from a connection contract (connection.schema.json). Derives issuer/gateway from workspace.slug; reads the client secret from the env var named by auth.secretEnv; requests exactly auth.scopes. Mutually exclusive with --issuer/--gateway/--scope/--client-credentials."],
+    )
+    var connectionFile: File? = null
+
+    /**
      * SSO-1145: bypass the `http://` non-loopback issuer-URL guard for local
      * development scenarios where TLS is not available. A WARN is printed to
      * stderr whenever this flag is active so the operator is aware.
@@ -229,6 +248,11 @@ class LoginCommand : Callable<Int> {
     override fun call(): Int {
         if (statusOnly) {
             return printStatus()
+        }
+        // SSO-2948 — the connection contract is the single source of the auth binding; it derives its
+        // own issuer/gateway/scopes, so it runs before the manual-flag path and is exclusive with it.
+        if (connectionFile != null) {
+            return runConnectionFlow(connectionFile!!)
         }
         // SSO-1145: validate the issuer URL before any network activity begins.
         try {
@@ -346,6 +370,102 @@ class LoginCommand : Callable<Int> {
         }
         return ClientCredentials(clientId, secret)
     }
+
+    /**
+     * SSO-2948 — sign in from a declarative connection contract. Derives issuer + gateway from the
+     * workspace slug (via [ThorynConfig.tenantIssuer] / [ThorynConfig.gatewayForIssuer]), resolves the
+     * client secret from the env var the contract NAMES (failing closed if unset/empty), and runs the
+     * existing client-credentials flow requesting EXACTLY the contract's scopes, then stamps the
+     * session so later commands need no host flags.
+     */
+    private fun runConnectionFlow(file: File): Int {
+        // The contract is the single source of the binding — refuse to also honour the manual flags.
+        val conflicting = buildList {
+            if (issuer != ThorynConfig.DEFAULT_ISSUER) add("--issuer")
+            if (!gateway.isNullOrBlank()) add("--gateway")
+            if (scope != ThorynConfig.DEFAULT_SCOPE) add("--scope")
+            if (clientId != ThorynConfig.DEFAULT_CLIENT_ID) add("--client-id")
+            if (useClientCredentials) add("--client-credentials")
+            if (useDeviceCode) add("--device-code")
+            if (useWorkloadIdentity) add("--workload-identity")
+        }
+        if (conflicting.isNotEmpty()) {
+            System.err.println(
+                "Error: --connection is mutually exclusive with ${conflicting.joinToString(", ")}. " +
+                    "The connection contract is the single source of the workspace, client and scopes.",
+            )
+            return EXIT_USAGE
+        }
+
+        val connection = try {
+            Connection.load(file)
+        } catch (e: ConnectionException) {
+            System.err.println("Error: ${e.message}")
+            return EXIT_USAGE
+        }
+
+        // Resolve the hub base from the env var the contract names (-D property first, then env, so
+        // tests and `java -jar -D…` work), falling back to the CLI's baked-in default hub.
+        val hubBase = resolveNamedEnv(connection.hubBaseUrlEnv) ?: ThorynConfig.DEFAULT_ISSUER
+        val derivedIssuer = ThorynConfig.tenantIssuer(hubBase, connection.slug)
+        val derivedGateway = ThorynConfig.gatewayForIssuer(hubBase)
+
+        try {
+            IssuerUrlValidator.validate(derivedIssuer, devMode)
+        } catch (e: IssuerUrlValidationException) {
+            System.err.println("Error: derived issuer '$derivedIssuer' is invalid — ${e.message}")
+            return EXIT_USAGE
+        }
+
+        // Fail closed when the named secret env var is unset/empty — the secret is NEVER in the file.
+        val secret = resolveNamedEnv(connection.secretEnv)
+        if (secret == null) {
+            System.err.println(
+                "Error: the client secret env var '${connection.secretEnv}' (named by the connection's " +
+                    "auth.secretEnv) is unset or empty. Export it before signing in.",
+            )
+            return EXIT_CLIENT_CREDENTIALS_FAILED
+        }
+
+        val flow = ClientCredentialsFlow(
+            issuer = derivedIssuer,
+            clientId = connection.clientId,
+            clientSecret = secret,
+            sender = realHttpSender(),
+        )
+        // Request EXACTLY the declared scopes — the hub grants only what is requested, so the
+        // contract's scope list is both the ceiling and the floor (no ScopeRegistry expansion).
+        val requestedScope = connection.scopes.joinToString(" ")
+
+        return try {
+            val tokens = flow.run(requestedScope)
+            tokenStore.write(
+                tokens.copy(
+                    issuer = derivedIssuer,
+                    gateway = derivedGateway,
+                    authMode = Tokens.AUTH_MODE_CLIENT_CREDENTIALS,
+                    clientId = connection.clientId,
+                ),
+            )
+            // SSO-2863 — a fresh login resets the base tenant; drop any stale workspace selection.
+            SelectedWorkspaceStore().clear()
+            println("Signed in (connection '${connection.slug}' / service account '${connection.clientId}').")
+            tokens.scope?.let { println("Scopes: $it") }
+            EXIT_OK
+        } catch (e: ClientCredentialsException) {
+            System.err.println("Sign-in failed: ${e.message}")
+            EXIT_CLIENT_CREDENTIALS_FAILED
+        }
+    }
+
+    /**
+     * SSO-2948 — resolve an env var BY NAME, `-D` system property first then the environment (the
+     * project-wide no-argv secret-resolution order, see [ThorynConfig.resolveClientSecret]). Returns
+     * null when unset or blank so the caller can fail closed.
+     */
+    private fun resolveNamedEnv(name: String): String? =
+        System.getProperty(name)?.takeIf { it.isNotBlank() }
+            ?: System.getenv(name)?.takeIf { it.isNotBlank() }
 
     /**
      * SSO-2879 — the secret-less WIF sign-in. Resolves the CI signing key (env / file), signs a

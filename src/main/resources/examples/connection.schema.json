@@ -1,0 +1,66 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://thoryn.io/examples/connection.schema.json",
+  "title": "Thoryn CLI connection contract",
+  "description": "SSO-2948 (epic SSO-2947) — a schema-backed, declarative sign-in configuration for the `thoryn` CLI: HOW a caller (a person for their own use cases, or a CI pipeline dogfooding the same feature) signs the CLI into a given workspace/identity. It is DATA, not code — a sibling of the recipe schema — passed to `thoryn login --connection <file>`. The workspace slug derives the per-tenant issuer (`https://<slug>.hub.<env>`) and gateway; the client authenticates by the client-credentials grant. The SECRET is NEVER in this file — only the NAME of the environment variable that carries it (`auth.secretEnv`); a client id is public and MAY appear.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["apiVersion", "workspace", "auth"],
+  "properties": {
+    "apiVersion": {
+      "description": "Connection schema version.",
+      "const": "thoryn.io/connection/v1"
+    },
+    "workspace": {
+      "description": "The workspace this CLI binds to. Its slug derives the per-tenant hub issuer and gateway.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["slug"],
+      "properties": {
+        "slug": {
+          "description": "Workspace slug (same grammar as a recipe workspace slug). Derives https://<slug>.hub.<env>.",
+          "type": "string",
+          "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"
+        },
+        "hubBaseUrlEnv": {
+          "description": "NAME of the environment variable holding the hub base URL (e.g. https://hub.stg.thoryn.org). The per-tenant issuer is derived by prefixing the slug on that host. Defaults to THORYN_HUB; when unset the CLI's baked-in default hub is used.",
+          "type": "string",
+          "pattern": "^[A-Za-z_][A-Za-z0-9_]*$",
+          "default": "THORYN_HUB"
+        }
+      }
+    },
+    "auth": {
+      "description": "How the CLI authenticates into the workspace.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["method", "clientId", "secretEnv", "scopes"],
+      "properties": {
+        "method": {
+          "description": "Authentication method. Only the non-interactive client-credentials grant is a connection method today.",
+          "const": "client_credentials"
+        },
+        "clientId": {
+          "description": "OAuth client id of the machine client. PUBLIC — a client id is not a secret and MAY be committed.",
+          "type": "string",
+          "minLength": 1
+        },
+        "secretEnv": {
+          "description": "NAME of the environment variable holding the client secret (a GitHub secret in CI; a locally-exported var for a developer). NEVER the secret value itself.",
+          "type": "string",
+          "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+        },
+        "scopes": {
+          "description": "The EXACT scope set requested — the ceiling AND the floor (the hub grants only what is requested). Non-empty, unique, each a tenant:<resource>.<verb> scope.",
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^tenant:[a-z-]+\\.[a-z-]+$"
+          }
+        }
+      }
+    }
+  }
+}
