@@ -3,6 +3,7 @@ package com.devnow.thoryn.cli.cmd.examples
 import com.devnow.thoryn.cli.api.ProductApiClient
 import com.devnow.thoryn.cli.auth.HttpSender
 import com.devnow.thoryn.cli.cmd.examples.recipe.Recipe
+import com.devnow.thoryn.cli.cmd.examples.recipe.RecipeException
 import com.devnow.thoryn.cli.cmd.examples.recipe.RecipeExample
 import com.devnow.thoryn.cli.auth.TokenExchangeFlow
 import com.devnow.thoryn.cli.auth.Tokens
@@ -150,11 +151,26 @@ internal object ExampleRegistry {
      */
     private fun examples(): List<Example> =
         listOf(
+            // TODO(SSO-2968 follow-up): retire bundled recipes once conformance/example-e2e migrate to
+            // the fetched signed catalog. They MUST stay for now — conformance.yml / example-e2e.yml run
+            // bundled `ci-signin` (no `examples update` first), so removing them breaks CI.
             RecipeExample(Recipe.load("simple-signin")),
             RecipeExample(Recipe.load("ci-signin")),
         )
 
     fun all(): List<Example> = examples()
 
-    fun byName(name: String): Example? = examples().firstOrNull { it.name == name }
+    /**
+     * Resolve an example by id for the `setup` / `run` / `teardown` verbs. Uses [Recipe.resolve]'s
+     * order (SSO-2968): a recipe in the fetched, verified catalog cache is preferred, else the bundled
+     * one — so a catalog-only recipe like `sandbox-signin` runs through the identical
+     * [RecipeInterpreter]. Returns `null` when the id is neither bundled nor cached; the caller then
+     * points the user at `thoryn examples update`.
+     */
+    fun byName(name: String): Example? =
+        try {
+            RecipeExample(Recipe.resolve(name))
+        } catch (_: RecipeException) {
+            null
+        }
 }
