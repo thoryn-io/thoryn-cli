@@ -20,23 +20,23 @@
 class Thoryn < Formula
   desc "Thoryn customer-plane CLI (OAuth 2.0 / OIDC identity broker)"
   homepage "https://github.com/thoryn-io/thoryn-cli"
-  version "0.3.6"
+  version "0.3.7"
 
   on_macos do
     on_arm do
       url "https://github.com/thoryn-io/thoryn-cli/releases/download/cli-v#{version}/thoryn-darwin-arm64"
-      sha256 "62d09776aa45a8e3ba46e703d62b51c72fc4a809d5b009979d01a398d1d25345"
+      sha256 "71f7d5db2519917c397286c0b40b17fdfba28820322fc36c11449a919e313610"
     end
   end
 
   on_linux do
     on_arm do
       url "https://github.com/thoryn-io/thoryn-cli/releases/download/cli-v#{version}/thoryn-linux-arm64"
-      sha256 "0276c0b7823e5d68c4835ca53c596a0d0ee53ef4fc2c425b46ee9f5b026db3b3"
+      sha256 "624a5d080d915fd14fec2319b2b8e2e0c2035c26fc9b5f4598d717e933780f03"
     end
     on_intel do
       url "https://github.com/thoryn-io/thoryn-cli/releases/download/cli-v#{version}/thoryn-linux-amd64"
-      sha256 "0bf3b7b131a77753800e250d7965196b53a9c673ad338095bffe9c6c140b9ec3"
+      sha256 "460f7874b1cbd55d466c0dc899261ede79e6b8afb6f8c4295462b53232891a01"
     end
   end
 
