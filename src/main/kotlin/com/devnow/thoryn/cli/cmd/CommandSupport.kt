@@ -136,15 +136,15 @@ internal object CommandSupport {
                     subjectToken = base.accessToken,
                     targetResource = selected.tenantHubIssuer,
                     sender = realHttpSender(),
-                    // SSO-2965 — request the base session's scopes on the exchange so the switched
-                    // token carries the login's entitlement (incl. `.write`). Without this the
-                    // exchange returns a narrowed default set, and switched product-api writes that
-                    // depend on the caller holding a scope (e.g. `clients update` granting a scope,
-                    // `env create`) fail `scope_not_grantable` even for a fully-entitled operator.
-                    // The hub still down-scopes to what the client is permitted on the target tenant,
-                    // so this only ever returns scopes the operator is genuinely entitled to. Mirrors
-                    // the client-credentials re-mint path below, which already passes `current.scope`.
-                ).run(base.scope)
+                    // SSO-2965 (reverted) — request NO scope on the switch exchange. The hub's
+                    // cross-tenant exchange already mints the FULL entitled set the caller holds in
+                    // the target tenant when no scope is requested (verified against staging: the
+                    // switched token carries clients.write + environments.write + the caller's whole
+                    // tenant:* entitlement; the subject's role is enforced downstream by product-api).
+                    // Passing `base.scope` NARROWED the switched token to the login scopes — dropping
+                    // clients.write and anything not requested at login — which broke `clients update`
+                    // / `env` management in a switched workspace. No-scope is the correct behaviour.
+                ).run()
             }.getOrNull()
         }
 
