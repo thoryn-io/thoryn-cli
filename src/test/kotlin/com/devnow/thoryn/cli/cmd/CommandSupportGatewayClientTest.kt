@@ -87,9 +87,11 @@ class CommandSupportGatewayClientTest : CommandTestBase() {
     }
 
     @Test
-    fun `SSO-2965 - the exchange requests the base session's scopes so the switched token keeps its entitlement`() {
-        // Base login holds write scopes; the switched token must carry them or scoped writes
-        // (clients update / env create) 403 scope_not_grantable even for an entitled operator.
+    fun `SSO-2965 reverted - the switch exchange requests NO scope so the hub mints the full entitled set`() {
+        // Requesting base.scope narrowed the switched token to the login scopes (dropping
+        // clients.write etc.) and broke `clients update` in a switched workspace. The hub's
+        // cross-tenant exchange mints the caller's FULL entitled set when no scope is requested
+        // (role enforced downstream by product-api), so the switch must send no `scope` param.
         val base = Tokens(
             accessToken = "AT-base",
             refreshToken = "RT",
@@ -108,8 +110,9 @@ class CommandSupportGatewayClientTest : CommandTestBase() {
         CommandSupport.gatewayClient(baseUrl(), base, selectedStore).listApplications()
 
         val exchangeBody = server.takeRequest().body.readUtf8()
-        // RFC 8693 `scope` param carries the base entitlement (form-encoded: space -> '+', ':' -> %3A).
-        assertThat(exchangeBody).contains("scope=openid+tenant%3Aapplications.write+tenant%3Aenvironments.write")
+        // No `scope` param on the exchange — even though the base session carries scopes, the switch
+        // must not narrow to them.
+        assertThat(exchangeBody).doesNotContain("scope=")
     }
 
     @Test
