@@ -22,6 +22,13 @@ internal data class Receipt(
     val recipe: RecipeRef,
     val appliedAt: String,
     val cliVersion: String? = null,
+    /**
+     * SSO-2967 — where the applied recipe came from, for audit: `"bundled"` for a recipe shipped in
+     * the CLI jar, or `"recipe-dir:<path>"` for one loaded from a checked-out `--recipe-dir`. Not part
+     * of the platform-signed attestation (which the platform re-derives from the resource set), so this
+     * is purely a local provenance note.
+     */
+    val source: String? = null,
     /** The founder's token `sub` at apply time (display/audit only). */
     val subject: String? = null,
     val workspace: WorkspaceRef,

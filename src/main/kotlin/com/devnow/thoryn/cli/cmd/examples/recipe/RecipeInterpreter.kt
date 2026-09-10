@@ -47,6 +47,8 @@ internal class RecipeInterpreter(
     private val overrides: Map<String, String> = emptyMap(),
     /** SSO-2876 — the environment the recipe's resources are provisioned into (X-Thoryn-Environment); null = production plane. */
     private val environmentSlug: String? = null,
+    /** SSO-2967 — recipe provenance recorded on the receipt: "bundled" or "recipe-dir:<path>". */
+    private val source: String? = null,
     /** Test seam for the random slug suffix. */
     private val randomSuffix: () -> String = { UUID.randomUUID().toString().replace("-", "").substring(0, 8) },
     /** Deadline budget for the post-create tenant-trust propagation retry (ms). */
@@ -547,6 +549,7 @@ internal class RecipeInterpreter(
             subject = JwtClaims.of(ctx.tokens.accessToken)["sub"]?.takeIf { !it.isNull }?.asString(),
             workspace = WorkspaceRef(slug = w?.slug ?: scope["workspaceSlug"], tenantId = w?.tenantId),
             environment = effectiveEnvironmentSlug,
+            source = source,
             resources = resources.toList(),
             verify = verifyResults.toList(),
         )

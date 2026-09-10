@@ -5,6 +5,7 @@ import com.devnow.thoryn.cli.cmd.examples.recipe.Recipe
 import com.devnow.thoryn.cli.cmd.examples.recipe.RecipeCatalog
 import com.devnow.thoryn.cli.cmd.examples.recipe.RecipeCatalogException
 import com.devnow.thoryn.cli.cmd.examples.recipe.RecipeException
+import com.devnow.thoryn.cli.cmd.examples.recipe.RecipeExample
 import com.devnow.thoryn.cli.cmd.examples.recipe.RecipeInterpreter
 import com.devnow.thoryn.cli.cmd.examples.recipe.ReceiptStore
 import com.devnow.thoryn.cli.config.ThorynConfig
@@ -79,8 +80,70 @@ class ExamplesCommand : Callable<Int> {
     @Command(name = "run", description = ["Run an example's interaction (opens your browser)."], mixinStandardHelpOptions = true)
     class RunSubcommand : LifecycleSubcommand({ ex, ctx -> ex.run(ctx) })
 
+    /**
+     * SSO-2967 — `thoryn examples teardown [name] [--recipe-dir <path>]`. Standalone (not a plain
+     * [LifecycleSubcommand]) so it can tear down an EXTERNAL recipe loaded from a checked-out directory,
+     * not only a bundled one. With `--recipe-dir` the recipe is loaded from disk (same model +
+     * interpreter as a bundled recipe) and its own `id` keys the persisted state/receipt the teardown
+     * reloads; without it, the bundled catalog behaviour is unchanged.
+     */
     @Command(name = "teardown", description = ["Remove what an example's setup created (best-effort)."], mixinStandardHelpOptions = true)
-    class TeardownSubcommand : LifecycleSubcommand({ ex, ctx -> ex.teardown(ctx) })
+    class TeardownSubcommand : Callable<Int> {
+        @Parameters(index = "0", arity = "0..1", description = ["Example name (optional when only one exists)."])
+        var name: String? = null
+
+        @Option(
+            names = ["--recipe-dir"],
+            description = [
+                "Load the recipe from a checked-out directory (e.g. a thoryn-examples recipe) instead of " +
+                    "the bundled catalog. Resolves <dir>/recipe.json, else <dir>/<name>/recipe.json.",
+            ],
+        )
+        var recipeDir: File? = null
+
+        @Option(names = ["--hub"], description = ["Override the hub base URL. Defaults to the hub you signed into, else http://localhost:54702."])
+        var hub: String = ThorynConfig.DEFAULT_HUB
+
+        @Option(names = ["--gateway"], description = ["Override the gateway base URL. Defaults to the gateway you signed into, else http://localhost:8991."])
+        var gateway: String = ThorynConfig.DEFAULT_GATEWAY
+
+        override fun call(): Int {
+            val example: Example = if (recipeDir != null) {
+                try {
+                    RecipeExample(loadRecipe(name, recipeDir).recipe)
+                } catch (ex: RecipeException) {
+                    System.err.println("Could not load the recipe from --recipe-dir (${ex.message}).")
+                    return CommandSupport.EXIT_USAGE
+                }
+            } else {
+                resolveBundledExample() ?: return CommandSupport.EXIT_USAGE
+            }
+            val tokens = CommandSupport.readTokens() ?: return CommandSupport.EXIT_NOT_SIGNED_IN
+            val ctx = ExampleContext(
+                hub = CommandSupport.resolveHub(hub, tokens),
+                gateway = CommandSupport.resolveGateway(gateway, tokens),
+                tokens = tokens,
+                state = ExampleStateStore(),
+            )
+            return example.teardown(ctx)
+        }
+
+        private fun resolveBundledExample(): Example? {
+            val all = ExampleRegistry.all()
+            val chosen = when {
+                name != null -> ExampleRegistry.byName(name!!)
+                all.size == 1 -> all.first()
+                else -> null
+            }
+            if (chosen == null) {
+                System.err.println(
+                    if (name != null) "Unknown example '$name'." else "Multiple examples exist — specify one by name.",
+                )
+                System.err.println("Available: ${all.joinToString(", ") { it.name }}")
+            }
+            return chosen
+        }
+    }
 
     /**
      * SSO-2875 — `thoryn examples receipt [name]` — show the portable receipt a recipe run wrote
@@ -119,6 +182,15 @@ class ExamplesCommand : Callable<Int> {
         @Parameters(index = "0", arity = "0..1", description = ["Example name (optional when only one exists)."])
         var name: String? = null
 
+        @Option(
+            names = ["--recipe-dir"],
+            description = [
+                "Load the recipe from a checked-out directory (e.g. a thoryn-examples recipe) instead of " +
+                    "the bundled catalog. Resolves <dir>/recipe.json, else <dir>/<name>/recipe.json.",
+            ],
+        )
+        var recipeDir: File? = null
+
         @Option(names = ["--hub"], description = ["Override the hub base URL."])
         var hub: String = ThorynConfig.DEFAULT_HUB
 
@@ -126,18 +198,18 @@ class ExamplesCommand : Callable<Int> {
         var gateway: String = ThorynConfig.DEFAULT_GATEWAY
 
         override fun call(): Int {
-            val exampleName = name ?: singleExampleName() ?: return CommandSupport.EXIT_USAGE
+            val recipe = try {
+                loadRecipe(name, recipeDir).recipe
+            } catch (ex: RecipeException) {
+                System.err.println("`verify` is only available for recipe-backed examples (${ex.message}).")
+                return CommandSupport.EXIT_USAGE
+            }
+            val exampleName = recipe.id
             val receipt = ReceiptStore().read(exampleName)
                 ?: run {
                     System.err.println("No receipt for '$exampleName'. Run `thoryn examples setup $exampleName` first.")
                     return CommandSupport.EXIT_USAGE
                 }
-            val recipe = try {
-                Recipe.load(exampleName)
-            } catch (ex: RecipeException) {
-                System.err.println("`verify` is only available for recipe-backed examples (${ex.message}).")
-                return CommandSupport.EXIT_USAGE
-            }
             val tokens = CommandSupport.readTokens() ?: return CommandSupport.EXIT_NOT_SIGNED_IN
             val ctx = ExampleContext(
                 hub = CommandSupport.resolveHub(hub, tokens),
@@ -249,6 +321,15 @@ class ExamplesCommand : Callable<Int> {
         @Option(names = ["--yes"], description = ["Skip the confirmation prompt (for non-interactive use)."])
         var yes: Boolean = false
 
+        @Option(
+            names = ["--recipe-dir"],
+            description = [
+                "Load the recipe from a checked-out directory (e.g. a thoryn-examples recipe) instead of " +
+                    "the bundled catalog. Resolves <dir>/recipe.json, else <dir>/<name>/recipe.json.",
+            ],
+        )
+        var recipeDir: File? = null
+
         @Option(names = ["--hub"])
         var hub: String = ThorynConfig.DEFAULT_HUB
 
@@ -256,13 +337,14 @@ class ExamplesCommand : Callable<Int> {
         var gateway: String = ThorynConfig.DEFAULT_GATEWAY
 
         override fun call(): Int {
-            val exampleName = name ?: singleExampleName() ?: return CommandSupport.EXIT_USAGE
-            val recipe = try {
-                Recipe.load(exampleName)
+            val loaded = try {
+                loadRecipe(name, recipeDir)
             } catch (ex: RecipeException) {
                 System.err.println("`apply` is only available for recipe-backed examples (${ex.message}).")
                 return CommandSupport.EXIT_USAGE
             }
+            val recipe = loaded.recipe
+            val exampleName = recipe.id
             val tokens = CommandSupport.readTokens() ?: return CommandSupport.EXIT_NOT_SIGNED_IN
             val ctx = ExampleContext(
                 hub = CommandSupport.resolveHub(hub, tokens),
@@ -283,7 +365,7 @@ class ExamplesCommand : Callable<Int> {
                 return CommandSupport.EXIT_OK
             }
             return try {
-                val run = RecipeInterpreter(ctx, recipe, overrides = overrides, environmentSlug = env).setup()
+                val run = RecipeInterpreter(ctx, recipe, overrides = overrides, environmentSlug = env, source = loaded.source).setup()
                 ctx.state.write(run.state)
                 ReceiptStore().write(run.receipt)
                 println()
@@ -385,9 +467,29 @@ class ExamplesCommand : Callable<Int> {
         }
     }
 
+    /** SSO-2967 — a loaded recipe plus its provenance (recorded on the receipt). */
+    internal data class LoadedRecipe(val recipe: Recipe, val source: String)
+
     internal companion object {
         /** The sole example's name when exactly one is bundled, else null (caller prints usage). */
         fun singleExampleName(): String? = ExampleRegistry.all().singleOrNull()?.name
+
+        /**
+         * SSO-2967 — load the recipe an `apply` / `verify` / `teardown` invocation targets, either from a
+         * checked-out [recipeDir] (a `thoryn-examples` recipe, run WITHOUT bundling) or the bundled
+         * catalog. An external recipe is parsed by the SAME model + interpreter as a bundled one, so the
+         * interpreter's closed action allowlist still gates execution. Throws [RecipeException] for every
+         * failure mode (unknown bundled id, missing/invalid external file, or an ambiguous absent name).
+         */
+        fun loadRecipe(name: String?, recipeDir: File?): LoadedRecipe {
+            if (recipeDir != null) {
+                val file = Recipe.resolveExternalRecipeFile(recipeDir.toPath(), name)
+                return LoadedRecipe(Recipe.loadFromFile(file), "recipe-dir:${file.toAbsolutePath()}")
+            }
+            val id = name ?: singleExampleName()
+                ?: throw RecipeException("no recipe name given and more than one is bundled — specify one by name")
+            return LoadedRecipe(Recipe.load(id), "bundled")
+        }
     }
 
     /**

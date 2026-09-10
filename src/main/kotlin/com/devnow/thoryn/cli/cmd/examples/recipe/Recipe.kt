@@ -3,6 +3,8 @@ package com.devnow.thoryn.cli.cmd.examples.recipe
 import tools.jackson.databind.JsonNode
 import tools.jackson.databind.json.JsonMapper
 import tools.jackson.module.kotlin.kotlinModule
+import java.nio.file.Files
+import java.nio.file.Path
 import java.security.MessageDigest
 
 /**
@@ -37,6 +39,44 @@ internal class Recipe(val root: JsonNode, rawBytes: ByteArray = root.toString().
             val bytes = Recipe::class.java.getResourceAsStream(path)?.use { it.readBytes() }
                 ?: throw RecipeException("no bundled recipe '$id' ($path)")
             return Recipe(mapper.readTree(bytes), bytes)
+        }
+
+        /**
+         * SSO-2967 — resolve an EXTERNAL recipe file authored in `thoryn-examples` (not bundled),
+         * checked out on disk. Callers may pass either the recipe's own directory (`<dir>/recipe.json`)
+         * or a catalog root (`<dir>/<id>/recipe.json`). Prefers the direct file; falls back to the
+         * `<id>`-nested one when an [id] is supplied. Throws [RecipeException] naming the paths tried
+         * when neither exists.
+         */
+        fun resolveExternalRecipeFile(dir: Path, id: String?): Path {
+            val direct = dir.resolve("recipe.json")
+            if (Files.isRegularFile(direct)) return direct
+            val nested = id?.let { dir.resolve(it).resolve("recipe.json") }
+            if (nested != null && Files.isRegularFile(nested)) return nested
+            throw RecipeException(
+                "no recipe.json under --recipe-dir '$dir' (tried '$direct'" +
+                    (nested?.let { " and '$it'" }
+                        ?: "; pass a recipe name to also try '<dir>/<name>/recipe.json'") + ")",
+            )
+        }
+
+        /**
+         * SSO-2967 — parse a recipe from a file on disk, EXACTLY as [load] parses a bundled resource
+         * (same JsonNode wrapper, same byte-digest). An external recipe is therefore DATA over the same
+         * model + interpreter as a bundled one — the interpreter's closed action allowlist still gates
+         * execution. Throws [RecipeException] on unreadable/invalid content.
+         */
+        fun loadFromFile(file: Path): Recipe {
+            val bytes = try {
+                Files.readAllBytes(file)
+            } catch (ex: Exception) {
+                throw RecipeException("could not read recipe file '$file' (${ex.message})")
+            }
+            return try {
+                Recipe(mapper.readTree(bytes), bytes)
+            } catch (ex: Exception) {
+                throw RecipeException("recipe file '$file' is not valid JSON (${ex.message})")
+            }
         }
     }
 }
