@@ -108,6 +108,15 @@ internal class RecipeCatalog(
         }
     }
 
+    /**
+     * SSO-2968 — the newest cached, already-verified `recipe.json` bytes for [recipeId] (its STEPS), or
+     * `null` when no cached catalog holds it. Reuses [cachedAsset], so the bytes come ONLY from a
+     * previously-extracted (hence Ed25519-signature-verified) catalog dir — nothing here fetches or
+     * trusts unverified content. [Recipe.resolve] parses these with the same model [Recipe.load] uses.
+     */
+    fun cachedRecipeBytes(recipeId: String): ByteArray? =
+        cachedAsset(recipeId, "recipe.json")?.let { Files.readAllBytes(it) }
+
     // ── GitHub release API ──────────────────────────────────────────────────────────────────────
 
     private fun getRelease(tag: String?): JsonNode {

@@ -133,7 +133,7 @@ class ExamplesCommand : Callable<Int> {
                     return CommandSupport.EXIT_USAGE
                 }
             val recipe = try {
-                Recipe.load(exampleName)
+                Recipe.resolve(exampleName)
             } catch (ex: RecipeException) {
                 System.err.println("`verify` is only available for recipe-backed examples (${ex.message}).")
                 return CommandSupport.EXIT_USAGE
@@ -197,7 +197,8 @@ class ExamplesCommand : Callable<Int> {
                 println("Verified catalog @ ${info.tag} (Ed25519 signature OK against the pinned key):")
                 info.recipes.forEach { println("  ${it.id}  v${it.version}  —  ${it.summary}") }
                 println()
-                println("Cached at ${info.dir}. (This CLI applies its bundled recipes; a later phase runs a fetched one.)")
+                println("Cached at ${info.dir}.")
+                println("Run one with:  thoryn examples setup <id>  (a fetched recipe is preferred over a bundled one of the same id; SSO-2968).")
                 CommandSupport.EXIT_OK
             } catch (ex: RecipeCatalogException) {
                 System.err.println("Could not load the remote catalog: ${ex.message}")
@@ -258,7 +259,7 @@ class ExamplesCommand : Callable<Int> {
         override fun call(): Int {
             val exampleName = name ?: singleExampleName() ?: return CommandSupport.EXIT_USAGE
             val recipe = try {
-                Recipe.load(exampleName)
+                Recipe.resolve(exampleName)
             } catch (ex: RecipeException) {
                 System.err.println("`apply` is only available for recipe-backed examples (${ex.message}).")
                 return CommandSupport.EXIT_USAGE
@@ -428,10 +429,15 @@ class ExamplesCommand : Callable<Int> {
                 else -> null
             }
             if (chosen == null) {
-                System.err.println(
-                    if (name != null) "Unknown example '$name'." else "Multiple examples exist — specify one by name.",
-                )
-                System.err.println("Available: ${all.joinToString(", ") { it.name }}")
+                if (name != null) {
+                    // SSO-2968 — byName resolves bundled OR the fetched+verified catalog cache; a null here
+                    // means the id is in neither.
+                    System.err.println("Unknown example '$name' — it is neither bundled with this CLI nor in the verified catalog cache.")
+                    System.err.println("If it is published in the signed catalog, run `thoryn examples update` first.")
+                } else {
+                    System.err.println("Multiple examples exist — specify one by name.")
+                }
+                System.err.println("Available (bundled): ${all.joinToString(", ") { it.name }}")
             }
             return chosen
         }
