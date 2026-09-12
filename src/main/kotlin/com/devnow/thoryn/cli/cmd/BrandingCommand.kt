@@ -100,6 +100,15 @@ class BrandingCommand : Callable<Int> {
         @Option(names = ["--theme"], description = ["Color theme: light | dark | auto. Empty clears."])
         var theme: String? = null
 
+        @Option(
+            names = ["--var"],
+            description = [
+                "Set an allowlisted --thoryn-* CSS variable, e.g. --var --thoryn-accent=#7c3aed (repeatable). " +
+                    "An empty value clears that one. Allowed: --thoryn-accent, --thoryn-text, --thoryn-muted, --thoryn-font-family.",
+            ],
+        )
+        var cssVars: MutableMap<String, String> = mutableMapOf()
+
         @Option(names = ["--gateway"], defaultValue = ThorynConfig.DEFAULT_GATEWAY)
         var gateway: String = ThorynConfig.DEFAULT_GATEWAY
 
@@ -109,9 +118,9 @@ class BrandingCommand : Callable<Int> {
         override fun call(): Int {
             val format = CommandSupport.parseFormat(outputRaw) ?: return CommandSupport.EXIT_USAGE
             if (logoUrl == null && primaryColor == null && backgroundColor == null &&
-                borderRadiusPx == null && theme == null
+                borderRadiusPx == null && theme == null && cssVars.isEmpty()
             ) {
-                System.err.println("Error: pass at least one of --logo-url, --primary-color, --background-color, --border-radius-px, --theme.")
+                System.err.println("Error: pass at least one of --logo-url, --primary-color, --background-color, --border-radius-px, --theme, --var.")
                 return CommandSupport.EXIT_USAGE
             }
             val tokens = CommandSupport.readTokens() ?: return CommandSupport.EXIT_NOT_SIGNED_IN
@@ -122,6 +131,8 @@ class BrandingCommand : Callable<Int> {
             // merge semantics we seed the body from the currently-stored overrides, then overlay
             // the flags the operator supplied. A flag passed with an EMPTY value clears that field.
             val body = linkedMapOf<String, Any?>()
+            // The CSS-variable map is also merged: seed from the stored map, overlay the --var flags.
+            val cssMap = linkedMapOf<String, String>()
             try {
                 val stored = client.getLoginBranding()["stored"]
                 stored?.get("logoUrl")?.takeUnless { it.isNull }?.let { body["logoUrl"] = it.asString() }
@@ -129,6 +140,9 @@ class BrandingCommand : Callable<Int> {
                 stored?.get("backgroundColor")?.takeUnless { it.isNull }?.let { body["backgroundColor"] = it.asString() }
                 stored?.get("borderRadiusPx")?.takeUnless { it.isNull }?.let { body["borderRadiusPx"] = it.asInt() }
                 stored?.get("theme")?.takeUnless { it.isNull }?.let { body["theme"] = it.asString() }
+                stored?.get("cssVariables")?.takeUnless { it.isNull }?.properties()?.forEach { (k, v) ->
+                    if (!v.isNull) cssMap[k] = v.asString()
+                }
             } catch (ex: ProductApiException) {
                 return CommandSupport.renderError(format, ex, requiredScope = "tenant:idp.read")
             } catch (ex: Exception) {
@@ -142,6 +156,10 @@ class BrandingCommand : Callable<Int> {
             backgroundColor?.let { body["backgroundColor"] = it.ifBlank { null } }
             borderRadiusPx?.let { body["borderRadiusPx"] = it }
             theme?.let { body["theme"] = it.ifBlank { null } }
+            // Overlay --var entries: a blank value clears that token, else set/replace it.
+            cssVars.forEach { (key, value) -> if (value.isBlank()) cssMap.remove(key) else cssMap[key] = value }
+            // Always send the merged map — the server PUT replaces, so omitting it would clear overrides.
+            body["cssVariables"] = cssMap
 
             return try {
                 val response = client.putLoginBranding(body)
@@ -174,6 +192,10 @@ class BrandingCommand : Callable<Int> {
                 "backgroundColor" to effStr("backgroundColor"),
                 "borderRadiusPx" to effStr("borderRadiusPx"),
                 "theme" to effStr("theme"),
+                // SSO-3038: the effective CSS-variable map, rendered as `--token=value` pairs.
+                "cssVariables" to (effective?.get("cssVariables")?.takeUnless { it.isNull }
+                    ?.properties()?.joinToString(", ") { (k, v) -> "$k=${v.asString()}" }
+                    ?.ifEmpty { "(none)" } ?: "(none)"),
                 "overrides" to listOfNotNull(
                     storedStr("logoUrl")?.let { "logoUrl" },
                     storedStr("primaryColor")?.let { "primaryColor" },

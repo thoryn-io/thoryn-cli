@@ -218,7 +218,8 @@ class RecipeInterpreterTest : CommandTestBase() {
                 { "id": "theme", "action": "tenant.configureLoginTheme",
                   "with": { "primaryColor": "#2563eb", "backgroundColor": "#ffffff",
                             "borderRadiusPx": 8, "theme": "auto",
-                            "logoUrl": "https://cdn.example.com/logo.svg" } }
+                            "logoUrl": "https://cdn.example.com/logo.svg",
+                            "cssVariables": { "--thoryn-accent": "#7c3aed", "--thoryn-font-family": "Inter, sans-serif" } } }
               ]
             }
         """.trimIndent()
@@ -260,6 +261,10 @@ class RecipeInterpreterTest : CommandTestBase() {
             .contains("\"borderRadiusPx\":8")
             .contains("\"theme\":\"auto\"")
             .contains("\"logoUrl\":\"https://cdn.example.com/logo.svg\"")
+            // SSO-3038: the allowlisted CSS-variable map is forwarded verbatim as a nested object.
+            .contains("\"cssVariables\"")
+            .contains("\"--thoryn-accent\":\"#7c3aed\"")
+            .contains("\"--thoryn-font-family\":\"Inter, sans-serif\"")
     }
 
     @Test
