@@ -90,6 +90,15 @@ thoryn env delete <id> --confirm <slug>      # hard-delete a sandbox (irreversib
 thoryn env test-emails list [--env <slug>] [--to <email>] [--channel <ch>] [--limit <n>]
 thoryn env test-emails get <email-id> [--env <slug>]   # one email, incl. its actionLink (e.g. the verify URL)
 
+# Hosted-login branding (SSO-3037) — the look of the hosted sign-in / register screens end users see,
+# per SELECTED ENVIRONMENT (thoryn env use). Rendered as CSS custom properties; server-validated
+# (hex colors, radius 0-64, theme enum, https logo) + WCAG-AA contrast-guarded. Needs tenant:idp.*.
+thoryn branding get                                    # effective values + which fields are overridden
+thoryn branding set [--primary-color '#2563eb'] [--background-color '#fff'] \
+                    [--logo-url https://…] [--border-radius-px 8] [--theme light|dark|auto]
+# set MERGES (unspecified fields keep their stored value); pass an empty value to clear an override,
+# e.g. `thoryn branding set --logo-url ""` drops the custom logo back to the platform default.
+
 # Tenant seeding (SSO-1553) — one-shot, zero-interaction provisioner for CI.
 thoryn tenant seed --non-interactive --secret-dir <dir> \
                    [--clients <N>] [--skip-federation] \
@@ -178,10 +187,11 @@ or land in shell history:
 ```bash
 # Default scopes (SSO-1552): openid offline_access plus the tenant-config set
 # (tenant:applications.{read,write}, tenant:federation.{read,write},
-# tenant:audit.read, tenant:environments.{read,write}) so `clients`, `federation`,
-# `audit`, and `env` (SSO-2870) work out of the box. `workspace` rides on
-# SCOPE_openid (the hub /account surface). The hub drops any scope the tenant
-# admin doesn't actually hold.
+# tenant:audit.read, tenant:environments.{read,write}, tenant:email.{read,write},
+# tenant:idp.{read,write}) so `clients`, `federation`, `audit`, `env` (SSO-2870),
+# `workspace email-provider`, and `branding` (SSO-3037) work out of the box.
+# `workspace` rides on SCOPE_openid (the hub /account surface). The hub drops any
+# scope the tenant admin doesn't actually hold.
 thoryn login
 
 # Grab the whole tenant-config scope set explicitly.
