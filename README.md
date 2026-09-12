@@ -83,6 +83,12 @@ thoryn env create <slug> --name <name>       # create a sandbox
 thoryn env rename <slug> --name <name>       # rename (display name only; slug immutable)
 thoryn env suspend <slug> [--confirm <slug>] # suspend a sandbox (production cannot be suspended)
 thoryn env reactivate <slug>                 # clear a sandbox suspension
+thoryn env delete <id> --confirm <slug>      # hard-delete a sandbox (irreversible; confirm = its own slug)
+
+# Sandbox test inbox (SSO-3026) — a sandbox SUPPRESSES real transactional email and captures it here,
+# so you can complete a sandbox email flow (verification, …) without a real mailbox. Read-only.
+thoryn env test-emails list [--env <slug>] [--to <email>] [--channel <ch>] [--limit <n>]
+thoryn env test-emails get <email-id> [--env <slug>]   # one email, incl. its actionLink (e.g. the verify URL)
 
 # Tenant seeding (SSO-1553) — one-shot, zero-interaction provisioner for CI.
 thoryn tenant seed --non-interactive --secret-dir <dir> \
