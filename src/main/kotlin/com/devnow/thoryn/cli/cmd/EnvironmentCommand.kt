@@ -55,13 +55,14 @@ import java.util.concurrent.Callable
         EnvironmentCommand.SuspendSubcommand::class,
         EnvironmentCommand.ReactivateSubcommand::class,
         EnvironmentCommand.DeleteSubcommand::class,
+        EnvironmentCommand.TestEmailsSubcommand::class,
     ],
 )
 class EnvironmentCommand : Callable<Int> {
 
     override fun call(): Int {
         System.err.println("Usage: thoryn env <subcommand>")
-        System.err.println("Subcommands: list | get | use | create | rename | suspend | reactivate | delete")
+        System.err.println("Subcommands: list | get | use | create | rename | suspend | reactivate | delete | test-emails")
         return CommandSupport.EXIT_USAGE
     }
 
@@ -389,6 +390,119 @@ class EnvironmentCommand : Callable<Int> {
         }
     }
 
+    /**
+     * `thoryn env test-emails ...` (SSO-3026) — read a sandbox environment's **test inbox**: the
+     * transactional emails the sandbox SUPPRESSES instead of really sending (verification links, …),
+     * captured so a developer can complete a sandbox email flow without a real mailbox. Read-only,
+     * scope `tenant:environments.read`. The target environment is the one selected by `thoryn env use`,
+     * or an explicit `--env <slug>`; a production environment captured nothing, so its inbox is empty.
+     *
+     *  - `list`        — GET /api/v1/environments/{id}/test-emails (newest first; client-side `--to` /
+     *                    `--channel` filters help find one in a round trip; `--limit` bounds the page)
+     *  - `get <id>`    — GET /api/v1/environments/{id}/test-emails/{id} (one email, incl. its action link)
+     */
+    @Command(
+        name = "test-emails",
+        description = ["Read a sandbox environment's captured test emails (the suppressed-email inbox)."],
+        mixinStandardHelpOptions = true,
+        subcommands = [
+            TestEmailsSubcommand.ListSub::class,
+            TestEmailsSubcommand.GetSub::class,
+        ],
+    )
+    class TestEmailsSubcommand : Callable<Int> {
+        override fun call(): Int {
+            System.err.println("Usage: thoryn env test-emails <list|get>")
+            return CommandSupport.EXIT_USAGE
+        }
+
+        /** `thoryn env test-emails list [--env <slug>] [--to <email>] [--channel <ch>] [--limit N]`. */
+        @Command(name = "list", description = ["List a sandbox's captured test emails (newest first)."], mixinStandardHelpOptions = true)
+        class ListSub : Callable<Int> {
+
+            @Option(names = ["--env"], description = ["Environment slug (default: the selected environment; see `thoryn env use`)."])
+            var env: String? = null
+
+            @Option(names = ["--to"], description = ["Only show emails addressed to this recipient (client-side filter)."])
+            var to: String? = null
+
+            @Option(names = ["--channel"], description = ["Only show this channel, e.g. email_verification (client-side filter)."])
+            var channel: String? = null
+
+            @Option(names = ["--limit"], description = ["Max emails to return (1-200; default 50)."])
+            var limit: Int? = null
+
+            @Option(names = ["--gateway"], defaultValue = ThorynConfig.DEFAULT_GATEWAY)
+            var gateway: String = ThorynConfig.DEFAULT_GATEWAY
+
+            @Option(names = ["--output"])
+            var outputRaw: String? = null
+
+            internal var store: SelectedWorkspaceStore = SelectedWorkspaceStore()
+
+            override fun call(): Int {
+                val format = CommandSupport.parseFormat(outputRaw) ?: return CommandSupport.EXIT_USAGE
+                val tokens = CommandSupport.readTokens() ?: return CommandSupport.EXIT_NOT_SIGNED_IN
+                gateway = CommandSupport.resolveGateway(gateway, tokens)
+                val client = CommandSupport.gatewayClient(gateway, tokens, applyEnvironment = false)
+                val targetSlug = env?.trim()?.takeIf { it.isNotEmpty() } ?: selectedEnvSlug(store) ?: return missingEnv()
+                val envId = resolveIdOrNull(client, targetSlug, format, gateway) ?: return CommandSupport.EXIT_HTTP_ERROR
+                return try {
+                    val raw = client.listTestEmails(envId, limit).emailsArray()
+                    val filtered = tools.jackson.databind.node.JsonNodeFactory.instance.arrayNode()
+                    raw.forEach { node ->
+                        val toOk = to == null || node["to"]?.asString().equals(to, ignoreCase = true)
+                        val chOk = channel == null || node["channel"]?.asString() == channel
+                        if (toOk && chOk) filtered.add(node)
+                    }
+                    CommandSupport.emitList(format, filtered, TEST_EMAIL_HEADERS, rowMapper = ::testEmailRow)
+                    CommandSupport.EXIT_OK
+                } catch (ex: ProductApiException) {
+                    CommandSupport.renderError(format, ex, requiredScope = "tenant:environments.read")
+                } catch (ex: Exception) {
+                    CommandSupport.renderRequestFailure(ex, gateway)
+                }
+            }
+        }
+
+        /** `thoryn env test-emails get <emailId> [--env <slug>]` — one captured email incl. its action link. */
+        @Command(name = "get", description = ["Show one captured test email (incl. its action link)."], mixinStandardHelpOptions = true)
+        class GetSub : Callable<Int> {
+
+            @Parameters(index = "0", description = ["Test-email id (UUID; see `thoryn env test-emails list`)."])
+            lateinit var id: String
+
+            @Option(names = ["--env"], description = ["Environment slug (default: the selected environment; see `thoryn env use`)."])
+            var env: String? = null
+
+            @Option(names = ["--gateway"], defaultValue = ThorynConfig.DEFAULT_GATEWAY)
+            var gateway: String = ThorynConfig.DEFAULT_GATEWAY
+
+            @Option(names = ["--output"])
+            var outputRaw: String? = null
+
+            internal var store: SelectedWorkspaceStore = SelectedWorkspaceStore()
+
+            override fun call(): Int {
+                val format = CommandSupport.parseFormat(outputRaw) ?: return CommandSupport.EXIT_USAGE
+                val tokens = CommandSupport.readTokens() ?: return CommandSupport.EXIT_NOT_SIGNED_IN
+                gateway = CommandSupport.resolveGateway(gateway, tokens)
+                val client = CommandSupport.gatewayClient(gateway, tokens, applyEnvironment = false)
+                val targetSlug = env?.trim()?.takeIf { it.isNotEmpty() } ?: selectedEnvSlug(store) ?: return missingEnv()
+                val envId = resolveIdOrNull(client, targetSlug, format, gateway) ?: return CommandSupport.EXIT_HTTP_ERROR
+                return try {
+                    val email = client.getTestEmail(envId, id.trim())
+                    CommandSupport.emitRecord(format, email, ::testEmailFields)
+                    CommandSupport.EXIT_OK
+                } catch (ex: ProductApiException) {
+                    CommandSupport.renderError(format, ex, requiredScope = "tenant:environments.read")
+                } catch (ex: Exception) {
+                    CommandSupport.renderRequestFailure(ex, gateway)
+                }
+            }
+        }
+    }
+
     companion object {
         internal val LIST_HEADERS: List<String> = listOf("slug", "name", "kind", "suspended", "active")
 
@@ -415,6 +529,38 @@ class EnvironmentCommand : Callable<Int> {
             "createdAt" to node["createdAt"]?.asString(),
             "suspendedAt" to node["suspendedAt"]?.asString(),
         )
+
+        internal val TEST_EMAIL_HEADERS: List<String> = listOf("id", "channel", "to", "subject", "createdAt")
+
+        /** The `emails` array from the inbox list envelope (`{ "emails": [...] }`). */
+        internal fun JsonNode.emailsArray(): JsonNode = this["emails"] ?: this
+
+        internal fun testEmailRow(node: JsonNode): List<Any?> = listOf(
+            node["id"]?.asString(),
+            node["channel"]?.asString(),
+            node["to"]?.asString(),
+            node["subject"]?.asString(),
+            node["createdAt"]?.asString(),
+        )
+
+        internal fun testEmailFields(node: JsonNode): List<Pair<String, Any?>> = listOf(
+            "id" to node["id"]?.asString(),
+            "channel" to node["channel"]?.asString(),
+            "to" to node["to"]?.asString(),
+            "subject" to node["subject"]?.asString(),
+            "actionLink" to node["actionLink"]?.asString(),
+            "createdAt" to node["createdAt"]?.asString(),
+        )
+
+        /** The environment slug the CLI currently targets (from the workspace selection), or null. */
+        internal fun selectedEnvSlug(store: SelectedWorkspaceStore): String? =
+            runCatching { store.read()?.environmentSlug }.getOrNull()?.takeIf { it.isNotBlank() }
+
+        /** Shared "no environment to read" guidance for the test-inbox subcommands. */
+        internal fun missingEnv(): Int {
+            System.err.println("Error: no environment selected. Pass --env <slug>, or run `thoryn env use <slug>` first.")
+            return CommandSupport.EXIT_USAGE
+        }
 
         /**
          * Resolve an environment SLUG to its UUID `id` (the CRUD verbs are keyed by id). Prints a

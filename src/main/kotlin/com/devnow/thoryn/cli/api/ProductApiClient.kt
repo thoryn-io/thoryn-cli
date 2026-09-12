@@ -174,6 +174,30 @@ class ProductApiClient(
     fun deleteEnvironment(id: String, confirmSlug: String? = null): Unit =
         deleteNoContent("/api/v1/environments/${encode(id)}", confirmSlug)
 
+    // ── Sandbox test inbox (SSO-3026; product-api /api/v1/environments/{id}/test-emails) ──────────
+    //
+    // A sandbox environment SUPPRESSES every real transactional email (TestModeEmailGate) and CAPTURES
+    // it here instead, so a developer can complete a sandbox email flow (verification, …) without a
+    // real mailbox. Read-only, environment-scoped in the PATH; scope tenant:environments.read (already
+    // granted to thoryn-cli, hub V119). A production environment captured nothing, so the list is empty.
+
+    /**
+     * `GET /api/v1/environments/{envId}/test-emails` — the sandbox's captured emails, newest first.
+     * [limit] (1..200, clamped server-side) bounds the page. Returns the list envelope
+     * `{ "emails": [ { id, channel, to, subject, actionLink, bodyHtml, createdAt } ] }`.
+     */
+    fun listTestEmails(envId: String, limit: Int? = null): JsonNode {
+        val query = limit?.let { "?limit=$it" } ?: ""
+        return get("/api/v1/environments/${encode(envId)}/test-emails$query")
+    }
+
+    /**
+     * `GET /api/v1/environments/{envId}/test-emails/{id}` — one captured email (incl. its `actionLink`,
+     * e.g. the verify URL). A cross-scope / unknown id is `404 not_found` (privacy-symmetric).
+     */
+    fun getTestEmail(envId: String, emailId: String): JsonNode =
+        get("/api/v1/environments/${encode(envId)}/test-emails/${encode(emailId)}")
+
     // ── Email provider (SSO-2917; product-api /api/v1/email-provider) ──────────
     //
     // The tenant's bring-your-own SMTP transport config (the activation, per tenant,
