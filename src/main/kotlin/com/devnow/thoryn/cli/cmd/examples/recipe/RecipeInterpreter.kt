@@ -424,6 +424,16 @@ internal class RecipeInterpreter(
         with["backgroundColor"].nonBlankString()?.let { body["backgroundColor"] = it }
         with["borderRadiusPx"]?.let { coerceInt(it)?.let { px -> body["borderRadiusPx"] = px } }
         with["theme"].nonBlankString()?.let { body["theme"] = it }
+        // SSO-3038: the allowlisted --thoryn-* CSS-variable map, passed through verbatim as a nested
+        // object; product-api/identity validate the keys + values (and the WCAG-AA contrast floor).
+        (with["cssVariables"] as? Map<*, *>)?.let { raw ->
+            val css = raw.entries.mapNotNull { (k, v) ->
+                val key = k?.toString()?.trim()?.takeIf { it.isNotEmpty() }
+                val value = v?.toString()?.trim()?.takeIf { it.isNotEmpty() }
+                if (key != null && value != null) key to value else null
+            }.toMap()
+            if (css.isNotEmpty()) body["cssVariables"] = css
+        }
         if (body.isEmpty()) {
             ctx.info("login theme: nothing supplied — leaving the platform-default hosted-login look")
             return mapOf("configured" to "false")

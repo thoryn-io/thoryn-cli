@@ -96,8 +96,12 @@ thoryn env test-emails get <email-id> [--env <slug>]   # one email, incl. its ac
 thoryn branding get                                    # effective values + which fields are overridden
 thoryn branding set [--primary-color '#2563eb'] [--background-color '#fff'] \
                     [--logo-url https://…] [--border-radius-px 8] [--theme light|dark|auto]
-# set MERGES (unspecified fields keep their stored value); pass an empty value to clear an override,
-# e.g. `thoryn branding set --logo-url ""` drops the custom logo back to the platform default.
+# SSO-3038 — additionally set allowlisted --thoryn-* CSS variables (repeatable --var KEY=VALUE):
+thoryn branding set --var --thoryn-accent=#7c3aed --var --thoryn-font-family='Inter, sans-serif'
+#   allowed: --thoryn-accent, --thoryn-text, --thoryn-muted, --thoryn-font-family (colors hex +
+#   WCAG-AA contrast-guarded; font a safe stack). An empty value clears one: --var --thoryn-accent=
+# set MERGES (unspecified fields + CSS vars keep their stored value); pass an empty value to clear an
+# override, e.g. `thoryn branding set --logo-url ""` drops the custom logo back to the platform default.
 
 # Tenant seeding (SSO-1553) — one-shot, zero-interaction provisioner for CI.
 thoryn tenant seed --non-interactive --secret-dir <dir> \

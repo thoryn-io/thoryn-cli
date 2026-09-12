@@ -89,6 +89,33 @@ class BrandingCommandTest : CommandTestBase() {
     }
 
     @Test
+    fun `set --var merges CSS variables over the stored map and sends them in the body`() {
+        // stored already has one --thoryn-* var; --var adds another + the merge preserves the first.
+        val withVars = """
+            {"stored":{"primaryColor":"#2563eb","cssVariables":{"--thoryn-text":"#111827"}},
+             "effective":{"logoUrl":null,"primaryColor":"#2563eb","backgroundColor":"#ffffff",
+                          "borderRadiusPx":4,"theme":"auto","cssVariables":{"--thoryn-text":"#111827"}},
+             "updatedAt":"2026-09-12T10:00:00Z"}
+        """.trimIndent()
+        server.enqueue(jsonResponse(200, withVars)) // GET (merge seed)
+        server.enqueue(jsonResponse(200, withVars)) // PUT
+
+        val (exit, _, _) = runCli(
+            "branding", "set", "--var", "--thoryn-accent=#7c3aed", "--gateway", baseUrl(),
+        )
+
+        assertThat(exit).isEqualTo(0)
+        server.takeRequest() // GET
+        val put = server.takeRequest()
+        assertThat(put.method).isEqualTo("PUT")
+        val body = put.body.readUtf8()
+        // the new var is set AND the stored var is preserved (merge, full-replace-safe).
+        assertThat(body).contains("\"cssVariables\"")
+        assertThat(body).contains("\"--thoryn-accent\":\"#7c3aed\"")
+        assertThat(body).contains("\"--thoryn-text\":\"#111827\"")
+    }
+
+    @Test
     fun `set surfaces an insufficient-scope error with the login hint`() {
         server.enqueue(jsonResponse(200, view)) // GET (merge seed) succeeds …
         server.enqueue( // … then the PUT is forbidden
