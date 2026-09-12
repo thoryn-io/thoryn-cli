@@ -233,6 +233,22 @@ class ProductApiClient(
     fun deleteEmailProvider(confirmSlug: String? = null): Unit =
         deleteNoContent("/api/v1/email-provider", confirmSlug)
 
+    // ── Hosted-login branding (SSO-3037; product-api /api/v1/login-experience/branding) ─
+    //
+    // The per-(tenant, environment) branding of the hosted sign-in / register screens:
+    // logoUrl + primaryColor + backgroundColor + borderRadiusPx + theme, rendered by
+    // identity-service as CSS custom properties (`--brand-*`) in the login templates. read →
+    // tenant:idp.read; write → tenant:idp.write (both granted to thoryn-cli by hub V83). PUT
+    // is a merge-upsert of the supplied fields; the response carries `stored` (raw, null = unset)
+    // + `effective` (post-fallback values the page uses) + `updatedAt`. Environment-scoped via
+    // the `X-Thoryn-Environment` header this client already sends for the selected env.
+
+    fun getLoginBranding(): JsonNode =
+        get("/api/v1/login-experience/branding")
+
+    fun putLoginBranding(body: Map<String, Any?>): JsonNode =
+        put("/api/v1/login-experience/branding", body)
+
     // ── Attestations (SSO-2878; product-api verify-then-sign) ──────────────────
     //
     // POST a receipt to have the platform re-verify its resources against live tenant

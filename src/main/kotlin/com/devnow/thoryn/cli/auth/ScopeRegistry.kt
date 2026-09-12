@@ -56,6 +56,11 @@ object ScopeRegistry {
         // granted to thoryn-cli by hub V149). read gates the get; write gates the upsert + reset.
         "tenant:email.read",
         "tenant:email.write",
+        // hosted-login branding — login-experience facade (product-api
+        // /api/v1/login-experience/branding — SSO-3037; granted to thoryn-cli by hub V83).
+        // read gates `branding get`; write gates `branding set`.
+        "tenant:idp.read",
+        "tenant:idp.write",
     )
 
     /**
