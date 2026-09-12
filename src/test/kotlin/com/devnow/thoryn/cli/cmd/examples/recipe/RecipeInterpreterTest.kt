@@ -204,6 +204,65 @@ class RecipeInterpreterTest : CommandTestBase() {
     }
 
     @Test
+    fun `tenant configureLoginTheme PUTs the branding and records a loginTheme receipt`() {
+        val ctx = context()
+        val recipeJson = """
+            {
+              "apiVersion": "thoryn.io/examples/v1",
+              "id": "configure-login-theme-test",
+              "version": "1.0.0",
+              "summary": "style the hosted sign-in screen",
+              "steps": [
+                { "id": "ws", "action": "hub.createWorkspace",
+                  "with": { "slug": "ex-signin-{{generate.slug8}}", "displayName": "T" } },
+                { "id": "theme", "action": "tenant.configureLoginTheme",
+                  "with": { "primaryColor": "#2563eb", "backgroundColor": "#ffffff",
+                            "borderRadiusPx": 8, "theme": "auto",
+                            "logoUrl": "https://cdn.example.com/logo.svg" } }
+              ]
+            }
+        """.trimIndent()
+        val recipe = Recipe(JsonMapper.builder().build().readTree(recipeJson))
+
+        // 1) createWorkspace → provisioning token
+        server.enqueue(jsonResponse(201, """{"tenantId":"t-1","slug":"srv-ignored","provisioningToken":"PT-1"}"""))
+        // 2) tenant.configureLoginTheme → PUT /api/v1/login-experience/branding returns stored+effective
+        server.enqueue(
+            jsonResponse(
+                200,
+                """{"stored":{"logoUrl":"https://cdn.example.com/logo.svg","primaryColor":"#2563eb",
+                    "backgroundColor":"#ffffff","borderRadiusPx":8,"theme":"auto"},
+                    "effective":{"logoUrl":"https://cdn.example.com/logo.svg","primaryColor":"#2563eb",
+                    "backgroundColor":"#ffffff","borderRadiusPx":8,"theme":"auto"},
+                    "updatedAt":"2026-09-12T10:00:00Z"}""".trimIndent(),
+            ),
+        )
+        // 3) best-effort platform attestation of the receipt
+        server.enqueue(jsonResponse(200, """{"kid":"k","signature":"s","canonicalPayload":"e30","attestedAt":"2026-01-01T00:00:00Z"}"""))
+
+        val run = RecipeInterpreter(ctx, recipe, trustPropagationBudgetMs = 2_000).setup()
+
+        // The theme is recorded on the receipt (effective values).
+        val themeRef = run.receipt.resources.firstOrNull { it.kind == "loginTheme" }
+        assertThat(themeRef).isNotNull
+        assertThat(themeRef!!.id).isEqualTo("auto")
+        assertThat(themeRef.attributes["primaryColor"]).isEqualTo("#2563eb")
+        assertThat(themeRef.attributes["borderRadiusPx"]).isEqualTo("8")
+
+        server.takeRequest() // createWorkspace
+        val brandingReq = server.takeRequest()
+        assertThat(brandingReq.method).isEqualTo("PUT")
+        assertThat(brandingReq.path).isEqualTo("/api/v1/login-experience/branding")
+        assertThat(brandingReq.getHeader("Authorization")).isEqualTo("Bearer PT-1")
+        val body = brandingReq.body.readUtf8()
+        assertThat(body)
+            .contains("\"primaryColor\":\"#2563eb\"")
+            .contains("\"borderRadiusPx\":8")
+            .contains("\"theme\":\"auto\"")
+            .contains("\"logoUrl\":\"https://cdn.example.com/logo.svg\"")
+    }
+
+    @Test
     fun `simple-signin configure-email-provider PUTs a typed BYO-SMTP body when smtp params are set`() {
         val ctx = context()
         // The example-e2e passes real SMTP params via --set; here as interpreter overrides.

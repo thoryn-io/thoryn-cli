@@ -239,6 +239,7 @@ internal class RecipeInterpreter(
             "applications.create" -> createApplication(with)
             "identity.registerUser" -> registerUser(with)
             "tenant.configureEmailProvider" -> configureEmailProvider(with)
+            "tenant.configureLoginTheme" -> configureLoginTheme(with)
             "federation.create" -> createFederation(with)
             "applications.delete" -> { tenantClient().deleteApplication(with["id"].toString(), workspace?.slug); emptyMap() }
             "federation.delete" -> { tenantClient().deleteFederationMember(with["id"].toString()); emptyMap() }
@@ -402,6 +403,50 @@ internal class RecipeInterpreter(
             put("providerType", providerType)
             configVersion?.let { put("configVersion", it) }
             enabled?.let { put("enabled", it) }
+        }
+    }
+
+    /**
+     * SSO-3037 — `tenant.configureLoginTheme`: style the hosted sign-in / register screens for the
+     * ACTIVE environment (a sandbox, or production) via product-api's
+     * `PUT /api/v1/login-experience/branding`. A recipe declares the COMPLETE theme for a fresh env,
+     * so this is a straight replace (unlike the CLI `branding set`, which merges): only the fields the
+     * recipe supplies are sent; the server validates them (hex colors, radius 0-64, theme enum, https
+     * logo) + enforces a WCAG-AA contrast guard. OPTIONAL like configureEmailProvider — with nothing
+     * supplied the step is a no-op, leaving the platform-default look.
+     *
+     * Exposes `{{<step id>.theme}}` / `{{<step id>.primaryColor}}` from the resolved (effective) values.
+     */
+    private fun configureLoginTheme(with: Map<String, Any?>): Map<String, String> {
+        val body = linkedMapOf<String, Any?>()
+        with["logoUrl"].nonBlankString()?.let { body["logoUrl"] = it }
+        with["primaryColor"].nonBlankString()?.let { body["primaryColor"] = it }
+        with["backgroundColor"].nonBlankString()?.let { body["backgroundColor"] = it }
+        with["borderRadiusPx"]?.let { coerceInt(it)?.let { px -> body["borderRadiusPx"] = px } }
+        with["theme"].nonBlankString()?.let { body["theme"] = it }
+        if (body.isEmpty()) {
+            ctx.info("login theme: nothing supplied — leaving the platform-default hosted-login look")
+            return mapOf("configured" to "false")
+        }
+
+        val resp = retryUntilTenantTrusted { tenantClient().putLoginBranding(body) }
+        val effective = resp["effective"]
+        val theme = effective?.get("theme")?.takeIf { !it.isNull }?.asString()
+        val primaryColor = effective?.get("primaryColor")?.takeIf { !it.isNull }?.asString()
+        resources += ResourceRef(
+            kind = "loginTheme",
+            id = theme ?: "login-theme",
+            attributes = buildMap {
+                primaryColor?.let { put("primaryColor", it) }
+                effective?.get("backgroundColor")?.takeIf { !it.isNull }?.asString()?.let { put("backgroundColor", it) }
+                effective?.get("borderRadiusPx")?.takeIf { !it.isNull }?.asString()?.let { put("borderRadiusPx", it) }
+                effective?.get("logoUrl")?.takeIf { !it.isNull }?.asString()?.let { put("logoUrl", it) }
+            },
+        )
+        ctx.info("login theme: theme=${theme ?: "(default)"}${primaryColor?.let { " primary=$it" } ?: ""}")
+        return buildMap {
+            theme?.let { put("theme", it) }
+            primaryColor?.let { put("primaryColor", it) }
         }
     }
 
