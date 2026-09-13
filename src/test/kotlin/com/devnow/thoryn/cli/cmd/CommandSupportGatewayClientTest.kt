@@ -129,4 +129,37 @@ class CommandSupportGatewayClientTest : CommandTestBase() {
         assertThat(server.requestCount).isEqualTo(1)
         assertThat(server.takeRequest().getHeader("Authorization")).isEqualTo("Bearer AT-base")
     }
+
+    @Test
+    fun `SSO-3068 - client with an explicit environment rides X-Thoryn-Environment on the base token (no exchange)`() {
+        // A client-credentials/CI session: base token already scoped to the workspace's per-tenant
+        // issuer, and NO SelectedWorkspaceStore (login clears it; only `workspace switch` writes it).
+        val base = Tokens(accessToken = "AT-cc", issuer = baseUrl(), gateway = baseUrl())
+        seedTokens(base)
+
+        server.enqueue(jsonResponse(200, """{"items":[],"total":0}"""))
+
+        CommandSupport.client(baseUrl(), base, environmentSlug = "sandbox-alpha").listApplications()
+
+        // One request only — the gateway call. No `workspace switch` token exchange, and the caller's
+        // chosen environment rides directly, carrying the base bearer.
+        assertThat(server.requestCount).isEqualTo(1)
+        val req = server.takeRequest()
+        assertThat(req.getHeader("Authorization")).isEqualTo("Bearer AT-cc")
+        assertThat(req.getHeader(com.devnow.thoryn.cli.api.ProductApiClient.ENVIRONMENT_HEADER))
+            .isEqualTo("sandbox-alpha")
+    }
+
+    @Test
+    fun `SSO-3068 - client with a blank environment sends no environment header`() {
+        val base = Tokens(accessToken = "AT-cc", issuer = baseUrl(), gateway = baseUrl())
+        seedTokens(base)
+
+        server.enqueue(jsonResponse(200, """{"items":[],"total":0}"""))
+
+        CommandSupport.client(baseUrl(), base, environmentSlug = "  ").listApplications()
+
+        assertThat(server.takeRequest().getHeader(com.devnow.thoryn.cli.api.ProductApiClient.ENVIRONMENT_HEADER))
+            .isNull()
+    }
 }
