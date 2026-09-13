@@ -249,6 +249,23 @@ class ProductApiClient(
     fun putLoginBranding(body: Map<String, Any?>): JsonNode =
         put("/api/v1/login-experience/branding", body)
 
+    // ── Login flows (SSO-3065; product-api /api/v1/login-flows, per environment) ──
+    // Author + activate the multi-step login journey (which authenticator stages a sign-in walks) for
+    // the selected environment. Enables e.g. a `password + REQUIRED passkey` second-factor flow — the
+    // one thing a passkey MFA example needs that no other CLI surface exposed. Scopes: read →
+    // tenant:idp.read, write (draft/activate/apply-template) → tenant:idp.write.
+    fun getActiveLoginFlow(): JsonNode =
+        get("/api/v1/login-flows/active")
+
+    fun putLoginFlowDraft(body: Map<String, Any?>): JsonNode =
+        put("/api/v1/login-flows/draft", body)
+
+    fun activateLoginFlow(version: Int): JsonNode =
+        post("/api/v1/login-flows/activate", mapOf("version" to version))
+
+    fun applyLoginFlowTemplate(templateId: String): JsonNode =
+        post("/api/v1/login-flows/templates/${encode(templateId)}/apply", emptyMap<String, Any?>())
+
     // ── Attestations (SSO-2878; product-api verify-then-sign) ──────────────────
     //
     // POST a receipt to have the platform re-verify its resources against live tenant
