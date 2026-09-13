@@ -85,7 +85,7 @@ internal object CommandSupport {
      * every command that builds its client here transparently recovers from a stale ~15-minute access
      * token instead of returning `HTTP 401` until the next `thoryn login`.
      */
-    fun client(baseUrl: String, tokens: Tokens): ProductApiClient =
+    fun client(baseUrl: String, tokens: Tokens, environmentSlug: String? = null): ProductApiClient =
         ProductApiClient(
             gateway = baseUrl,
             tokens = ensureFresh(tokens),
@@ -93,6 +93,12 @@ internal object CommandSupport {
             // and retries. Covers the cases the proactive skew check misses (unknown/short expiry,
             // clock skew, a token the hub invalidated early).
             reauthenticate = { forceRefresh() },
+            // SSO-3068 — an explicitly-supplied environment rides as `X-Thoryn-Environment` on every
+            // request, WITHOUT going through a `workspace switch` + `env use` selection. Lets a
+            // client-credentials/CI session (already scoped to the workspace's per-tenant issuer)
+            // target a specific environment — the same escape hatch `thoryn examples --environment`
+            // uses for provisioning. Null keeps the base-tenant/production-plane behaviour.
+            environmentSlug = environmentSlug?.takeIf { it.isNotBlank() },
         )
 
     /**

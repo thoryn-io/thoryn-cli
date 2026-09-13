@@ -63,11 +63,14 @@ class LoginFlowCommand : Callable<Int> {
         @Option(names = ["--output"], description = ["Output format: json|yaml|table (default: table)."])
         var outputRaw: String? = null
 
+        @Option(names = ["--environment"], description = [ENVIRONMENT_OPTION_DESC])
+        var environment: String? = null
+
         override fun call(): Int {
             val format = CommandSupport.parseFormat(outputRaw) ?: return CommandSupport.EXIT_USAGE
             val tokens = CommandSupport.readTokens() ?: return CommandSupport.EXIT_NOT_SIGNED_IN
             gateway = CommandSupport.resolveGateway(gateway, tokens)
-            val client = CommandSupport.gatewayClient(gateway, tokens)
+            val client = resolveClient(gateway, tokens, environment)
             return try {
                 CommandSupport.emitRecord(format, client.getActiveLoginFlow(), ::loginFlowRecordFields)
                 CommandSupport.EXIT_OK
@@ -110,12 +113,15 @@ class LoginFlowCommand : Callable<Int> {
         @Option(names = ["--output"])
         var outputRaw: String? = null
 
+        @Option(names = ["--environment"], description = [ENVIRONMENT_OPTION_DESC])
+        var environment: String? = null
+
         override fun call(): Int {
             val format = CommandSupport.parseFormat(outputRaw) ?: return CommandSupport.EXIT_USAGE
             val parsed = parseStages(stages) ?: return CommandSupport.EXIT_USAGE
             val tokens = CommandSupport.readTokens() ?: return CommandSupport.EXIT_NOT_SIGNED_IN
             gateway = CommandSupport.resolveGateway(gateway, tokens)
-            val client = CommandSupport.gatewayClient(gateway, tokens)
+            val client = resolveClient(gateway, tokens, environment)
             val definition = mapOf(
                 "version" to 1, // the store assigns the real next version; this satisfies the parse.
                 "status" to "DRAFT",
@@ -155,11 +161,14 @@ class LoginFlowCommand : Callable<Int> {
         @Option(names = ["--output"])
         var outputRaw: String? = null
 
+        @Option(names = ["--environment"], description = [ENVIRONMENT_OPTION_DESC])
+        var environment: String? = null
+
         override fun call(): Int {
             val format = CommandSupport.parseFormat(outputRaw) ?: return CommandSupport.EXIT_USAGE
             val tokens = CommandSupport.readTokens() ?: return CommandSupport.EXIT_NOT_SIGNED_IN
             gateway = CommandSupport.resolveGateway(gateway, tokens)
-            val client = CommandSupport.gatewayClient(gateway, tokens)
+            val client = resolveClient(gateway, tokens, environment)
             return try {
                 CommandSupport.emitRecord(format, client.activateLoginFlow(version), ::loginFlowRecordFields)
                 CommandSupport.EXIT_OK
@@ -191,11 +200,14 @@ class LoginFlowCommand : Callable<Int> {
         @Option(names = ["--output"])
         var outputRaw: String? = null
 
+        @Option(names = ["--environment"], description = [ENVIRONMENT_OPTION_DESC])
+        var environment: String? = null
+
         override fun call(): Int {
             val format = CommandSupport.parseFormat(outputRaw) ?: return CommandSupport.EXIT_USAGE
             val tokens = CommandSupport.readTokens() ?: return CommandSupport.EXIT_NOT_SIGNED_IN
             gateway = CommandSupport.resolveGateway(gateway, tokens)
-            val client = CommandSupport.gatewayClient(gateway, tokens)
+            val client = resolveClient(gateway, tokens, environment)
             return try {
                 val draft = client.applyLoginFlowTemplate(templateId)
                 if (!activate) {
@@ -219,6 +231,25 @@ class LoginFlowCommand : Callable<Int> {
 
     companion object {
         private val VALID_REQUIREMENTS = setOf("REQUIRED", "ALTERNATIVE", "CONDITIONAL", "DISABLED")
+
+        internal const val ENVIRONMENT_OPTION_DESC =
+            "Target environment slug (rides X-Thoryn-Environment). Use for a client-credentials/CI " +
+                "session that hasn't run `workspace switch` + `env use`. Omit to use the environment " +
+                "selected by `env use`."
+
+        /**
+         * SSO-3068 — pick the gateway client for a login-flow call. With `--environment <slug>` the
+         * environment rides directly as `X-Thoryn-Environment` on a base (e.g. client-credentials/CI)
+         * token, so an API-key session that never ran `workspace switch` + `env use` can still target a
+         * specific environment — mirroring `thoryn examples --environment`. Without it, behaviour is
+         * unchanged: honour an active `workspace switch` and the environment selected by `env use`.
+         */
+        internal fun resolveClient(gateway: String, tokens: com.devnow.thoryn.cli.auth.Tokens, environment: String?) =
+            if (!environment.isNullOrBlank()) {
+                CommandSupport.client(gateway, tokens, environmentSlug = environment)
+            } else {
+                CommandSupport.gatewayClient(gateway, tokens)
+            }
 
         /**
          * Parse `--stage id:TYPE:REQUIREMENT` entries into login-flow stage maps. Returns null (and
