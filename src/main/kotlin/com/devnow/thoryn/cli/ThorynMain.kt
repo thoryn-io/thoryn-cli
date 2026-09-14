@@ -4,6 +4,7 @@ import com.devnow.thoryn.cli.cmd.AuditCommand
 import com.devnow.thoryn.cli.cmd.AuditReplayCommand
 import com.devnow.thoryn.cli.cmd.BrandingCommand
 import com.devnow.thoryn.cli.cmd.LoginFlowCommand
+import com.devnow.thoryn.cli.cmd.LoginMethodsCommand
 import com.devnow.thoryn.cli.cmd.ClientsCommand
 import com.devnow.thoryn.cli.cmd.DiagCommand
 import com.devnow.thoryn.cli.cmd.EnvironmentCommand
@@ -46,6 +47,7 @@ import kotlin.system.exitProcess
         EnvironmentCommand::class,
         BrandingCommand::class,
         LoginFlowCommand::class,
+        LoginMethodsCommand::class,
         TenantCommand::class,
         AuditCommand::class,
         AuditReplayCommand::class,

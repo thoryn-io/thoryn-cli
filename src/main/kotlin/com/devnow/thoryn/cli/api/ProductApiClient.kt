@@ -266,6 +266,19 @@ class ProductApiClient(
     fun applyLoginFlowTemplate(templateId: String): JsonNode =
         post("/api/v1/login-flows/templates/${encode(templateId)}/apply", emptyMap<String, Any?>())
 
+    // ── Login methods (SSO-3075; product-api /api/v1/login-methods, per environment) ──
+    // The allow-list of sign-in methods the hosted login offers for the selected environment. Enables
+    // e.g. adding `magic_code` (opt-in, not default-on) — the one thing a magic-code example needs that
+    // no other CLI surface exposed. GET → tenant:idp.read; PUT/DELETE → tenant:idp.write.
+    fun getLoginMethods(): JsonNode =
+        get("/api/v1/login-methods")
+
+    fun putLoginMethods(methods: List<String>): JsonNode =
+        put("/api/v1/login-methods", mapOf("methods" to methods))
+
+    fun resetLoginMethods(): JsonNode =
+        delete("/api/v1/login-methods")
+
     // ── Attestations (SSO-2878; product-api verify-then-sign) ──────────────────
     //
     // POST a receipt to have the platform re-verify its resources against live tenant
