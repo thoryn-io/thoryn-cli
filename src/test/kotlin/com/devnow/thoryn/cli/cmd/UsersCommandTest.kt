@@ -88,6 +88,20 @@ class UsersCommandTest : CommandTestBase() {
     }
 
     @Test
+    fun `--environment rides X-Thoryn-Environment on the list + suspend (client-credentials env targeting, SSO-3068)`() {
+        server.enqueue(jsonResponse(200, usersEnvelope(user())))
+        server.enqueue(noContent())
+
+        val (exit, _, _) = runCli("users", "suspend", "--email", "jane@example.com", "--environment", "production", "--confirm", slug, "--gateway", baseUrl())
+
+        assertThat(exit).isEqualTo(0)
+        val lookup = server.takeRequest()
+        assertThat(lookup.getHeader(ProductApiClient.ENVIRONMENT_HEADER)).isEqualTo("production")
+        val suspend = server.takeRequest()
+        assertThat(suspend.getHeader(ProductApiClient.ENVIRONMENT_HEADER)).isEqualTo("production")
+    }
+
+    @Test
     fun `suspend by email fails when no user matches and makes no suspend call`() {
         server.enqueue(jsonResponse(200, usersEnvelope())) // empty items
 

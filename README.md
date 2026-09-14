@@ -88,9 +88,11 @@ thoryn env delete <id> --confirm <slug>      # hard-delete a sandbox (irreversib
 # Directory users (SSO-3081) — the users of your workspace (product-api /api/v1/users), honouring the
 # SELECTED environment (thoryn env use); with none selected, the production plane. Suspending a user
 # refuses their next sign-in (the hosted login shows the suspended notice, not the generic error).
-thoryn users list [--email <email>] [--status <ACTIVE|SUSPENDED>] [--limit <n>]
-thoryn users suspend (<id> | --email <email>) [--confirm <workspace-slug>]  # production plane needs --confirm
-thoryn users reactivate (<id> | --email <email>)                           # clear a suspension
+thoryn users list [--email <email>] [--status <ACTIVE|SUSPENDED>] [--limit <n>] [--environment <slug>]
+thoryn users suspend (<id> | --email <email>) [--confirm <workspace-slug>] [--environment <slug>]  # production plane needs --confirm
+thoryn users reactivate (<id> | --email <email>) [--environment <slug>]                            # clear a suspension
+# --environment targets a plane directly (rides X-Thoryn-Environment) for a client-credentials/CI
+# session that hasn't run `workspace switch` + `env use` (SSO-3068); e.g. `--environment production`.
 
 # Sandbox test inbox (SSO-3026) — a sandbox SUPPRESSES real transactional email and captures it here,
 # so you can complete a sandbox email flow (verification, …) without a real mailbox. Read-only.
