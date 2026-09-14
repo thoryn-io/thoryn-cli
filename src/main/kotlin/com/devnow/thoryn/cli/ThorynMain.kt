@@ -13,6 +13,7 @@ import com.devnow.thoryn.cli.cmd.LoginCommand
 import com.devnow.thoryn.cli.cmd.LogoutCommand
 import com.devnow.thoryn.cli.cmd.StatusCommand
 import com.devnow.thoryn.cli.cmd.TenantCommand
+import com.devnow.thoryn.cli.cmd.UsersCommand
 import com.devnow.thoryn.cli.cmd.WhoamiCommand
 import com.devnow.thoryn.cli.cmd.WorkspaceCommand
 import com.devnow.thoryn.cli.cmd.examples.ExamplesCommand
@@ -49,6 +50,7 @@ import kotlin.system.exitProcess
         LoginFlowCommand::class,
         LoginMethodsCommand::class,
         TenantCommand::class,
+        UsersCommand::class,
         AuditCommand::class,
         AuditReplayCommand::class,
         ExamplesCommand::class,
