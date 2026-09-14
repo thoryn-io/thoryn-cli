@@ -57,6 +57,9 @@ class UsersCommand : Callable<Int> {
         @Option(names = ["--limit"], description = ["Maximum users to return."])
         var limit: Int? = null
 
+        @Option(names = ["--environment"], description = [ENVIRONMENT_OPTION_DESC])
+        var environment: String? = null
+
         @Option(names = ["--gateway"], description = ["Override the gateway base URL (default: \${DEFAULT-VALUE})."], defaultValue = ThorynConfig.DEFAULT_GATEWAY)
         var gateway: String = ThorynConfig.DEFAULT_GATEWAY
 
@@ -67,7 +70,7 @@ class UsersCommand : Callable<Int> {
             val format = CommandSupport.parseFormat(outputRaw) ?: return CommandSupport.EXIT_USAGE
             val tokens = CommandSupport.readTokens() ?: return CommandSupport.EXIT_NOT_SIGNED_IN
             gateway = CommandSupport.resolveGateway(gateway, tokens)
-            val client = CommandSupport.gatewayClient(gateway, tokens)
+            val client = clientFor(gateway, tokens, environment)
             return try {
                 val users = client.listUsers(email = email, status = status, limit = limit)
                 CommandSupport.emitList(format, users, LIST_HEADERS, rowMapper = ::row)
@@ -93,6 +96,9 @@ class UsersCommand : Callable<Int> {
         @Option(names = ["--confirm"], description = [CommandSupport.CONFIRM_OPTION_DESC])
         var confirm: String? = null
 
+        @Option(names = ["--environment"], description = [ENVIRONMENT_OPTION_DESC])
+        var environment: String? = null
+
         @Option(names = ["--gateway"], defaultValue = ThorynConfig.DEFAULT_GATEWAY)
         var gateway: String = ThorynConfig.DEFAULT_GATEWAY
 
@@ -103,7 +109,7 @@ class UsersCommand : Callable<Int> {
             val format = CommandSupport.parseFormat(outputRaw) ?: return CommandSupport.EXIT_USAGE
             val tokens = CommandSupport.readTokens() ?: return CommandSupport.EXIT_NOT_SIGNED_IN
             gateway = CommandSupport.resolveGateway(gateway, tokens)
-            val client = CommandSupport.gatewayClient(gateway, tokens)
+            val client = clientFor(gateway, tokens, environment)
             val userId = resolveUserId(client, id, email, gateway) ?: return CommandSupport.EXIT_HTTP_ERROR
             return try {
                 client.suspendUser(userId, confirm)
@@ -127,6 +133,9 @@ class UsersCommand : Callable<Int> {
         @Option(names = ["--email"], description = ["Address the user by email instead of id (resolves via a directory lookup)."])
         var email: String? = null
 
+        @Option(names = ["--environment"], description = [ENVIRONMENT_OPTION_DESC])
+        var environment: String? = null
+
         @Option(names = ["--gateway"], defaultValue = ThorynConfig.DEFAULT_GATEWAY)
         var gateway: String = ThorynConfig.DEFAULT_GATEWAY
 
@@ -137,7 +146,7 @@ class UsersCommand : Callable<Int> {
             val format = CommandSupport.parseFormat(outputRaw) ?: return CommandSupport.EXIT_USAGE
             val tokens = CommandSupport.readTokens() ?: return CommandSupport.EXIT_NOT_SIGNED_IN
             gateway = CommandSupport.resolveGateway(gateway, tokens)
-            val client = CommandSupport.gatewayClient(gateway, tokens)
+            val client = clientFor(gateway, tokens, environment)
             val userId = resolveUserId(client, id, email, gateway) ?: return CommandSupport.EXIT_HTTP_ERROR
             return try {
                 client.reactivateUser(userId)
@@ -152,6 +161,24 @@ class UsersCommand : Callable<Int> {
     }
 
     companion object {
+        internal const val ENVIRONMENT_OPTION_DESC =
+            "Target environment slug (rides X-Thoryn-Environment). Use for a client-credentials/CI " +
+                "session that hasn't run `workspace switch` + `env use` (SSO-3068). Omit to use the " +
+                "environment selected by `env use`."
+
+        /**
+         * Build the client for the target environment. An explicit `--environment` rides
+         * `X-Thoryn-Environment` directly (the client-credentials/CI path, SSO-3068 — a CI session
+         * clears the SelectedWorkspaceStore, so `env use` can't select one); otherwise the environment
+         * comes from `env use` via [CommandSupport.gatewayClient].
+         */
+        internal fun clientFor(gateway: String, tokens: com.devnow.thoryn.cli.auth.Tokens, environment: String?): ProductApiClient =
+            if (!environment.isNullOrBlank()) {
+                CommandSupport.client(gateway, tokens, environmentSlug = environment)
+            } else {
+                CommandSupport.gatewayClient(gateway, tokens)
+            }
+
         internal val LIST_HEADERS: List<String> = listOf("id", "email", "status", "emailVerified", "createdAt")
 
         internal fun row(node: JsonNode): List<Any?> = listOf(
