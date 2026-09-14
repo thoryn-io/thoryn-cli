@@ -365,6 +365,10 @@ internal object CommandSupport {
             OutputFormat.TABLE -> {
                 val items: List<JsonNode> = when {
                     body.isArray -> body.toList()
+                    // The customer-plane collection envelope is `{ "data": [...], "pagination": {...} }`
+                    // (product-api ListEnvelope); older/other surfaces use `{ "items": [...] }`.
+                    body.isObject && body.has("data") && body["data"].isArray ->
+                        body["data"].toList()
                     body.isObject && body.has("items") && body["items"].isArray ->
                         body["items"].toList()
                     body.isObject -> listOf(body)

@@ -15,7 +15,8 @@ class UsersCommandTest : CommandTestBase() {
     private val slug = "acme"
 
     private fun usersEnvelope(vararg users: String): String =
-        """{"items":[${users.joinToString(",")}],"pageInfo":{"hasNextPage":false}}"""
+        // The real product-api collection envelope (ListEnvelope): `{ "data": [...], "pagination": {...} }`.
+        """{"data":[${users.joinToString(",")}],"pagination":{"cursor":null,"hasMore":false}}"""
 
     private fun user(id: String = userId, email: String = "jane@example.com", status: String = "ACTIVE"): String =
         """{"id":"$id","email":"$email","status":"$status","emailVerified":true,"createdAt":"2026-09-14T10:00:00Z"}"""

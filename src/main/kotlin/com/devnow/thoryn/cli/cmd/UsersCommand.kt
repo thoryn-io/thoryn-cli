@@ -214,8 +214,11 @@ class UsersCommand : Callable<Int> {
                 return null
             }
             val matches = try {
-                val items = client.listUsers(email = trimmedEmail).get("items")
-                if (items != null && items.isArray) items.toList() else emptyList()
+                // The customer-plane collection envelope is `{ "data": [...], "pagination": {...} }`
+                // (product-api ListEnvelope); fall back to `items` for any older/other surface.
+                val envelope = client.listUsers(email = trimmedEmail)
+                val arr = envelope.get("data")?.takeIf { it.isArray } ?: envelope.get("items")
+                if (arr != null && arr.isArray) arr.toList() else emptyList()
             } catch (ex: ProductApiException) {
                 err.println("Error: could not look up '$trimmedEmail' (${ex.errorCode ?: ex.message}). A --email lookup needs tenant:users.read.")
                 return null
