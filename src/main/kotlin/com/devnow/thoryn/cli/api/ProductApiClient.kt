@@ -123,6 +123,45 @@ class ProductApiClient(
     fun createUser(body: Map<String, Any?>): JsonNode =
         post("/api/v1/users", body)
 
+    // ── User lifecycle (SSO-3081; product-api `/api/v1/users`) ─────────────────
+    //
+    // Suspend / reactivate a directory user in the caller's tenant. `suspend` is a
+    // production-destructive action gated by the SSO-2413 confirmation contract
+    // (X-Thoryn-Confirm = workspace slug); `reactivate` is not gated. Scopes:
+    // read → tenant:users.read, write → tenant:users.write.
+
+    /**
+     * `GET /api/v1/users` — the caller tenant's directory users, newest first, as the
+     * `{ items: [...], pageInfo }` list envelope. [email] / [status] narrow the page
+     * (server-side filters); [limit] bounds it (clamped 1..server-max). Used by the
+     * suspend / reactivate commands to resolve an `--email` to its user id.
+     */
+    fun listUsers(email: String? = null, status: String? = null, limit: Int? = null): JsonNode {
+        val query = buildList {
+            email?.takeIf { it.isNotBlank() }?.let { add("email=${encode(it)}") }
+            status?.takeIf { it.isNotBlank() }?.let { add("status=${encode(it)}") }
+            limit?.let { add("limit=$it") }
+        }.joinToString("&").let { if (it.isEmpty()) "" else "?$it" }
+        return get("/api/v1/users$query")
+    }
+
+    fun getUser(userId: String): JsonNode =
+        get("/api/v1/users/${encode(userId)}")
+
+    /**
+     * `POST /api/v1/users/{id}/suspend` — disable a user so their next sign-in is refused
+     * (identity marks the account non-ACTIVE → the hosted login shows the suspended notice).
+     * `204 No Content`. [confirmSlug] rides as `X-Thoryn-Confirm`, clearing the SSO-2413
+     * production-confirmation gate (`428` absent / `422` mismatch on the production plane; a
+     * sandbox plane is ungated).
+     */
+    fun suspendUser(userId: String, confirmSlug: String? = null): Unit =
+        postNoContent("/api/v1/users/${encode(userId)}/suspend", confirmSlug)
+
+    /** `POST /api/v1/users/{id}/reactivate` — clear a suspension (`204`; not confirmation-gated). */
+    fun reactivateUser(userId: String): Unit =
+        postNoContent("/api/v1/users/${encode(userId)}/reactivate")
+
     // ── Environments (SSO-2870; product-api SSO-2410 `/api/v1/environments`) ────
     //
     // A workspace (tenant) holds N durable sandbox environments + one platform-
@@ -678,6 +717,24 @@ class ProductApiClient(
                 .header("Accept", "application/json")
                 .withConfirmation(confirmSlug)
                 .DELETE()
+                .build()
+        }
+        if (response.statusCode() !in 200..299) {
+            throw ProductApiException.fromResponse(response.statusCode(), response.body() ?: "", mapper)
+        }
+    }
+
+    /**
+     * POST that expects `204 No Content` (a body-less side-effect — user suspend / reactivate).
+     * Throws [ProductApiException] on any non-2xx; ignores the (empty) body on success. [confirmSlug]
+     * rides as the SSO-2413 `X-Thoryn-Confirm` header when non-blank (mirrors [deleteNoContent]).
+     */
+    private fun postNoContent(path: String, confirmSlug: String? = null) {
+        val response = sendAuthed(HttpResponse.BodyHandlers.ofString()) { at ->
+            baseRequest(path).authed(at)
+                .header("Accept", "application/json")
+                .withConfirmation(confirmSlug)
+                .POST(HttpRequest.BodyPublishers.noBody())
                 .build()
         }
         if (response.statusCode() !in 200..299) {
