@@ -230,4 +230,48 @@ class ProvisionConvergeTest : CommandTestBase() {
         engine().destroy(after, "acme") {}
         assertThat(api.writes.single().confirm).isEqualTo("acme")
     }
+
+    @Test
+    fun `an environment slug given as an env placeholder converges by its RESOLVED slug — twice is a no-op and adoption records the real slug`() {
+        val f = file(
+            """
+            apiVersion: thoryn.io/provision/v1
+            resources:
+              - kind: environment
+                name: sandbox
+                spec: { slug: "{{env.E2E_ENV_SLUG}}", displayName: "e2e sandbox" }
+              - kind: application
+                name: rp
+                environment: sandbox
+                spec: { displayName: "RP", redirectUris: ["http://127.0.0.1/callback"] }
+            """,
+        )
+        val env = mapOf("E2E_ENV_SLUG" to "sbx-signin-42-1")
+        val first = apply(f, null, env)
+        assertThat(first.resources[0].attributes["slug"]).isEqualTo("sbx-signin-42-1")
+        assertThat(api.writes.map { it.method + " " + it.path }).containsExactly("POST /api/v1/environments", "POST /api/v1/applications")
+        assertThat(api.writes[0].body["slug"]).isEqualTo("sbx-signin-42-1")
+        assertThat(api.writes[1].env).isEqualTo("sbx-signin-42-1")
+
+        // Second apply: the dependant is probed in the RESOLVED sandbox, so nothing is re-created.
+        api.reset()
+        assertThat(apply(f, first, env).resources.map { it.id }).isEqualTo(first.resources.map { it.id })
+        assertThat(api.writes).isEmpty()
+
+        // A leftover sandbox with that slug (no receipt) is adopted under its real slug, and the client inside it is found.
+        api.reset()
+        val plan = engine(env).plan(f, null, false)
+        assertThat(plan.changes.map { it.action }).containsExactly(ChangeAction.ADOPT, ChangeAction.ADOPT)
+        val adopted = apply(f, null, env)
+        assertThat(api.writes).isEmpty()
+        assertThat(adopted.resources[0].attributes["slug"]).isEqualTo("sbx-signin-42-1")
+        assertThat(adopted.resources[0].adopted).isTrue()
+
+        // The schema itself accepts the placeholder form and still rejects a malformed literal slug.
+        val schema = tools.jackson.databind.json.JsonMapper.builder().build().readTree(javaClass.getResourceAsStream(ProvisionFile.SCHEMA_RESOURCE)!!.readBytes())
+        val pattern = Regex(schema["\$defs"]["resource"]["allOf"][0]["then"]["properties"]["spec"]["properties"]["slug"]["pattern"].asString())
+        assertThat(pattern.matches("{{env.E2E_ENV_SLUG}}")).isTrue()
+        assertThat(pattern.matches("sbx-signin-42-1")).isTrue()
+        assertThat(pattern.matches("Bad_Slug")).isFalse()
+    }
 }
