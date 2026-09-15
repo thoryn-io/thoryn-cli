@@ -5,6 +5,7 @@ import com.devnow.thoryn.cli.api.ProductApiException
 import com.devnow.thoryn.cli.auth.JwtClaims
 import com.devnow.thoryn.cli.cmd.examples.ExampleContext
 import com.devnow.thoryn.cli.cmd.examples.ExampleState
+import com.devnow.thoryn.cli.cmd.examples.RecipeParamEnv
 import com.devnow.thoryn.cli.cmd.provision.ChangeAction
 import com.devnow.thoryn.cli.cmd.provision.ProvisionEngine
 import com.devnow.thoryn.cli.cmd.provision.ProvisionException
@@ -21,7 +22,12 @@ import java.util.UUID
 
 /** SSO-2875 — the result of applying a recipe: the [ExampleState] the `run`/RP flow reads, plus the
  *  portable [Receipt] recording exactly what was provisioned. */
-internal data class RecipeRun(val state: ExampleState, val receipt: Receipt)
+internal data class RecipeRun(
+    val state: ExampleState,
+    val receipt: Receipt,
+    /** SSO-3102 — the recipe's params as resolved for this run (so a generated secret can be revealed once). */
+    val params: Map<String, String> = emptyMap(),
+)
 
 /** SSO-2873 — a recipe could not be applied (bad shape, unresolved reference, or a step failure). */
 internal open class RecipeException(message: String) : RuntimeException(message)
@@ -74,7 +80,7 @@ internal class RecipeInterpreter(
      * `<key>Env` secret references fall back to AFTER the recipe's resolved params, and (SSO-3102) the
      * channel every recipe param reads BEFORE its default — the example's override surface (test seam).
      */
-    private val provisionEnv: (String) -> String? = { System.getenv(it) },
+    private val provisionEnv: (String) -> String? = { RecipeParamEnv.lookup(it) },
 ) {
     private val mapper = JsonMapper.builder().addModule(kotlinModule()).build()
 
@@ -126,7 +132,7 @@ internal class RecipeInterpreter(
         runProvision() // SSO-3100 — the provisioning file first; a no-op for a recipe without one.
         recipe.steps.forEachIndexed { i, step -> executeStep(i + 1, step) }
         runVerify()
-        return RecipeRun(buildState(), attest(buildReceipt()))
+        return RecipeRun(buildState(), attest(buildReceipt()), params = recipe.params.mapNotNull { p -> p["name"].asString().let { n -> scope[n]?.let { n to it } } }.toMap())
     }
 
     /**

@@ -395,9 +395,12 @@ recipe's own steps and `verify`. The file's `{{env.NAME}}` placeholders and `<ke
 references resolve **first from the recipe's params** (so `passwordEnv: demoPassword` reads the
 `secret: true` param, `slug: "{{env.envSlug}}"` reads `envSlug`) and **then from the process
 environment**; secret values never reach a file or receipt. The recipe's **`params` section is
-overridable by the example that runs it**: a param takes `--set`, else the **process env var of
-its own name** (`export envSlug=…`, `export demoPassword=…` — the channel CI uses; a secret never
-rides on argv), else the recipe default (SSO-3102). What the file owns is exposed to
+overridable by the example that runs it**, and a local `apply` **asks for each param**: a param
+takes `--set`, else the **process env var of its own name** (`export envSlug=…`,
+`export demoPassword=…` — the channel CI uses; a secret never rides on argv; either skips the
+prompt), else the interactive prompt (a `secret: true` param is read without echo and its default
+is never shown), else the recipe default — a generated secret default is revealed **once** after
+apply so you can sign in with it (SSO-3102). What the file owns is exposed to
 the recipe as `{{provision.<kind>.<name>.id}}` (plus `.slug` for an environment, `.email` for
 a user, `.clientId` / `.redirectUri` for an application, `.methods` for `loginMethods`), the
 first `environment` resource becomes the environment later steps and `examples run` target,
