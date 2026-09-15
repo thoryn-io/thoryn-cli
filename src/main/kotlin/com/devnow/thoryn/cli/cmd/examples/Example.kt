@@ -143,19 +143,15 @@ internal object ExampleRegistry {
      * and its in-process Kotlin RP were retired with SSO-2880, and the former `THORYN_RECIPE_ENGINE`
      * flag with them.
      *
-     * `ci-signin` (SSO-2944) is the WORKSPACE-LESS sibling: it provisions an ephemeral loopback OAuth
-     * client inside a STANDING workspace the caller already owns (no `hub.createWorkspace` /
-     * `hub.deleteWorkspace`). It exists because a customer-plane `client_credentials` API key is
-     * tenant-scoped and cannot create workspaces — so CI (the reusable provisioning Action) targets a
-     * standing workspace rather than minting a fresh one per run.
+     * The former workspace-less `ci-signin` sibling (SSO-2944) was retired under SSO-3092: this repo's
+     * own CI converges `.thoryn/provision.yaml` (SSO-3090) and every `thoryn-examples` scenario now
+     * orchestrates a provisioning file through its recipe (`provision:`, SSO-3100), so nothing runs it.
      */
     private fun examples(): List<Example> =
         listOf(
-            // TODO(SSO-2968 follow-up): retire bundled recipes once conformance/example-e2e migrate to
-            // the fetched signed catalog. They MUST stay for now — conformance.yml / example-e2e.yml run
-            // bundled `ci-signin` (no `examples update` first), so removing them breaks CI.
+            // TODO(SSO-2968 follow-up): retire the bundled simple-signin once the guided `apply` no
+            // longer needs a recipe that works without `examples update` first.
             RecipeExample(Recipe.load("simple-signin")),
-            RecipeExample(Recipe.load("ci-signin")),
         )
 
     fun all(): List<Example> = examples()
