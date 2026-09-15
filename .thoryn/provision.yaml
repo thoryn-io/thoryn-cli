@@ -55,6 +55,10 @@ resources:
         - tenant:email.write
         - tenant:idp.read
         - tenant:idp.write
+        # SSO-3113 — `thoryn access …` + the `grants:` block of a provisioning file. Grantable only once
+        # the product side (SSO-3112) has deployed the scopes; a founder re-applies this file after that.
+        - tenant:access.read
+        - tenant:access.write
       requireAuthorizationConsent: false  # first-party: no consent screen for the platform's own CLI
 
   - kind: environment

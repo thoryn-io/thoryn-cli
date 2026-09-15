@@ -30,6 +30,10 @@ import java.util.concurrent.Callable
  *    would do; `apply` converges (a second run is a no-op; `--prune` removes what the file dropped);
  *    `destroy` removes everything the file's receipt owns, child-first. Production-plane removals are
  *    confirmation-gated with `--confirm <workspace-slug>`, like `env delete` / `clients delete`.
+ *    SSO-3113: `apply --secret-file <path>` / `--force-stdout` deliver a confidential application's
+ *    one-time client secret through [SecretIo] (exactly as `clients create`); an undeliverable secret
+ *    still records the resource and exits [SecretIo.EXIT_NO_SECRET]. A resource's `grants:` block is
+ *    converged with it (`thoryn access` is the imperative twin).
  */
 @Command(
     name = "provision",
@@ -98,9 +102,14 @@ class ProvisionCommand : Callable<Int> {
 
     internal companion object {
         /** An engine whose clients target the file's per-resource environment on the caller's session. */
-        fun engine(gateway: String, tokens: com.devnow.thoryn.cli.auth.Tokens): ProvisionEngine = ProvisionEngine(
+        fun engine(
+            gateway: String,
+            tokens: com.devnow.thoryn.cli.auth.Tokens,
+            secretSink: ProvisionEngine.SecretSink = ProvisionEngine.SecretSink.undeliverable(),
+        ): ProvisionEngine = ProvisionEngine(
             clients = { slug -> CommandSupport.gatewayClient(gateway, tokens, applyEnvironment = false, environmentOverride = slug ?: "") },
             cliVersion = runCatching { VersionProvider.readVersion() }.getOrNull(),
+            secretSink = secretSink,
         )
 
         fun workspaceSlug(): String? = runCatching { SelectedWorkspaceStore().read()?.slug }.getOrNull()
@@ -116,9 +125,15 @@ class ProvisionCommand : Callable<Int> {
             plan.changes.filter { it.diff.isNotEmpty() }.forEach { c ->
                 c.diff.forEach { (field, change) -> println("      ${c.kind} ${c.name}: $field: $change") }
             }
+            // SSO-3113 — grant changes per object (a no-op resource can still carry them).
+            plan.changes.filter { it.hasGrantChanges }.forEach { c ->
+                c.grantAdds.forEach { println("      ${c.kind} ${c.name}: grant + $it") }
+                c.grantRemoves.forEach { println("      ${c.kind} ${c.name}: grant - $it") }
+            }
             println(
                 "  ${plan.creates.size} to create, ${plan.updates.size} to update, ${plan.adopts.size} to adopt, " +
-                    "${plan.removes.size} to remove, ${plan.changes.count { it.action == ChangeAction.NOOP }} unchanged.",
+                    "${plan.removes.size} to remove, ${plan.changes.count { it.action == ChangeAction.NOOP }} unchanged" +
+                    (if (plan.grantChanges > 0) ", ${plan.grantChanges} grant change(s)." else "."),
             )
         }
 
@@ -156,7 +171,16 @@ class ProvisionCommand : Callable<Int> {
         }
     }
 
-    /** `thoryn provision apply [--file] [--prune] [--confirm <ws>] [--yes]` — converge the file. */
+    /**
+     * `thoryn provision apply [--file] [--prune] [--confirm <ws>] [--yes] [--secret-file <path>] [--force-stdout]`
+     * — converge the file. SSO-3113: a confidential `application` the apply CREATES is minted a one-time
+     * client secret, delivered through [SecretIo] like `thoryn clients create` — written to
+     * `--secret-file` (owner-only; a second one in the same apply lands at `<path>.<clientId>`), or
+     * printed to an interactive TTY with a WARN; a non-interactive stdout is refused unless
+     * `--force-stdout`. The secret never enters the receipt, the plan, or a log. When it cannot be
+     * delivered the resource is still recorded and the command exits [SecretIo.EXIT_NO_SECRET],
+     * naming `thoryn clients rotate-secret`.
+     */
     @Command(name = "apply", description = ["Converge the account to the provisioning file (a second run is a no-op)."], mixinStandardHelpOptions = true)
     internal class ApplySubcommand : FileOptions(), Callable<Int> {
         @Option(names = ["--prune"], description = ["Remove owned resources the file no longer declares."])
@@ -168,6 +192,12 @@ class ProvisionCommand : Callable<Int> {
         @Option(names = ["--yes", "-y"], description = ["Skip the confirmation prompt (non-interactive use)."])
         var yes: Boolean = false
 
+        @Option(names = ["--secret-file"], description = ["Write a created confidential application's one-time client secret to this file (owner-only) instead of a TTY/pipe."])
+        var secretFile: File? = null
+
+        @Option(names = ["--force-stdout"], description = ["Allow printing a minted client secret to a non-interactive stdout (pipe/redirect). Off by default."])
+        var forceStdout: Boolean = false
+
         override fun call(): Int {
             val format = CommandSupport.parseFormat(outputRaw) ?: return CommandSupport.EXIT_USAGE
             val s = try { open() ?: return CommandSupport.EXIT_USAGE } catch (ex: ProvisionException) {
@@ -175,7 +205,7 @@ class ProvisionCommand : Callable<Int> {
             }
             val tokens = CommandSupport.readTokens() ?: return CommandSupport.EXIT_NOT_SIGNED_IN
             gateway = CommandSupport.resolveGateway(gateway, tokens)
-            val engine = engine(gateway, tokens)
+            val engine = engine(gateway, tokens, ProvisionEngine.SecretSink.toSecretIo(secretFile, forceStdout))
             val plan = engine.plan(s.file, s.receipt, prune)
             if (format == OutputFormat.TABLE) printPlan(plan, s.file)
             if (!plan.hasChanges) {
@@ -196,6 +226,16 @@ class ProvisionCommand : Callable<Int> {
                     println("Applied. ${result.resources.size} resource(s) owned. Receipt: ${s.receiptPath.path}")
                 } else {
                     CommandSupport.emitValue(format, result, "")
+                }
+                // SSO-3113 — the resources exist and are owned, but a minted client secret was not surfaced.
+                val lost = engine.undeliveredSecrets
+                if (lost.isNotEmpty()) {
+                    System.err.println(
+                        "The client secret of ${lost.size} created application(s) could not be delivered (${lost.joinToString(", ")}). " +
+                            "Re-run with --secret-file <path> (or --force-stdout) next time; for these, mint a new secret now with " +
+                            lost.joinToString("; ") { "`thoryn clients rotate-secret $it --secret-file <path>`" } + ".",
+                    )
+                    return SecretIo.EXIT_NO_SECRET
                 }
                 CommandSupport.EXIT_OK
             } catch (ex: Exception) {

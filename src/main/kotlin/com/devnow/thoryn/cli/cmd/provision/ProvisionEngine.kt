@@ -2,8 +2,11 @@ package com.devnow.thoryn.cli.cmd.provision
 
 import com.devnow.thoryn.cli.api.ProductApiClient
 import com.devnow.thoryn.cli.api.ProductApiException
+import com.devnow.thoryn.cli.cmd.AccessCommand
+import com.devnow.thoryn.cli.cmd.SecretIo
 import com.devnow.thoryn.cli.config.ThorynConfig
 import tools.jackson.databind.JsonNode
+import java.io.File
 import java.io.PrintStream
 import java.time.Instant
 
@@ -23,12 +26,19 @@ internal data class PlannedChange(
     val diff: Map<String, String> = emptyMap(),
     /** SSO-3089 — the resource existed before this file managed it (never deleted by destroy/prune). */
     val adopted: Boolean = false,
+    /** SSO-3113 — grants (`<subject> <relation>`) the file declares on this object that do not exist live. */
+    val grantAdds: List<String> = emptyList(),
+    /** SSO-3113 — grants live on this object that the file no longer declares (never the admin userset). */
+    val grantRemoves: List<String> = emptyList(),
 ) {
+    val hasGrantChanges: Boolean get() = grantAdds.isNotEmpty() || grantRemoves.isNotEmpty()
+
     fun toStructured(): Map<String, Any?> = buildMap {
         put("kind", kind); put("name", name); put("action", action.name.lowercase()); put("reason", reason)
         liveId?.let { put("id", it) }
         if (diff.isNotEmpty()) put("diff", diff)
         if (adopted) put("adopted", true)
+        if (hasGrantChanges) put("grants", mapOf("add" to grantAdds, "remove" to grantRemoves))
     }
 }
 
@@ -37,7 +47,9 @@ internal class ProvisionPlan(val changes: List<PlannedChange>) {
     val updates: List<PlannedChange> get() = changes.filter { it.action == ChangeAction.UPDATE }
     val adopts: List<PlannedChange> get() = changes.filter { it.action == ChangeAction.ADOPT }
     val removes: List<PlannedChange> get() = changes.filter { it.action == ChangeAction.REMOVE }
-    val hasChanges: Boolean get() = creates.isNotEmpty() || updates.isNotEmpty() || adopts.isNotEmpty() || removes.isNotEmpty()
+    /** SSO-3113 — resources whose grants differ (a no-op resource can still carry grant changes). */
+    val grantChanges: Int get() = changes.sumOf { it.grantAdds.size + it.grantRemoves.size }
+    val hasChanges: Boolean get() = creates.isNotEmpty() || updates.isNotEmpty() || adopts.isNotEmpty() || removes.isNotEmpty() || grantChanges > 0
 
     /** True when any planned removal targets the workspace's PRODUCTION plane (confirmation-gated). */
     val removesOnProductionPlane: Boolean
@@ -52,6 +64,7 @@ internal class ProvisionPlan(val changes: List<PlannedChange>) {
             "remove" to removes.size,
             "noop" to changes.count { it.action == ChangeAction.NOOP },
             "skip" to changes.count { it.action == ChangeAction.SKIP },
+            "grants" to grantChanges,
         ),
     )
 }
@@ -78,6 +91,19 @@ internal data class RemovalOutcome(val remaining: ProvisionReceipt, val failures
  * write-only secret (an SMTP password, a federation client secret) cannot be read back, so it never
  * causes a diff on its own; it is re-sent whenever the resource is created or updated.
  *
+ * **Server-minted client secrets (SSO-3113).** A confidential `application` (product-api's default
+ * `clientType`) is created with a ONE-TIME `client_secret` on the create response. It leaves the engine
+ * EXCLUSIVELY through [secretSink] (the `--secret-file` / guarded-stdout [SecretIo] channel) — never
+ * the receipt, the plan, the console, or a log. When the sink refuses it, the resource is still recorded
+ * (it exists) and its clientId lands on [undeliveredSecrets] so `apply` can exit
+ * [SecretIo.EXIT_NO_SECRET] and point at `thoryn clients rotate-secret`.
+ *
+ * **Grants (SSO-3113).** A resource's `grants:` block is converged like any other field: after the
+ * resource resolves to a live id, the object's grants are listed (`GET /api/v1/access/grants?object=…`),
+ * missing ones POSTed and ones the file no longer declares DELETEd — for THAT object only (never an
+ * object the file does not own), never the workspace admin userset. The object ref derives from the
+ * receipt id ([objectRef]). A session without `tenant:access.write` fails closed with a clear message.
+ *
  * [clients] yields a tenant-scoped [ProductApiClient] bound to an environment slug (`null` ⇒ the
  * production plane); [persist] is invoked after every successful write so the receipt on disk always
  * reflects reality even when a later step fails.
@@ -89,7 +115,51 @@ internal class ProvisionEngine(
     private val env: (String) -> String? = { System.getenv(it) },
     private val cliVersion: String? = null,
     private val now: () -> Instant = { Instant.now() },
+    /** SSO-3113 — the single channel a minted `client_secret` leaves through; the default delivers nothing. */
+    private val secretSink: SecretSink = SecretSink.undeliverable(),
 ) {
+
+    /**
+     * SSO-3113 — clientIds of confidential applications created by the last [apply] whose one-time
+     * secret the [secretSink] could NOT deliver. The clients exist (and are owned); the operator must
+     * mint a new secret with `thoryn clients rotate-secret <clientId>`.
+     */
+    private val undelivered = mutableListOf<String>()
+    val undeliveredSecrets: List<String> get() = undelivered.toList()
+
+    /**
+     * SSO-3113 — the single channel a server-minted `client_secret` leaves the engine through (mirrors
+     * [MachineClientProvisioner.SecretSink]). [emit] returns `true` when delivered, `false` when refused
+     * (no `--secret-file` and a non-interactive stdout) — the resource is still recorded; `apply` then
+     * exits [SecretIo.EXIT_NO_SECRET].
+     */
+    fun interface SecretSink {
+        fun emit(clientId: String, secret: String): Boolean
+
+        companion object {
+            /** Delivers nothing — every minted secret is reported as undelivered (the engine's default). */
+            fun undeliverable(): SecretSink = SecretSink { _, _ -> false }
+
+            /**
+             * The production sink over [SecretIo], exactly as `thoryn clients create`: write to [secretFile]
+             * when given, else print to an interactive TTY (with a WARN) and REFUSE a non-interactive pipe
+             * unless [forceStdout]. A file receives the FIRST secret; a second confidential application in
+             * the same apply is written next to it as `<secret-file>.<clientId>` so nothing is overwritten.
+             */
+            fun toSecretIo(secretFile: File?, forceStdout: Boolean): SecretSink {
+                var delivered = 0
+                return SecretSink { clientId, secret ->
+                    val target = if (secretFile != null && delivered > 0) File(secretFile.path + "." + clientId) else secretFile
+                    SecretIo.emitSecret(
+                        label = "client secret for application $clientId",
+                        secret = secret,
+                        secretFile = target,
+                        forceStdout = forceStdout,
+                    ).also { if (it) delivered++ }
+                }
+            }
+        }
+    }
 
     // ── plan ─────────────────────────────────────────────────────────────────────────────────────
 
@@ -100,7 +170,7 @@ internal class ProvisionEngine(
         val envSlugs = mutableMapOf<String, String>()
         orderForApply(file.resources).forEach { r ->
             val owned = ownedByKey[r.key]
-            val change = probe(r, file, owned, envSlugs)
+            val change = probe(r, file, owned, envSlugs).let { c -> planGrants(r, c, planSlug(r, file, envSlugs)) }
             changes += change
             if (r.kind == ProvisionFile.KIND_ENVIRONMENT && change.liveId != null) {
                 // The RESOLVED slug (a `{{env.NAME}}` placeholder names a per-run sandbox), never the raw spec.
@@ -119,6 +189,18 @@ internal class ProvisionEngine(
         return ProvisionPlan(changes)
     }
 
+    /**
+     * The environment slug a declared resource is probed in at plan time: `null` for the production
+     * plane (and for an `environment` resource itself), a pre-existing slug, or the RESOLVED slug of an
+     * `environment` resource of this file — `null` as well when that environment does not exist yet.
+     */
+    private fun planSlug(r: ProvisionResource, file: ProvisionFile, envSlugs: Map<String, String>): String? = when {
+        r.kind == ProvisionFile.KIND_ENVIRONMENT -> null
+        r.environment == null -> null
+        file.environmentResource(r.environment) == null -> r.environment
+        else -> envSlugs[r.environment]
+    }
+
     /** Live lookup by converge key → create / update / adopt / noop for one declared resource. */
     private fun probe(r: ProvisionResource, file: ProvisionFile, owned: OwnedResource?, envSlugs: Map<String, String>): PlannedChange {
         val slug: String? = when {
@@ -126,7 +208,7 @@ internal class ProvisionEngine(
             r.environment == null -> null
             file.environmentResource(r.environment) == null -> r.environment
             else -> envSlugs[r.environment]
-                ?: return PlannedChange(r.kind, r.name, ChangeAction.CREATE, "environment '${r.environment}' will be created first", resource = r)
+                ?: return PlannedChange(r.kind, r.name, ChangeAction.CREATE, "environment '${r.environment}' will be created first${mintNote(r)}", resource = r)
         }
         val desired = resolveSpec(r, strict = false)
         val live = try {
@@ -135,8 +217,8 @@ internal class ProvisionEngine(
             throw ProvisionException("${r.key}: could not read live state (${ex.message})")
         }
         return when {
-            live == null && owned != null -> PlannedChange(r.kind, r.name, ChangeAction.CREATE, "owned id ${owned.id} no longer exists — will be re-created", resource = r, owned = owned)
-            live == null -> PlannedChange(r.kind, r.name, ChangeAction.CREATE, "not found by its converge key", resource = r)
+            live == null && owned != null -> PlannedChange(r.kind, r.name, ChangeAction.CREATE, "owned id ${owned.id} no longer exists — will be re-created${mintNote(r)}", resource = r, owned = owned)
+            live == null -> PlannedChange(r.kind, r.name, ChangeAction.CREATE, "not found by its converge key${mintNote(r)}", resource = r)
             live.diff.isNotEmpty() -> PlannedChange(
                 r.kind, r.name, ChangeAction.UPDATE,
                 if (owned == null) "exists (adopting) — ${live.diff.size} field(s) differ" else "${live.diff.size} field(s) differ",
@@ -145,6 +227,30 @@ internal class ProvisionEngine(
             owned == null -> PlannedChange(r.kind, r.name, ChangeAction.ADOPT, "exists and matches — adopted under management (never deleted by destroy)", resource = r, liveId = live.id, adopted = true)
             else -> PlannedChange(r.kind, r.name, ChangeAction.NOOP, "owned (id ${live.id}) and matches", resource = r, owned = owned, liveId = live.id, adopted = owned.adopted)
         }
+    }
+
+    /** SSO-3113 — the plan marker for a confidential application about to be created (its secret is shown once). */
+    private fun mintNote(r: ProvisionResource): String =
+        if (r.kind == ProvisionFile.KIND_APPLICATION && isConfidential(r.spec)) " (a client secret will be minted and shown once)" else ""
+
+    /** product-api's `clientType` defaults to `confidential`; only an explicit `public` client is secret-less. */
+    private fun isConfidential(spec: Map<String, Any?>): Boolean =
+        !spec["clientType"]?.toString()?.trim().equals("public", ignoreCase = true)
+
+    /**
+     * SSO-3113 — attach the grant diff to a planned change: for a CREATE every declared grant is an add
+     * (nothing exists yet); otherwise the object's live grants are listed and compared as a set. A
+     * resource without a `grants:` block is left untouched (nothing is even read).
+     */
+    private fun planGrants(r: ProvisionResource, change: PlannedChange, slug: String?): PlannedChange {
+        val declared = r.grants ?: return change
+        if (change.action == ChangeAction.CREATE || change.liveId == null) {
+            return change.copy(grantAdds = declared.map { it.label })
+        }
+        val (adds, removes) = grantDiff(r, declared, liveGrants(r, objectRef(r.kind, change.liveId, slug)))
+        if (adds.isEmpty() && removes.isEmpty()) return change
+        val note = "; grants: +${adds.size} −${removes.size}"
+        return change.copy(reason = change.reason + note, grantAdds = adds, grantRemoves = removes)
     }
 
     // ── apply ────────────────────────────────────────────────────────────────────────────────────
@@ -180,13 +286,20 @@ internal class ProvisionEngine(
             if (i >= 0) owned[i] = o else owned += o
             persist(current())
         }
+        undelivered.clear()
         plan.changes.filter { it.resource != null }.forEach { change ->
             val r = change.resource!!
-            when (change.action) {
-                ChangeAction.CREATE -> record(create(r, file, owned))
-                ChangeAction.UPDATE -> record(update(r, file, owned, change))
-                ChangeAction.ADOPT -> record(adopt(r, file, owned, change))
-                else -> Unit
+            val resolved: OwnedResource? = when (change.action) {
+                ChangeAction.CREATE -> create(r, file, owned).also { record(it) }
+                ChangeAction.UPDATE -> update(r, file, owned, change).also { record(it) }
+                ChangeAction.ADOPT -> adopt(r, file, owned, change).also { record(it) }
+                ChangeAction.NOOP -> owned.firstOrNull { it.key == r.key }
+                else -> null
+            }
+            // SSO-3113 — grants converge AFTER the resource exists (the object ref needs its id); the
+            // receipt already records the resource, so a grant failure never loses ownership.
+            if (r.grants != null && resolved != null) {
+                convergeGrants(r, objectRef(r.kind, resolved.id, resolved.environment))
             }
         }
         // Prune: drop skipped entries from the receipt, remove the rest child-first.
@@ -343,7 +456,19 @@ internal class ProvisionEngine(
                 val slug = targetSlug(r, file, owned)
                 val resp = clients(slug).createApplication(spec)
                 val id = resp.str("clientId") ?: resp.str("client_id") ?: throw ProvisionException("${r.key}: the application create returned no clientId")
-                out.println("  + application ${r.name}: clientId=$id${slug?.let { " env=$it" } ?: ""}")
+                // SSO-3113 — the ONE server-minted secret goes to the sink and NOWHERE else: never a field,
+                // the receipt, the plan, the console, or a log. The response node is not retained.
+                val secret = resp.str("clientSecret") ?: resp.str("client_secret")
+                val minted = !secret.isNullOrEmpty()
+                val delivered = if (minted) secretSink.emit(id, secret!!) else false
+                out.println("  + application ${r.name}: clientId=$id${slug?.let { " env=$it" } ?: ""}${if (minted) " (client secret minted — shown once)" else ""}")
+                if (minted && !delivered) {
+                    undelivered += id
+                    err.println(
+                        "  ! application ${r.name}: its client secret was minted but could NOT be delivered (clientId $id). " +
+                            "The client exists and is owned; mint a new secret with `thoryn clients rotate-secret $id --secret-file <path>`.",
+                    )
+                }
                 OwnedResource(r.kind, r.name, id, slug, buildMap {
                     (spec["redirectUris"] as? List<*>)?.firstOrNull()?.toString()?.let { put("redirectUri", it) }
                 })
@@ -492,6 +617,61 @@ internal class ProvisionEngine(
         out.println("  $mark loginMethods: ${stored.joinToString(", ")}")
         return OwnedResource(r.kind, r.name, "login-methods", slug, mapOf("methods" to stored.joinToString(",")))
     }
+
+    // ── grants (SSO-3113) ────────────────────────────────────────────────────────────────────────
+
+    /** The live grants on [ref] as `<subject> <relation>` labels (the product-api ListEnvelope: the array is under `data`). */
+    private fun liveGrants(r: ProvisionResource, ref: String): List<String> = try {
+        listItems(clients(null).listGrants(objectRef = ref), "data")
+            .mapNotNull { g -> g.str("subject")?.let { s -> g.str("relation")?.let { rel -> "$s $rel" } } }
+    } catch (ex: ProductApiException) {
+        throw grantFailure(r, ex, AccessCommand.SCOPE_READ, "read the grants on $ref")
+    }
+
+    /**
+     * Adds = declared but not live; removes = live but not declared, EXCEPT the workspace admin userset
+     * (`workspace:<id>#admin`), which is never revoked whatever the file says.
+     */
+    private fun grantDiff(r: ProvisionResource, declared: List<ProvisionGrant>, live: List<String>): Pair<List<String>, List<String>> {
+        val wanted = declared.map { it.label }.distinct()
+        val have = live.distinct()
+        val adds = wanted.filter { it !in have }
+        val removes = have.filter { it !in wanted && !AccessCommand.ADMIN_USERSET_PATTERN.matches(it.substringBefore(' ')) }
+        return adds to removes
+    }
+
+    /** Converge the `grants:` block on ONE owned object: list, POST the missing, DELETE the undeclared. */
+    private fun convergeGrants(r: ProvisionResource, ref: String) {
+        val declared = r.grants ?: return
+        val (adds, removes) = grantDiff(r, declared, liveGrants(r, ref))
+        if (adds.isEmpty() && removes.isEmpty()) return
+        val client = clients(null)
+        try {
+            adds.forEach { label ->
+                val (subject, relation) = label.split(' ', limit = 2)
+                client.createGrant(subject, relation, ref)
+                out.println("  + grant ${r.kind} ${r.name}: $subject $relation on $ref")
+            }
+            removes.forEach { label ->
+                val (subject, relation) = label.split(' ', limit = 2)
+                client.deleteGrant(subject, relation, ref)
+                out.println("  - grant ${r.kind} ${r.name}: $subject $relation on $ref (no longer declared)")
+            }
+        } catch (ex: ProductApiException) {
+            throw grantFailure(r, ex, AccessCommand.SCOPE_WRITE, "converge the grants on $ref")
+        }
+    }
+
+    /** Fail closed: a 403 `insufficient_scope` on the access API names the missing scope and the login line. */
+    private fun grantFailure(r: ProvisionResource, ex: ProductApiException, scope: String, what: String): ProvisionException =
+        if (ex.isInsufficientScope) {
+            ProvisionException(
+                "${r.key}: could not $what — this session lacks the '$scope' scope (${ex.message}). " +
+                    "Grants are NOT converged; sign in with `thoryn login --scope $scope` (or grant the CI client that scope) and re-run.",
+            )
+        } else {
+            ProvisionException("${r.key}: could not $what (${ex.message})")
+        }
 
     // ── per-kind remove ──────────────────────────────────────────────────────────────────────────
 
@@ -660,5 +840,27 @@ internal class ProvisionEngine(
         fun onProductionPlane(o: OwnedResource): Boolean =
             o.kind != ProvisionFile.KIND_ENVIRONMENT &&
                 (o.environment.isNullOrBlank() || o.environment == ThorynConfig.PRODUCTION_ENV_SLUG)
+
+        /**
+         * SSO-3113 — the access-API OBJECT ref of an owned resource, derived from its receipt id (the
+         * SSO-3112 contract): `environment:<id>`, `application:<clientId>`, `user:<id>`,
+         * `federation_member:<id>`; the per-environment singletons are keyed by their environment SLUG
+         * (`email_provider:<envSlug>`, `login_theme:<envSlug>`, `login_flow:<envSlug>`,
+         * `login_methods:<envSlug>`; the production plane ⇒ `production`).
+         */
+        fun objectRef(kind: String, id: String, environmentSlug: String?): String {
+            val envSlug = environmentSlug?.takeIf { it.isNotBlank() } ?: ThorynConfig.PRODUCTION_ENV_SLUG
+            return when (kind) {
+                ProvisionFile.KIND_ENVIRONMENT -> "environment:$id"
+                ProvisionFile.KIND_APPLICATION -> "application:$id"
+                ProvisionFile.KIND_USER -> "user:$id"
+                ProvisionFile.KIND_FEDERATION_MEMBER -> "federation_member:$id"
+                ProvisionFile.KIND_EMAIL_PROVIDER -> "email_provider:$envSlug"
+                ProvisionFile.KIND_LOGIN_THEME -> "login_theme:$envSlug"
+                ProvisionFile.KIND_LOGIN_FLOW -> "login_flow:$envSlug"
+                ProvisionFile.KIND_LOGIN_METHODS -> "login_methods:$envSlug"
+                else -> throw ProvisionException("$kind: no access object type for this kind")
+            }
+        }
     }
 }

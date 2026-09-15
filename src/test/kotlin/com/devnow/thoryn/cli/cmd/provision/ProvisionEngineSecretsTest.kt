@@ -39,13 +39,79 @@ class ProvisionEngineSecretsTest : CommandTestBase() {
         "provision.yaml",
     )
 
-    private fun engine(env: Map<String, String>, out: PrintStream = PrintStream(ByteArrayOutputStream())): ProvisionEngine =
+    private fun engine(
+        env: Map<String, String>,
+        out: PrintStream = PrintStream(ByteArrayOutputStream()),
+        sink: ProvisionEngine.SecretSink = ProvisionEngine.SecretSink.undeliverable(),
+    ): ProvisionEngine =
         ProvisionEngine(
             clients = { slug -> ProductApiClient(gateway = baseUrl(), tokens = Tokens(accessToken = "AT-test"), environmentSlug = slug) },
             out = out,
             err = out,
             env = { env[it] },
+            secretSink = sink,
         )
+
+    // ── SSO-3113: a confidential application's server-minted secret ──
+
+    private val confidentialApp = ProvisionFile.parse(
+        """
+        apiVersion: thoryn.io/provision/v1
+        resources:
+          - kind: application
+            name: ci-worker
+            environment: sbx
+            spec: { displayName: "CI worker", clientType: confidential, grantTypes: [client_credentials], scopes: ["tenant:environments.write"] }
+          - kind: application
+            name: spa
+            environment: sbx
+            spec: { displayName: "SPA", clientType: public, redirectUris: ["http://127.0.0.1/callback"] }
+        """.trimIndent().toByteArray(),
+        "provision.yaml",
+    )
+
+    @Test
+    fun `a minted client secret leaves ONLY through the sink — never the receipt, the plan, or the console`() {
+        val console = ByteArrayOutputStream()
+        val captured = mutableListOf<Pair<String, String>>()
+        val engine = engine(emptyMap(), PrintStream(console), ProvisionEngine.SecretSink { id, secret -> captured += id to secret; true })
+        val plan = engine.plan(confidentialApp, null, false)
+        assertThat(plan.changes[0].reason).contains("(a client secret will be minted and shown once)")
+        assertThat(plan.changes[1].reason).doesNotContain("minted") // public: no secret
+        val persisted = mutableListOf<ProvisionReceipt>()
+        val receipt = engine.apply(confidentialApp, null, plan, "acme", null) { persisted += it }
+
+        val clientId = receipt.resources[0].id
+        val secret = api.mintedSecrets.getValue(clientId)
+        assertThat(captured).containsExactly(clientId to secret) // exactly once, the confidential client only
+        assertThat(engine.undeliveredSecrets).isEmpty()
+        val mapper = jacksonObjectMapper()
+        assertThat(mapper.writeValueAsString(receipt)).doesNotContain(secret)
+        assertThat(persisted.map { mapper.writeValueAsString(it) }).noneMatch { it.contains(secret) }
+        assertThat(mapper.writeValueAsString(plan.toStructured())).doesNotContain(secret)
+        assertThat(console.toString()).doesNotContain(secret).contains("client secret minted — shown once")
+        assertThat(receipt.resources.map { it.key }).containsExactly("application/ci-worker", "application/spa")
+    }
+
+    @Test
+    fun `an undeliverable secret still records the resource and names the client for rotate-secret`() {
+        val console = ByteArrayOutputStream()
+        val engine = engine(emptyMap(), PrintStream(console)) // default sink: delivers nothing
+        val receipt = engine.apply(confidentialApp, null, engine.plan(confidentialApp, null, false), "acme", null) {}
+
+        val clientId = receipt.resources[0].id
+        assertThat(engine.undeliveredSecrets).containsExactly(clientId)
+        assertThat(receipt.resources[0].id).isEqualTo(api.applications[0]["clientId"]) // exists + owned
+        assertThat(console.toString())
+            .contains("could NOT be delivered")
+            .contains("thoryn clients rotate-secret $clientId")
+            .doesNotContain(api.mintedSecrets.getValue(clientId))
+        // A later apply that creates nothing reports nothing undelivered.
+        api.reset()
+        engine.apply(confidentialApp, receipt, engine.plan(confidentialApp, receipt, false), "acme", null) {}
+        assertThat(engine.undeliveredSecrets).isEmpty()
+        assertThat(api.writes).isEmpty()
+    }
 
     @Test
     fun `env-named secrets are forwarded to the API but never recorded or printed`() {
