@@ -79,7 +79,8 @@ internal class RecipeInterpreter(
 
     /**
      * SSO-2944 — does this recipe create its OWN workspace (a `hub.createWorkspace` step)? When it does
-     * NOT (a workspace-less recipe like `ci-signin`), the caller's session token is ALREADY tenant-
+     * NOT (a workspace-less recipe — today every recipe that orchestrates a provisioning file, SSO-3100,
+     * targets the workspace the caller signed in to), the caller's session token is ALREADY tenant-
      * scoped to a standing workspace, so the interpreter provisions with that token directly — there is
      * no provisioning token to prefer and no token-exchange to a freshly-created tenant. This flag is
      * fixed by the recipe shape, so every tenant-scoped call (steps, verify, teardown, attest) resolves
