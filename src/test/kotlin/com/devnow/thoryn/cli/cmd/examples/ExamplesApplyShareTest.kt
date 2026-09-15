@@ -81,6 +81,55 @@ class ExamplesApplyShareTest : CommandTestBase() {
     }
 
     @Test
+    fun `apply takes a param from the env var of its name without --set, and never echoes a secret`() {
+        // SSO-3102 — the recipe's params are overridable by the example that runs it: CI exports demoPassword
+        // under that NAME; the guided apply skips its prompt (no console here anyway), feeds it to the
+        // provisioning file's passwordEnv, and shows it only as "(secret)" in the plan.
+        seedTokens(Tokens(accessToken = "AT-test", refreshToken = "RT", issuer = baseUrl(), gateway = baseUrl()))
+        val api = FakeProductApi()
+        server.dispatcher = api
+        val dir = tempHome.resolve(".config/thoryn/recipes-cache/v1.0.0-cache/recipes/env-demo")
+        Files.createDirectories(dir)
+        Files.writeString(
+            dir.resolve("recipe.json"),
+            """
+            {
+              "apiVersion": "thoryn.io/examples/v1",
+              "id": "env-demo",
+              "version": "1.0.0",
+              "summary": "params from the environment",
+              "provision": "./provision.yaml",
+              "params": [
+                { "name": "workspaceSlug", "prompt": "Standing workspace", "default": "acme" },
+                { "name": "envSlug", "prompt": "Sandbox slug", "default": "demo-sbx" },
+                { "name": "demoPassword", "prompt": "Demo user password", "default": "Default-{{generate.slug8}}-Pw1!", "secret": true }
+              ]
+            }
+            """.trimIndent(),
+        )
+        Files.writeString(
+            dir.resolve("provision.yaml"),
+            """
+            apiVersion: thoryn.io/provision/v1
+            resources:
+              - { kind: environment, name: sandbox, spec: { slug: "{{env.envSlug}}" } }
+              - { kind: user, name: demo, environment: sandbox, spec: { email: demo@example.com, passwordEnv: demoPassword, emailVerified: true } }
+            """.trimIndent(),
+        )
+        val originalEnv = RecipeParamEnv.lookup
+        RecipeParamEnv.lookup = { mapOf("demoPassword" to "From-Env-9!", "envSlug" to "env-sbx")[it] }
+        try {
+            val (exit, out, _) = runCli("examples", "apply", "env-demo", "--yes", "--hub", baseUrl(), "--gateway", baseUrl())
+            assertThat(exit).isEqualTo(0)
+            assertThat(out).contains("demoPassword = (secret)").contains("envSlug = env-sbx").doesNotContain("From-Env-9!")
+            assertThat(api.provisioningWrites.first { it.path == "/api/v1/environments" }.body["slug"]).isEqualTo("env-sbx")
+            assertThat(api.provisioningWrites.first { it.path == "/api/v1/users" }.body["password"]).isEqualTo("From-Env-9!")
+        } finally {
+            RecipeParamEnv.lookup = originalEnv
+        }
+    }
+
+    @Test
     fun `apply provisions a recipe's provisioning file first, plans it, and teardown destroys it`() {
         // SSO-3100 — a catalog recipe (previously verified + cached) that carries only a `provision`
         // reference: the guided apply lists the provisioning file in its plan, says the sandbox is created

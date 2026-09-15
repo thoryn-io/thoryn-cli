@@ -254,6 +254,32 @@ class RecipeProvisionOrchestrationTest : CommandTestBase() {
     }
 
     @Test
+    fun `every param reads the process env var of its name before its default, and --set wins over both`() {
+        // SSO-3102 — the recipe's params section is overridable by the example that runs it: CI exports the
+        // value under the param's NAME (a secret never on argv); it must reach the provisioning instead of the default.
+        val ctx = context()
+        val r = recipe(provisionedRecipe, provisionYaml)
+        RecipeInterpreter(ctx, r, trustPropagationBudgetMs = 2_000, provisionEnv = { if (it == "demoPassword") "From-Env-2!" else null }).setup()
+        assertThat(api.provisioningWrites.first { it.path == "/api/v1/users" }.body["password"]).isEqualTo("From-Env-2!")
+
+        // Without the env var the default still applies (a local `examples apply`).
+        api.reset(); api.users.clear() // the sandbox + app are adopted; the user is created afresh
+        stateStore.provisionReceiptPath("sandbox-demo").toFile().delete()
+        RecipeInterpreter(ctx, r, trustPropagationBudgetMs = 2_000, provisionEnv = { null }).setup()
+        assertThat(api.provisioningWrites.first { it.path == "/api/v1/users" }.body["password"]).isEqualTo("Demo-Pw1!")
+
+        // An explicit --set beats the env var; a non-secret param (envSlug) is overridable from the env too.
+        api.reset(); api.users.clear() // the sandbox + app are adopted; the user is created afresh
+        stateStore.provisionReceiptPath("sandbox-demo").toFile().delete()
+        RecipeInterpreter(
+            ctx, r, overrides = mapOf("demoPassword" to "From-Set-3!"), trustPropagationBudgetMs = 2_000,
+            provisionEnv = { mapOf("demoPassword" to "From-Env-2!", "envSlug" to "not-this")[it] },
+        ).setup()
+        assertThat(api.provisioningWrites.first { it.path == "/api/v1/users" }.body["password"]).isEqualTo("From-Set-3!")
+        assertThat(api.provisioningWrites.first { it.path == "/api/v1/environments" }.body["slug"]).isEqualTo("not-this")
+    }
+
+    @Test
     fun `a recipe that creates its own workspace cannot also carry a provisioning file`() {
         val ctx = context()
         val r = recipe(

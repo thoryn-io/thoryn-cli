@@ -5,6 +5,7 @@ import com.devnow.thoryn.cli.api.ProductApiException
 import com.devnow.thoryn.cli.auth.JwtClaims
 import com.devnow.thoryn.cli.cmd.examples.ExampleContext
 import com.devnow.thoryn.cli.cmd.examples.ExampleState
+import com.devnow.thoryn.cli.cmd.examples.RecipeParamEnv
 import com.devnow.thoryn.cli.cmd.provision.ChangeAction
 import com.devnow.thoryn.cli.cmd.provision.ProvisionEngine
 import com.devnow.thoryn.cli.cmd.provision.ProvisionException
@@ -21,7 +22,12 @@ import java.util.UUID
 
 /** SSO-2875 — the result of applying a recipe: the [ExampleState] the `run`/RP flow reads, plus the
  *  portable [Receipt] recording exactly what was provisioned. */
-internal data class RecipeRun(val state: ExampleState, val receipt: Receipt)
+internal data class RecipeRun(
+    val state: ExampleState,
+    val receipt: Receipt,
+    /** SSO-3102 — the recipe's params as resolved for this run (so a generated secret can be revealed once). */
+    val params: Map<String, String> = emptyMap(),
+)
 
 /** SSO-2873 — a recipe could not be applied (bad shape, unresolved reference, or a step failure). */
 internal open class RecipeException(message: String) : RuntimeException(message)
@@ -71,9 +77,10 @@ internal class RecipeInterpreter(
     private val trustPropagationBudgetMs: Long = 75_000,
     /**
      * SSO-3100 — the process environment the provisioning file's `{{env.NAME}}` placeholders and
-     * `<key>Env` secret references fall back to AFTER the recipe's resolved params (test seam).
+     * `<key>Env` secret references fall back to AFTER the recipe's resolved params, and (SSO-3102) the
+     * channel every recipe param reads BEFORE its default — the example's override surface (test seam).
      */
-    private val provisionEnv: (String) -> String? = { System.getenv(it) },
+    private val provisionEnv: (String) -> String? = { RecipeParamEnv.lookup(it) },
 ) {
     private val mapper = JsonMapper.builder().addModule(kotlinModule()).build()
 
@@ -125,7 +132,7 @@ internal class RecipeInterpreter(
         runProvision() // SSO-3100 — the provisioning file first; a no-op for a recipe without one.
         recipe.steps.forEachIndexed { i, step -> executeStep(i + 1, step) }
         runVerify()
-        return RecipeRun(buildState(), attest(buildReceipt()))
+        return RecipeRun(buildState(), attest(buildReceipt()), params = recipe.params.mapNotNull { p -> p["name"].asString().let { n -> scope[n]?.let { n to it } } }.toMap())
     }
 
     /**
@@ -371,10 +378,20 @@ internal class RecipeInterpreter(
     private fun resolveParams() {
         recipe.params.forEach { p ->
             val name = p["name"].asString()
-            val raw = overrides[name]
-                ?: p["default"]?.takeIf { !it.isNull }?.asString()
-                ?: throw RecipeException("parameter '$name' has no value and no default (guided prompting is SSO-2876)")
-            val value = substitute(raw)
+            // SSO-3102 — every param in the recipe's `params` section is overridable by the example that runs it:
+            // `--set` (explicit) wins, else the PROCESS ENV VAR of the param's own name, else the recipe default.
+            // The env channel is what CI and a local shell use (a secret never rides on argv or in a file);
+            // without it a generated default such as `Example-{{generate.slug8}}-Pw1!` silently shadowed the
+            // exported value and the provisioned demo user's password was unknowable.
+            val fromEnv = provisionEnv(name)?.takeIf { it.isNotEmpty() }
+            val value = when {
+                overrides[name] != null -> substitute(overrides.getValue(name))
+                fromEnv != null -> fromEnv // verbatim: an env value is concrete, never template-expanded
+                else -> substitute(
+                    p["default"]?.takeIf { !it.isNull }?.asString()
+                        ?: throw RecipeException("parameter '$name' has no value and no default (guided prompting is SSO-2876)"),
+                )
+            }
             p["validate"]?.takeIf { !it.isNull }?.asString()?.let { pattern ->
                 if (!Regex(pattern).matches(value)) {
                     throw RecipeException("parameter '$name' value '$value' does not match /$pattern/")

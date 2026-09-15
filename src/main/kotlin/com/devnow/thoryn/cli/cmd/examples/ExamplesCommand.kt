@@ -6,6 +6,7 @@ import com.devnow.thoryn.cli.cmd.examples.recipe.RecipeCatalog
 import com.devnow.thoryn.cli.cmd.examples.recipe.RecipeCatalogException
 import com.devnow.thoryn.cli.cmd.examples.recipe.RecipeException
 import com.devnow.thoryn.cli.cmd.examples.recipe.RecipeInterpreter
+import com.devnow.thoryn.cli.cmd.examples.recipe.RecipeRun
 import com.devnow.thoryn.cli.cmd.examples.recipe.ReceiptStore
 import com.devnow.thoryn.cli.cmd.provision.ProvisionFile
 import com.devnow.thoryn.cli.config.ThorynConfig
@@ -266,7 +267,7 @@ class ExamplesCommand : Callable<Int> {
         @Parameters(index = "0", arity = "0..1", description = ["Recipe name (optional when only one exists)."])
         var name: String? = null
 
-        @Option(names = ["--set"], description = ["Pre-set a parameter (repeatable): --set name=value. Skips its prompt."])
+        @Option(names = ["--set"], description = ["Pre-set a parameter (repeatable): --set name=value. Skips its prompt (so does an env var of the parameter's name)."])
         var sets: Array<String> = emptyArray()
 
         @Option(names = ["--environment"], description = ["Target environment slug (skips the prompt)."])
@@ -319,6 +320,7 @@ class ExamplesCommand : Callable<Int> {
                 val run = RecipeInterpreter(ctx, recipe, overrides = overrides, environmentSlug = env).setup()
                 ctx.state.write(run.state)
                 ReceiptStore().write(run.receipt)
+                revealGeneratedSecrets(run)
                 println()
                 println("Applied. Receipt: thoryn examples receipt $exampleName   Next: thoryn examples run $exampleName")
                 CommandSupport.EXIT_OK
@@ -330,6 +332,16 @@ class ExamplesCommand : Callable<Int> {
             }
         }
 
+        /** SSO-3102 — secret params the user left to the recipe's generated default; revealed once after apply. */
+        private val generatedSecrets = LinkedHashSet<String>()
+
+        /**
+         * SSO-3102 — the recipe's `params` section is overridable by the example that runs it, and a local run
+         * is ASKED for each param. Precedence per param: `--set` → the process env var of the param's own name
+         * (CI's channel; skips the prompt like `--set`) → the interactive prompt (a `secret: true` param is read
+         * without echo and its default is never shown) → the recipe default (a generated secret default is then
+         * revealed once after apply, so the user can sign in with it).
+         */
         private fun resolveParams(recipe: Recipe): Map<String, String> {
             val preset = sets.mapNotNull { s -> s.split("=", limit = 2).takeIf { it.size == 2 }?.let { it[0] to it[1] } }.toMap()
             val resolved = LinkedHashMap<String, String>()
@@ -339,12 +351,29 @@ class ExamplesCommand : Callable<Int> {
                     resolved[paramName] = preset.getValue(paramName)
                     return@forEach
                 }
+                RecipeParamEnv.lookup(paramName)?.takeIf { it.isNotEmpty() }?.let {
+                    resolved[paramName] = it
+                    return@forEach
+                }
                 val default = p["default"]?.takeIf { !it.isNull }?.asString()
                 val promptText = p["prompt"]?.asString() ?: paramName
-                val value = Prompt.ask(promptText, default)
-                if (value.isNotEmpty()) resolved[paramName] = value
+                val secret = p["secret"]?.asBoolean() == true
+                val value = if (secret) Prompt.askSecret(promptText, hasDefault = !default.isNullOrEmpty()) else Prompt.ask(promptText, default)
+                when {
+                    value.isNotEmpty() -> resolved[paramName] = value
+                    secret && !default.isNullOrEmpty() && Prompt.interactive() -> generatedSecrets += paramName
+                }
             }
             return resolved
+        }
+
+        /** Reveal, once, the secret params that were generated from the recipe default (never written anywhere). */
+        private fun revealGeneratedSecrets(run: RecipeRun) {
+            val shown = generatedSecrets.mapNotNull { n -> run.params[n]?.let { n to it } }
+            if (shown.isEmpty()) return
+            println()
+            println("Generated for this run (shown once, not stored — keep it to sign in):")
+            shown.forEach { (n, v) -> println("  $n = $v") }
         }
 
         /** A sandbox by default when the recipe runs in an existing workspace; null (production plane)
