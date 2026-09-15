@@ -59,16 +59,36 @@ class ExamplesCommand : Callable<Int> {
 
     @Command(name = "list", description = ["List the available examples."], mixinStandardHelpOptions = true)
     class ListSubcommand : Callable<Int> {
+        private data class Row(val name: String, val summary: String, val source: String)
+
         override fun call(): Int {
-            val examples = ExampleRegistry.all()
-            if (examples.isEmpty()) {
-                println("No examples are bundled.")
+            // SSO-3096 — reflect BOTH the bundled recipes AND the fetched+verified catalog cache, i.e.
+            // the same set `setup`/`run` can resolve (Recipe.resolve prefers a cached recipe over a
+            // bundled one of the same id, SSO-2968). Before this, `list` showed only the 2 bundled
+            // recipes even right after `examples update` fetched the full catalog — so a user who
+            // updated saw far fewer examples than they had actually fetched.
+            val bundled = ExampleRegistry.all()
+            val cached = runCatching { RecipeCatalog().cachedRecipes() }.getOrDefault(emptyList())
+
+            val rows = LinkedHashMap<String, Row>()
+            bundled.forEach { rows[it.name] = Row(it.name, it.summary, "bundled") }
+            // Cached entries override a bundled one of the same id (fetched preferred, SSO-2968).
+            cached.forEach { rows[it.id] = Row(it.id, it.summary, "catalog v${it.version}") }
+
+            if (rows.isEmpty()) {
+                println("No examples are bundled or cached.")
+                println("Fetch the signed catalog with:  thoryn examples update")
                 return CommandSupport.EXIT_OK
             }
-            val width = examples.maxOf { it.name.length }
+
+            val ordered = rows.values.sortedBy { it.name }
+            val width = ordered.maxOf { it.name.length }
             println("Available examples:")
-            examples.forEach { println("  ${it.name.padEnd(width)}  ${it.summary}") }
+            ordered.forEach { println("  ${it.name.padEnd(width)}  ${it.summary}  (${it.source})") }
             println()
+            if (cached.isEmpty()) {
+                println("Showing bundled recipes only — fetch the full signed catalog with:  thoryn examples update")
+            }
             println("Run one with:  thoryn examples setup <name>  →  run <name>  →  teardown <name>")
             return CommandSupport.EXIT_OK
         }

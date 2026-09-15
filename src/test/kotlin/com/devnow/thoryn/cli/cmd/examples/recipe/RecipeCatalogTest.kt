@@ -106,6 +106,28 @@ class RecipeCatalogTest {
     }
 
     @Test
+    fun `SSO-3096 cachedRecipes lists the newest verified cache offline`() {
+        val zip = catalogZip()
+        server.enqueue(MockResponse().setBody(releaseJson()).setHeader("Content-Type", "application/json"))
+        server.enqueue(MockResponse().setBody(okio.Buffer().write(zip)))
+        server.enqueue(MockResponse().setBody(enc.encodeToString(sign(zip))))
+        catalog().update(null) // extracts + verifies -> populates the cache
+
+        // A fresh instance pointed at an unreachable API reads the cache with NO network call.
+        val offline = RecipeCatalog(apiBase = "http://127.0.0.1:1", publicKeySpkiB64 = publicSpkiB64, cacheDir = cache)
+        val cached = offline.cachedRecipes()
+
+        assertThat(cached).anyMatch {
+            it.id == "simple-signin" && it.version == "1.2.0" && it.summary == "Sign a user in."
+        }
+    }
+
+    @Test
+    fun `SSO-3096 cachedRecipes is empty when nothing is cached`() {
+        assertThat(catalog().cachedRecipes()).isEmpty()
+    }
+
+    @Test
     fun `refuses a bundle whose signature does not verify against the pinned key`() {
         val zip = catalogZip()
         val wrongKey = KeyPairGenerator.getInstance("Ed25519").generateKeyPair()

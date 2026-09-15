@@ -117,6 +117,25 @@ internal class RecipeCatalog(
     fun cachedRecipeBytes(recipeId: String): ByteArray? =
         cachedAsset(recipeId, "recipe.json")?.let { Files.readAllBytes(it) }
 
+    /**
+     * SSO-3096 — every recipe (id/version/summary) held in the NEWEST cached, already-verified catalog,
+     * or empty when nothing is cached. Offline: reads ONLY a previously-extracted (hence Ed25519-
+     * signature-verified) catalog dir; never fetches. Backs `examples list` so it reflects what
+     * `examples update` fetched — the same set `setup`/`run` can resolve ([Recipe.resolve], SSO-2968).
+     */
+    fun cachedRecipes(): List<RemoteRecipe> {
+        if (!Files.isDirectory(cacheDir)) return emptyList()
+        val newest = Files.list(cacheDir).use { stream ->
+            stream.filter { Files.isDirectory(it) }
+                .sorted(
+                    compareBy { runCatching { Files.getLastModifiedTime(it).toMillis() }.getOrDefault(0L) },
+                )
+                .toList()
+                .lastOrNull()
+        } ?: return emptyList()
+        return listRecipes(newest)
+    }
+
     // ── GitHub release API ──────────────────────────────────────────────────────────────────────
 
     private fun getRelease(tag: String?): JsonNode {
