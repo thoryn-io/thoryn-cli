@@ -162,6 +162,15 @@ class ProductApiClient(
     fun reactivateUser(userId: String): Unit =
         postNoContent("/api/v1/users/${encode(userId)}/reactivate")
 
+    /**
+     * `DELETE /api/v1/users/{userId}` (SSO-3088; product-api `usersDelete`, `tenant:users.write`) —
+     * remove a directory user. product-api already exposed this; the CLI gained it for
+     * `thoryn provision destroy` (a `user` resource is a scenario FIXTURE, pruned with its file).
+     * [confirmSlug] rides as the SSO-2413 confirmation header for a production-plane delete.
+     */
+    fun deleteUser(userId: String, confirmSlug: String? = null): Unit =
+        deleteNoContent("/api/v1/users/${encode(userId)}", confirmSlug)
+
     // ── Environments (SSO-2870; product-api SSO-2410 `/api/v1/environments`) ────
     //
     // A workspace (tenant) holds N durable sandbox environments + one platform-

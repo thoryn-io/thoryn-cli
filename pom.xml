@@ -196,7 +196,8 @@
         <dependency>
             <groupId>tools.jackson.dataformat</groupId>
             <artifactId>jackson-dataformat-yaml</artifactId>
-            <scope>test</scope>
+            <!-- SSO-3088: promoted from test to COMPILE scope — `thoryn provision plan|apply|destroy`
+                 reads the hand-authored .thoryn/provision.yaml at runtime (epic SSO-3087). -->
         </dependency>
     </dependencies>
 
