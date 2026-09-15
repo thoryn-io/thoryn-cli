@@ -1,0 +1,10 @@
+{
+  "apiVersion": "thoryn.io/examples/v1",
+  "id": "provisioned-fixture",
+  "version": "1.0.0",
+  "summary": "SSO-3100 test fixture: a bundled recipe whose infrastructure comes from its sibling provision.yaml",
+  "provision": "./provision.yaml",
+  "verify": [
+    { "assert": "applications.get", "id": "{{provision.application.rp.clientId}}", "expect": { "status": "active" } }
+  ]
+}

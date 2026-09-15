@@ -76,6 +76,15 @@ internal class ExampleStateStore(
 
     private fun pathFor(exampleName: String): Path = dir.resolve("$exampleName.json")
 
+    /**
+     * SSO-3100 — where the provisioning receipt of a recipe's `provision` file lives: next to the
+     * example's state as `<name>.provision.receipt.json` (the same secret-free ownership ledger
+     * `thoryn provision apply` writes next to a `.thoryn/provision.yaml`). Written by the engine after
+     * EVERY successful write — so a run that fails half-way still records what `teardown` must destroy —
+     * and deleted only once `teardown` has removed everything it owned.
+     */
+    fun provisionReceiptPath(exampleName: String): Path = dir.resolve("$exampleName.provision.receipt.json")
+
     companion object {
         const val OVERRIDE_ENV_VAR: String = "THORYN_EXAMPLES_DIR"
 

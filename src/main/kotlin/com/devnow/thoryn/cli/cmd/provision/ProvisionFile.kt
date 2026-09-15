@@ -62,17 +62,19 @@ internal class ProvisionFile private constructor(
         const val KIND_EMAIL_PROVIDER = "emailProvider"
         const val KIND_LOGIN_THEME = "loginTheme"
         const val KIND_LOGIN_FLOW = "loginFlow"
+        /** SSO-3100 — the per-environment sign-in METHOD allow-list (`/api/v1/login-methods`). */
+        const val KIND_LOGIN_METHODS = "loginMethods"
         const val KIND_FEDERATION_MEMBER = "federationMember"
         const val KIND_USER = "user"
 
         /** The CLOSED kind allowlist — must equal the schema's `kind` enum (asserted by the conformance test). */
         val KINDS: Set<String> = setOf(
             KIND_ENVIRONMENT, KIND_APPLICATION, KIND_EMAIL_PROVIDER, KIND_LOGIN_THEME,
-            KIND_LOGIN_FLOW, KIND_FEDERATION_MEMBER, KIND_USER,
+            KIND_LOGIN_FLOW, KIND_LOGIN_METHODS, KIND_FEDERATION_MEMBER, KIND_USER,
         )
 
         /** One-per-environment kinds: `name` is optional (defaults to the kind) and their API is a PUT. */
-        val SINGLETON_KINDS: Set<String> = setOf(KIND_EMAIL_PROVIDER, KIND_LOGIN_THEME, KIND_LOGIN_FLOW)
+        val SINGLETON_KINDS: Set<String> = setOf(KIND_EMAIL_PROVIDER, KIND_LOGIN_THEME, KIND_LOGIN_FLOW, KIND_LOGIN_METHODS)
 
         /** Required `spec` members per kind — mirrors the schema's per-kind `then.required`. */
         val REQUIRED_SPEC: Map<String, Set<String>> = mapOf(
@@ -83,6 +85,7 @@ internal class ProvisionFile private constructor(
             KIND_EMAIL_PROVIDER to setOf("smtpHost"),
             KIND_LOGIN_FLOW to setOf("templateId"),
             KIND_LOGIN_THEME to emptySet(),
+            KIND_LOGIN_METHODS to setOf("methods"),
         )
 
         val NAME_PATTERN = Regex("^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
@@ -186,11 +189,23 @@ internal class ProvisionFile private constructor(
                     }
                 }
                 REQUIRED_SPEC.getValue(kind).forEach { req ->
-                    if (spec[req]?.takeIf { !it.isNull }?.asString().isNullOrBlank()) v += "$where ($kind) spec.$req is required"
+                    if (isMissing(spec[req])) v += "$where ($kind) spec.$req is required"
+                }
+                // SSO-3100 — `loginMethods.methods` is the FULL allow-list: a non-empty array of method tokens.
+                if (kind == KIND_LOGIN_METHODS) spec["methods"]?.takeIf { it.isArray() }?.let { methods ->
+                    if (methods.toList().any { !it.isTextual() || it.asString().isBlank() }) v += "$where (loginMethods) spec.methods must be a list of non-empty method names"
                 }
             }
             keys.groupBy { it }.filterValues { it.size > 1 }.keys.forEach { v += "duplicate resource '$it' — kind + name must be unique" }
             return v
+        }
+
+        /** A required spec member is missing when absent, null, a blank scalar, or an empty array. */
+        private fun isMissing(node: JsonNode?): Boolean = when {
+            node == null || node.isNull -> true
+            node.isArray() -> node.isEmpty()
+            node.isObject() -> false
+            else -> node.asString().isBlank()
         }
 
         private fun rejectUnknownKeys(node: JsonNode, allowed: Set<String>, where: String, into: MutableList<String>) {

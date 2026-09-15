@@ -131,6 +131,8 @@ thoryn examples verify   <name>              # SSO-2875 — re-check the provisi
 thoryn examples catalog  [--remote] [--tag]  # SSO-2874 — list recipes (bundled, or --remote from the signed public release)
 thoryn examples update   [--tag]             # SSO-2874 — fetch + verify (Ed25519) + cache the public recipe catalog
 thoryn examples apply    <name> [--set k=v]… [--environment <slug>] [--yes]   # SSO-2876 — guided: prompt params + env, dry-run, confirm, provision
+                                             # SSO-3100 — a recipe with `provision: ./provision.yaml` converges that provisioning file FIRST
+                                             # (same engine as `provision apply`; a re-apply is a no-op), then runs its extra steps; `teardown` destroys it last
 thoryn examples share    <name> [--output <file>]   # SSO-2876 — export the secret-free receipt (notes if platform-signed)
 
 # Operator provisioning (SSO-2952) — bootstrap the CI machine identity (founder-run, once).
@@ -138,7 +140,8 @@ thoryn provision ci-identity [--secret-file <path>] [--force-stdout] [--gateway 
 
 # Provisioning-as-code (SSO-3088, epic SSO-3087) — converge the DESIRED STATE in .thoryn/provision.yaml
 # (resources with a stable `name`: environment, application, user, federationMember, and the
-# per-environment singletons emailProvider / loginTheme / loginFlow). The receipt next to the file
+# per-environment singletons emailProvider / loginTheme / loginFlow / loginMethods — the last, SSO-3100,
+# is the sign-in METHOD allow-list `login-methods set` writes; destroy resets it). The receipt next to the file
 # (<name>.receipt.json) is the ownership ledger. SSO-3089: every resource is read LIVE by its converge
 # key before any write (env slug, app displayName within its env, user email, member displayName, the
 # singletons by existence): equal ⇒ no-op, different ⇒ update with only the changed fields, existing
@@ -356,6 +359,52 @@ ephemeral loopback client inside a standing workspace. **Retired for CI use by S
 this repo's own CI now converges `.thoryn/provision.yaml` with `thoryn provision apply`
 (see below). The bundled recipe stays shipped only until the `thoryn-examples`
 conformance workflow moves to provisioning files (SSO-3091); do not build on it.
+
+**Recipes reference a provisioning file (SSO-3100, epic SSO-3087).** The provisioning file
+(`provision.yaml`, schema `src/main/resources/provision/provision.schema.json`) is **leading**
+for all the infrastructure a normal end user configures — environment (incl. a throwaway
+sandbox), application, demo user, sign-in methods (`loginMethods`), look-and-feel
+(`loginTheme`), `loginFlow`, `emailProvider`, `federationMember`. A recipe is the
+**orchestration file** on top. In the product owner's words: *the provision file is about how to get
+Thoryn up and running; the recipe file is about how to get an example configured — the extra steps beyond
+the provisioning.* The recipe names its provisioning file under `provision:
+./provision.yaml` (shipped next to `recipe.json` in the signed catalog bundle and in the
+bundled resources) and carries only what is extra to *run* the example — params, any
+extra `steps`, `verify`, `assets`. `steps` is optional when `provision` is set.
+
+```yaml
+apiVersion: thoryn.io/examples/v1
+id: sandbox-signin
+version: 1.0.0
+summary: Sign in on a throwaway sandbox provisioned from provision.yaml.
+provision: ./provision.yaml          # environment + application + user + loginMethods live here
+params:
+  - { name: workspaceSlug, prompt: "Standing workspace slug" }
+  - { name: envSlug, prompt: "Sandbox slug", default: "sbx-{{generate.slug8}}" }
+  - { name: demoPassword, prompt: "Demo user password", secret: true }
+verify:
+  - assert: applications.get
+    id: "{{provision.application.rp.clientId}}"   # provisioned resources are addressable
+    expect: { status: active }
+```
+
+`thoryn examples apply` (and `setup`) **provisions first**: it plans + applies the file with
+the same converge engine as `thoryn provision apply` (create / update / adopt by converge
+key — a re-apply issues no writes, a leftover sandbox is adopted by its slug), then runs the
+recipe's own steps and `verify`. The file's `{{env.NAME}}` placeholders and `<key>Env` secret
+references resolve **first from the recipe's params** (so `passwordEnv: demoPassword` reads the
+`secret: true` param, `slug: "{{env.envSlug}}"` reads `envSlug`) and **then from the process
+environment**; secret values never reach a file or receipt. What the file owns is exposed to
+the recipe as `{{provision.<kind>.<name>.id}}` (plus `.slug` for an environment, `.email` for
+a user, `.clientId` / `.redirectUri` for an application, `.methods` for `loginMethods`), the
+first `environment` resource becomes the environment later steps and `examples run` target,
+and every resource lands on the recipe receipt. The provisioning receipt itself is written
+next to the example state (`~/.config/thoryn/examples/<name>.provision.receipt.json`) after
+every successful write. `thoryn examples teardown` runs the recipe's own teardown actions and
+**then destroys** the provisioned resources child-first (adopted ones are left in place); a
+failed removal keeps the state + receipt so a re-run can retry. A recipe that creates its own
+workspace (`hub.createWorkspace`) cannot also carry a provisioning file — the file targets the
+caller's standing workspace. Recipes without `provision` behave exactly as before.
 
 `run` therefore **requires Node 18+** on your `PATH` and the **verified signed
 catalog** on disk (the RP code lives in exactly one place — the Node asset — not

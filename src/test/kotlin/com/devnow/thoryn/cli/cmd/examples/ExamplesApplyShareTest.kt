@@ -8,8 +8,10 @@ import com.devnow.thoryn.cli.cmd.examples.recipe.Receipt
 import com.devnow.thoryn.cli.cmd.examples.recipe.ReceiptStore
 import com.devnow.thoryn.cli.cmd.examples.recipe.RecipeRef
 import com.devnow.thoryn.cli.cmd.examples.recipe.WorkspaceRef
+import com.devnow.thoryn.cli.cmd.provision.FakeProductApi
 import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.api.Test
+import java.nio.file.Files
 
 /**
  * SSO-2876 — the guided `examples apply` (driven non-interactively here via --set + --yes) and
@@ -76,6 +78,74 @@ class ExamplesApplyShareTest : CommandTestBase() {
         val appReq = server.takeRequest()
         assertThat(appReq.path).isEqualTo("/api/v1/applications")
         assertThat(appReq.getHeader("Authorization")).isEqualTo("Bearer AT-test")
+    }
+
+    @Test
+    fun `apply provisions a recipe's provisioning file first, plans it, and teardown destroys it`() {
+        // SSO-3100 — a catalog recipe (previously verified + cached) that carries only a `provision`
+        // reference: the guided apply lists the provisioning file in its plan, says the sandbox is created
+        // by that file (no environment prompt), converges it, and `teardown` destroys it child-first.
+        seedTokens(Tokens(accessToken = "AT-test", refreshToken = "RT", issuer = baseUrl(), gateway = baseUrl()))
+        val api = FakeProductApi()
+        server.dispatcher = api
+        val dir = tempHome.resolve(".config/thoryn/recipes-cache/v1.0.0-cache/recipes/sandbox-demo")
+        Files.createDirectories(dir)
+        Files.writeString(
+            dir.resolve("recipe.json"),
+            """
+            {
+              "apiVersion": "thoryn.io/examples/v1",
+              "id": "sandbox-demo",
+              "version": "1.0.0",
+              "summary": "provisioned sign-in demo",
+              "provision": "./provision.yaml",
+              "params": [ { "name": "workspaceSlug", "prompt": "Standing workspace", "default": "acme" } ],
+              "verify": [ { "assert": "applications.get", "id": "{{provision.application.rp.clientId}}", "expect": { "status": "active" } } ]
+            }
+            """.trimIndent(),
+        )
+        Files.writeString(
+            dir.resolve("provision.yaml"),
+            """
+            apiVersion: thoryn.io/provision/v1
+            resources:
+              - { kind: environment, name: sandbox, spec: { slug: demo-sbx } }
+              - { kind: application, name: rp, environment: sandbox, spec: { displayName: "Demo RP", redirectUris: ["http://127.0.0.1/callback"] } }
+              - { kind: loginMethods, environment: sandbox, spec: { methods: [password, passkey] } }
+            """.trimIndent(),
+        )
+
+        val (exit, out, _) = runCli("examples", "apply", "sandbox-demo", "--yes", "--hub", baseUrl(), "--gateway", baseUrl())
+
+        assertThat(exit).isEqualTo(0)
+        assertThat(out)
+            .contains("Plan — recipe sandbox-demo")
+            .contains("environment: sandbox 'sandbox' (slug demo-sbx) — created by ./provision.yaml")
+            .contains("provision (./provision.yaml, applied first — 3 resource(s))")
+            .contains("- application rp (in sandbox)")
+            .contains("steps: none — the provisioning file carries everything")
+            .contains("[provision] ./provision.yaml")
+            .contains("Applied")
+        assertThat(api.provisioningWrites.map { it.method + " " + it.path })
+            .containsExactly("POST /api/v1/environments", "POST /api/v1/applications", "PUT /api/v1/login-methods")
+        val receipt = ReceiptStore().read("sandbox-demo")!!
+        assertThat(receipt.resources.map { it.kind }).containsExactly("environment", "application", "loginMethods")
+        assertThat(receipt.verify).allMatch { it.passed }
+        assertThat(ExampleStateStore().provisionReceiptPath("sandbox-demo").toFile()).exists()
+
+        // A second apply is refused while the setup exists (unchanged guard) …
+        assertThat(runCli("examples", "apply", "sandbox-demo", "--yes", "--hub", baseUrl(), "--gateway", baseUrl()).err).contains("teardown")
+
+        // … and teardown destroys what the provisioning file created, child-first (sandbox last).
+        api.reset()
+        val down = runCli("examples", "teardown", "sandbox-demo", "--hub", baseUrl(), "--gateway", baseUrl())
+        assertThat(down.exit).isEqualTo(0)
+        assertThat(api.provisioningWrites.map { it.method + " " + it.path }).containsExactly(
+            "DELETE /api/v1/login-methods", "DELETE /api/v1/applications/${receipt.resources[1].id}", "DELETE /api/v1/environments/${receipt.resources[0].id}",
+        )
+        assertThat(api.environments).isEmpty()
+        assertThat(ExampleStateStore().provisionReceiptPath("sandbox-demo").toFile()).doesNotExist()
+        assertThat(ReceiptStore().read("sandbox-demo")).isNull()
     }
 
     @Test

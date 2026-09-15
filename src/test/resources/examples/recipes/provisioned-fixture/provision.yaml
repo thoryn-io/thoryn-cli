@@ -1,0 +1,10 @@
+# SSO-3100 test fixture — ships next to recipe.json exactly as the catalog bundle lays it out.
+apiVersion: thoryn.io/provision/v1
+resources:
+  - kind: environment
+    name: sandbox
+    spec: { slug: fixture-sbx, displayName: "Fixture sandbox" }
+  - kind: application
+    name: rp
+    environment: sandbox
+    spec: { displayName: "Fixture RP", clientType: public, redirectUris: ["http://127.0.0.1/callback"], scopes: [openid, profile] }

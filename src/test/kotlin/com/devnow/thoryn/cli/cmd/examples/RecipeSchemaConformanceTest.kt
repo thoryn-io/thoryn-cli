@@ -49,8 +49,14 @@ class RecipeSchemaConformanceTest {
         if (recipe["version"]?.asString()?.matches(Regex("""^\d+\.\d+\.\d+$""")) != true) v += "version must be semver"
         if (recipe["summary"]?.asString().isNullOrBlank()) v += "summary is required"
 
+        // SSO-3100 — a recipe declares a provisioning file, steps, or both (the schema's top-level anyOf):
+        // `steps` is omitted (not empty) when the provisioning file carries everything.
+        val provision = recipe["provision"]?.takeIf { !it.isNull }?.asString()
+        val provisionPattern = Regex(schema["properties"]["provision"]["pattern"].asString())
+        if (provision != null && !provisionPattern.matches(provision)) v += "provision '$provision' must be a recipe-relative .yaml/.yml/.json path"
         val steps = recipe["steps"]?.toList() ?: emptyList()
-        if (steps.isEmpty()) v += "steps must be non-empty"
+        if (steps.isEmpty() && provision == null) v += "steps must be non-empty"
+        else if (steps.isEmpty() && recipe.has("steps")) v += "steps must be omitted, not empty, when the provisioning file carries everything"
 
         val stepActions = allowlist("steps", "action")
         val assertActions = allowlist("verify", "assert")
@@ -78,7 +84,8 @@ class RecipeSchemaConformanceTest {
         // Every {{placeholder}} must reference a declared param, a (prior) step id, or the reserved
         // `generate` namespace the interpreter resolves ({{generate.slug8}} / {{generate.uuid}}, SSO-2873).
         val params = recipe["params"]?.toList()?.mapNotNull { it["name"]?.asString() }?.toSet() ?: emptySet()
-        val knownRoots = params + stepIds.toSet() + "generate"
+        // SSO-3100 — `{{provision.<kind>.<name>.<field>}}` addresses what the provisioning file created.
+        val knownRoots = params + stepIds.toSet() + "generate" + (if (provision != null) setOf("provision") else emptySet())
         placeholder.findAll(recipe.toString()).forEach { m ->
             val root = m.groupValues[1].substringBefore('.')
             if (root !in knownRoots) v += "placeholder '{{${m.groupValues[1]}}}' references unknown '$root' (params=$params steps=$stepIds)"
@@ -174,6 +181,85 @@ class RecipeSchemaConformanceTest {
             """.trimIndent(),
         )
         assertThat(violations(recipe)).isEmpty()
+    }
+
+    @Test
+    fun `a recipe may reference a provisioning file and then needs no steps`() {
+        // SSO-3100 — the schema's top-level anyOf: `provision` OR `steps` (or both); `steps` is no longer
+        // required, and provisioned resources are addressable as {{provision.<kind>.<name>.<field>}}.
+        assertThat(schema["required"].toList().map { it.asString() }).doesNotContain("steps")
+        assertThat(schema["anyOf"].toList().map { it["required"][0].asString() }).containsExactlyInAnyOrder("provision", "steps")
+        val recipe = yaml.readTree(
+            """
+            apiVersion: thoryn.io/examples/v1
+            id: provisioned-signin
+            version: 1.0.0
+            summary: everything comes from the provisioning file
+            provision: ./provision.yaml
+            verify:
+              - assert: applications.get
+                id: "{{provision.application.rp.clientId}}"
+                expect: { status: active }
+            """.trimIndent(),
+        )
+        assertThat(violations(recipe)).isEmpty()
+        // A provisioning file plus EXTRA steps is fine too, and the step may reference the provisioned app.
+        val withSteps = yaml.readTree(
+            """
+            apiVersion: thoryn.io/examples/v1
+            id: provisioned-plus
+            version: 1.0.0
+            summary: provisioning file plus an extra step
+            provision: provision.yaml
+            steps:
+              - { id: fed, action: federation.create, with: { providerType: okta, displayName: "Okta for {{provision.application.rp.clientId}}" } }
+            """.trimIndent(),
+        )
+        assertThat(violations(withSteps)).isEmpty()
+    }
+
+    @Test
+    fun `zero steps is allowed only with a provisioning file, and the provision path stays recipe-relative`() {
+        val noSteps = yaml.readTree(
+            """
+            apiVersion: thoryn.io/examples/v1
+            id: empty
+            version: 1.0.0
+            summary: neither steps nor provision
+            """.trimIndent(),
+        )
+        assertThat(violations(noSteps)).contains("steps must be non-empty")
+        val emptySteps = yaml.readTree(
+            """
+            apiVersion: thoryn.io/examples/v1
+            id: empty-steps
+            version: 1.0.0
+            summary: an explicit empty steps list next to a provisioning file
+            provision: ./provision.yaml
+            steps: []
+            """.trimIndent(),
+        )
+        assertThat(violations(emptySteps)).anyMatch { it.contains("omitted, not empty") }
+        // The schema pattern confines `provision` to the recipe's own directory (no `..`, not absolute).
+        val pattern = Regex(schema["properties"]["provision"]["pattern"].asString())
+        assertThat(pattern.matches("./provision.yaml")).isTrue()
+        assertThat(pattern.matches("infra/provision.yml")).isTrue()
+        assertThat(pattern.matches("provision.json")).isTrue()
+        assertThat(pattern.matches("../provision.yaml")).isFalse()
+        assertThat(pattern.matches("/etc/provision.yaml")).isFalse()
+        assertThat(pattern.matches("provision.txt")).isFalse()
+        // Without `provision`, a {{provision.*}} placeholder is dangling.
+        val dangling = yaml.readTree(
+            """
+            apiVersion: thoryn.io/examples/v1
+            id: dangling-provision
+            version: 1.0.0
+            summary: references a provisioned app without a provisioning file
+            steps:
+              - { id: app, action: applications.create, with: { displayName: "{{provision.application.rp.clientId}}" } }
+            """.trimIndent(),
+        )
+        assertThat(violations(dangling)).anyMatch { it.contains("{{provision.application.rp.clientId}}") }
     }
 
     @Test

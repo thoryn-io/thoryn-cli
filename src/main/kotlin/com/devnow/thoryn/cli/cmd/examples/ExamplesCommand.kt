@@ -7,6 +7,7 @@ import com.devnow.thoryn.cli.cmd.examples.recipe.RecipeCatalogException
 import com.devnow.thoryn.cli.cmd.examples.recipe.RecipeException
 import com.devnow.thoryn.cli.cmd.examples.recipe.RecipeInterpreter
 import com.devnow.thoryn.cli.cmd.examples.recipe.ReceiptStore
+import com.devnow.thoryn.cli.cmd.provision.ProvisionFile
 import com.devnow.thoryn.cli.config.ThorynConfig
 import com.devnow.thoryn.cli.output.OutputFormat
 import com.devnow.thoryn.cli.output.Printers
@@ -235,6 +236,10 @@ class ExamplesCommand : Callable<Int> {
      * params, resolve a target environment (a sandbox by default when the recipe operates in an
      * existing workspace), show a dry-run plan, confirm, then provision. `--set k=v` and `--yes` make
      * it non-interactive (CI). Writes the same state + receipt as `setup`.
+     *
+     * SSO-3100 — a recipe with a `provision` file is provisioned FIRST (the interpreter converges the
+     * file, then runs the recipe's extra steps); the plan lists the file's resources, and when it
+     * declares an `environment` the sandbox is created by the file rather than prompted for.
      */
     @Command(name = "apply", description = ["Guided: provision a recipe interactively (params, environment, dry-run, confirm)."], mixinStandardHelpOptions = true)
     class ApplySubcommand : Callable<Int> {
@@ -276,9 +281,16 @@ class ExamplesCommand : Callable<Int> {
                 return CommandSupport.EXIT_OK
             }
 
+            // SSO-3100 — a declared-but-broken provisioning file fails before any prompt or write.
+            val provision = try {
+                recipe.provisionFile()
+            } catch (ex: RecipeException) {
+                System.err.println("Could not apply '$exampleName': ${ex.message}")
+                return CommandSupport.EXIT_USAGE
+            }
             val overrides = resolveParams(recipe)
-            val env = environment ?: resolveEnvironment(recipe, ctx)
-            printPlan(recipe, overrides, env)
+            val env = environment ?: resolveEnvironment(recipe, provision, ctx)
+            printPlan(recipe, provision, overrides, env)
             if (!yes && !Prompt.confirm("Apply this recipe now?")) {
                 println("Aborted — nothing was provisioned.")
                 return CommandSupport.EXIT_OK
@@ -317,10 +329,15 @@ class ExamplesCommand : Callable<Int> {
 
         /** A sandbox by default when the recipe runs in an existing workspace; null (production plane)
          *  when it creates its own workspace (only production exists then). */
-        private fun resolveEnvironment(recipe: Recipe, ctx: ExampleContext): String? {
+        private fun resolveEnvironment(recipe: Recipe, provision: ProvisionFile?, ctx: ExampleContext): String? {
             val createsWorkspace = recipe.steps.any { it["action"]?.asString() == "hub.createWorkspace" }
             if (createsWorkspace) {
                 ctx.info("This recipe creates its own workspace; its resources go to that workspace's production environment.")
+                return null
+            }
+            // SSO-3100 — the provisioning file creates (or adopts) the sandbox itself; nothing to choose.
+            provision?.resources?.firstOrNull { it.kind == ProvisionFile.KIND_ENVIRONMENT }?.let { e ->
+                ctx.info("This recipe's provisioning file creates the sandbox '${e.name}' (slug ${e.spec["slug"]}); later steps target it.")
                 return null
             }
             val envs = runCatching { ctx.gatewayClient().listEnvironments()["environments"]?.toList().orEmpty() }.getOrDefault(emptyList())
@@ -332,17 +349,37 @@ class ExamplesCommand : Callable<Int> {
             return Prompt.ask("Target environment", defaultEnv).ifEmpty { null }
         }
 
-        private fun printPlan(recipe: Recipe, overrides: Map<String, String>, env: String?) {
+        private fun printPlan(recipe: Recipe, provision: ProvisionFile?, overrides: Map<String, String>, env: String?) {
             println()
             println("Plan — recipe ${recipe.id} v${recipe.version}")
             if (overrides.isNotEmpty()) {
                 println("  parameters:")
-                overrides.forEach { (k, v) -> println("    $k = $v") }
+                // SSO-3100 — never echo a `secret: true` param (it may feed a provisioning `<key>Env`).
+                val secret = recipe.params.filter { it["secret"]?.asBoolean() == true }.map { it["name"].asString() }.toSet()
+                overrides.forEach { (k, v) -> println("    $k = ${if (k in secret) "(secret)" else v}") }
             }
-            println("  environment: ${env ?: "production (default plane)"}")
-            println("  steps:")
-            recipe.steps.forEach { s ->
-                println("    - ${s["action"]?.asString()}${s["description"]?.takeIf { !it.isNull }?.let { " — ${it.asString()}" } ?: ""}")
+            val provisionedEnv = provision?.resources?.firstOrNull { it.kind == ProvisionFile.KIND_ENVIRONMENT }
+            println(
+                when {
+                    provisionedEnv != null -> "  environment: sandbox '${provisionedEnv.name}' (slug ${provisionedEnv.spec["slug"]}) — created by ${recipe.provision}"
+                    else -> "  environment: ${env ?: "production (default plane)"}"
+                },
+            )
+            if (provision != null) {
+                // SSO-3100 — the provisioning file is converged FIRST (create / update / adopt by converge key; a second apply is a no-op).
+                println("  provision (${recipe.provision}, applied first — ${provision.resources.size} resource(s)):")
+                provision.resources.forEach { r ->
+                    val plane = r.environment ?: "production plane"
+                    println("    - ${r.kind} ${r.name}${if (r.kind != ProvisionFile.KIND_ENVIRONMENT) " (in $plane)" else ""}")
+                }
+            }
+            if (recipe.steps.isNotEmpty()) {
+                println("  steps:")
+                recipe.steps.forEach { s ->
+                    println("    - ${s["action"]?.asString()}${s["description"]?.takeIf { !it.isNull }?.let { " — ${it.asString()}" } ?: ""}")
+                }
+            } else if (provision != null) {
+                println("  steps: none — the provisioning file carries everything")
             }
         }
     }

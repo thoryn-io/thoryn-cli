@@ -44,6 +44,13 @@ class RecipeCatalogTest {
             zip.putNextEntry(ZipEntry("recipes/simple-signin/recipe.json"))
             zip.write("""{"id":"simple-signin","version":"1.2.0","summary":"Sign a user in."}""".toByteArray())
             zip.closeEntry()
+            // SSO-3100 — a recipe that references its sibling provisioning file; the bundle ships it next to recipe.json.
+            zip.putNextEntry(ZipEntry("recipes/sandbox-demo/recipe.json"))
+            zip.write("""{"apiVersion":"thoryn.io/examples/v1","id":"sandbox-demo","version":"2.0.0","summary":"Provisioned demo.","provision":"./provision.yaml"}""".toByteArray())
+            zip.closeEntry()
+            zip.putNextEntry(ZipEntry("recipes/sandbox-demo/provision.yaml"))
+            zip.write("apiVersion: thoryn.io/provision/v1\nresources:\n  - { kind: environment, name: sandbox, spec: { slug: demo-sbx } }\n".toByteArray())
+            zip.closeEntry()
         }
         return out.toByteArray()
     }
@@ -74,6 +81,28 @@ class RecipeCatalogTest {
 
         assertThat(info.tag).isEqualTo("v1.2.0")
         assertThat(info.recipes).anyMatch { it.id == "simple-signin" && it.version == "1.2.0" }
+    }
+
+    @Test
+    fun `a fetched recipe resolves its provisioning file from the same verified catalog dir`() {
+        // SSO-3100 — `provision: ./provision.yaml` is read NEXT TO recipe.json inside the extracted
+        // (signature-verified) catalog, never from the working directory.
+        val zip = catalogZip()
+        server.enqueue(MockResponse().setBody(releaseJson()).setHeader("Content-Type", "application/json"))
+        server.enqueue(MockResponse().setBody(okio.Buffer().write(zip)))
+        server.enqueue(MockResponse().setBody(enc.encodeToString(sign(zip))))
+        val cat = catalog()
+        cat.update(null)
+
+        val recipe = Recipe.resolve("sandbox-demo", cat)
+        assertThat(recipe.version).isEqualTo("2.0.0")
+        assertThat(recipe.provision).isEqualTo("./provision.yaml")
+        val file = recipe.provisionFile()!!
+        assertThat(file.source).isEqualTo("recipes/sandbox-demo/provision.yaml")
+        assertThat(file.resources.single().key).isEqualTo("environment/sandbox")
+        assertThat(cat.cachedAsset("sandbox-demo", "provision.yaml")).isNotNull
+        // A cached recipe without the sibling file fails closed when it claims one.
+        assertThat(Recipe.resolve("simple-signin", cat).provision).isNull()
     }
 
     @Test
