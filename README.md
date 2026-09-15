@@ -135,6 +135,17 @@ thoryn examples share    <name> [--output <file>]   # SSO-2876 — export the se
 
 # Operator provisioning (SSO-2952) — bootstrap the CI machine identity (founder-run, once).
 thoryn provision ci-identity [--secret-file <path>] [--force-stdout] [--gateway <url>]   # mint the confidential client_credentials machine client; secret shown once via SecretIo
+
+# Provisioning-as-code (SSO-3088, epic SSO-3087) — converge the DESIRED STATE in .thoryn/provision.yaml
+# (resources with a stable `name`: environment, application, user, federationMember, and the
+# per-environment singletons emailProvider / loginTheme / loginFlow). The receipt next to the file
+# (<name>.receipt.json) is the ownership ledger: apply twice is a no-op; destroy and --prune act ONLY
+# on receipt-recorded ids. Secrets never enter the file — name the env var (`passwordEnv`,
+# `smtpPasswordEnv`, `clientSecretEnv`) or use `{{env.NAME}}`; they are resolved at apply and never
+# recorded. Production-plane removals need `--confirm <workspace-slug>` (the SSO-2413 gate).
+thoryn provision plan    [--file <path>] [--prune]                                  # read-only: what apply would create / remove
+thoryn provision apply   [--file <path>] [--prune] [--confirm <ws>] [--yes]        # converge; environments first, dependants into them
+thoryn provision destroy [--file <path>|--receipt <path>] [--confirm <ws>] [--yes] # remove everything owned, child-first (sandbox hard-delete cascades)
 ```
 
 > The supply-chain / verifiable-credential command tree was **removed** when the

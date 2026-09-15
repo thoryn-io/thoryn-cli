@@ -126,10 +126,16 @@ internal object CommandSupport {
         // current selection is stale/suspended (a suspended selection would otherwise 403 the very
         // `env list` you'd run to fix it).
         applyEnvironment: Boolean = true,
+        // SSO-3088 — `thoryn provision` targets a PER-RESOURCE environment declared in the provisioning
+        // file, independent of any `thoryn env use` selection: a non-null override rides as the
+        // X-Thoryn-Environment header (an empty string ⇒ production plane, no header) and the selection
+        // is ignored. Null (the default) keeps the SSO-2870 selected-environment behaviour.
+        environmentOverride: String? = null,
     ): ProductApiClient {
+        val overrideSlug = environmentOverride?.takeIf { it.isNotBlank() }
         val selected = runCatching { selectedWorkspace.read() }.getOrNull()
-            ?: return client(gateway, baseTokens)
-        val environmentSlug = selected.environmentSlug?.takeIf { applyEnvironment }
+            ?: return client(gateway, baseTokens, overrideSlug)
+        val environmentSlug = if (environmentOverride != null) overrideSlug else selected.environmentSlug?.takeIf { applyEnvironment }
 
         fun mint(): Tokens? {
             val base = ensureFresh(baseTokens, err)

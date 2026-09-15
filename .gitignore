@@ -8,6 +8,10 @@ HELP.md
 # Maven wrapper (only-script): keep mvnw / mvnw.cmd / maven-wrapper.properties;
 # the downloaded distribution lives under ~/.m2/wrapper and is never committed.
 
+# SSO-3088 — provisioning receipts (`thoryn provision apply` writes <name>.receipt.json next to the
+# file; secret-free, but per-account state like Terraform state — not committed by default).
+.thoryn/*.receipt.json
+
 # GraalVM native-image build artifacts
 *.build_artifacts.txt
 /thoryn
