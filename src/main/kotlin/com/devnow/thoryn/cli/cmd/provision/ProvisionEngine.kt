@@ -103,7 +103,8 @@ internal class ProvisionEngine(
             val change = probe(r, file, owned, envSlugs)
             changes += change
             if (r.kind == ProvisionFile.KIND_ENVIRONMENT && change.liveId != null) {
-                envSlugs[r.name] = r.spec["slug"].toString()
+                // The RESOLVED slug (a `{{env.NAME}}` placeholder names a per-run sandbox), never the raw spec.
+                envSlugs[r.name] = resolveSpec(r, strict = false)["slug"].toString()
             }
         }
         val declared = file.resources.map { it.key }.toSet()
@@ -398,9 +399,10 @@ internal class ProvisionEngine(
         val id = change.liveId ?: throw ProvisionException("${r.key}: adopt planned without a live id")
         val slug = if (r.kind == ProvisionFile.KIND_ENVIRONMENT) null else targetSlug(r, file, owned)
         out.println("  = ${r.kind} ${r.name}: adopted (id $id) — will be converged, never deleted by destroy")
+        val resolved = resolveSpec(r, strict = true)
         val attributes = when (r.kind) {
-            ProvisionFile.KIND_ENVIRONMENT -> mapOf("slug" to r.spec["slug"].toString())
-            ProvisionFile.KIND_USER -> mapOf("email" to r.spec["email"].toString())
+            ProvisionFile.KIND_ENVIRONMENT -> mapOf("slug" to resolved["slug"].toString())
+            ProvisionFile.KIND_USER -> mapOf("email" to resolved["email"].toString())
             else -> emptyMap()
         }
         return OwnedResource(r.kind, r.name, id, slug, attributes, adopted = true)

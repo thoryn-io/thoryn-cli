@@ -43,17 +43,20 @@
       "allOf": [
         { "if": { "properties": { "kind": { "const": "environment" } } },
           "then": { "not": { "required": ["environment"] }, "required": ["name"],
-                    "properties": { "spec": { "required": ["slug"], "properties": { "slug": { "type": "string", "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$" }, "displayName": { "type": "string" } } } } } },
+                    "properties": { "spec": { "type": "object", "required": ["slug"], "properties": {
+                      "slug": { "description": "A slug, or a `{{env.NAME}}` placeholder resolved from the environment at apply time (a per-run sandbox in CI).",
+                                "type": "string", "pattern": "^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?|.*\\{\\{\\s*env\\.[A-Za-z_][A-Za-z0-9_]*\\s*\\}\\}.*)$" },
+                      "displayName": { "type": "string" } } } } } },
         { "if": { "properties": { "kind": { "const": "application" } } },
-          "then": { "required": ["name"], "properties": { "spec": { "required": ["displayName"] } } } },
+          "then": { "required": ["name"], "properties": { "spec": { "type": "object", "required": ["displayName"] } } } },
         { "if": { "properties": { "kind": { "const": "user" } } },
-          "then": { "required": ["name"], "properties": { "spec": { "required": ["email"] } } } },
+          "then": { "required": ["name"], "properties": { "spec": { "type": "object", "required": ["email"] } } } },
         { "if": { "properties": { "kind": { "const": "federationMember" } } },
-          "then": { "required": ["name"], "properties": { "spec": { "required": ["providerType"] } } } },
+          "then": { "required": ["name"], "properties": { "spec": { "type": "object", "required": ["providerType"] } } } },
         { "if": { "properties": { "kind": { "const": "emailProvider" } } },
-          "then": { "properties": { "spec": { "required": ["smtpHost"] } } } },
+          "then": { "properties": { "spec": { "type": "object", "required": ["smtpHost"] } } } },
         { "if": { "properties": { "kind": { "const": "loginFlow" } } },
-          "then": { "properties": { "spec": { "required": ["templateId"] } } } }
+          "then": { "properties": { "spec": { "type": "object", "required": ["templateId"] } } } }
       ]
     }
   }
