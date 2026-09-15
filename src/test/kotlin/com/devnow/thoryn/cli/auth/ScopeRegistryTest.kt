@@ -28,6 +28,17 @@ class ScopeRegistryTest {
             // SSO-2870 — `env` select/manage surface.
             .contains("tenant:environments.read")
             .contains("tenant:environments.write")
+            // SSO-3113 — `access` grants + the provisioning file's `grants:` block.
+            .contains("tenant:access.read")
+            .contains("tenant:access.write")
+    }
+
+    @Test
+    fun `the access scopes are deliberately NOT in the default login scope until the product side deploys them`() {
+        // SSO-2278 — a default login requesting a scope the hub's client has not been granted yet is an
+        // invalid_scope loop for every user; the cut-over (after SSO-3112) adds them to DEFAULT_SCOPE.
+        assertThat(com.devnow.thoryn.cli.config.ThorynConfig.DEFAULT_SCOPE.split(' '))
+            .doesNotContain("tenant:access.read", "tenant:access.write")
     }
 
     @Test

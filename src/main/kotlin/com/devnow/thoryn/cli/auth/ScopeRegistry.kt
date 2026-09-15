@@ -61,6 +61,13 @@ object ScopeRegistry {
         // read gates `branding get`; write gates `branding set`.
         "tenant:idp.read",
         "tenant:idp.write",
+        // access grants — least-privilege relationships (product-api /api/v1/access — SSO-3113,
+        // the SSO-3112 contract). read gates `access list|mine`; write gates `access grant|revoke`
+        // and the `grants:` block `provision apply` converges. NOT in ThorynConfig.DEFAULT_SCOPE
+        // until the product side (SSO-3112) has deployed the scopes to the hub: a default login
+        // requesting an unregistered scope is an invalid_scope loop (SSO-2278).
+        "tenant:access.read",
+        "tenant:access.write",
     )
 
     /**

@@ -38,6 +38,20 @@
           "description": "Kind-specific desired state, forwarded to the product API. Property names ending in password / secret / token are REJECTED — use `<key>Env` naming the env var that carries the value.",
           "type": "object",
           "propertyNames": { "not": { "pattern": "([Pp]assword|[Ss]ecret|[Tt]oken)$" } }
+        },
+        "grants": {
+          "description": "SSO-3113 (epic SSO-3108) — least-privilege ACCESS GRANTS on this resource, converged with it by `apply`: a listed grant that is missing is created, a grant on this object the file no longer lists is revoked (the workspace admin userset `workspace:<id>#admin` is never revoked; grants on objects the file does not own are never touched). The OBJECT is implicit — it derives from the receipt id (`environment:<id>`, `application:<clientId>`, `user:<id>`, `federation_member:<id>`, `<singleton>:<envSlug>`). Omit to leave the object's grants unmanaged; `[]` declares none. Needs `tenant:access.write` (a session without it fails closed).",
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["subject", "relation"],
+            "properties": {
+              "subject": { "description": "`member:<sub>` or `client:<clientId>`.", "type": "string", "pattern": "^(member|client):[^\\s]+$" },
+              "relation": { "enum": ["manager", "viewer"] }
+            }
+          }
         }
       },
       "allOf": [

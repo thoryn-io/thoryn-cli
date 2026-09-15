@@ -51,6 +51,13 @@ class ProvisionSchemaConformanceTest {
           - kind: loginMethods
             environment: ci
             spec: { methods: [password, magic_link, passkey] }
+          - kind: application
+            name: ci-worker
+            environment: ci
+            spec: { displayName: "CI worker", clientType: confidential, grantTypes: [client_credentials] }
+            grants:
+              - { subject: "client:cli-ci", relation: manager }
+              - { subject: "member:alice", relation: viewer }
     """.trimIndent()
 
     @Test
@@ -66,8 +73,11 @@ class ProvisionSchemaConformanceTest {
         val file = ProvisionFile.parse(representative.toByteArray(), "provision.yaml")
         assertThat(file.digest).startsWith("sha256:")
         assertThat(file.resources.map { it.key }).containsExactly(
-            "environment/ci", "application/loopback-rp", "user/tester", "emailProvider/emailProvider", "loginTheme/loginTheme", "loginMethods/loginMethods",
+            "environment/ci", "application/loopback-rp", "user/tester", "emailProvider/emailProvider", "loginTheme/loginTheme", "loginMethods/loginMethods", "application/ci-worker",
         )
+        // SSO-3113 — `grants` parses into (subject, relation) pairs; a resource without the block has null (unmanaged).
+        assertThat(file.resources[6].grants).containsExactly(ProvisionGrant("client:cli-ci", "manager"), ProvisionGrant("member:alice", "viewer"))
+        assertThat(file.resources[1].grants).isNull()
         assertThat(file.resources[1].environment).isEqualTo("ci")
         assertThat(file.environmentResource("ci")).isNotNull
         // A singleton without a name defaults its name to the kind.
@@ -77,7 +87,7 @@ class ProvisionSchemaConformanceTest {
     @Test
     fun `the same document parses as JSON`() {
         val asJson = json.writeValueAsBytes(yaml.readTree(representative))
-        assertThat(ProvisionFile.parse(asJson, "provision.json", yaml = false).resources).hasSize(6)
+        assertThat(ProvisionFile.parse(asJson, "provision.json", yaml = false).resources).hasSize(7)
     }
 
     @Test
@@ -160,6 +170,39 @@ class ProvisionSchemaConformanceTest {
         assertThat(methods["minItems"].asInt()).isEqualTo(1)
         assertThat(methods["items"]["type"].asString()).isEqualTo("string")
         assertThat(ProvisionFile.SINGLETON_KINDS).contains(ProvisionFile.KIND_LOGIN_METHODS)
+    }
+
+    @Test
+    fun `grants are validated — subject grammar, the relation enum, duplicates and unknown keys`() {
+        // SSO-3113 — the `grants:` block carries no object (it derives from the receipt id) and no secret.
+        val bad = yaml.readTree(
+            """
+            apiVersion: thoryn.io/provision/v1
+            resources:
+              - { kind: environment, name: a, spec: { slug: a }, grants: [ { subject: "robot:x", relation: manager } ] }
+              - { kind: environment, name: b, spec: { slug: b }, grants: [ { subject: "client:x", relation: owner } ] }
+              - { kind: environment, name: c, spec: { slug: c }, grants: [ { subject: "client:x", relation: manager }, { subject: "client:x", relation: manager } ] }
+              - { kind: environment, name: d, spec: { slug: d }, grants: [ { subject: "client:x", relation: manager, object: "environment:zzz" } ] }
+              - { kind: environment, name: e, spec: { slug: e }, grants: { subject: "client:x" } }
+              - { kind: environment, name: f, spec: { slug: f }, grants: [ { relation: viewer } ] }
+            """.trimIndent(),
+        )
+        val v = ProvisionFile.validate(bad)
+        assertThat(v).anyMatch { it.contains("resources[0] grants[0]") && it.contains("subject type 'robot'") }
+        assertThat(v).anyMatch { it.contains("resources[1] grants[0]") && it.contains("relation 'owner'") }
+        assertThat(v).anyMatch { it.contains("resources[2] grants[1]") && it.contains("duplicates grant 'client:x manager'") }
+        assertThat(v).anyMatch { it.contains("resources[3] grants[0]") && it.contains("unknown property 'object'") }
+        assertThat(v).anyMatch { it.contains("resources[4] grants must be an array") }
+        assertThat(v).anyMatch { it.contains("resources[5] grants[0] subject is required") }
+        // The schema pins the same grammar: the relation enum equals the loader's set, the subject pattern equals the CLI's.
+        val grants = schema["\$defs"]["resource"]["properties"]["grants"]
+        assertThat(grants["items"]["properties"]["relation"]["enum"].toList().map { it.asString() }.toSet()).isEqualTo(ProvisionFile.GRANT_RELATIONS)
+        val subject = Regex(grants["items"]["properties"]["subject"]["pattern"].asString())
+        assertThat(subject.matches("client:cli-ci")).isTrue()
+        assertThat(subject.matches("member:auth0|abc")).isTrue()
+        assertThat(subject.matches("robot:x")).isFalse()
+        assertThat(grants["items"]["additionalProperties"].asBoolean()).isFalse()
+        assertThat(grants["items"]["required"].toList().map { it.asString() }).containsExactly("subject", "relation")
     }
 
     @Test

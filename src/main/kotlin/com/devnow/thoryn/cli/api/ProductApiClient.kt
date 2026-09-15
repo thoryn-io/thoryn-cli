@@ -335,6 +335,48 @@ class ProductApiClient(
     fun resetLoginMethods(): JsonNode =
         delete("/api/v1/login-methods")
 
+    // ── Access grants (SSO-3113; product-api /api/v1/access — the SSO-3112 contract) ──────────
+    //
+    // Least-privilege relationships between a SUBJECT (`member:<sub>` / `client:<clientId>`) and an
+    // OBJECT (`workspace:<tenantId>`, `environment:<id>`, `application:<clientId>`, `user:<id>`,
+    // `federation_member:<id>`, `email_provider:<envSlug>`, `login_theme:<envSlug>`,
+    // `login_flow:<envSlug>`, `login_methods:<envSlug>`) via a RELATION (`manager` / `viewer`).
+    // Workspace-level (objects carry their environment id), so no X-Thoryn-Environment dependency.
+    // Scopes: read → tenant:access.read, write → tenant:access.write.
+
+    /**
+     * `GET /api/v1/access/grants?object=<type>:<id>` / `?subject=<type>:<id>` — the grants on an object
+     * or held by a subject, as the product-api ListEnvelope `{ "data": [ {subject, relation, object,
+     * createdAt} ], "pagination": {…} }` (the array is under `data`, NOT `items`).
+     */
+    fun listGrants(objectRef: String? = null, subjectRef: String? = null): JsonNode {
+        val query = buildList {
+            objectRef?.takeIf { it.isNotBlank() }?.let { add("object=${encode(it)}") }
+            subjectRef?.takeIf { it.isNotBlank() }?.let { add("subject=${encode(it)}") }
+        }.joinToString("&").let { if (it.isEmpty()) "" else "?$it" }
+        return get("/api/v1/access/grants$query")
+    }
+
+    /** `POST /api/v1/access/grants` `{subject, relation, object}` — 201 created, 200 when it already exists (idempotent). */
+    fun createGrant(subjectRef: String, relation: String, objectRef: String): JsonNode =
+        post("/api/v1/access/grants", grantBody(subjectRef, relation, objectRef))
+
+    /** `DELETE /api/v1/access/grants` with the JSON body `{subject, relation, object}` — 204 No Content. */
+    fun deleteGrant(subjectRef: String, relation: String, objectRef: String): Unit =
+        deleteWithBodyNoContent("/api/v1/access/grants", grantBody(subjectRef, relation, objectRef))
+
+    /** `GET /api/v1/access/mine?type=<objectType>&relation=<relation>` — `{ "data": [ "<type>:<id>", … ] }` for the caller. */
+    fun listMyAccess(type: String? = null, relation: String? = null): JsonNode {
+        val query = buildList {
+            type?.takeIf { it.isNotBlank() }?.let { add("type=${encode(it)}") }
+            relation?.takeIf { it.isNotBlank() }?.let { add("relation=${encode(it)}") }
+        }.joinToString("&").let { if (it.isEmpty()) "" else "?$it" }
+        return get("/api/v1/access/mine$query")
+    }
+
+    private fun grantBody(subjectRef: String, relation: String, objectRef: String): Map<String, Any?> =
+        linkedMapOf("subject" to subjectRef, "relation" to relation, "object" to objectRef)
+
     // ── Attestations (SSO-2878; product-api verify-then-sign) ──────────────────
     //
     // POST a receipt to have the platform re-verify its resources against live tenant
@@ -746,6 +788,24 @@ class ProductApiClient(
                 .header("Accept", "application/json")
                 .withConfirmation(confirmSlug)
                 .DELETE()
+                .build()
+        }
+        if (response.statusCode() !in 200..299) {
+            throw ProductApiException.fromResponse(response.statusCode(), response.body() ?: "", mapper)
+        }
+    }
+
+    /**
+     * DELETE carrying a JSON body that expects `204 No Content` (SSO-3113 — `DELETE /api/v1/access/grants`
+     * identifies the grant by `{subject, relation, object}` in the body, not the path). Throws
+     * [ProductApiException] on any non-2xx; ignores the (empty) body on success.
+     */
+    private fun deleteWithBodyNoContent(path: String, body: Any) {
+        val response = sendAuthed(HttpResponse.BodyHandlers.ofString()) { at ->
+            baseRequest(path).authed(at)
+                .header("Content-Type", "application/json")
+                .header("Accept", "application/json")
+                .method("DELETE", HttpRequest.BodyPublishers.ofString(mapper.writeValueAsString(body)))
                 .build()
         }
         if (response.statusCode() !in 200..299) {

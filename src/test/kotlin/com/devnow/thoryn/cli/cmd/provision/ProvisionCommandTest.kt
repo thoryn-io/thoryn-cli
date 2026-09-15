@@ -107,9 +107,14 @@ class ProvisionCommandTest : CommandTestBase() {
                 spec: { displayName: "Web app", redirectUris: ["https://app.example.com/cb"] }
             """.trimIndent(),
         )
-        assertThat(runCli("provision", "apply", "--file", file.path, "--gateway", baseUrl(), "--yes").exit).isEqualTo(0)
+        // `web` has no clientType ⇒ confidential (product-api's default) ⇒ a one-time secret is minted; deliver it to a file.
+        val secretFile = File(tempHome.toFile(), "web.secret")
+        val applied = runCli("provision", "apply", "--file", file.path, "--gateway", baseUrl(), "--yes", "--secret-file", secretFile.path)
+        assertThat(applied.exit).isEqualTo(0)
         assertThat(api.writes.single().env).isNull()
         val id = api.applications.single()["clientId"]
+        assertThat(secretFile.readText().trim()).isEqualTo(api.mintedSecrets[id])
+        assertThat(applied.out).doesNotContain(api.mintedSecrets[id])
         api.reset()
 
         val refused = runCli("provision", "destroy", "--file", file.path, "--gateway", baseUrl(), "--yes")
@@ -144,6 +149,96 @@ class ProvisionCommandTest : CommandTestBase() {
         assertThat(paths()).containsExactly("DELETE /api/v1/users/$userId")
         val recorded = ProvisionReceiptStore().read(File(file.parentFile, "provision.receipt.json"))!!
         assertThat(recorded.resources.map { it.key }).containsExactly("environment/ci", "application/rp")
+    }
+
+    @Test
+    fun `apply delivers a minted client secret through --secret-file and exits EXIT_NO_SECRET when it cannot`() {
+        // SSO-3113 — a confidential client_credentials application (a least-privilege CI identity).
+        val file = writeFile(
+            "provision.yaml",
+            """
+            apiVersion: thoryn.io/provision/v1
+            resources:
+              - kind: environment
+                name: ci
+                spec: { slug: ci-sbx }
+              - kind: application
+                name: ci-worker
+                environment: ci
+                spec: { displayName: "CI worker", clientType: confidential, grantTypes: [client_credentials] }
+            """.trimIndent(),
+        )
+        val plan = runCli("provision", "plan", "--file", file.path, "--gateway", baseUrl())
+        assertThat(plan.out).contains("(a client secret will be minted and shown once)")
+
+        // No --secret-file and a non-TTY stdout ⇒ SecretIo refuses; the client is still created + owned; exit 65.
+        val refused = runCli("provision", "apply", "--file", file.path, "--gateway", baseUrl(), "--yes")
+        assertThat(refused.exit).isEqualTo(com.devnow.thoryn.cli.cmd.SecretIo.EXIT_NO_SECRET)
+        val clientId = api.applications.single()["clientId"].toString()
+        val secret = api.mintedSecrets.getValue(clientId)
+        assertThat(refused.out).doesNotContain(secret)
+        assertThat(refused.err).doesNotContain(secret).contains("thoryn clients rotate-secret $clientId")
+        val receipt = ProvisionReceiptStore().read(File(file.parentFile, "provision.receipt.json"))!!
+        assertThat(receipt.resources.map { it.key }).containsExactly("environment/ci", "application/ci-worker")
+        assertThat(File(file.parentFile, "provision.receipt.json").readText()).doesNotContain(secret)
+
+        // A second confidential client, this time with --secret-file: delivered to the owner-only file, never stdout.
+        file.appendText(
+            "\n" + """
+            - kind: application
+              name: reporter
+              environment: ci
+              spec: { displayName: "Reporter", grantTypes: [client_credentials] }
+            """.trimIndent().prependIndent("  ") + "\n",
+        )
+        val secretFile = File(tempHome.toFile(), "reporter.secret")
+        val delivered = runCli("provision", "apply", "--file", file.path, "--gateway", baseUrl(), "--yes", "--secret-file", secretFile.path)
+        assertThat(delivered.exit).isEqualTo(0)
+        val reporterId = api.applications.last()["clientId"].toString()
+        assertThat(secretFile.readText().trim()).isEqualTo(api.mintedSecrets.getValue(reporterId))
+        assertThat(delivered.out).doesNotContain(api.mintedSecrets.getValue(reporterId)).contains("Applied. 3 resource(s) owned.")
+        assertThat(delivered.err).contains("written to").doesNotContain(api.mintedSecrets.getValue(reporterId))
+    }
+
+    @Test
+    fun `apply converges a resource's grants and plan lists the grant changes`() {
+        val file = writeFile(
+            "provision.yaml",
+            """
+            apiVersion: thoryn.io/provision/v1
+            resources:
+              - kind: environment
+                name: ci
+                spec: { slug: ci-sbx }
+                grants:
+                  - { subject: "client:cli-ci", relation: manager }
+            """.trimIndent(),
+        )
+        val plan = runCli("provision", "plan", "--file", file.path, "--gateway", baseUrl())
+        assertThat(plan.exit).isEqualTo(0)
+        assertThat(plan.out).contains("environment ci: grant + client:cli-ci manager").contains("1 grant change(s).")
+
+        val apply = runCli("provision", "apply", "--file", file.path, "--gateway", baseUrl(), "--yes")
+        assertThat(apply.err).isEmpty()
+        assertThat(apply.exit).isEqualTo(0)
+        val envId = api.environments.single()["id"]
+        assertThat(paths()).containsExactly("POST /api/v1/environments", "POST /api/v1/access/grants")
+        assertThat(api.writes[1].body).isEqualTo(mapOf("subject" to "client:cli-ci", "relation" to "manager", "object" to "environment:$envId"))
+        assertThat(apply.out).contains("+ grant environment ci: client:cli-ci manager on environment:$envId")
+
+        // Converged: a second apply reads the grants and writes nothing.
+        api.reset()
+        val again = runCli("provision", "apply", "--file", file.path, "--gateway", baseUrl(), "--yes")
+        assertThat(again.exit).isEqualTo(0)
+        assertThat(again.out).contains("No changes.")
+        assertThat(api.writes).isEmpty()
+
+        // Without tenant:access.write the apply fails closed with the scope named (the sandbox stays owned).
+        api.denyGrantWrites = true
+        api.seedGrant("client:stale", "viewer", "environment:$envId")
+        val denied = runCli("provision", "apply", "--file", file.path, "--gateway", baseUrl(), "--yes")
+        assertThat(denied.exit).isNotEqualTo(0)
+        assertThat(denied.err).contains("tenant:access.write").contains("thoryn login --scope tenant:access.write")
     }
 
     @Test

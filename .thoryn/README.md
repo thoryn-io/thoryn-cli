@@ -35,7 +35,7 @@ no longer hosts it. A founder creates it **once** as a real customer would:
 ```bash
 # a thoryn workspace admin, requesting every scope the file grants the client (the hub can only let
 # you grant what your own session holds — SSO-1028's intersection rule)
-thoryn login --workspace thoryn --scope "openid offline_access tenant:applications.read tenant:applications.write tenant:clients.read tenant:users.read tenant:users.write tenant:federation.read tenant:federation.write tenant:audit.read tenant:environments.read tenant:environments.write tenant:email.read tenant:email.write tenant:idp.read tenant:idp.write"
+thoryn login --workspace thoryn --scope "openid offline_access tenant:applications.read tenant:applications.write tenant:clients.read tenant:users.read tenant:users.write tenant:federation.read tenant:federation.write tenant:audit.read tenant:environments.read tenant:environments.write tenant:email.read tenant:email.write tenant:idp.read tenant:idp.write tenant:access.read tenant:access.write"
 thoryn provision plan  --file .thoryn/provision.yaml
 thoryn provision apply --file .thoryn/provision.yaml --yes
 ```
@@ -43,6 +43,28 @@ thoryn provision apply --file .thoryn/provision.yaml --yes
 Every later `apply` — CI signs in as the CI machine client, whose receipt does not own `cli` — **adopts**
 it by its fixed id and converges its non-secret shape; adopted resources are never removed by
 `destroy`, so CI cannot delete the client it depends on. Rotating it is editing this file.
+
+## Least-privilege CI identity (coming with SSO-3113 / SSO-3112 — not yet cut over)
+
+Today the CI identity `connection.json` names is a **workspace-wide** machine client: its scope set
+(`applications` + `federation` + `users` + `environments`, read+write) reaches every environment of
+the `thoryn` workspace, not just the `cli-ci` sandbox it provisions. Epic SSO-3108 narrows that to
+**least privilege**: a machine client that is `manager` of exactly one sandbox.
+
+What has shipped in the CLI (SSO-3113, this repo): `thoryn access grant | revoke | list | mine`,
+a `grants:` block on any resource of a provisioning file (converged with the resource — the object
+derives from the receipt id, e.g. `client:cli-ci manager` on the `ci` environment ⇒
+`environment:<id>`), and `provision apply --secret-file` delivering a provisioned confidential
+client's one-time secret through the `SecretIo` channel (never the receipt). The `cli` login client
+below now also lists `tenant:access.read` / `tenant:access.write`.
+
+What has **not** happened yet, deliberately: this file does not declare a `cli-ci` machine client,
+`connection.json` is unchanged, and `thoryn provision ci-identity` is untouched. Those are the
+cut-over steps and they wait for the product side (**SSO-3112** — the `/api/v1/access` API and the
+two `tenant:access.*` scopes) to deploy: a founder must hold `tenant:access.*` to re-apply this
+file with them, and a `grants:` block needs the API to converge against. Until then, `apply` with
+a session lacking `tenant:access.write` fails closed on a `grants:` block (the resource itself is
+still recorded), and the extra `cli` scopes above are grantable only once the hub knows them.
 
 ## One-time bootstrap (founder, run once)
 
@@ -69,7 +91,9 @@ both the ceiling and the floor. It must stay a **subset** of what `thoryn provis
 the client (the declarative spec `src/main/resources/provision/ci-identity.json`) —
 `CiConnectionConfinementTest` asserts exactly that — and it must **cover every resource kind
 `provision.yaml` declares** (`environment` → `tenant:environments.write`, `application` →
-`tenant:applications.write`) — `CiProvisionFileConformanceTest` asserts that (SSO-3090).
+`tenant:applications.write`) — `CiProvisionFileConformanceTest` asserts that (SSO-3090). The same
+test pins the `cli` login client's scope list to **exactly** the tenant scopes the CLI's sources
+reference — which is why `tenant:access.read` / `tenant:access.write` (SSO-3113) appear on it.
 
 ## Confinement
 
