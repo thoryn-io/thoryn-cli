@@ -66,7 +66,7 @@ internal data class RemovalOutcome(val remaining: ProvisionReceipt, val failures
  * before any write: an owned resource by its recorded id (a 404 means it was deleted out of band and is
  * re-created); an unowned one by its natural key (environment `slug`, application `displayName` within
  * its environment, user `email`, federation member `displayName`, the per-environment singletons by
- * existence). Found + equal ⇒ `noop`; found + different ⇒ `update` with exactly the changed fields;
+ * existence — `loginMethods` (SSO-3100) by its stored allow-list, compared as a set). Found + equal ⇒ `noop`; found + different ⇒ `update` with exactly the changed fields;
  * found but not yet managed ⇒ `adopt` (recorded as owned with `adopted=true` — converged from then on,
  * but NEVER deleted by `destroy`/`--prune`: the CLI only removes what it created); absent ⇒ `create`.
  * A second `apply` therefore issues no writes.
@@ -309,6 +309,14 @@ internal class ProvisionEngine(
                 else -> Live(version ?: "", mapOf("activeVersion" to "${version ?: "(none)"} → re-apply template ${desired["templateId"]}"))
             }
         }
+        ProvisionFile.KIND_LOGIN_METHODS -> {
+            // SSO-3100 — the stored allow-list (null ⇒ the platform default policy, nothing to converge
+            // against unless already owned). Compared as a SET: order is display-only.
+            val stored = clients(slug).getLoginMethods()["stored"]?.takeIf { !it.isNull && it.isArray }
+            val wanted = (desired["methods"] as? List<*>)?.map { it.toString().trim().lowercase() }
+            if (stored == null && owned == null) null
+            else Live("login-methods", diffOf(mapOf("methods" to wanted), mapOf("methods" to stored?.let { plain(it) })))
+        }
         else -> null
     }
 
@@ -353,6 +361,7 @@ internal class ProvisionEngine(
             ProvisionFile.KIND_EMAIL_PROVIDER -> putEmailProvider(r, targetSlug(r, file, owned), spec, "+")
             ProvisionFile.KIND_LOGIN_THEME -> putLoginTheme(r, targetSlug(r, file, owned), spec, "+")
             ProvisionFile.KIND_LOGIN_FLOW -> applyLoginFlow(r, targetSlug(r, file, owned), spec, "+")
+            ProvisionFile.KIND_LOGIN_METHODS -> putLoginMethods(r, targetSlug(r, file, owned), spec, "+")
             else -> throw ProvisionException("${r.key}: unsupported kind '${r.kind}'")
         }
     }
@@ -390,6 +399,7 @@ internal class ProvisionEngine(
             ProvisionFile.KIND_EMAIL_PROVIDER -> putEmailProvider(r, slug, spec, "~").copy(adopted = change.adopted)
             ProvisionFile.KIND_LOGIN_THEME -> putLoginTheme(r, slug, spec, "~").copy(adopted = change.adopted)
             ProvisionFile.KIND_LOGIN_FLOW -> applyLoginFlow(r, slug, spec, "~").copy(adopted = change.adopted)
+            ProvisionFile.KIND_LOGIN_METHODS -> putLoginMethods(r, slug, spec, "~").copy(adopted = change.adopted)
             else -> throw ProvisionException("${r.key}: unsupported kind '${r.kind}'")
         }
     }
@@ -465,6 +475,19 @@ internal class ProvisionEngine(
         return OwnedResource(r.kind, r.name, version.toString(), slug, mapOf("templateId" to templateId, "activated" to activate.toString()))
     }
 
+    /**
+     * SSO-3100 — PUT the FULL sign-in method allow-list (`thoryn login-methods set`): replace, not merge.
+     * Tokens are normalised (trimmed, lower-cased); the server rejects an unknown or empty list.
+     */
+    private fun putLoginMethods(r: ProvisionResource, slug: String?, spec: Map<String, Any?>, mark: String): OwnedResource {
+        val methods = (spec["methods"] as? List<*>).orEmpty().mapNotNull { it?.toString()?.trim()?.lowercase()?.takeIf { m -> m.isNotEmpty() } }.distinct()
+        if (methods.isEmpty()) throw ProvisionException("${r.key}: spec.methods must list at least one sign-in method")
+        val resp = clients(slug).putLoginMethods(methods)
+        val stored = resp["stored"]?.takeIf { !it.isNull && it.isArray }?.toList()?.map { it.asString() } ?: methods
+        out.println("  $mark loginMethods: ${stored.joinToString(", ")}")
+        return OwnedResource(r.kind, r.name, "login-methods", slug, mapOf("methods" to stored.joinToString(",")))
+    }
+
     // ── per-kind remove ──────────────────────────────────────────────────────────────────────────
 
     private fun remove(o: OwnedResource, confirmSlug: String?) {
@@ -489,6 +512,11 @@ internal class ProvisionEngine(
             ProvisionFile.KIND_EMAIL_PROVIDER -> {
                 clients(o.environment).deleteEmailProvider(confirmSlug)
                 out.println("  - emailProvider: reset to the platform sender")
+            }
+            ProvisionFile.KIND_LOGIN_METHODS -> {
+                // SSO-3100 — the delete path IS a reset: back to the default (every method offered).
+                clients(o.environment).resetLoginMethods()
+                out.println("  - loginMethods: reset to the default (every method offered)")
             }
             else -> throw ProvisionException("${o.key}: no delete API for kind '${o.kind}'")
         }
@@ -617,7 +645,7 @@ internal class ProvisionEngine(
         val ENV_NAME_PATTERN = Regex("^[A-Za-z_][A-Za-z0-9_]*$")
         val ENV_PLACEHOLDER = Regex("""\{\{\s*env\.([A-Za-z_][A-Za-z0-9_]*)\s*}}""")
 
-        /** Kinds the customer plane can delete; `loginTheme` / `loginFlow` have no delete surface. */
+        /** Kinds the customer plane can delete; `loginTheme` / `loginFlow` have no delete surface (`loginMethods` resets via DELETE, SSO-3100). */
         fun deletable(kind: String): Boolean = kind !in setOf(ProvisionFile.KIND_LOGIN_THEME, ProvisionFile.KIND_LOGIN_FLOW)
 
         /** Owned, created by this file (not adopted), and of a deletable kind. */

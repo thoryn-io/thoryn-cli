@@ -274,4 +274,97 @@ class ProvisionConvergeTest : CommandTestBase() {
         assertThat(pattern.matches("sbx-signin-42-1")).isTrue()
         assertThat(pattern.matches("Bad_Slug")).isFalse()
     }
+
+    @Test
+    fun `loginMethods converges the sign-in allow-list as a set — PUT on create, no-op on reorder, reset on destroy`() {
+        // SSO-3100 — the per-environment singleton behind `thoryn login-methods set | reset`.
+        val f = file(
+            """
+            apiVersion: thoryn.io/provision/v1
+            resources:
+              - kind: environment
+                name: ci
+                spec: { slug: ci-sbx }
+              - kind: loginMethods
+                environment: ci
+                spec: { methods: [password, magic_link, Passkey] }
+            """,
+        )
+        val first = apply(f, null)
+        assertThat(first.resources.map { it.key }).containsExactly("environment/ci", "loginMethods/loginMethods")
+        val put = api.writes.single { it.path == "/api/v1/login-methods" }
+        assertThat(put.method).isEqualTo("PUT")
+        assertThat(put.env).isEqualTo("ci-sbx")
+        // The FULL allow-list, normalised (trimmed + lower-cased), replaces whatever was stored.
+        assertThat(put.body["methods"]).isEqualTo(listOf("password", "magic_link", "passkey"))
+        assertThat(first.resources[1].attributes["methods"]).isEqualTo("password,magic_link,passkey")
+
+        // Same set in a different order ⇒ no diff, no write (order is display-only).
+        api.reset()
+        val reordered = file(
+            """
+            apiVersion: thoryn.io/provision/v1
+            resources:
+              - { kind: environment, name: ci, spec: { slug: ci-sbx } }
+              - { kind: loginMethods, environment: ci, spec: { methods: [passkey, password, magic_link] } }
+            """,
+        )
+        assertThat(engine().plan(reordered, first, false).changes.map { it.action }).allMatch { it == ChangeAction.NOOP }
+        apply(reordered, first)
+        assertThat(api.writes).isEmpty()
+
+        // A different set ⇒ exactly one PUT carrying the new full list.
+        val changed = file(
+            """
+            apiVersion: thoryn.io/provision/v1
+            resources:
+              - { kind: environment, name: ci, spec: { slug: ci-sbx } }
+              - { kind: loginMethods, environment: ci, spec: { methods: [password, magic_code] } }
+            """,
+        )
+        val plan = engine().plan(changed, first, false)
+        assertThat(plan.changes.first { it.kind == "loginMethods" }.action).isEqualTo(ChangeAction.UPDATE)
+        assertThat(plan.changes.first { it.kind == "loginMethods" }.diff.keys).containsExactly("methods")
+        val second = apply(changed, first)
+        assertThat(api.writes.map { it.method + " " + it.path }).containsExactly("PUT /api/v1/login-methods")
+        assertThat(api.loginMethods["ci-sbx"]).isEqualTo(listOf("password", "magic_code"))
+
+        // Reset out of band (stored ⇒ null) while owned ⇒ re-applied on the next apply.
+        api.loginMethods.remove("ci-sbx")
+        api.reset()
+        apply(changed, second)
+        assertThat(api.writes.map { it.method + " " + it.path }).containsExactly("PUT /api/v1/login-methods")
+
+        // destroy: the delete path IS the reset (DELETE /login-methods), child-first before the sandbox.
+        api.reset()
+        val outcome = engine().destroy(second, "acme") {}
+        assertThat(outcome.failures).isEmpty()
+        assertThat(api.writes.map { it.method + " " + it.path }).containsExactly("DELETE /api/v1/login-methods", "DELETE /api/v1/environments/${second.resources[0].id}")
+        assertThat(api.writes[0].env).isEqualTo("ci-sbx")
+        assertThat(api.loginMethods).isEmpty()
+        assertThat(outcome.remaining.resources).isEmpty()
+    }
+
+    @Test
+    fun `an unmanaged stored login-method policy is adopted when it matches and updated when it differs`() {
+        api.seedEnvironment("ci-sbx")
+        api.loginMethods["ci-sbx"] = listOf("password", "magic_link")
+        val f = file(
+            """
+            apiVersion: thoryn.io/provision/v1
+            resources:
+              - { kind: environment, name: ci, spec: { slug: ci-sbx } }
+              - { kind: loginMethods, environment: ci, spec: { methods: [magic_link, password] } }
+            """,
+        )
+        val plan = engine().plan(f, null, false)
+        assertThat(plan.changes.map { it.action }).containsExactly(ChangeAction.ADOPT, ChangeAction.ADOPT)
+        val receipt = apply(f, null)
+        assertThat(api.writes).isEmpty()
+        assertThat(receipt.resources[1].adopted).isTrue()
+        // Adopted ⇒ destroy leaves the policy in place (it was not set by this file).
+        engine().destroy(receipt, "acme") {}
+        assertThat(api.writes).isEmpty()
+        assertThat(api.loginMethods["ci-sbx"]).isEqualTo(listOf("password", "magic_link"))
+    }
 }

@@ -48,6 +48,9 @@ class ProvisionSchemaConformanceTest {
           - kind: loginTheme
             environment: ci
             spec: { primaryColor: "#0f62fe", theme: light }
+          - kind: loginMethods
+            environment: ci
+            spec: { methods: [password, magic_link, passkey] }
     """.trimIndent()
 
     @Test
@@ -63,7 +66,7 @@ class ProvisionSchemaConformanceTest {
         val file = ProvisionFile.parse(representative.toByteArray(), "provision.yaml")
         assertThat(file.digest).startsWith("sha256:")
         assertThat(file.resources.map { it.key }).containsExactly(
-            "environment/ci", "application/loopback-rp", "user/tester", "emailProvider/emailProvider", "loginTheme/loginTheme",
+            "environment/ci", "application/loopback-rp", "user/tester", "emailProvider/emailProvider", "loginTheme/loginTheme", "loginMethods/loginMethods",
         )
         assertThat(file.resources[1].environment).isEqualTo("ci")
         assertThat(file.environmentResource("ci")).isNotNull
@@ -74,7 +77,7 @@ class ProvisionSchemaConformanceTest {
     @Test
     fun `the same document parses as JSON`() {
         val asJson = json.writeValueAsBytes(yaml.readTree(representative))
-        assertThat(ProvisionFile.parse(asJson, "provision.json", yaml = false).resources).hasSize(5)
+        assertThat(ProvisionFile.parse(asJson, "provision.json", yaml = false).resources).hasSize(6)
     }
 
     @Test
@@ -133,6 +136,30 @@ class ProvisionSchemaConformanceTest {
         assertThat(v).anyMatch { it.contains("name 'Bad_Name'") }
         assertThat(v).anyMatch { it.contains("spec.templateId is required") }
         assertThat(v).anyMatch { it.contains("duplicate resource 'application/dup'") }
+    }
+
+    @Test
+    fun `loginMethods requires a non-empty list of method names`() {
+        // SSO-3100 — the singleton's `methods` is the FULL allow-list; an absent, empty, or non-string list is rejected.
+        val bad = yaml.readTree(
+            """
+            apiVersion: thoryn.io/provision/v1
+            resources:
+              - { kind: loginMethods, environment: ci, spec: { } }
+              - { kind: loginMethods, name: empty, environment: ci, spec: { methods: [] } }
+              - { kind: loginMethods, name: blank, environment: ci, spec: { methods: [password, ""] } }
+            """.trimIndent(),
+        )
+        val v = ProvisionFile.validate(bad)
+        assertThat(v).anyMatch { it.contains("resources[0] (loginMethods) spec.methods is required") }
+        assertThat(v).anyMatch { it.contains("resources[1] (loginMethods) spec.methods is required") }
+        assertThat(v).anyMatch { it.contains("resources[2]") && it.contains("non-empty method names") }
+        // The schema pins the same shape: minItems 1, string items, and the kind is a singleton (no name needed).
+        val methods = schema["\$defs"]["resource"]["allOf"].toList()
+            .first { it["if"]["properties"]["kind"]["const"].asString() == "loginMethods" }["then"]["properties"]["spec"]["properties"]["methods"]
+        assertThat(methods["minItems"].asInt()).isEqualTo(1)
+        assertThat(methods["items"]["type"].asString()).isEqualTo("string")
+        assertThat(ProvisionFile.SINGLETON_KINDS).contains(ProvisionFile.KIND_LOGIN_METHODS)
     }
 
     @Test

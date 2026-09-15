@@ -14,6 +14,10 @@
         "comment": "SSO-2873 — bundled example recipes the RecipeInterpreter reads from the classpath at runtime (examples/recipes/<id>/recipe.json). native-image strips un-referenced resources, so list them explicitly. JSON (not YAML) is shipped so the runtime needs no YAML parser."
       },
       {
+        "pattern": "^examples/recipes/.*/provision\\.(ya?ml|json)$",
+        "comment": "SSO-3100 — a bundled recipe's provisioning file (examples/recipes/<id>/provision.yaml), referenced by the recipe's `provision` key and converged by `examples apply` before the steps run. Read from the classpath next to recipe.json; native-image strips un-referenced resources, so list it explicitly."
+      },
+      {
         "pattern": "^examples/recipe\\.schema\\.json$",
         "comment": "SSO-2872 — the recipe schema, bundled for reference/validation."
       },

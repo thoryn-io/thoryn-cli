@@ -5,6 +5,7 @@ import com.devnow.thoryn.cli.cmd.CommandSupport
 import com.devnow.thoryn.cli.cmd.examples.Example
 import com.devnow.thoryn.cli.cmd.examples.ExampleContext
 import com.devnow.thoryn.cli.cmd.examples.NodeRelyingParty
+import com.devnow.thoryn.cli.cmd.provision.ProvisionFile
 
 /**
  * SSO-2871 — an [Example] whose `setup` / `teardown` are driven by a declarative [Recipe] via
@@ -13,6 +14,9 @@ import com.devnow.thoryn.cli.cmd.examples.NodeRelyingParty
  * SSO-2880). The RP logic lives in exactly one place — the readable Node app in `thoryn-examples` —
  * not in the CLI; `run` only obtains the verified asset and orchestrates the browser flow via
  * [NodeRelyingParty]. The in-process Kotlin RP was retired with SSO-2880.
+ *
+ * SSO-3100 — when the recipe references a provisioning file (`provision:`), `setup` converges it FIRST
+ * (via the interpreter) and `teardown` destroys what it created AFTER the recipe's own teardown actions.
  */
 internal class RecipeExample(
     private val recipe: Recipe,
@@ -36,6 +40,7 @@ internal class RecipeExample(
             ctx.out.println()
             ctx.out.println("Setup complete (recipe ${recipe.id} v${recipe.version}). Live state:")
             ctx.info("workspace slug : ${run.state.workspaceSlug}")
+            run.state.environmentSlug?.let { ctx.info("environment    : $it") }
             run.state.tenantIssuer?.let { ctx.info("tenant issuer  : $it") }
             run.state.identityHost?.let { ctx.info("sign-in host   : $it") }
             run.state.clientId?.let { ctx.info("app client id  : $it") }
@@ -80,19 +85,34 @@ internal class RecipeExample(
         )
     }
 
-    /** The space-separated scopes the recipe's `applications.create` step requests, or null. */
+    /**
+     * The space-separated scopes the recipe's `applications.create` step requests — or, SSO-3100, the
+     * scopes of the first `application` resource in the recipe's provisioning file when the app was
+     * provisioned rather than created by a step — else null.
+     */
     private fun requestedScopes(): String? =
         recipe.steps.firstOrNull { it["action"]?.asString() == "applications.create" }
             ?.get("with")?.get("scopes")?.takeIf { !it.isNull }
             ?.toList()?.mapNotNull { it.asString() }?.takeIf { it.isNotEmpty() }
             ?.joinToString(" ")
+            ?: runCatching { recipe.provisionFile() }.getOrNull()
+                ?.resources?.firstOrNull { it.kind == ProvisionFile.KIND_APPLICATION }
+                ?.spec?.get("scopes")?.let { it as? List<*> }
+                ?.mapNotNull { it?.toString() }?.takeIf { it.isNotEmpty() }
+                ?.joinToString(" ")
 
     override fun teardown(ctx: ExampleContext): Int {
         val state = ctx.state.read(name) ?: run {
             ctx.info("Nothing to tear down — no '$name' state found.")
             return CommandSupport.EXIT_OK
         }
-        RecipeInterpreter(ctx, recipe).teardown(state)
+        // SSO-3100 — false when the recipe's provisioning file still owns resources that could not be
+        // removed: the state (and the provisioning receipt) are KEPT so a re-run can retry.
+        val clean = RecipeInterpreter(ctx, recipe).teardown(state)
+        if (!clean) {
+            ctx.warn("Some provisioned resources remain; state kept — re-run `thoryn examples teardown $name` to retry.")
+            return CommandSupport.EXIT_HTTP_ERROR
+        }
         ctx.state.clear(name)
         receiptStore.clear(name)
         ctx.out.println()

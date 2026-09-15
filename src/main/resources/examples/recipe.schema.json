@@ -2,10 +2,14 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://thoryn.io/examples/recipe.schema.json",
   "title": "Thoryn example recipe",
-  "description": "SSO-2871 (Phase 0, SSO-2872) — a declarative, in-boundary product example the CLI applies to the caller's own account using only supported product workflows. Recipes are DATA, not code: the CLI is the only executor. The `action`/`assert` enums are a CLOSED allowlist mapping to supported product APIs — this is what structurally enforces the CLAUDE.md product-boundary rule (a recipe cannot express a DB seed, a demo endpoint, or any unsupported shortcut).",
+  "description": "SSO-2871 (Phase 0, SSO-2872) — a declarative, in-boundary product example the CLI applies to the caller's own account using only supported product workflows. Recipes are DATA, not code: the CLI is the only executor. The `action`/`assert` enums are a CLOSED allowlist mapping to supported product APIs — this is what structurally enforces the CLAUDE.md product-boundary rule (a recipe cannot express a DB seed, a demo endpoint, or any unsupported shortcut). SSO-3100 (epic SSO-3087): a recipe is an ORCHESTRATION file — the infrastructure a normal end user configures (environment / sandbox, application, demo user, sign-in methods, look-and-feel, login flow, email provider, federation member) is declared in the provisioning file it references under `provision` (`provision.schema.json`, converged by the same engine as `thoryn provision apply`), and the recipe carries only what is extra to RUN the example. `thoryn examples apply` provisions that file FIRST; `examples teardown` destroys it after the recipe's own teardown. A recipe declares `provision`, `steps`, or both (`anyOf` below): omit `steps` when the provisioning file carries everything. Authoring note: `provision` is recipe-relative (no `..`, no absolute path), the file ships NEXT TO `recipe.json` in the signed catalog bundle and in the CLI's bundled resources, and — like the recipe — it never carries a secret VALUE: name the env var (`passwordEnv: demoPassword`) or a `{{env.NAME}}` placeholder, which the CLI resolves FIRST from the recipe's params (a `demoPassword` param, marked `secret: true`) and THEN from the process environment.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["apiVersion", "id", "version", "summary", "steps"],
+  "required": ["apiVersion", "id", "version", "summary"],
+  "anyOf": [
+    { "required": ["provision"] },
+    { "required": ["steps"] }
+  ],
   "properties": {
     "apiVersion": {
       "description": "Recipe schema version.",
@@ -25,6 +29,11 @@
       "description": "One-line description shown by `thoryn examples catalog`.",
       "type": "string",
       "minLength": 1
+    },
+    "provision": {
+      "description": "SSO-3100 — recipe-relative path of the provisioning file (`provision.schema.json`) that declares the example's infrastructure as DESIRED STATE (e.g. `./provision.yaml`). `examples apply` converges it BEFORE the steps run (a second apply issues no writes; a leftover sandbox is adopted by its slug) and `examples teardown` destroys what it created, child-first, AFTER the recipe's own teardown. Provisioned resources are addressable from steps / verify as `{{provision.<kind>.<name>.id}}` (plus `.slug` for an environment, `.email` for a user, `.clientId` / `.redirectUri` for an application); the first `environment` resource becomes the environment later steps and `examples run` target. Recipe params feed the provisioning file's `{{env.NAME}}` placeholders and `<key>Env` secret references by param name.",
+      "type": "string",
+      "pattern": "^(\\./)?[A-Za-z0-9_-][A-Za-z0-9._-]*(/[A-Za-z0-9_-][A-Za-z0-9._-]*)*\\.(ya?ml|json)$"
     },
     "requires": {
       "description": "Preconditions the CLI checks before applying the recipe.",
@@ -56,7 +65,7 @@
       }
     },
     "steps": {
-      "description": "Ordered provisioning actions. Each maps to a supported product API; results are addressable as {{<step id>.<field>}} in later steps.",
+      "description": "Ordered actions that are EXTRA to the provisioning file (SSO-3100: infrastructure belongs in `provision`; a recipe with a provisioning file usually needs no steps and omits this key). Each maps to a supported product API; results are addressable as {{<step id>.<field>}} in later steps.",
       "type": "array",
       "minItems": 1,
       "items": {

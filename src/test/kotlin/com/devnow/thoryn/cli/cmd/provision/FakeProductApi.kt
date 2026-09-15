@@ -25,10 +25,16 @@ internal class FakeProductApi : Dispatcher() {
     val emailProviders = mutableMapOf<String?, MutableMap<String, Any?>>()
     val branding = mutableMapOf<String?, MutableMap<String, Any?>>()
     val activeFlow = mutableMapOf<String?, Int>()
+    /** SSO-3100 — the stored sign-in method allow-list per environment (absent ⇒ the default policy). */
+    val loginMethods = mutableMapOf<String?, List<String>>()
+    private val supportedLoginMethods = listOf("password", "magic_link", "magic_code", "passkey", "totp", "sms")
     private var seq = 0
     private val mapper = JsonMapper.builder().addModule(kotlinModule()).build()
 
     fun writesTo(pathPrefix: String) = writes.filter { it.path.startsWith(pathPrefix) }
+
+    /** SSO-3100 — the PROVISIONING writes only: the recipe interpreter's best-effort receipt attestation POST is not one. */
+    val provisioningWrites: List<Write> get() = writes.filter { !it.path.startsWith("/api/v1/attestations") }
     fun reset() { writes.clear() }
 
     fun seedEnvironment(slug: String, name: String = slug): String =
@@ -151,6 +157,18 @@ internal class FakeProductApi : Dispatcher() {
                 val stored = branding.getOrPut(env) { mutableMapOf() }; stored.putAll(b)
                 json(200, mapOf("stored" to stored, "effective" to (mapOf("theme" to "light", "primaryColor" to "#000000") + stored)))
             }
+            // ── login methods (singleton per env; SSO-3100 — product-api /api/v1/login-methods) ──
+            route == "/api/v1/login-methods" && method == "GET" -> {
+                val stored = loginMethods[env]
+                json(200, mapOf("stored" to stored, "effective" to (stored ?: supportedLoginMethods), "supported" to supportedLoginMethods))
+            }
+            route == "/api/v1/login-methods" && method == "PUT" -> {
+                val methods = (b["methods"] as? List<*>).orEmpty().map { it.toString() }
+                if (methods.isEmpty() || methods.any { it !in supportedLoginMethods }) return problem(400, "invalid_login_method")
+                loginMethods[env] = methods
+                json(200, mapOf("stored" to methods, "effective" to methods, "supported" to supportedLoginMethods))
+            }
+            route == "/api/v1/login-methods" && method == "DELETE" -> { loginMethods.remove(env); MockResponse().setResponseCode(204) }
             // ── login flows ──
             route == "/api/v1/login-flows/active" && method == "GET" ->
                 activeFlow[env]?.let { json(200, mapOf("version" to it, "status" to "active", "stages" to emptyList<Any>())) } ?: problem(404, "not_found")
@@ -160,6 +178,9 @@ internal class FakeProductApi : Dispatcher() {
                 val v = (b["version"] as Number).toInt(); activeFlow[env] = v
                 json(200, mapOf("version" to v, "status" to "active", "stages" to emptyList<Any>()))
             }
+            // ── receipt attestation (SSO-2878; the recipe interpreter's best-effort signed layer) ──
+            route == "/api/v1/attestations" && method == "POST" ->
+                json(200, mapOf("kid" to "receipt-attestation-fake-v1", "signature" to "sig", "canonicalPayload" to "e30", "attestedAt" to "2026-01-01T00:00:00Z"))
             else -> problem(404, "no_route:$method $route")
         }
     }

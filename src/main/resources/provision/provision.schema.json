@@ -21,8 +21,8 @@
       "required": ["kind", "spec"],
       "properties": {
         "kind": {
-          "description": "CLOSED allowlist of resource kinds, each mapping to one supported product API. `emailProvider`, `loginTheme` and `loginFlow` are singletons per environment (no `name` needed). `user` exists so a scenario can declare its test account; a customer's real users self-register.",
-          "enum": ["environment", "application", "emailProvider", "loginTheme", "loginFlow", "federationMember", "user"]
+          "description": "CLOSED allowlist of resource kinds, each mapping to one supported product API. `emailProvider`, `loginTheme`, `loginFlow` and `loginMethods` are singletons per environment (no `name` needed). `loginMethods` (SSO-3100) is the sign-in METHOD allow-list the hosted login offers (`PUT /api/v1/login-methods`; `destroy` resets it to the default via `DELETE`). `user` exists so a scenario can declare its test account; a customer's real users self-register.",
+          "enum": ["environment", "application", "emailProvider", "loginTheme", "loginFlow", "loginMethods", "federationMember", "user"]
         },
         "name": {
           "description": "Stable converge key (unique per kind within the file). Required for every non-singleton kind.",
@@ -56,7 +56,11 @@
         { "if": { "properties": { "kind": { "const": "emailProvider" } } },
           "then": { "properties": { "spec": { "type": "object", "required": ["smtpHost"] } } } },
         { "if": { "properties": { "kind": { "const": "loginFlow" } } },
-          "then": { "properties": { "spec": { "type": "object", "required": ["templateId"] } } } }
+          "then": { "properties": { "spec": { "type": "object", "required": ["templateId"] } } } },
+        { "if": { "properties": { "kind": { "const": "loginMethods" } } },
+          "then": { "properties": { "spec": { "type": "object", "required": ["methods"], "properties": {
+                      "methods": { "description": "The FULL sign-in method allow-list, in display order (e.g. password, magic_link, magic_code, passkey, totp, sms); the server rejects an unknown token. Converged as a SET (order-insensitive).",
+                                   "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "string", "minLength": 1 } } } } } } }
       ]
     }
   }
