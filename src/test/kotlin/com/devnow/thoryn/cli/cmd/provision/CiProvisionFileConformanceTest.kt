@@ -41,6 +41,18 @@ class CiProvisionFileConformanceTest {
         // Everything a bare `thoryn login` requests is grantable by the client (else: invalid_scope loop).
         val granted = (cli.spec["scopes"] as List<*>).map { it.toString() }.toSet()
         assertThat(granted).containsAll(ThorynConfig.DEFAULT_SCOPE.split(" "))
+        // …and nothing the CLI can never ask for: the grant is exactly openid + offline_access + the
+        // tenant scopes referenced anywhere in the CLI's own sources (a founder must hold each to grant it).
+        val requestable = requestableTenantScopes()
+        assertThat(granted - setOf("openid", "offline_access")).isEqualTo(requestable)
+    }
+
+    /** Every `tenant:<area>.<read|write>` literal under src/main (sources + bundled resources). */
+    private fun requestableTenantScopes(): Set<String> {
+        val root = File(locate(PROVISION_PATH).parentFile.parentFile, "src/main").walkTopDown()
+            .filter { it.isFile && (it.extension == "kt" || it.extension == "json" || it.extension == "yaml") }
+        val pattern = Regex("tenant:[a-z-]+\\.(read|write)")
+        return root.flatMap { f -> pattern.findAll(f.readText()).map { it.value } }.toSet()
     }
 
     @Test

@@ -33,7 +33,9 @@ device-code grant, the tenant-config scope set, first-party) — the platform's 
 no longer hosts it. A founder creates it **once** as a real customer would:
 
 ```bash
-thoryn login --workspace thoryn --scope all-tenant-config   # a thoryn workspace admin
+# a thoryn workspace admin, requesting every scope the file grants the client (the hub can only let
+# you grant what your own session holds — SSO-1028's intersection rule)
+thoryn login --workspace thoryn --scope "openid offline_access tenant:applications.read tenant:applications.write tenant:clients.read tenant:users.read tenant:users.write tenant:federation.read tenant:federation.write tenant:audit.read tenant:environments.read tenant:environments.write tenant:email.read tenant:email.write tenant:idp.read tenant:idp.write"
 thoryn provision plan  --file .thoryn/provision.yaml
 thoryn provision apply --file .thoryn/provision.yaml --yes
 ```

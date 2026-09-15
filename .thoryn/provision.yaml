@@ -36,15 +36,14 @@ resources:
         - "urn:ietf:params:oauth:grant-type:device_code"   # `thoryn login --device-code`
       # RFC 8252 §7.3 literal-IP loopback redirects (port-agnostic); the CLI binds an ephemeral port.
       redirectUris: ["http://127.0.0.1/callback", "http://[::1]/callback"]
-      # The full tenant-config set a `thoryn login [--scope all-tenant-config]` may request: the hub
-      # grants a login only the scopes the client holds AND the admin actually has.
+      # Exactly the scopes any `thoryn` command can request (CiProvisionFileConformanceTest pins this to
+      # the CLI's sources); the hub grants a login only what the client holds AND the admin actually has.
       scopes:
         - openid
         - offline_access
         - tenant:applications.read
         - tenant:applications.write
         - tenant:clients.read
-        - tenant:clients.write
         - tenant:users.read
         - tenant:users.write
         - tenant:federation.read
