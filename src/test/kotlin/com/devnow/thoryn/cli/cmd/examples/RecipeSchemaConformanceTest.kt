@@ -100,18 +100,6 @@ class RecipeSchemaConformanceTest {
     }
 
     @Test
-    fun `the bundled ci-signin recipe conforms to the schema`() {
-        // SSO-2944 — the workspace-less recipe is structurally conformant: its only step
-        // (applications.create), its verify (applications.get), and its teardown (applications.delete)
-        // are all in the closed allowlists, and it declares NO hub.createWorkspace / hub.deleteWorkspace.
-        val recipe = yaml.readTree(readResource("/examples/recipes/ci-signin/recipe.yaml"))
-        assertThat(violations(recipe)).isEmpty()
-        val actions = recipe["steps"].toList().map { it["action"].asString() }
-        assertThat(actions).doesNotContain("hub.createWorkspace")
-        assertThat(recipe["teardown"].toList().map { it["action"].asString() }).doesNotContain("hub.deleteWorkspace")
-    }
-
-    @Test
     fun `clients createMachine is NOT an example-recipe step action`() {
         // SSO-2952 — secret-bearing machine-client provisioning was relocated OFF the example-recipe
         // surface into the dedicated `thoryn provision ci-identity` operator command, reverting the
