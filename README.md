@@ -351,13 +351,11 @@ sign in on the real hosted screens and land on the protected page, which shows y
 ID-token claims. Nothing is added to oathy's deployed services — the app runs only
 for the duration of `run`.
 
-**`ci-signin`** (SSO-2944) is the **workspace-less** sibling: it provisions an
-**ephemeral loopback OAuth client inside a workspace you already own** (no
-`hub.createWorkspace` / `hub.deleteWorkspace`) and tears down only that client. It
-exists because a customer-plane `client_credentials` API key is tenant-scoped and
-cannot create workspaces, so CI (the provisioning Action below) targets a standing
-workspace. Apply it with the standing slug:
-`thoryn examples apply ci-signin --set workspaceSlug=<your-standing-slug> --yes`.
+**`ci-signin`** (SSO-2944) was the **workspace-less** sibling CI used to provision an
+ephemeral loopback client inside a standing workspace. **Retired for CI use by SSO-3090** —
+this repo's own CI now converges `.thoryn/provision.yaml` with `thoryn provision apply`
+(see below). The bundled recipe stays shipped only until the `thoryn-examples`
+conformance workflow moves to provisioning files (SSO-3091); do not build on it.
 
 `run` therefore **requires Node 18+** on your `PATH` and the **verified signed
 catalog** on disk (the RP code lives in exactly one place — the Node asset — not
@@ -373,109 +371,66 @@ name-confirmation guard); those artifacts remain in your account until that
 lands. A `--headless` mode that drives register + sign-in programmatically is a
 planned follow-up (it needs privileged provisioning credentials).
 
-## Provisioning GitHub Action (SSO-2938 → SSO-2944)
+## Provisioning GitHub Action (SSO-2938 → SSO-2944 → SSO-3090)
 
 `.github/actions/provision` is a reusable **composite Action** that configures the
 product as a real customer against **shared staging**, using ONLY the product APIs
-via this CLI and a signed recipe (no DB seeding, no demo endpoints — the
-product-boundary rule applied to CI).
+via this CLI and the two committed `.thoryn/` files (no DB seeding, no demo endpoints,
+no imperative sign-in or provisioning — the product-boundary rule applied to CI).
 
-**The pivot (SSO-2944).** CI authenticates with a **customer-plane
-`client_credentials` API key the operator mints themselves** — not a seeded platform
-client. Such a key is **tenant-scoped** (bound to one workspace via its `tnt` claim)
-and **cannot create workspaces** (workspace-create needs a machine scope a tenant
-admin can't delegate — the SSO-2943 gap). So the Action no longer creates a fresh
-workspace per run; it provisions an **ephemeral OAuth client inside a STANDING
-workspace** the operator owns, and deletes only that client on exit. It:
+**thoryn-cli is the reference consumer (SSO-3090).** A repository binds itself to
+Thoryn with one folder, and this repo's own CI runs exactly that:
 
-1. **builds the CLI from source** (`./mvnw -q -DskipTests package` → `target/thoryn.jar`;
-   switches to a `gh release download --pattern thoryn.jar` once a `cli-v*` release
-   exists, SSO-2936),
-2. **signs in non-interactively** with the tenant-scoped client-credentials API key at
-   the **per-tenant issuer** `https://<slug>.hub.<env>` (derived from the hub base +
-   `workspace-slug`; the shared `api.<env>` gateway is set explicitly), credential from
-   `THORYN_API_KEY=<client-id>:<client-secret>` (never echoed, never an argv flag),
-3. **provisions** with the workspace-less recipe
-   `thoryn examples apply ci-signin --set workspaceSlug=<slug> --yes` — an ephemeral
-   public loopback OAuth client registered UNDER the standing workspace with the
-   caller's own bearer (no `hub.createWorkspace`, no token-exchange),
-4. **exposes** `workspace-slug` / `client-id` / `issuer` as Action outputs (read from
-   the run's receipt), and
-5. **deletes the ephemeral client on exit** in an `if: always()` step
-   (`thoryn examples teardown ci-signin` → `applications.delete` only; the standing
-   workspace and standing user are never touched), so a failed run leaks nothing.
+| File | Declares | Verb |
+|---|---|---|
+| `.thoryn/connection.json` | **who I am** — workspace slug, client id, the *name* of the secret env var, the scope set (SSO-2948) | `thoryn login --connection` |
+| `.thoryn/provision.yaml` | **what I own** — desired-state resources: a sandbox environment + a loopback OAuth client (SSO-3088) | `thoryn provision plan / apply / destroy` |
+
+The Action:
+
+1. **downloads the released CLI** (`gh release download --pattern thoryn.jar` from the
+   latest `cli-v*`, or the `cli-version` input) — it needs **cli-v0.11.0+**, the first
+   release carrying `thoryn provision apply`, and fails loud on an older jar,
+2. **signs in non-interactively** from the connection contract
+   (`thoryn login --connection .thoryn/connection.json`); the secret arrives ONLY as the
+   env var the contract names (`THORYN_CLI_CI_CLIENT_SECRET`), never on argv,
+3. **converges the provisioning file** — `thoryn provision plan` (logged) then
+   `thoryn provision apply --file .thoryn/provision.yaml --yes`: a sandbox `cli-ci` inside
+   the `thoryn` workspace and a public loopback client in it. Apply twice issues no writes;
+   a sandbox left by a failed run is **adopted** by its slug, never duplicated (SSO-3089),
+4. **exposes** `workspace-slug` / `environment` / `client-id` / `issuer` / `receipt` as
+   outputs, read from the secret-free receipt the CLI writes next to the file, and
+5. **destroys on exit** (`thoryn provision destroy --file … --yes`, `if: always()`,
+   disable with `destroy: "false"`): child-first, the sandbox hard-delete cascades the
+   client; adopted resources and the standing workspace are never touched.
 
 The demo caller is `.github/workflows/provision-e2e.yml` (manual `workflow_dispatch`).
 
-### CI provisioning setup (one-time, per environment)
+**Consume it from another repository** (a `thoryn-examples` scenario, a customer
+pipeline): check out *your* repo, then `uses: thoryn-io/thoryn-cli/.github/actions/provision@main`
+with `client-secret`, `connection` and `file` pointing at *your* `.thoryn/` files (paths
+resolve in the caller's workspace). The `secret-env` input must equal the env-var name
+your `connection.json` declares in `auth.secretEnv`.
 
-The Action assumes a **standing workspace**, a **standing test user**, and a
-**tenant-scoped API key** already exist. Create them once as a tenant admin (the
-commands below target staging; adjust the issuer for another environment):
+### CI provisioning setup (one-time)
+
+Everything the run needs is either committed or minted once by a founder:
 
 ```bash
-# 0) Sign in interactively as a tenant admin (authorization-code + PKCE, opens a browser).
+# 0) Sign in interactively as a founder of the `thoryn` workspace (authorization-code + PKCE).
 thoryn login --issuer https://hub.stg.thoryn.org
+thoryn workspace switch thoryn
 
-# 1) Create the STANDING workspace the CI runs will provision into (skip if it exists).
-thoryn workspace create --slug ci-standing --display-name "CI Standing Workspace"
+# 1) Mint the CI machine client (SSO-2952). The secret is shown ONCE, via SecretIo.
+thoryn provision ci-identity --secret-file ci.secret
 
-# 2) Enter it, so the following resources are created UNDER that tenant.
-thoryn workspace switch ci-standing
-
-# 3) Mint the CUSTOMER-PLANE client_credentials API key, scoped to exactly what the
-#    recipe needs. The secret is written to a file (never printed to the CI log).
-#    NOTE (SSO-2943 friction): `clients create` REQUIRES --redirect-uri even for a
-#    machine (client_credentials) client that never redirects — pass a throwaway.
-thoryn clients create \
-  --display-name "CI provisioning key (ci-standing)" \
-  --client-type confidential \
-  --grant-type client_credentials \
-  --scope tenant:applications.write \
-  --scope tenant:applications.read \
-  --redirect-uri https://ci.invalid/unused \
-  --secret-file ci-key.secret
-# → prints the client-id; the secret is in ci-key.secret. Set the repo secret:
-#   THORYN_API_KEY = "<client-id>:<contents of ci-key.secret>"
+# 2) Paste the printed clientId into .thoryn/connection.json (auth.clientId) and commit.
+# 3) Set the GitHub secret THORYN_CLI_CI_CLIENT_SECRET to the contents of ci.secret; shred ci.secret.
+# 4) Dispatch provision-e2e — it converges .thoryn/provision.yaml and destroys it on exit.
 ```
 
-**Standing test user** — there is no `thoryn users create` command yet (another
-SSO-2943 gap), so create the standing sign-in user through the product API with your
-tenant-admin bearer (or the console's Users screen). Against the standing tenant:
-
-```bash
-# $ADMIN_BEARER = a tenant-admin access token for the STANDING tenant (carrying
-# tenant:users.write). Obtain it from your interactive session; it must have iss
-# https://ci-standing.hub.stg.thoryn.org (the standing tenant), i.e. minted after the
-# `workspace switch ci-standing` above.
-curl -sS -X POST https://api.stg.thoryn.org/api/v1/users \
-  -H "Authorization: Bearer $ADMIN_BEARER" \
-  -H "Content-Type: application/json" \
-  -H "X-Thoryn-Environment: production" \
-  -d '{"email":"[email protected]","password":"<strong-password>",
-       "givenName":"CI","familyName":"Tester","emailVerified":true}'
-```
-
-Then, in the thoryn-cli repo's **Actions secrets/vars**:
-
-- secret `THORYN_API_KEY` = `<client-id>:<client-secret>` from step 3,
-- (the standing workspace slug is passed as the workflow's `workspace-slug` input).
-
-**SSO-2943 gaps to close / validate live** (this story is CLI-only and does NOT touch
-oauthy):
-
-- Confirm the hub **issues a usable tenant-scoped token** for a customer-plane
-  `client_credentials` client registered in a non-default tenant, authenticating at
-  `https://<slug>.hub.<env>` — the whole design turns on this. If it is refused, the
-  fallback is a product-API-minted machine credential; record the gap on SSO-2943.
-- `thoryn clients create` requires `--redirect-uri` even for a `client_credentials`
-  client — a throwaway works, but it is friction worth removing.
-- There is no `thoryn users create`; the standing user is created via product-API
-  `POST /api/v1/users` (or the console) until a CLI verb exists.
-
-Live validation is **pending operator setup** — the standing workspace + key don't
-exist yet, so the flow is validated locally only (build, unit tests, recipe/YAML
-parse, `--help` of every invoked command).
+No standing test user and no standing sandbox are needed any more: the provisioning file
+creates (or adopts) the sandbox and the client per run.
 
 ## Build
 
