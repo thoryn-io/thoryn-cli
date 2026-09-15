@@ -5,6 +5,7 @@ import com.devnow.thoryn.cli.auth.Tokens
 import com.devnow.thoryn.cli.cmd.CommandTestBase
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.assertThatThrownBy
+import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import tools.jackson.module.kotlin.jacksonObjectMapper
 import java.io.ByteArrayOutputStream
@@ -17,6 +18,11 @@ import java.io.PrintStream
  * credential); `{{env.NAME}}` placeholders resolve the same way.
  */
 class ProvisionEngineSecretsTest : CommandTestBase() {
+
+    private val api = FakeProductApi()
+
+    @BeforeEach
+    fun mount() { server.dispatcher = api }
 
     private val file = ProvisionFile.parse(
         """
@@ -43,8 +49,6 @@ class ProvisionEngineSecretsTest : CommandTestBase() {
 
     @Test
     fun `env-named secrets are forwarded to the API but never recorded or printed`() {
-        server.enqueue(jsonResponse(201, """{"id":"u-9","email":"t@example.com"}"""))
-        server.enqueue(jsonResponse(200, """{"providerType":"smtp","smtpHost":"smtp.example.com","fromAddress":"no-reply@example.com","configVersion":"3","enabled":true}"""))
         val console = ByteArrayOutputStream()
         val engine = engine(
             mapOf("TEST_USER_EMAIL" to "t@example.com", "TEST_USER_PASSWORD" to "Sup3r-Secret!", "SMTP_PASSWORD" to "smtp-s3cret"),
@@ -54,18 +58,18 @@ class ProvisionEngineSecretsTest : CommandTestBase() {
         val persisted = mutableListOf<ProvisionReceipt>()
         val receipt = engine.apply(file, null, plan, workspace = "acme", confirmSlug = null) { persisted += it }
 
-        val userBody = server.takeRequest().body.readUtf8()
-        assertThat(userBody).contains("\"password\":\"Sup3r-Secret!\"").contains("\"email\":\"t@example.com\"").doesNotContain("passwordEnv")
-        val smtpBody = server.takeRequest().body.readUtf8()
-        assertThat(smtpBody).contains("\"smtpPassword\":\"smtp-s3cret\"").contains("\"smtpPort\":2525").contains("\"enabled\":true")
+        val userBody = api.writes.first { it.path == "/api/v1/users" }.body
+        assertThat(userBody).containsEntry("password", "Sup3r-Secret!").containsEntry("email", "t@example.com").doesNotContainKey("passwordEnv")
+        val smtpBody = api.writes.first { it.path == "/api/v1/email-provider" }.body
+        assertThat(smtpBody).containsEntry("smtpPassword", "smtp-s3cret").containsEntry("smtpPort", 2525).containsEntry("enabled", true)
 
         val serialised = jacksonObjectMapper().writeValueAsString(receipt)
         assertThat(serialised).doesNotContain("Sup3r-Secret!").doesNotContain("smtp-s3cret")
         assertThat(persisted).isNotEmpty
         assertThat(persisted.map { jacksonObjectMapper().writeValueAsString(it) }).noneMatch { it.contains("s3cret") || it.contains("Secret!") }
         assertThat(console.toString()).doesNotContain("Sup3r-Secret!").doesNotContain("smtp-s3cret")
-        assertThat(receipt.resources.map { it.key to it.id }).containsExactly("user/tester" to "u-9", "emailProvider/emailProvider" to "smtp")
-        assertThat(receipt.resources[1].attributes).containsEntry("configVersion", "3").doesNotContainKey("smtpPassword")
+        assertThat(receipt.resources.map { it.key }).containsExactly("user/tester", "emailProvider/emailProvider")
+        assertThat(receipt.resources[1].attributes).containsEntry("configVersion", "1").doesNotContainKey("smtpPassword")
     }
 
     @Test
@@ -76,6 +80,6 @@ class ProvisionEngineSecretsTest : CommandTestBase() {
             .isInstanceOf(ProvisionException::class.java)
             .hasMessageContaining("TEST_USER_PASSWORD")
             .hasMessageContaining("not set")
-        assertThat(server.requestCount).isZero()
+        assertThat(api.writes).isEmpty()
     }
 }

@@ -2,6 +2,7 @@ package com.devnow.thoryn.cli.cmd.provision
 
 import com.devnow.thoryn.cli.cmd.CommandTestBase
 import org.assertj.core.api.Assertions.assertThat
+import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import java.io.File
 
@@ -16,6 +17,13 @@ import java.io.File
  * and is removed once nothing is owned.
  */
 class ProvisionCommandTest : CommandTestBase() {
+
+    private val api = FakeProductApi()
+
+    @BeforeEach
+    fun mount() { server.dispatcher = api }
+
+    private fun paths() = api.writes.map { it.method + " " + it.path }
 
     private fun writeFile(name: String, body: String): File =
         File(tempHome.toFile(), ".thoryn/$name").also { it.parentFile.mkdirs(); it.writeText(body) }
@@ -41,68 +49,48 @@ class ProvisionCommandTest : CommandTestBase() {
         val file = writeFile("provision.yaml", sandboxFile)
         val receipt = File(file.parentFile, "provision.receipt.json")
 
-        // plan: three creates, no HTTP traffic, no session needed.
+        // plan: three creates, only GET traffic (live read-by-key), no receipt.
         val plan = runCli("provision", "plan", "--file", file.path, "--gateway", baseUrl())
         assertThat(plan.exit).isEqualTo(0)
-        assertThat(plan.out).contains("environment").contains("create").contains("3 to create, 0 to remove, 0 unchanged")
-        assertThat(server.requestCount).isZero()
+        assertThat(plan.out).contains("environment").contains("create").contains("3 to create, 0 to update, 0 to adopt, 0 to remove, 0 unchanged")
+        assertThat(api.writes).isEmpty()
         assertThat(receipt).doesNotExist()
 
         // apply: env, then app + user INTO the created sandbox.
-        server.enqueue(jsonResponse(201, """{"id":"env-1","slug":"ci-sbx","kind":"sandbox"}"""))
-        server.enqueue(jsonResponse(201, """{"clientId":"app-1","status":"active"}"""))
-        server.enqueue(jsonResponse(201, """{"id":"u-1","email":"tester@example.com"}"""))
         val apply = runCli("provision", "apply", "--file", file.path, "--gateway", baseUrl(), "--yes")
         assertThat(apply.err).isEmpty()
         assertThat(apply.exit).isEqualTo(0)
         assertThat(apply.out).contains("Applied. 3 resource(s) owned.")
-
-        val envReq = server.takeRequest()
-        assertThat(envReq.method).isEqualTo("POST")
-        assertThat(envReq.path).isEqualTo("/api/v1/environments")
-        assertThat(envReq.getHeader("X-Thoryn-Environment")).isNull()
-        assertThat(envReq.body.readUtf8()).contains("\"slug\":\"ci-sbx\"").contains("\"name\":\"CI sandbox\"")
-        val appReq = server.takeRequest()
-        assertThat(appReq.path).isEqualTo("/api/v1/applications")
-        assertThat(appReq.getHeader("X-Thoryn-Environment")).isEqualTo("ci-sbx")
-        assertThat(appReq.body.readUtf8()).contains("\"displayName\":\"RP\"")
-        val userReq = server.takeRequest()
-        assertThat(userReq.path).isEqualTo("/api/v1/users")
-        assertThat(userReq.getHeader("X-Thoryn-Environment")).isEqualTo("ci-sbx")
+        assertThat(paths()).containsExactly("POST /api/v1/environments", "POST /api/v1/applications", "POST /api/v1/users")
+        assertThat(api.writes[0].env).isNull()
+        assertThat(api.writes[0].body).containsEntry("slug", "ci-sbx").containsEntry("name", "CI sandbox")
+        assertThat(api.writes[1].env).isEqualTo("ci-sbx")
+        assertThat(api.writes[1].body).containsEntry("displayName", "RP")
+        assertThat(api.writes[2].env).isEqualTo("ci-sbx")
 
         // The receipt sits next to the file, records ids + env slugs, and is the ownership ledger.
         assertThat(receipt).exists()
         val recorded = ProvisionReceiptStore().read(receipt)!!
         assertThat(recorded.file.digest).startsWith("sha256:")
-        assertThat(recorded.resources.map { it.key to it.id }).containsExactly(
-            "environment/ci" to "env-1", "application/rp" to "app-1", "user/tester" to "u-1",
-        )
+        assertThat(recorded.resources.map { it.key }).containsExactly("environment/ci", "application/rp", "user/tester")
         assertThat(recorded.resources[0].attributes["slug"]).isEqualTo("ci-sbx")
         assertThat(recorded.resources[1].environment).isEqualTo("ci-sbx")
+        val ids = recorded.resources.map { it.id }
 
-        // second apply: everything owned → no writes at all.
-        val before = server.requestCount
+        // second apply: everything owned and matching → no writes at all.
+        api.reset()
         val again = runCli("provision", "apply", "--file", file.path, "--gateway", baseUrl(), "--yes")
         assertThat(again.exit).isEqualTo(0)
-        assertThat(again.out).contains("0 to create, 0 to remove, 3 unchanged").contains("No changes.")
-        assertThat(server.requestCount).isEqualTo(before)
+        assertThat(again.out).contains("0 to create, 0 to update, 0 to adopt, 0 to remove, 3 unchanged").contains("No changes.")
+        assertThat(api.writes).isEmpty()
 
         // destroy: user + app first (reverse), then the sandbox, confirmed with its OWN slug.
-        server.enqueue(jsonResponse(200, "{}"))
-        server.enqueue(jsonResponse(204, ""))
-        server.enqueue(jsonResponse(204, ""))
         val destroy = runCli("provision", "destroy", "--file", file.path, "--gateway", baseUrl(), "--yes")
         assertThat(destroy.err).isEmpty()
         assertThat(destroy.exit).isEqualTo(0)
-        val d1 = server.takeRequest()
-        assertThat(d1.method).isEqualTo("DELETE")
-        assertThat(d1.path).isEqualTo("/api/v1/users/u-1")
-        assertThat(d1.getHeader("X-Thoryn-Environment")).isEqualTo("ci-sbx")
-        val d2 = server.takeRequest()
-        assertThat(d2.path).isEqualTo("/api/v1/applications/app-1")
-        val d3 = server.takeRequest()
-        assertThat(d3.path).isEqualTo("/api/v1/environments/env-1")
-        assertThat(d3.getHeader("X-Thoryn-Confirm")).isEqualTo("ci-sbx")
+        assertThat(paths()).containsExactly("DELETE /api/v1/users/${ids[2]}", "DELETE /api/v1/applications/${ids[1]}", "DELETE /api/v1/environments/${ids[0]}")
+        assertThat(api.writes[0].env).isEqualTo("ci-sbx")
+        assertThat(api.writes[2].confirm).isEqualTo("ci-sbx")
         assertThat(receipt).doesNotExist()
         assertThat(destroy.out).contains("Destroyed. Nothing is owned any more.")
     }
@@ -119,44 +107,41 @@ class ProvisionCommandTest : CommandTestBase() {
                 spec: { displayName: "Web app", redirectUris: ["https://app.example.com/cb"] }
             """.trimIndent(),
         )
-        server.enqueue(jsonResponse(201, """{"clientId":"app-prod","status":"active"}"""))
         assertThat(runCli("provision", "apply", "--file", file.path, "--gateway", baseUrl(), "--yes").exit).isEqualTo(0)
-        assertThat(server.takeRequest().getHeader("X-Thoryn-Environment")).isNull()
+        assertThat(api.writes.single().env).isNull()
+        val id = api.applications.single()["clientId"]
+        api.reset()
 
         val refused = runCli("provision", "destroy", "--file", file.path, "--gateway", baseUrl(), "--yes")
         assertThat(refused.exit).isNotEqualTo(0)
         assertThat(refused.err).contains("PRODUCTION plane").contains("--confirm <workspace-slug>")
-        assertThat(server.requestCount).isEqualTo(1) // nothing was deleted
+        assertThat(api.writes).isEmpty() // nothing was deleted
 
-        server.enqueue(jsonResponse(204, ""))
         val ok = runCli("provision", "destroy", "--file", file.path, "--gateway", baseUrl(), "--yes", "--confirm", "acme")
         assertThat(ok.exit).isEqualTo(0)
-        val del = server.takeRequest()
-        assertThat(del.path).isEqualTo("/api/v1/applications/app-prod")
-        assertThat(del.getHeader("X-Thoryn-Confirm")).isEqualTo("acme")
+        assertThat(paths()).containsExactly("DELETE /api/v1/applications/$id")
+        assertThat(api.writes.single().confirm).isEqualTo("acme")
     }
 
     @Test
     fun `dropping a resource from the file is a skip until --prune removes it`() {
         val file = writeFile("provision.yaml", sandboxFile)
-        server.enqueue(jsonResponse(201, """{"id":"env-1","slug":"ci-sbx"}"""))
-        server.enqueue(jsonResponse(201, """{"clientId":"app-1"}"""))
-        server.enqueue(jsonResponse(201, """{"id":"u-1"}"""))
         assertThat(runCli("provision", "apply", "--file", file.path, "--gateway", baseUrl(), "--yes").exit).isEqualTo(0)
-        repeat(3) { server.takeRequest() }
+        val userId = api.users.single()["id"]
+        api.reset()
 
         // Drop the user from the desired state.
         file.writeText(sandboxFile.lines().takeWhile { !it.contains("kind: user") }.joinToString("\n"))
-        val plan = runCli("provision", "plan", "--file", file.path)
+        val plan = runCli("provision", "plan", "--file", file.path, "--gateway", baseUrl())
         assertThat(plan.out).contains("skip").contains("re-run with --prune")
-        val prunePlan = runCli("provision", "plan", "--file", file.path, "--prune")
+        val prunePlan = runCli("provision", "plan", "--file", file.path, "--gateway", baseUrl(), "--prune")
         assertThat(prunePlan.out).contains("remove").contains("1 to remove")
+        assertThat(api.writes).isEmpty()
 
-        server.enqueue(jsonResponse(200, "{}"))
         val pruned = runCli("provision", "apply", "--file", file.path, "--gateway", baseUrl(), "--yes", "--prune")
         assertThat(pruned.err).isEmpty()
         assertThat(pruned.exit).isEqualTo(0)
-        assertThat(server.takeRequest().path).isEqualTo("/api/v1/users/u-1")
+        assertThat(paths()).containsExactly("DELETE /api/v1/users/$userId")
         val recorded = ProvisionReceiptStore().read(File(file.parentFile, "provision.receipt.json"))!!
         assertThat(recorded.resources.map { it.key }).containsExactly("environment/ci", "application/rp")
     }
@@ -167,6 +152,7 @@ class ProvisionCommandTest : CommandTestBase() {
         val r = runCli("provision", "apply", "--file", file.path, "--gateway", baseUrl(), "--yes")
         assertThat(r.exit).isNotEqualTo(0)
         assertThat(r.err).contains("invalid provisioning file").contains("allowlist")
+        assertThat(api.writes).isEmpty()
         assertThat(server.requestCount).isZero()
     }
 }
