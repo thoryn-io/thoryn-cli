@@ -2,13 +2,26 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://thoryn.io/examples/recipe.schema.json",
   "title": "Thoryn example recipe",
-  "description": "SSO-2871 (Phase 0, SSO-2872) — a declarative, in-boundary product example the CLI applies to the caller's own account using only supported product workflows. Recipes are DATA, not code: the CLI is the only executor. The `action`/`assert` enums are a CLOSED allowlist mapping to supported product APIs — this is what structurally enforces the CLAUDE.md product-boundary rule (a recipe cannot express a DB seed, a demo endpoint, or any unsupported shortcut). SSO-3100 (epic SSO-3087): a recipe is an ORCHESTRATION file — the infrastructure a normal end user configures (environment / sandbox, application, demo user, sign-in methods, look-and-feel, login flow, email provider, federation member) is declared in the provisioning file it references under `provision` (`provision.schema.json`, converged by the same engine as `thoryn provision apply`), and the recipe carries only what is extra to RUN the example. `thoryn examples apply` provisions that file FIRST; `examples teardown` destroys it after the recipe's own teardown. A recipe declares `provision`, `steps`, or both (`anyOf` below): omit `steps` when the provisioning file carries everything. Authoring note: `provision` is recipe-relative (no `..`, no absolute path), the file ships NEXT TO `recipe.json` in the signed catalog bundle and in the CLI's bundled resources, and — like the recipe — it never carries a secret VALUE: name the env var (`passwordEnv: demoPassword`) or a `{{env.NAME}}` placeholder, which the CLI resolves FIRST from the recipe's params (a `demoPassword` param, marked `secret: true`) and THEN from the process environment.",
+  "description": "SSO-2871 (Phase 0, SSO-2872) \u2014 a declarative, in-boundary product example the CLI applies to the caller's own account using only supported product workflows. Recipes are DATA, not code: the CLI is the only executor. The `action`/`assert` enums are a CLOSED allowlist mapping to supported product APIs \u2014 this is what structurally enforces the CLAUDE.md product-boundary rule (a recipe cannot express a DB seed, a demo endpoint, or any unsupported shortcut). SSO-3100 (epic SSO-3087): a recipe is an ORCHESTRATION file \u2014 the infrastructure a normal end user configures (environment / sandbox, application, demo user, sign-in methods, look-and-feel, login flow, email provider, federation member) is declared in the provisioning file it references under `provision` (`provision.schema.json`, converged by the same engine as `thoryn provision apply`), and the recipe carries only what is extra to RUN the example. `thoryn examples apply` provisions that file FIRST; `examples teardown` destroys it after the recipe's own teardown. A recipe declares `provision`, `steps`, or both (`anyOf` below): omit `steps` when the provisioning file carries everything. Authoring note: `provision` is recipe-relative (no `..`, no absolute path), the file ships NEXT TO `recipe.json` in the signed catalog bundle and in the CLI's bundled resources, and \u2014 like the recipe \u2014 it never carries a secret VALUE: name the env var (`passwordEnv: demoPassword`) or a `{{env.NAME}}` placeholder, which the CLI resolves FIRST from the recipe's params (a `demoPassword` param, marked `secret: true`) and THEN from the process environment.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["apiVersion", "id", "version", "summary"],
+  "required": [
+    "apiVersion",
+    "id",
+    "version",
+    "summary"
+  ],
   "anyOf": [
-    { "required": ["provision"] },
-    { "required": ["steps"] }
+    {
+      "required": [
+        "provision"
+      ]
+    },
+    {
+      "required": [
+        "steps"
+      ]
+    }
   ],
   "properties": {
     "apiVersion": {
@@ -31,7 +44,7 @@
       "minLength": 1
     },
     "provision": {
-      "description": "SSO-3100 — recipe-relative path of the provisioning file (`provision.schema.json`) that declares the example's infrastructure as DESIRED STATE (e.g. `./provision.yaml`). `examples apply` converges it BEFORE the steps run (a second apply issues no writes; a leftover sandbox is adopted by its slug) and `examples teardown` destroys what it created, child-first, AFTER the recipe's own teardown. Provisioned resources are addressable from steps / verify as `{{provision.<kind>.<name>.id}}` (plus `.slug` for an environment, `.email` for a user, `.clientId` / `.redirectUri` for an application); the first `environment` resource becomes the environment later steps and `examples run` target. Recipe params feed the provisioning file's `{{env.NAME}}` placeholders and `<key>Env` secret references by param name.",
+      "description": "How to get Thoryn UP AND RUNNING for this example \u2014 the recipe itself is only how to get the example configured, the extra steps beyond the provisioning. SSO-3100 \u2014 recipe-relative path of the provisioning file (`provision.schema.json`) that declares the example's infrastructure as DESIRED STATE (e.g. `./provision.yaml`). `examples apply` converges it BEFORE the steps run (a second apply issues no writes; a leftover sandbox is adopted by its slug) and `examples teardown` destroys what it created, child-first, AFTER the recipe's own teardown. Provisioned resources are addressable from steps / verify as `{{provision.<kind>.<name>.id}}` (plus `.slug` for an environment, `.email` for a user, `.clientId` / `.redirectUri` for an application); the first `environment` resource becomes the environment later steps and `examples run` target. Recipe params feed the provisioning file's `{{env.NAME}}` placeholders and `<key>Env` secret references by param name.",
       "type": "string",
       "pattern": "^(\\./)?[A-Za-z0-9_-][A-Za-z0-9._-]*(/[A-Za-z0-9_-][A-Za-z0-9._-]*)*\\.(ya?ml|json)$"
     },
@@ -42,10 +55,16 @@
       "properties": {
         "scopes": {
           "type": "array",
-          "items": { "type": "string", "pattern": "^tenant:[a-z-]+\\.[a-z-]+$" },
+          "items": {
+            "type": "string",
+            "pattern": "^tenant:[a-z-]+\\.[a-z-]+$"
+          },
           "uniqueItems": true
         },
-        "minCliVersion": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$" }
+        "minCliVersion": {
+          "type": "string",
+          "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+        }
       }
     },
     "params": {
@@ -54,13 +73,30 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["name", "prompt"],
+        "required": [
+          "name",
+          "prompt"
+        ],
         "properties": {
-          "name": { "type": "string", "pattern": "^[a-zA-Z][a-zA-Z0-9_]*$" },
-          "prompt": { "type": "string", "minLength": 1 },
-          "default": { "type": "string" },
-          "validate": { "description": "A regex the resolved value must match.", "type": "string" },
-          "secret": { "description": "If true, the value is never echoed or written to a receipt.", "type": "boolean" }
+          "name": {
+            "type": "string",
+            "pattern": "^[a-zA-Z][a-zA-Z0-9_]*$"
+          },
+          "prompt": {
+            "type": "string",
+            "minLength": 1
+          },
+          "default": {
+            "type": "string"
+          },
+          "validate": {
+            "description": "A regex the resolved value must match.",
+            "type": "string"
+          },
+          "secret": {
+            "description": "If true, the value is never echoed or written to a receipt.",
+            "type": "boolean"
+          }
         }
       }
     },
@@ -71,11 +107,17 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["id", "action"],
+        "required": [
+          "id",
+          "action"
+        ],
         "properties": {
-          "id": { "type": "string", "pattern": "^[a-zA-Z][a-zA-Z0-9_]*$" },
+          "id": {
+            "type": "string",
+            "pattern": "^[a-zA-Z][a-zA-Z0-9_]*$"
+          },
           "action": {
-            "description": "CLOSED allowlist — supported product APIs only. Widening this is a deliberate product decision, never a convenience.",
+            "description": "CLOSED allowlist \u2014 supported product APIs only. Widening this is a deliberate product decision, never a convenience.",
             "enum": [
               "hub.createWorkspace",
               "productApi.registerTenant",
@@ -91,10 +133,12 @@
             ]
           },
           "with": {
-            "description": "Per-action inputs, forwarded to the supported product API. For `applications.create` (register-app) these are `displayName`, `clientType`, `grantTypes`, `scopes`, `redirectUris` (array of redirect URI strings) and the optional `postLogoutRedirectUris` (array of OIDC RP-Initiated-Logout post-logout redirect URI strings, same shape as `redirectUris`; SSO-2897). For `identity.registerUser` (SSO-2907 — provision a sign-in-able tenant user via product-api `POST /api/v1/users`, `tenant:users.write`) these are `email`, `password` (sets an initial credential so the user can sign in immediately), the optional `givenName` / `familyName` / `locale`, and `emailVerified` (set `true` to mark the account verified without an email round-trip). The created user's `id` and `email` are addressable as `{{<step id>.id}}` / `{{<step id>.email}}` in later steps. For `tenant.configureEmailProvider` (SSO-2917 — configure the workspace's bring-your-own SMTP transport via product-api `PUT /api/v1/email-provider`, `tenant:email.write`) these are the merge-upsert config fields `providerType`, `enabled`, `smtpHost`, `smtpPort`, `smtpUsername`, `smtpPassword` (write-only; mark the param `secret:true` so it is never echoed or written to a receipt), `transportSecurity`, `fromAddress`, `fromName`, `replyTo`; the resulting `providerType` / `configVersion` / `enabled` are addressable as `{{<step id>.providerType}}` / `{{<step id>.configVersion}}` / `{{<step id>.enabled}}`. For `tenant.configureLoginTheme` (SSO-3037 — style the hosted sign-in / register screens for the active environment via product-api `PUT /api/v1/login-experience/branding`, `tenant:idp.write`) these are `logoUrl` (https), `primaryColor` / `backgroundColor` (CSS hex), `borderRadiusPx` (0-64) and `theme` (`light` | `dark` | `auto`); the server validates them and enforces a WCAG-AA contrast guard, and the resolved `theme` / `primaryColor` are addressable as `{{<step id>.theme}}` / `{{<step id>.primaryColor}}`. Secret-bearing machine-client provisioning is NOT an example-recipe action — it is the dedicated operator command `thoryn provision ci-identity` (SSO-2952), so a DATA recipe can never mint a credential and every recipe receipt stays secret-free.",
+            "description": "Per-action inputs, forwarded to the supported product API. For `applications.create` (register-app) these are `displayName`, `clientType`, `grantTypes`, `scopes`, `redirectUris` (array of redirect URI strings) and the optional `postLogoutRedirectUris` (array of OIDC RP-Initiated-Logout post-logout redirect URI strings, same shape as `redirectUris`; SSO-2897). For `identity.registerUser` (SSO-2907 \u2014 provision a sign-in-able tenant user via product-api `POST /api/v1/users`, `tenant:users.write`) these are `email`, `password` (sets an initial credential so the user can sign in immediately), the optional `givenName` / `familyName` / `locale`, and `emailVerified` (set `true` to mark the account verified without an email round-trip). The created user's `id` and `email` are addressable as `{{<step id>.id}}` / `{{<step id>.email}}` in later steps. For `tenant.configureEmailProvider` (SSO-2917 \u2014 configure the workspace's bring-your-own SMTP transport via product-api `PUT /api/v1/email-provider`, `tenant:email.write`) these are the merge-upsert config fields `providerType`, `enabled`, `smtpHost`, `smtpPort`, `smtpUsername`, `smtpPassword` (write-only; mark the param `secret:true` so it is never echoed or written to a receipt), `transportSecurity`, `fromAddress`, `fromName`, `replyTo`; the resulting `providerType` / `configVersion` / `enabled` are addressable as `{{<step id>.providerType}}` / `{{<step id>.configVersion}}` / `{{<step id>.enabled}}`. For `tenant.configureLoginTheme` (SSO-3037 \u2014 style the hosted sign-in / register screens for the active environment via product-api `PUT /api/v1/login-experience/branding`, `tenant:idp.write`) these are `logoUrl` (https), `primaryColor` / `backgroundColor` (CSS hex), `borderRadiusPx` (0-64) and `theme` (`light` | `dark` | `auto`); the server validates them and enforces a WCAG-AA contrast guard, and the resolved `theme` / `primaryColor` are addressable as `{{<step id>.theme}}` / `{{<step id>.primaryColor}}`. Secret-bearing machine-client provisioning is NOT an example-recipe action \u2014 it is the dedicated operator command `thoryn provision ci-identity` (SSO-2952), so a DATA recipe can never mint a credential and every recipe receipt stays secret-free.",
             "type": "object"
           },
-          "description": { "type": "string" }
+          "description": {
+            "type": "string"
+          }
         }
       }
     },
@@ -104,27 +148,50 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["assert"],
+        "required": [
+          "assert"
+        ],
         "properties": {
           "assert": {
-            "enum": ["applications.get", "federation.get", "env.get"]
+            "enum": [
+              "applications.get",
+              "federation.get",
+              "env.get"
+            ]
           },
-          "id": { "type": "string" },
-          "expect": { "type": "object" }
+          "id": {
+            "type": "string"
+          },
+          "expect": {
+            "type": "object"
+          }
         }
       }
     },
     "teardown": {
-      "description": "Best-effort removal of what the steps created, executed in declared order (child-first: delete the child resources, then the container they live in — the app before the workspace it lives in (SSO-2901), or a resource before the `env.delete` that hard-deletes the ephemeral sandbox it was provisioned into (SSO-2961)). `env.delete` (SSO-2960 — product-api `DELETE /api/v1/environments/{id}`, `tenant:environments.write`) targets the environment created by an `env.create` step: its `id` is the env id (reference it as `{{<env-create step id>.id}}`, which the interpreter records on the run state so a later `teardown` invocation can resolve it), and the confirmation slug the interpreter sends as `X-Thoryn-Confirm` is the environment's OWN slug (absent → 428, mismatch → 422). It refuses the production plane (409 `cannot_delete_production_environment`); a cross-tenant/unknown id is 404.",
+      "description": "Best-effort removal of what the steps created, executed in declared order (child-first: delete the child resources, then the container they live in \u2014 the app before the workspace it lives in (SSO-2901), or a resource before the `env.delete` that hard-deletes the ephemeral sandbox it was provisioned into (SSO-2961)). `env.delete` (SSO-2960 \u2014 product-api `DELETE /api/v1/environments/{id}`, `tenant:environments.write`) targets the environment created by an `env.create` step: its `id` is the env id (reference it as `{{<env-create step id>.id}}`, which the interpreter records on the run state so a later `teardown` invocation can resolve it), and the confirmation slug the interpreter sends as `X-Thoryn-Confirm` is the environment's OWN slug (absent \u2192 428, mismatch \u2192 422). It refuses the production plane (409 `cannot_delete_production_environment`); a cross-tenant/unknown id is 404.",
       "type": "array",
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["action"],
+        "required": [
+          "action"
+        ],
         "properties": {
-          "action": { "enum": ["applications.delete", "federation.delete", "env.delete", "hub.deleteWorkspace"] },
-          "id": { "type": "string" },
-          "with": { "type": "object" }
+          "action": {
+            "enum": [
+              "applications.delete",
+              "federation.delete",
+              "env.delete",
+              "hub.deleteWorkspace"
+            ]
+          },
+          "id": {
+            "type": "string"
+          },
+          "with": {
+            "type": "object"
+          }
         }
       }
     },
@@ -133,8 +200,12 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "rp": { "type": "string" },
-        "docs": { "type": "string" }
+        "rp": {
+          "type": "string"
+        },
+        "docs": {
+          "type": "string"
+        }
       }
     }
   }

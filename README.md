@@ -365,7 +365,9 @@ conformance workflow moves to provisioning files (SSO-3091); do not build on it.
 for all the infrastructure a normal end user configures — environment (incl. a throwaway
 sandbox), application, demo user, sign-in methods (`loginMethods`), look-and-feel
 (`loginTheme`), `loginFlow`, `emailProvider`, `federationMember`. A recipe is the
-**orchestration file** on top: it names its provisioning file under `provision:
+**orchestration file** on top. In the product owner's words: *the provision file is about how to get
+Thoryn up and running; the recipe file is about how to get an example configured — the extra steps beyond
+the provisioning.* The recipe names its provisioning file under `provision:
 ./provision.yaml` (shipped next to `recipe.json` in the signed catalog bundle and in the
 bundled resources) and carries only what is extra to *run* the example — params, any
 extra `steps`, `verify`, `assets`. `steps` is optional when `provision` is set.
