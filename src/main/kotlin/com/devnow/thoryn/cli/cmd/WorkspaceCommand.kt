@@ -32,7 +32,7 @@ import java.util.concurrent.Callable
  *  - `switch` — there is no server-side "switch" for a bearer-token CLI: a
  *    switch is a re-authentication against the tenant's hub subdomain. This
  *    subcommand validates the workspace, records the selection locally, and
- *    prints the exact `thoryn login --issuer <tenant-hub>` line to run. No
+ *    prints the exact `thoryn login --workspace <slug>` line to run. No
  *    secret is involved.
  *
  * Scope: `SCOPE_openid` only — the default `thoryn login` already requests it.
@@ -174,7 +174,7 @@ class WorkspaceCommand : Callable<Int> {
             val tenantHub = WorkspaceTenantHost.tenantIssuer(hub, createdSlug)
             if (tenantHub != null && format == OutputFormat.TABLE) {
                 System.err.println(
-                    "To use this workspace, switch into it:  thoryn login --issuer $tenantHub",
+                    "To use this workspace, switch into it:  thoryn login --workspace $createdSlug",
                 )
             }
             return CommandSupport.EXIT_OK
@@ -185,7 +185,7 @@ class WorkspaceCommand : Callable<Int> {
      * `thoryn workspace switch <slug>`
      *
      * Validates the workspace by listing the caller's workspaces, records the
-     * selection locally, and prints the `thoryn login --issuer <tenant-hub>`
+     * selection locally, and prints the `thoryn login --workspace <slug>`
      * line that re-authenticates into it. The CLI cannot perform the OIDC
      * redirect itself (no browser session); this is the honest thin-client
      * equivalent of the console's `loginUrl` redirect.
@@ -485,7 +485,7 @@ class WorkspaceCommand : Callable<Int> {
  * Derives a tenant's hub issuer URL (`{slug}.{hubHost}`) from the base hub URL,
  * matching the BFF's `TenantAwareClientRegistrationRepository.withTenantHost`
  * rewrite (scheme/port/path preserved, host prefixed with the slug). Used to
- * print the `thoryn login --issuer …` line for a workspace switch.
+ * print the `thoryn login --workspace …` line for a workspace switch.
  */
 internal object WorkspaceTenantHost {
 

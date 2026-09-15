@@ -47,7 +47,7 @@ the stable asset name the `thoryn-examples` conformance CI consumes.
 ## Command tree
 
 ```
-thoryn login                                 # Auth code + PKCE (loopback) or --device-code
+thoryn login --workspace <slug>              # Auth code + PKCE (loopback) or --device-code — ON your workspace (SSO-3104)
 thoryn login --client-credentials [--client-id <id>] # SSO-1553/2941 — non-interactive API key (CI); THORYN_API_KEY=<id>:<secret>, auto re-mints on expiry
 thoryn login --status
 thoryn logout
@@ -222,14 +222,16 @@ or land in shell history:
 # `workspace email-provider`, and `branding` (SSO-3037) work out of the box.
 # `workspace` rides on SCOPE_openid (the hub /account surface). The hub drops any
 # scope the tenant admin doesn't actually hold.
-thoryn login
+# SSO-3104 — sign-in is always ON A WORKSPACE (`https://<slug>.hub.<env>`, client `cli`,
+# provisioned in the `thoryn` workspace by this repo's .thoryn/provision.yaml); the shared
+# default tenant is not a sign-in target. `--workspace` or `export THORYN_WORKSPACE=<slug>`.
+thoryn login --workspace thoryn
 
 # Grab the whole tenant-config scope set explicitly.
-thoryn login --scope all-tenant-config
+thoryn login --workspace thoryn --scope all-tenant-config
 
 # Headless (no browser).
-export THORYN_CLIENT_SECRET=...
-thoryn login --device-code
+thoryn login --workspace thoryn --device-code
 ```
 
 The wildcard `all-tenant-config` expands client-side per `ScopeRegistry.kt`

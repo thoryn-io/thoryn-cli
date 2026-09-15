@@ -259,7 +259,12 @@ internal class ProvisionEngine(
         }
         ProvisionFile.KIND_APPLICATION -> {
             val client = clients(slug)
+            // SSO-3104 — a spec with a fixed `clientId` (the CLI's own `cli` login client) is adopted by that
+            // id, so a re-apply from a receipt that does not own it (CI) converges it instead of creating a
+            // duplicate by display name.
+            val fixedId = desired["clientId"]?.toString()?.takeIf { it.isNotBlank() }
             val node = owned?.let { fetchOrNull { client.getApplication(it.id) } }
+                ?: fixedId?.let { fetchOrNull { client.getApplication(it) } }
                 ?: listItems(client.listApplications(), "data").filter { it.str("displayName") == desired["displayName"] }.singleOrNull()
             node?.let { n ->
                 val fields = listOf("displayName", "redirectUris", "postLogoutRedirectUris", "scopes", "grantTypes")

@@ -164,6 +164,9 @@ class ThorynCliE2ETest {
         val (loginExit, loginOut, loginErr) = runCli(
             "login",
             "--device-code",
+            // SSO-3104 — interactive sign-in is always on a workspace; a loopback test hub has no
+            // `hub.` host, so the derived issuer stays the mock server's URL.
+            "--workspace", "acme",
             "--issuer", hub.url("/").toString().trimEnd('/'),
             "--client-id", "thoryn-cli",
             "--scope", "openid offline_access tenant:clients.read",
