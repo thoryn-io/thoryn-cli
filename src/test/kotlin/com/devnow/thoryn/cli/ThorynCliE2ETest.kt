@@ -164,6 +164,9 @@ class ThorynCliE2ETest {
         val (loginExit, loginOut, loginErr) = runCli(
             "login",
             "--device-code",
+            // SSO-3104 — interactive sign-in is always on a workspace; a loopback test hub has no
+            // `hub.` host, so the derived issuer stays the mock server's URL.
+            "--workspace", "acme",
             "--issuer", hub.url("/").toString().trimEnd('/'),
             "--client-id", "thoryn-cli",
             "--scope", "openid offline_access tenant:clients.read",
@@ -182,6 +185,8 @@ class ThorynCliE2ETest {
         assertThat(tokenJson).contains("\"accessToken\"")
         assertThat(tokenJson).contains("AT-real-1")
         assertThat(tokenJson).contains("RT-real-1")
+        // SSO-3104 — the session remembers the client it signed in with (refresh + exchange reuse it).
+        assertThat(tokenJson).contains("\"clientId\":\"thoryn-cli\"")
 
         // Hub saw exactly the requests we expect, with confidential-client
         // Basic auth headers.

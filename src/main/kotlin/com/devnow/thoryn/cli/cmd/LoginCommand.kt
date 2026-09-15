@@ -60,10 +60,24 @@ class LoginCommand : Callable<Int> {
 
     @Option(
         names = ["--issuer"],
-        description = ["Override the hub issuer URL (default: \${DEFAULT-VALUE})."],
+        description = ["Override the hub BASE URL (default: \${DEFAULT-VALUE}); interactive sign-in happens on <workspace>.<hub>."],
         defaultValue = ThorynConfig.DEFAULT_ISSUER,
     )
     var issuer: String = ThorynConfig.DEFAULT_ISSUER
+
+    /**
+     * SSO-3104 — the workspace an interactive sign-in (loopback / device-code) happens on: the issuer
+     * becomes `https://<slug>.hub.<env>` ([ThorynConfig.tenantIssuer]) and the session's `tnt` is that
+     * workspace. REQUIRED for those flows — the shared default tenant is not a sign-in target. Falls
+     * back to the `THORYN_WORKSPACE` env var. The non-interactive modes bind their tenant elsewhere
+     * (`--connection` from the contract's workspace; `--client-credentials` from the key's `tnt`).
+     */
+    @Option(
+        names = ["--workspace"],
+        description = ["Workspace slug to sign in on (interactive flows sign in at <slug>.<hub>). Default: \${env:THORYN_WORKSPACE}."],
+        defaultValue = "\${env:THORYN_WORKSPACE}",
+    )
+    var workspace: String? = null
 
     /**
      * SSO-2827 — the customer-plane gateway this session should use for the
@@ -235,8 +249,33 @@ class LoginCommand : Callable<Int> {
     private fun withSession(tokens: Tokens): Tokens =
         tokens.copy(
             issuer = issuer,
-            gateway = gateway?.takeIf { it.isNotBlank() } ?: ThorynConfig.gatewayForIssuer(issuer),
+            // SSO-3104 — remember which client signed in, so refresh / workspace exchange use the same one.
+            clientId = tokens.clientId ?: clientId,
+            // The gateway derives from the hub BASE (`hub.<env>` → `api.<env>`), never from a tenant host.
+            gateway = gateway?.takeIf { it.isNotBlank() } ?: ThorynConfig.gatewayForIssuer(baseIssuer),
         )
+
+    /** The hub base URL as given on the command line (before any workspace prefixing). */
+    private var baseIssuer: String = ThorynConfig.DEFAULT_ISSUER
+
+    /**
+     * SSO-3104 — resolve the interactive sign-in issuer: `--workspace` (or THORYN_WORKSPACE) is required
+     * and the issuer becomes the workspace's tenant hub. Returns false (after printing the guidance) when
+     * no workspace was named — the shared default tenant is not a sign-in target.
+     */
+    private fun selectWorkspaceIssuer(): Boolean {
+        val slug = workspace?.trim()?.takeIf { it.isNotEmpty() }
+        if (slug == null) {
+            System.err.println(
+                "Error: no workspace selected — sign in on your workspace with `thoryn login --workspace <slug>` " +
+                    "(or export ${ThorynConfig.WORKSPACE_ENV}). The shared default tenant is not a sign-in target.",
+            )
+            return false
+        }
+        baseIssuer = issuer
+        issuer = ThorynConfig.tenantIssuer(issuer, slug)
+        return true
+    }
 
     /**
      * SSO-959: expand `all-supply-chain` (and any other client-side
@@ -270,8 +309,11 @@ class LoginCommand : Callable<Int> {
             return runWorkloadIdentityFlow()
         }
         if (useClientCredentials) {
+            baseIssuer = issuer
             return runClientCredentialsFlow()
         }
+        // SSO-3104 — the interactive flows sign in ON A WORKSPACE, never on the shared default tenant.
+        if (!selectWorkspaceIssuer()) return EXIT_USAGE
         if (useDeviceCode) {
             return runDeviceCodeFlow()
         }
@@ -665,7 +707,7 @@ class LoginCommand : Callable<Int> {
     private fun printStatus(): Int {
         val tokens = tokenStore.read()
         if (tokens == null) {
-            println("Not signed in. Run `thoryn login`.")
+            println("Not signed in. Run `thoryn login --workspace <slug>`.")
             return 1
         }
         // SSO-2834 — report real access-token validity, not just token presence. A stale access

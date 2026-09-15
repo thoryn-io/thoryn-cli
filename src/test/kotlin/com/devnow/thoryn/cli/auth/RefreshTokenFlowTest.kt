@@ -1,5 +1,6 @@
 package com.devnow.thoryn.cli.auth
 
+import com.devnow.thoryn.cli.config.ThorynConfig
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.assertThatThrownBy
 import org.junit.jupiter.api.Test
@@ -83,7 +84,7 @@ class RefreshTokenFlowTest {
         val body = captured.lastBody!!
         assertThat(body).contains("grant_type=refresh_token")
         assertThat(body).contains("refresh_token=RT-old")
-        assertThat(body).contains("client_id=thoryn-cli")
+        assertThat(body).contains("client_id=${ThorynConfig.DEFAULT_CLIENT_ID}")
     }
 
     @Test

@@ -9,6 +9,7 @@ import com.devnow.thoryn.cli.auth.RefreshTokenFlow
 import com.devnow.thoryn.cli.auth.ScopeRegistry
 import com.devnow.thoryn.cli.auth.TokenExchangeFlow
 import com.devnow.thoryn.cli.auth.TokenStoreFactory
+import com.devnow.thoryn.cli.auth.JwtClaims
 import com.devnow.thoryn.cli.auth.Tokens
 import com.devnow.thoryn.cli.config.ThorynConfig
 import com.devnow.thoryn.cli.output.OutputFormat
@@ -143,7 +144,7 @@ internal object CommandSupport {
             return runCatching {
                 TokenExchangeFlow(
                     issuer = issuer,
-                    clientId = ThorynConfig.DEFAULT_CLIENT_ID,
+                    clientId = sessionClientId(base),
                     clientSecret = ThorynConfig.resolveClientSecret(),
                     subjectToken = base.accessToken,
                     targetResource = selected.tenantHubIssuer,
@@ -173,6 +174,18 @@ internal object CommandSupport {
             environmentSlug = environmentSlug, // SSO-2870 — ride the selected environment on every request.
         )
     }
+
+    /**
+     * SSO-3104 — the OAuth client THIS session was signed in with, for every later token round-trip
+     * (refresh, workspace exchange): the stored [Tokens.clientId], else the `client_id` / `azp` claim of
+     * the access token (a session written by an older CLI), else [ThorynConfig.DEFAULT_CLIENT_ID]. The
+     * default alone was wrong once the login client moved (`thoryn-cli` → `cli`): a session signed in
+     * with one client must not refresh or exchange as another.
+     */
+    fun sessionClientId(tokens: Tokens): String =
+        tokens.clientId?.takeIf { it.isNotBlank() }
+            ?: JwtClaims.of(tokens.accessToken).let { c -> c["client_id"]?.asString() ?: c["azp"]?.asString() }?.takeIf { it.isNotBlank() }
+            ?: ThorynConfig.DEFAULT_CLIENT_ID
 
     /** Seconds before expiry at which [ensureFresh] proactively refreshes the access token. */
     private const val REFRESH_SKEW_SECONDS: Long = 60
@@ -230,10 +243,10 @@ internal object CommandSupport {
     private fun refreshViaRefreshToken(current: Tokens, refreshToken: String, err: PrintStream): Tokens? {
         val issuer = current.issuer?.takeIf { it.isNotBlank() } ?: return null
         return try {
-            val refreshed = RefreshTokenFlow(issuer = issuer, sender = realHttpSender())
+            val refreshed = RefreshTokenFlow(issuer = issuer, sender = realHttpSender(), clientId = sessionClientId(current))
                 .refresh(refreshToken)
-                // Preserve the CLI-local session hosts (not returned by /oauth2/token).
-                .copy(issuer = current.issuer, gateway = current.gateway)
+                // Preserve the CLI-local session hosts + client (not returned by /oauth2/token).
+                .copy(issuer = current.issuer, gateway = current.gateway, clientId = current.clientId)
             runCatching { TokenStoreFactory.default().write(refreshed) }
             refreshed
         } catch (e: Exception) {

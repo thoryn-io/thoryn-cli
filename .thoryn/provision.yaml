@@ -4,10 +4,17 @@
 # file against shared staging, runs against the result, and destroys it on exit. A customer binds a
 # repository to Thoryn the same way — the identical files, the identical verbs.
 #
-# What CI needs: a throwaway SANDBOX environment inside the contract's workspace, and a public
-# loopback OAuth client inside that sandbox (what the retired `ci-signin` recipe used to create on the
-# production plane). Everything is environment-scoped, so `destroy` needs no production-plane
-# confirmation: the sandbox hard-delete (confirmed with its own slug) cascades the client.
+# What this file owns:
+#  - `cli` (SSO-3104): the CLI's OWN customer-plane login client — the public PKCE client every
+#    `thoryn login --workspace <slug>` signs in with. It lives on the `thoryn` workspace's PRODUCTION
+#    plane (no `environment:`), replacing the hub-seeded `thoryn-cli` client on the shared default tenant
+#    (the platform is moving everything off that tenant). A founder creates it ONCE with
+#    `thoryn provision apply` while switched into the `thoryn` workspace; every later `apply` (CI signs in
+#    as the CI machine client, whose receipt does not own it) ADOPTS it by its fixed `clientId` and
+#    converges its non-secret shape — adopted resources are never deleted by `destroy`.
+#  - What CI needs (SSO-3090): a throwaway SANDBOX environment inside the contract's workspace, and a
+#    public loopback OAuth client inside that sandbox. Both are environment-scoped, so `destroy` needs no
+#    production-plane confirmation: the sandbox hard-delete (confirmed with its own slug) cascades it.
 #
 # Converge, not create: the environment slug is FIXED (`provision-e2e` serialises runs with a
 # concurrency group). If a previous run failed to destroy it, the next `apply` ADOPTS the leftover
@@ -16,6 +23,40 @@
 # it (`thoryn env delete <id> --confirm cli-ci`). No secrets live here; none are needed.
 apiVersion: thoryn.io/provision/v1
 resources:
+  # SSO-3104 — the `thoryn` CLI's login client, in the `thoryn` workspace (production plane).
+  - kind: application
+    name: cli
+    spec:
+      clientId: cli                       # fixed id: ThorynConfig.DEFAULT_CLIENT_ID signs in with it
+      displayName: "Thoryn CLI"
+      clientType: public                  # RFC 8252 native app: PKCE, no secret
+      grantTypes:
+        - authorization_code
+        - refresh_token
+        - "urn:ietf:params:oauth:grant-type:device_code"   # `thoryn login --device-code`
+      # RFC 8252 §7.3 literal-IP loopback redirects (port-agnostic); the CLI binds an ephemeral port.
+      redirectUris: ["http://127.0.0.1/callback", "http://[::1]/callback"]
+      # Exactly the scopes any `thoryn` command can request (CiProvisionFileConformanceTest pins this to
+      # the CLI's sources); the hub grants a login only what the client holds AND the admin actually has.
+      scopes:
+        - openid
+        - offline_access
+        - tenant:applications.read
+        - tenant:applications.write
+        - tenant:clients.read
+        - tenant:users.read
+        - tenant:users.write
+        - tenant:federation.read
+        - tenant:federation.write
+        - tenant:audit.read
+        - tenant:environments.read
+        - tenant:environments.write
+        - tenant:email.read
+        - tenant:email.write
+        - tenant:idp.read
+        - tenant:idp.write
+      requireAuthorizationConsent: false  # first-party: no consent screen for the platform's own CLI
+
   - kind: environment
     name: ci
     spec:

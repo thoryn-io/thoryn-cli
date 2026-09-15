@@ -1,6 +1,7 @@
 package com.devnow.thoryn.cli.cmd.provision
 
 import com.devnow.thoryn.cli.cmd.connection.Connection
+import com.devnow.thoryn.cli.config.ThorynConfig
 import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.api.Test
 import java.io.File
@@ -19,15 +20,39 @@ class CiProvisionFileConformanceTest {
     private val connection: Connection = Connection.load(locate(CONNECTION_PATH))
 
     @Test
-    fun `the committed provisioning file loads, declares the CI sandbox + loopback client, and nothing on the production plane`() {
-        assertThat(file.resources.map { it.key }).containsExactly("environment/ci", "application/loopback-rp")
+    fun `the committed provisioning file declares the CLI login client on the production plane plus the CI sandbox and its loopback client`() {
+        assertThat(file.resources.map { it.key }).containsExactly("application/cli", "environment/ci", "application/loopback-rp")
         val env = file.environmentResource("ci")!!
         assertThat(env.spec["slug"]).isEqualTo("cli-ci")
-        val app = file.resources.single { it.kind == ProvisionFile.KIND_APPLICATION }
-        assertThat(app.environment).isEqualTo("ci") // lives INSIDE the sandbox → destroy needs no production confirmation
-        assertThat(app.spec["clientType"]).isEqualTo("public")
-        assertThat(app.spec["redirectUris"]).isEqualTo(listOf("http://127.0.0.1/callback"))
-        assertThat(file.resources.filter { it.kind != ProvisionFile.KIND_ENVIRONMENT }).allMatch { it.environment != null }
+        val rp = file.resources.single { it.key == "application/loopback-rp" }
+        assertThat(rp.environment).isEqualTo("ci") // lives INSIDE the sandbox → destroy needs no production confirmation
+        assertThat(rp.spec["clientType"]).isEqualTo("public")
+        assertThat(rp.spec["redirectUris"]).isEqualTo(listOf("http://127.0.0.1/callback"))
+        // SSO-3104 — the ONLY production-plane resource is the CLI's own login client, adopted (never
+        // deleted) by every apply whose receipt does not own it, and pinned to the id the CLI signs in with.
+        val production = file.resources.filter { it.kind != ProvisionFile.KIND_ENVIRONMENT && it.environment == null }
+        assertThat(production.map { it.key }).containsExactly("application/cli")
+        val cli = production.single()
+        assertThat(cli.spec["clientId"]).isEqualTo(ThorynConfig.DEFAULT_CLIENT_ID)
+        assertThat(cli.spec["clientType"]).isEqualTo("public")
+        assertThat(cli.spec["grantTypes"]).isEqualTo(listOf("authorization_code", "refresh_token", "urn:ietf:params:oauth:grant-type:device_code"))
+        assertThat(cli.spec["redirectUris"]).isEqualTo(listOf("http://127.0.0.1/callback", "http://[::1]/callback"))
+        assertThat(cli.spec["requireAuthorizationConsent"]).isEqualTo(false)
+        // Everything a bare `thoryn login` requests is grantable by the client (else: invalid_scope loop).
+        val granted = (cli.spec["scopes"] as List<*>).map { it.toString() }.toSet()
+        assertThat(granted).containsAll(ThorynConfig.DEFAULT_SCOPE.split(" "))
+        // …and nothing the CLI can never ask for: the grant is exactly openid + offline_access + the
+        // tenant scopes referenced anywhere in the CLI's own sources (a founder must hold each to grant it).
+        val requestable = requestableTenantScopes()
+        assertThat(granted - setOf("openid", "offline_access")).isEqualTo(requestable)
+    }
+
+    /** Every `tenant:<area>.<read|write>` literal under src/main (sources + bundled resources). */
+    private fun requestableTenantScopes(): Set<String> {
+        val root = File(locate(PROVISION_PATH).parentFile.parentFile, "src/main").walkTopDown()
+            .filter { it.isFile && (it.extension == "kt" || it.extension == "json" || it.extension == "yaml") }
+        val pattern = Regex("tenant:[a-z-]+\\.(read|write)")
+        return root.flatMap { f -> pattern.findAll(f.readText()).map { it.value } }.toSet()
     }
 
     @Test

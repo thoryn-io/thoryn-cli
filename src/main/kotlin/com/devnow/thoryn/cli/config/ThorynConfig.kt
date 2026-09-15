@@ -28,7 +28,14 @@ object ThorynConfig {
      * confidential, so interactive/device/CI sign-in still needs the client secret via
      * `THORYN_CLIENT_SECRET` / `--client-secret-file` (see [resolveClientSecret]).
      */
-    const val DEFAULT_CLIENT_ID = "thoryn-cli"
+    const val DEFAULT_CLIENT_ID = "cli"
+
+    /**
+     * SSO-3104 — the env var that names the workspace `thoryn login` signs in on when `--workspace` is
+     * not passed. Interactive sign-in is always ON A WORKSPACE (`https://<slug>.hub.<env>`): the shared
+     * default tenant is not a sign-in target any more.
+     */
+    const val WORKSPACE_ENV = "THORYN_WORKSPACE"
 
     /**
      * SSO-2870 — the reserved slug of a workspace's platform-managed PRODUCTION environment (mirrors
