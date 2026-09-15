@@ -139,8 +139,11 @@ thoryn provision ci-identity [--secret-file <path>] [--force-stdout] [--gateway 
 # Provisioning-as-code (SSO-3088, epic SSO-3087) — converge the DESIRED STATE in .thoryn/provision.yaml
 # (resources with a stable `name`: environment, application, user, federationMember, and the
 # per-environment singletons emailProvider / loginTheme / loginFlow). The receipt next to the file
-# (<name>.receipt.json) is the ownership ledger: apply twice is a no-op; destroy and --prune act ONLY
-# on receipt-recorded ids. Secrets never enter the file — name the env var (`passwordEnv`,
+# (<name>.receipt.json) is the ownership ledger. SSO-3089: every resource is read LIVE by its converge
+# key before any write (env slug, app displayName within its env, user email, member displayName, the
+# singletons by existence): equal ⇒ no-op, different ⇒ update with only the changed fields, existing
+# but unmanaged ⇒ adopted (converged from then on, NEVER deleted by destroy/--prune), deleted out of
+# band ⇒ re-created. Apply twice issues no writes. Secrets never enter the file — name the env var (`passwordEnv`,
 # `smtpPasswordEnv`, `clientSecretEnv`) or use `{{env.NAME}}`; they are resolved at apply and never
 # recorded. Production-plane removals need `--confirm <workspace-slug>` (the SSO-2413 gate).
 thoryn provision plan    [--file <path>] [--prune]                                  # read-only: what apply would create / remove

@@ -41,6 +41,12 @@ internal data class OwnedResource(
     val id: String,
     val environment: String? = null,
     val attributes: Map<String, String> = emptyMap(),
+    /**
+     * SSO-3089 — true when the resource already existed (matched live by its converge key) and was
+     * ADOPTED under management rather than created by this file. `apply` converges it, but `destroy`
+     * / `--prune` NEVER delete it: the CLI only removes what it created.
+     */
+    val adopted: Boolean = false,
 ) {
     val key: String get() = "$kind/$name"
 }

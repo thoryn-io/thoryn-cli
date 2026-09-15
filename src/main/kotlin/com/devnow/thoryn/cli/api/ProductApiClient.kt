@@ -149,6 +149,14 @@ class ProductApiClient(
         get("/api/v1/users/${encode(userId)}")
 
     /**
+     * `PATCH /api/v1/users/{userId}` (SSO-3089; product-api `usersUpdate`, `tenant:users.write`) —
+     * update a directory user's mutable profile fields (`emailVerified`, `firstName`, `lastName`,
+     * `locale`, …). Used by `thoryn provision apply` to converge a declared `user` resource.
+     */
+    fun updateUser(userId: String, body: Map<String, Any?>): JsonNode =
+        patch("/api/v1/users/${encode(userId)}", body)
+
+    /**
      * `POST /api/v1/users/{id}/suspend` — disable a user so their next sign-in is refused
      * (identity marks the account non-ACTIVE → the hosted login shows the suspended notice).
      * `204 No Content`. [confirmSlug] rides as `X-Thoryn-Confirm`, clearing the SSO-2413
@@ -351,6 +359,18 @@ class ProductApiClient(
 
     fun createFederationMember(body: Map<String, Any?>): JsonNode =
         post("/api/v1/federation-members", body)
+
+    /** `GET /api/v1/federation-members/{memberId}` (SSO-3089) — one member; 404 cross-tenant / unknown. */
+    fun getFederationMember(memberId: String): JsonNode =
+        get("/api/v1/federation-members/${encode(memberId)}")
+
+    /**
+     * `PATCH /api/v1/federation-members/{memberId}` (SSO-3089; product-api `federationMembersUpdate`,
+     * `tenant:federation.write`) — update a member's `displayName` / `discoveryUrl` / `clientId` /
+     * `clientSecret` / `claimMapping` / `providerConfig`. Used by `thoryn provision apply` to converge.
+     */
+    fun updateFederationMember(memberId: String, body: Map<String, Any?>): JsonNode =
+        patch("/api/v1/federation-members/${encode(memberId)}", body)
 
     /**
      * DELETE returns 204 No Content on success; surfaces non-2xx as [ProductApiException].

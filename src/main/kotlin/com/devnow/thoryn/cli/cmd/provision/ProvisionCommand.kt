@@ -113,7 +113,13 @@ class ProvisionCommand : Callable<Int> {
             plan.changes.forEach { c ->
                 println("  ${c.kind.padEnd(w1)}  ${c.name.padEnd(w2)}  ${c.action.name.lowercase().padEnd(6)}  ${c.reason}")
             }
-            println("  ${plan.creates.size} to create, ${plan.removes.size} to remove, ${plan.changes.count { it.action == ChangeAction.NOOP }} unchanged.")
+            plan.changes.filter { it.diff.isNotEmpty() }.forEach { c ->
+                c.diff.forEach { (field, change) -> println("      ${c.kind} ${c.name}: $field: $change") }
+            }
+            println(
+                "  ${plan.creates.size} to create, ${plan.updates.size} to update, ${plan.adopts.size} to adopt, " +
+                    "${plan.removes.size} to remove, ${plan.changes.count { it.action == ChangeAction.NOOP }} unchanged.",
+            )
         }
 
         fun fail(ex: Exception, gateway: String, format: OutputFormat): Int = when (ex) {
@@ -123,22 +129,29 @@ class ProvisionCommand : Callable<Int> {
         }
     }
 
-    /** `thoryn provision plan [--file] [--prune]` — read-only: what `apply` would do. Needs no session. */
-    @Command(name = "plan", description = ["Show what `apply` would create / remove for the provisioning file (read-only)."], mixinStandardHelpOptions = true)
+    /**
+     * `thoryn provision plan [--file] [--prune]` — read-only: what `apply` would do. SSO-3089 — reads the
+     * LIVE state of every declared resource by its converge key (so it needs a session), and reports
+     * create / update (with the changed fields) / adopt / no-op / remove.
+     */
+    @Command(name = "plan", description = ["Show what `apply` would create / update / adopt / remove for the provisioning file (read-only)."], mixinStandardHelpOptions = true)
     internal class PlanSubcommand : FileOptions(), Callable<Int> {
         @Option(names = ["--prune"], description = ["Also plan removal of owned resources the file no longer declares."])
         var prune: Boolean = false
 
         override fun call(): Int {
             val format = CommandSupport.parseFormat(outputRaw) ?: return CommandSupport.EXIT_USAGE
+            val s = try { open() ?: return CommandSupport.EXIT_USAGE } catch (ex: ProvisionException) {
+                System.err.println("Error: ${ex.message}"); return CommandSupport.EXIT_USAGE
+            }
+            val tokens = CommandSupport.readTokens() ?: return CommandSupport.EXIT_NOT_SIGNED_IN
+            gateway = CommandSupport.resolveGateway(gateway, tokens)
             return try {
-                val s = open() ?: return CommandSupport.EXIT_USAGE
-                val plan = ProvisionEngine(clients = { _ -> error("plan is read-only") }).plan(s.file, s.receipt, prune)
+                val plan = engine(gateway, tokens).plan(s.file, s.receipt, prune)
                 if (format == OutputFormat.TABLE) printPlan(plan, s.file) else CommandSupport.emitValue(format, plan.toStructured(), "")
                 CommandSupport.EXIT_OK
-            } catch (ex: ProvisionException) {
-                System.err.println("Error: ${ex.message}")
-                CommandSupport.EXIT_USAGE
+            } catch (ex: Exception) {
+                fail(ex, gateway, format)
             }
         }
     }
@@ -213,7 +226,7 @@ class ProvisionCommand : Callable<Int> {
             val tokens = CommandSupport.readTokens() ?: return CommandSupport.EXIT_NOT_SIGNED_IN
             gateway = CommandSupport.resolveGateway(gateway, tokens)
             val engine = engine(gateway, tokens)
-            val production = receipt.resources.any { ProvisionEngine.deletable(it.kind) && ProvisionEngine.onProductionPlane(it) }
+            val production = receipt.resources.any { ProvisionEngine.removable(it) && ProvisionEngine.onProductionPlane(it) }
             if (production && confirm.isNullOrBlank()) {
                 System.err.println("destroy would remove resources on the PRODUCTION plane; re-run with --confirm <workspace-slug>.")
                 return CommandSupport.EXIT_HTTP_ERROR
