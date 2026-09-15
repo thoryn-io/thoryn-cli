@@ -72,7 +72,7 @@ internal class RecipeInterpreter(
     /**
      * SSO-3100 — the process environment the provisioning file's `{{env.NAME}}` placeholders and
      * `<key>Env` secret references fall back to AFTER the recipe's resolved params, and (SSO-3102) the
-     * channel a `secret: true` recipe param reads BEFORE its default (test seam).
+     * channel every recipe param reads BEFORE its default — the example's override surface (test seam).
      */
     private val provisionEnv: (String) -> String? = { System.getenv(it) },
 ) {
@@ -372,15 +372,15 @@ internal class RecipeInterpreter(
     private fun resolveParams() {
         recipe.params.forEach { p ->
             val name = p["name"].asString()
-            // SSO-3102 — a `secret: true` param is supplied on argv (`--set`), else through the PROCESS ENV VAR
-            // of its own name, else by its default. The env channel is the only secret-safe one for CI (never
-            // on argv, never in a file); without it a generated default such as `Example-{{generate.slug8}}-Pw1!`
-            // silently shadowed the exported value and the provisioned demo user's password was unknowable.
-            val secret = p["secret"]?.asBoolean() == true
-            val fromEnv = if (secret) provisionEnv(name)?.takeIf { it.isNotEmpty() } else null
+            // SSO-3102 — every param in the recipe's `params` section is overridable by the example that runs it:
+            // `--set` (explicit) wins, else the PROCESS ENV VAR of the param's own name, else the recipe default.
+            // The env channel is what CI and a local shell use (a secret never rides on argv or in a file);
+            // without it a generated default such as `Example-{{generate.slug8}}-Pw1!` silently shadowed the
+            // exported value and the provisioned demo user's password was unknowable.
+            val fromEnv = provisionEnv(name)?.takeIf { it.isNotEmpty() }
             val value = when {
                 overrides[name] != null -> substitute(overrides.getValue(name))
-                fromEnv != null -> fromEnv // verbatim: a secret is never template-expanded
+                fromEnv != null -> fromEnv // verbatim: an env value is concrete, never template-expanded
                 else -> substitute(
                     p["default"]?.takeIf { !it.isNull }?.asString()
                         ?: throw RecipeException("parameter '$name' has no value and no default (guided prompting is SSO-2876)"),

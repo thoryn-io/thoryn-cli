@@ -394,9 +394,10 @@ key — a re-apply issues no writes, a leftover sandbox is adopted by its slug),
 recipe's own steps and `verify`. The file's `{{env.NAME}}` placeholders and `<key>Env` secret
 references resolve **first from the recipe's params** (so `passwordEnv: demoPassword` reads the
 `secret: true` param, `slug: "{{env.envSlug}}"` reads `envSlug`) and **then from the process
-environment**; secret values never reach a file or receipt. A **`secret: true` param** itself is
-supplied with `--set`, else through the **process env var of its own name** (`export
-demoPassword=…` — the channel CI uses, never argv), else by its default (SSO-3102). What the file owns is exposed to
+environment**; secret values never reach a file or receipt. The recipe's **`params` section is
+overridable by the example that runs it**: a param takes `--set`, else the **process env var of
+its own name** (`export envSlug=…`, `export demoPassword=…` — the channel CI uses; a secret never
+rides on argv), else the recipe default (SSO-3102). What the file owns is exposed to
 the recipe as `{{provision.<kind>.<name>.id}}` (plus `.slug` for an environment, `.email` for
 a user, `.clientId` / `.redirectUri` for an application, `.methods` for `loginMethods`), the
 first `environment` resource becomes the environment later steps and `examples run` target,

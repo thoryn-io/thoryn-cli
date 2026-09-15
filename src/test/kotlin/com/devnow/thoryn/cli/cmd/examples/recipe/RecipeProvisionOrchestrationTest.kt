@@ -254,9 +254,9 @@ class RecipeProvisionOrchestrationTest : CommandTestBase() {
     }
 
     @Test
-    fun `a secret param reads the process env var of its name before its default, and --set wins over both`() {
-        // SSO-3102 — the recipe's `demoPassword` param is `secret: true` with a default. CI exports the real
-        // value under the SAME NAME (never on argv); it must reach the provisioned user instead of the default.
+    fun `every param reads the process env var of its name before its default, and --set wins over both`() {
+        // SSO-3102 — the recipe's params section is overridable by the example that runs it: CI exports the
+        // value under the param's NAME (a secret never on argv); it must reach the provisioning instead of the default.
         val ctx = context()
         val r = recipe(provisionedRecipe, provisionYaml)
         RecipeInterpreter(ctx, r, trustPropagationBudgetMs = 2_000, provisionEnv = { if (it == "demoPassword") "From-Env-2!" else null }).setup()
@@ -268,7 +268,7 @@ class RecipeProvisionOrchestrationTest : CommandTestBase() {
         RecipeInterpreter(ctx, r, trustPropagationBudgetMs = 2_000, provisionEnv = { null }).setup()
         assertThat(api.provisioningWrites.first { it.path == "/api/v1/users" }.body["password"]).isEqualTo("Demo-Pw1!")
 
-        // An explicit --set beats the env var; a NON-secret param never reads the env (envSlug stays the default).
+        // An explicit --set beats the env var; a non-secret param (envSlug) is overridable from the env too.
         api.reset(); api.users.clear() // the sandbox + app are adopted; the user is created afresh
         stateStore.provisionReceiptPath("sandbox-demo").toFile().delete()
         RecipeInterpreter(
@@ -276,7 +276,7 @@ class RecipeProvisionOrchestrationTest : CommandTestBase() {
             provisionEnv = { mapOf("demoPassword" to "From-Env-2!", "envSlug" to "not-this")[it] },
         ).setup()
         assertThat(api.provisioningWrites.first { it.path == "/api/v1/users" }.body["password"]).isEqualTo("From-Set-3!")
-        assertThat(api.environments.map { it["slug"] }).containsExactly("demo-sbx")
+        assertThat(api.provisioningWrites.first { it.path == "/api/v1/environments" }.body["slug"]).isEqualTo("not-this")
     }
 
     @Test
