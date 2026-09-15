@@ -113,7 +113,7 @@ internal class ExampleContext(
     fun tenantGatewayClient(tenantIssuer: String, environmentSlug: String? = null): ProductApiClient {
         val exchanged = TokenExchangeFlow(
             issuer = hub,
-            clientId = ThorynConfig.DEFAULT_CLIENT_ID,
+            clientId = CommandSupport.sessionClientId(tokens),
             clientSecret = null,
             subjectToken = tokens.accessToken,
             targetResource = tenantIssuer,

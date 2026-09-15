@@ -25,6 +25,19 @@ class LoginWorkspaceTest : CommandTestBase() {
     }
 
     @Test
+    fun `later token round-trips use the client the session signed in with, not the default`() {
+        val enc = java.util.Base64.getUrlEncoder().withoutPadding()
+        fun jwt(claims: String) = enc.encodeToString("""{"alg":"none"}""".toByteArray()) + "." + enc.encodeToString(claims.toByteArray()) + "."
+        // 1) stored on the session (a login with this branch or `--client-id`)
+        assertThat(CommandSupport.sessionClientId(com.devnow.thoryn.cli.auth.Tokens(accessToken = "opaque", clientId = "app-1"))).isEqualTo("app-1")
+        // 2) a session written by an older CLI: the client_id / azp claim of the access token
+        assertThat(CommandSupport.sessionClientId(com.devnow.thoryn.cli.auth.Tokens(accessToken = jwt("""{"client_id":"thoryn-cli"}""")))).isEqualTo("thoryn-cli")
+        assertThat(CommandSupport.sessionClientId(com.devnow.thoryn.cli.auth.Tokens(accessToken = jwt("""{"azp":"thoryn-cli"}""")))).isEqualTo("thoryn-cli")
+        // 3) nothing known → the CLI's default client
+        assertThat(CommandSupport.sessionClientId(com.devnow.thoryn.cli.auth.Tokens(accessToken = "opaque"))).isEqualTo(ThorynConfig.DEFAULT_CLIENT_ID)
+    }
+
+    @Test
     fun `the default login client is cli and a workspace derives the tenant hub issuer plus the base gateway`() {
         assertThat(ThorynConfig.DEFAULT_CLIENT_ID).isEqualTo("cli")
         val base = "https://hub.stg.thoryn.org"

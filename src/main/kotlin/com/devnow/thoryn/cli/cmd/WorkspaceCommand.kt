@@ -199,8 +199,8 @@ class WorkspaceCommand : Callable<Int> {
         @Option(names = ["--hub"], description = ["Override the hub base URL (default: \${DEFAULT-VALUE})."], defaultValue = ThorynConfig.DEFAULT_HUB)
         var hub: String = ThorynConfig.DEFAULT_HUB
 
-        @Option(names = ["--client-id"], description = ["OAuth client id used for the switch exchange (default: \${DEFAULT-VALUE})."], defaultValue = ThorynConfig.DEFAULT_CLIENT_ID)
-        var clientId: String = ThorynConfig.DEFAULT_CLIENT_ID
+        @Option(names = ["--client-id"], description = ["OAuth client id used for the switch exchange (default: the client this session signed in with)."])
+        var clientIdOverride: String? = null
 
         @Option(names = ["--client-secret-file"], description = ["File with the client secret for a confidential client. Public clients omit it. Falls back to THORYN_CLIENT_SECRET."])
         var clientSecretFile: String? = null
@@ -220,6 +220,8 @@ class WorkspaceCommand : Callable<Int> {
             val format = CommandSupport.parseFormat(outputRaw) ?: return CommandSupport.EXIT_USAGE
             val tokens = CommandSupport.readTokens() ?: return CommandSupport.EXIT_NOT_SIGNED_IN
             hub = CommandSupport.resolveHub(hub, tokens) // SSO-2827 — the hub you signed into (also feeds the token exchange below)
+            // SSO-3104 — exchange as the client this session was signed in with, never a fixed default.
+            val clientId = clientIdOverride?.takeIf { it.isNotBlank() } ?: CommandSupport.sessionClientId(tokens)
             val client = CommandSupport.client(hub, tokens)
 
             val workspaces = try {

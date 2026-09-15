@@ -185,6 +185,8 @@ class ThorynCliE2ETest {
         assertThat(tokenJson).contains("\"accessToken\"")
         assertThat(tokenJson).contains("AT-real-1")
         assertThat(tokenJson).contains("RT-real-1")
+        // SSO-3104 — the session remembers the client it signed in with (refresh + exchange reuse it).
+        assertThat(tokenJson).contains("\"clientId\":\"thoryn-cli\"")
 
         // Hub saw exactly the requests we expect, with confidential-client
         // Basic auth headers.

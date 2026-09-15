@@ -249,6 +249,8 @@ class LoginCommand : Callable<Int> {
     private fun withSession(tokens: Tokens): Tokens =
         tokens.copy(
             issuer = issuer,
+            // SSO-3104 — remember which client signed in, so refresh / workspace exchange use the same one.
+            clientId = tokens.clientId ?: clientId,
             // The gateway derives from the hub BASE (`hub.<env>` → `api.<env>`), never from a tenant host.
             gateway = gateway?.takeIf { it.isNotBlank() } ?: ThorynConfig.gatewayForIssuer(baseIssuer),
         )
