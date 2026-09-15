@@ -1,93 +1,92 @@
-# SSO-2951 (epic SSO-2947) — reusable "provision-as-a-real-customer" composite Action,
-# now bound to the CLI's CONNECTION CONTRACT (`.thoryn/connection.json`).
+# SSO-3090 (epic SSO-3087) — reusable "provision-as-a-real-customer" composite Action, now driven
+# by the repo's PROVISIONING-AS-CODE (`.thoryn/provision.yaml`) on top of its CONNECTION CONTRACT
+# (`.thoryn/connection.json`, SSO-2951).
 #
-# Configures the Thoryn product against SHARED STAGING using ONLY the real product
-# APIs, exercised through the `thoryn` CLI + a signed recipe. There is NO DB seeding,
-# no bespoke endpoint, no demo shortcut — the product-boundary rule (CLAUDE.md) applied
-# to CI: every resource is created through the same customer-plane workflow a real
-# tenant admin would use.
+# Configures the Thoryn product against SHARED STAGING using ONLY the real product APIs, exercised
+# through the `thoryn` CLI and the two committed `.thoryn/` files. There is NO DB seeding, no bespoke
+# endpoint, no demo shortcut — the product-boundary rule (CLAUDE.md) applied to CI: every resource is
+# created through the same customer-plane workflow a real tenant admin would use, with the same verbs
+# a customer runs from their own pipeline.
 #
-# AUTHENTICATION IS AS-CODE (SSO-2951, superseding the SSO-2944 imperative bash sign-in).
-# The binding — which workspace, which client, which scopes — lives in the committed
-# connection contract `.thoryn/connection.json` (schema: connection.schema.json, SSO-2948),
-# NOT in bash `sed` + workflow inputs. Sign-in collapses to one declarative step:
-#
-#     thoryn login --connection .thoryn/connection.json
-#
-# The CLI derives the per-tenant issuer (`https://<slug>.hub.<env>`), the gateway, and
-# the requested scopes FROM the contract; it reads the client secret from the env var the
-# contract NAMES (`auth.secretEnv` = THORYN_CLI_CI_CLIENT_SECRET), failing closed if unset.
-# The only injected secret is that one env var — never an argv flag, never echoed.
-#
-# The machine client the contract names is minted ONCE by a founder via the customer plane
-# (`thoryn provision ci-identity`, SSO-2952); the operator pastes its clientId into the
-# contract and sets the THORYN_CLI_CI_CLIENT_SECRET GitHub secret. See `.thoryn/README.md`.
+# The two files (both DATA, both schema-validated by the CLI):
+#   .thoryn/connection.json  — WHO I AM: workspace slug, client id, the NAME of the secret env var,
+#                              the scope set. `thoryn login --connection` signs in from it (SSO-2948).
+#   .thoryn/provision.yaml   — WHAT I OWN: the desired-state resources (a sandbox environment + a
+#                              loopback OAuth client for this repo). `thoryn provision apply` converges
+#                              it (SSO-3088/3089): apply twice issues no writes; a leftover from a
+#                              failed run is adopted by its key rather than duplicated.
 #
 # What it does, end to end:
-#   1. Downloads the prebuilt `thoryn.jar` from the LATEST `cli-v*` release of
-#      thoryn-io/thoryn-cli (`gh release download <tag> --pattern thoryn.jar --dir .` ->
-#      `./thoryn.jar`). Releases now exist (SSO-2936 stood up the release workflow and
-#      cli-v* tags are cut), so CI validates the actually-shipped artifact instead of
-#      rebuilding from source — faster, and it exercises exactly what customers get.
-#   2. Signs in NON-INTERACTIVELY from the connection contract:
-#      `thoryn login --connection <file>`. The secret is supplied as the env var the
-#      contract names (THORYN_CLI_CI_CLIENT_SECRET); the hub base is supplied as the env
-#      var the contract names for it (THORYN_HUB). Issuer/gateway/scope are derived by the
-#      CLI and stamped onto the session (SSO-2827), so later `examples` commands need no
-#      host flags.
-#   3. Provisions by APPLYING the WORKSPACE-LESS recipe:
-#      `thoryn examples apply <recipe> --set workspaceSlug=<contract slug> --yes`. The
-#      standing workspace is the contract's `workspace.slug` (single-sourced — read from
-#      the contract, not a separate input). The bundled `ci-signin` recipe registers a
-#      public loopback OAuth client UNDER that workspace using the caller's tenant-scoped
-#      bearer — no hub.createWorkspace, no token-exchange.
-#   4. Exposes the workspace slug / ephemeral client id / per-tenant issuer as Action
-#      outputs (read from the run's receipt) for downstream steps.
-#   5. TEARS DOWN in an `if: always()` step: `thoryn examples teardown <recipe>` runs the
-#      recipe's teardown — which deletes ONLY the ephemeral OAuth client. The standing
-#      workspace and standing user are the operator's and are never touched. Guaranteed on
-#      failure so a broken run never leaks an ephemeral client.
+#   1. Downloads the prebuilt `thoryn.jar` from a `cli-v*` release of thoryn-io/thoryn-cli (the
+#      latest, or `cli-version`) — CI validates the actually-shipped artifact. The verbs this Action
+#      runs need cli-v0.11.0 or newer (the first release carrying `thoryn provision apply`).
+#   2. Signs in NON-INTERACTIVELY from the connection contract: `thoryn login --connection <file>`.
+#      The secret is supplied as the env var the contract NAMES; the hub base as the env var the
+#      contract names for it (THORYN_HUB). Issuer/gateway/scopes are derived by the CLI.
+#   3. `thoryn provision plan --file <file>` (read-only, printed for the log), then
+#      `thoryn provision apply --file <file> --yes`. The receipt the CLI writes NEXT TO the file
+#      (`<name>.receipt.json`, secret-free) is the ownership ledger.
+#   4. Exposes the workspace slug (from the contract), the provisioned environment slug, the client
+#      id, the per-tenant issuer and the receipt path as outputs (read from the receipt).
+#   5. `thoryn provision destroy --file <file> --yes` in an `if: always()` step (unless
+#      `destroy: "false"`): removes everything the receipt owns, child-first — the sandbox hard-delete
+#      cascades the client. Guaranteed on failure so a broken run never leaks a sandbox.
 #
-# Scope: the CLI jar is DOWNLOADED from the release (no longer built from the checked-out
-# source), but the caller must still `actions/checkout` thoryn-cli before `uses:`-ing it —
-# the Action reads the committed connection contract `.thoryn/connection.json` and is itself
-# a local composite Action in this repo (the demo caller `.github/workflows/provision-e2e.yml`
-# checks out first). Making it consumable from a foreign repo is a follow-up.
+# CONSUMING THIS ACTION FROM ANOTHER REPOSITORY (the thoryn-examples scenarios, a customer pipeline):
+#   - uses: actions/checkout@v4                       # YOUR repo, holding YOUR .thoryn/ files
+#   - uses: thoryn-io/thoryn-cli/.github/actions/provision@main   # or a cli-v* tag
+#     with:
+#       client-secret: ${{ secrets.MY_CLI_CLIENT_SECRET }}   # the env var YOUR connection.json names
+#       connection: .thoryn/connection.json
+#       file: recipes/my-scenario/e2e/provision.yaml          # any provisioning file in your checkout
+#   The connection/file paths are resolved in the CALLER's workspace. The env var name the contract's
+#   `auth.secretEnv` declares must match `secret-env` (default THORYN_CLI_CI_CLIENT_SECRET).
 
 name: "Provision Thoryn (as a real customer)"
 description: >-
-  Download the latest released thoryn CLI jar, sign in from the committed connection contract
-  (.thoryn/connection.json), provision an ephemeral OAuth client inside the contract's workspace via a
-  signed recipe, expose its ids as outputs, and delete the ephemeral client on exit. Product APIs only
-  — no DB seeding, no demo endpoints, no imperative sign-in.
+  Download a released thoryn CLI jar, sign in from the committed connection contract
+  (.thoryn/connection.json), converge the committed provisioning file (.thoryn/provision.yaml) with
+  `thoryn provision apply`, expose the provisioned ids as outputs, and `thoryn provision destroy` on exit.
+  Product APIs only — no DB seeding, no demo endpoints, no imperative sign-in, no imperative provisioning.
 
 inputs:
   client-secret:
     description: >-
       The client SECRET of the machine client named by the connection contract's `auth.clientId`.
-      Pass `secrets.THORYN_CLI_CI_CLIENT_SECRET`. NEVER a literal — the repo is public. Supplied to the
-      CLI as the THORYN_CLI_CI_CLIENT_SECRET env var (the name the contract's `auth.secretEnv` declares);
-      never echoed, never an argv flag. See `.thoryn/README.md` for the one-time bootstrap that mints it.
+      Pass it from a repository secret. NEVER a literal — this repo is public. Supplied to the CLI as
+      the env var named by `secret-env`; never echoed, never an argv flag. See `.thoryn/README.md`
+      for the one-time bootstrap that mints it (`thoryn provision ci-identity`).
     required: true
+  secret-env:
+    description: "NAME of the env var the connection contract's `auth.secretEnv` declares for the secret."
+    required: false
+    default: "THORYN_CLI_CI_CLIENT_SECRET"
   connection:
-    description: "Path to the connection contract the CLI signs in from (schema: connection.schema.json)."
+    description: "Path (in the caller's workspace) to the connection contract the CLI signs in from."
     required: false
     default: ".thoryn/connection.json"
+  file:
+    description: "Path (in the caller's workspace) to the provisioning file `thoryn provision apply` converges."
+    required: false
+    default: ".thoryn/provision.yaml"
   hub:
     description: >-
-      Hub BASE URL to provision against (the staging broker). Supplied to the CLI as the THORYN_HUB env
-      var — the name the contract's `workspace.hubBaseUrlEnv` declares — from which the CLI derives the
-      per-tenant issuer `https://<slug>.hub.<env>` and the shared `api.<env>` gateway.
+      Hub BASE URL to provision against. Supplied to the CLI as THORYN_HUB (the name the contract's
+      `workspace.hubBaseUrlEnv` declares); the CLI derives the per-tenant issuer + gateway from it.
     required: false
     default: "https://hub.stg.thoryn.org"
-  recipe:
-    description: "The bundled workspace-less recipe to apply. `ci-signin` provisions an ephemeral app in the contract's workspace."
+  destroy:
+    description: "Run `thoryn provision destroy` on exit (\"true\"/\"false\"). Default true: never leak a sandbox from CI."
     required: false
-    default: "ci-signin"
-  environment:
+    default: "true"
+  confirm:
     description: >-
-      Optional target environment slug within the contract's workspace (e.g. a sandbox). EMPTY (the
-      default) omits `--environment`, so resources go to the workspace's default (production) plane.
+      Workspace slug confirming PRODUCTION-plane removals on destroy (the SSO-2413 gate). Leave empty
+      when the file only owns environment-scoped resources (this repo's default file).
+    required: false
+    default: ""
+  cli-version:
+    description: "A specific `cli-v*` release tag to download (default: the latest cli-v* release)."
     required: false
     default: ""
   java-version:
@@ -97,14 +96,20 @@ inputs:
 
 outputs:
   workspace-slug:
-    description: "Slug of the workspace the ephemeral client was created in (the connection contract's workspace.slug)."
+    description: "Slug of the workspace the resources live in (the connection contract's workspace.slug)."
     value: ${{ steps.apply.outputs.workspace-slug }}
+  environment:
+    description: "Slug of the (first) environment the file provisioned, or empty when it targets the production plane."
+    value: ${{ steps.apply.outputs.environment }}
   client-id:
-    description: "Client id of the ephemeral OAuth application the recipe registered."
+    description: "Client id of the (first) OAuth application the file provisioned."
     value: ${{ steps.apply.outputs.client-id }}
   issuer:
     description: "Per-tenant OIDC issuer for the workspace (https://<slug>.hub.<env>)."
     value: ${{ steps.apply.outputs.issuer }}
+  receipt:
+    description: "Path of the secret-free provisioning receipt (<file-name>.receipt.json, next to the file)."
+    value: ${{ steps.apply.outputs.receipt }}
 
 runs:
   using: composite
@@ -115,18 +120,20 @@ runs:
         distribution: temurin
         java-version: ${{ inputs.java-version }}
 
-    # Download the prebuilt `thoryn.jar` from the LATEST `cli-v*` release of this repo,
-    # rather than rebuilding from source: faster CI, and it validates the actually-shipped
-    # artifact. The release workflow publishes the fat jar under the stable asset name
-    # `thoryn.jar` on every `cli-v*` tag; `--dir .` lands it at `./thoryn.jar`. `github.token`
-    # is sufficient — this is a same-repo release read.
-    - name: Download the released thoryn CLI (latest cli-v* release)
+    # Download the prebuilt `thoryn.jar` from a `cli-v*` release rather than rebuilding from source:
+    # faster CI, and it validates the actually-shipped artifact. `github.token` is sufficient for a
+    # public-release read; a foreign caller's token works the same way.
+    - name: Download the released thoryn CLI
       shell: bash
       env:
         GH_TOKEN: ${{ github.token }}
+        CLI_VERSION: ${{ inputs.cli-version }}
       run: |
         set -euo pipefail
-        tag="$(gh release list --repo thoryn-io/thoryn-cli --limit 40 --json tagName -q '.[].tagName' | grep '^cli-v' | head -1)"
+        tag="$CLI_VERSION"
+        if [ -z "$tag" ]; then
+          tag="$(gh release list --repo thoryn-io/thoryn-cli --limit 40 --json tagName -q '.[].tagName' | grep '^cli-v' | head -1)"
+        fi
         if [ -z "$tag" ]; then
           echo "::error::no cli-v* release found in thoryn-io/thoryn-cli — run its release workflow (SSO-2936) first." >&2
           exit 1
@@ -134,105 +141,106 @@ runs:
         echo "Using CLI release $tag"
         gh release download "$tag" --repo thoryn-io/thoryn-cli --pattern 'thoryn.jar' --dir .
         test -f thoryn.jar
+        # The provisioning verbs (SSO-3088) must be present in the downloaded release.
+        if ! java -jar thoryn.jar provision --help 2>/dev/null | grep -q 'apply'; then
+          echo "::error::release $tag predates 'thoryn provision apply' (SSO-3088) — pin cli-version to cli-v0.11.0 or newer." >&2
+          exit 1
+        fi
         echo "Downloaded thoryn.jar ($(du -h thoryn.jar | cut -f1)) from release $tag."
 
-    # Sign in from the connection contract. The CLI derives the per-tenant issuer, the gateway and the
-    # requested scopes from the contract (workspace.slug + THORYN_HUB), reads the secret from the env
-    # var the contract names, and stamps issuer + gateway onto the session (SSO-2827) so the later
-    # `examples` commands need no host flags. This one step replaces the former ~20-line bash block that
-    # `sed`-derived the issuer/gateway and ran a manual `login --client-credentials --issuer … --scope …`.
+    # Sign in from the connection contract: the CLI derives the per-tenant issuer, the gateway and the
+    # requested scopes from it, reads the secret from the env var the contract names, and stamps the
+    # session (SSO-2827) so the later `provision` commands need no host flags.
     - name: Sign in (connection contract)
       shell: bash
       env:
-        # The secret the contract's `auth.secretEnv` names. Read from the env by the CLI; never argv.
-        THORYN_CLI_CI_CLIENT_SECRET: ${{ inputs.client-secret }}
-        # The hub base the contract's `workspace.hubBaseUrlEnv` names; the CLI derives the issuer/gateway.
+        SECRET_ENV: ${{ inputs.secret-env }}
+        SECRET_VALUE: ${{ inputs.client-secret }}
         THORYN_HUB: ${{ inputs.hub }}
         CONNECTION: ${{ inputs.connection }}
-        # Headless GitHub runners have no OS keychain (Secret Service / D-Bus), so the CLI's default
-        # KeychainTokenStore is unavailable. This is the documented CI opt-in for the plaintext file
-        # token store (chmod-0600 JSON under $HOME). The token lives only on the ephemeral runner.
+        # Headless runners have no OS keychain; this is the documented CI opt-in for the plaintext
+        # file token store (chmod-0600 JSON under $HOME). The token lives only on the ephemeral runner.
         THORYN_CI_PLAINTEXT_TOKENS: "1"
       run: |
         set -euo pipefail
-        if [ -z "${THORYN_CLI_CI_CLIENT_SECRET:-}" ]; then
-          echo "::error::client-secret is empty — pass secrets.THORYN_CLI_CI_CLIENT_SECRET as the action's client-secret input." >&2
+        if [ -z "${SECRET_VALUE:-}" ]; then
+          echo "::error::client-secret is empty — pass the repository secret the connection contract's auth.secretEnv names." >&2
           exit 1
         fi
         if [ ! -f "$CONNECTION" ]; then
           echo "::error::connection contract '$CONNECTION' not found — commit .thoryn/connection.json or pass the connection input." >&2
           exit 1
         fi
+        declared="$(jq -r '.auth.secretEnv // ""' "$CONNECTION")"
+        if [ "$declared" != "$SECRET_ENV" ]; then
+          echo "::error::connection contract names secret env var '$declared' but the Action's secret-env input is '$SECRET_ENV' — make them match." >&2
+          exit 1
+        fi
+        # Export the secret under the NAME the contract declares (never on argv, never echoed).
+        export "$SECRET_ENV"="$SECRET_VALUE"
         echo "Signing in from connection contract $CONNECTION (hub base $THORYN_HUB)."
         java -jar thoryn.jar login --connection "$CONNECTION"
         java -jar thoryn.jar login --status
 
-    # Provision via the workspace-less recipe, then read the run's receipt to expose ids as outputs.
-    # The standing workspace is the contract's `workspace.slug` (single-sourced — read from the contract
-    # with jq, not a separate input); `--yes` skips the confirmation. `--environment` is added only when
-    # a non-empty environment input is supplied.
-    - name: Provision (apply recipe) and expose outputs
+    # Converge the provisioning file, then read its receipt to expose ids as outputs. `plan` first is
+    # read-only and lands the diff in the job log; `apply --yes` skips the interactive confirmation.
+    - name: Provision (thoryn provision apply) and expose outputs
       id: apply
       shell: bash
       env:
-        RECIPE: ${{ inputs.recipe }}
+        FILE: ${{ inputs.file }}
         HUB: ${{ inputs.hub }}
         CONNECTION: ${{ inputs.connection }}
-        ENVIRONMENT: ${{ inputs.environment }}
         THORYN_CI_PLAINTEXT_TOKENS: "1"
       run: |
         set -euo pipefail
-        # The workspace is the contract's — the single source of the binding.
-        slug="$(jq -r '.workspace.slug // ""' "$CONNECTION")"
-        if [ -z "$slug" ]; then
-          echo "::error::connection contract '$CONNECTION' has no workspace.slug." >&2
+        if [ ! -f "$FILE" ]; then
+          echo "::error::provisioning file '$FILE' not found — commit .thoryn/provision.yaml or pass the file input." >&2
           exit 1
         fi
+        slug="$(jq -r '.workspace.slug // ""' "$CONNECTION")"
+        [ -n "$slug" ] || { echo "::error::connection contract '$CONNECTION' has no workspace.slug." >&2; exit 1; }
 
-        apply_args=(examples apply "$RECIPE" --set "workspaceSlug=${slug}" --yes)
-        if [ -n "${ENVIRONMENT:-}" ]; then
-          apply_args+=(--environment "$ENVIRONMENT")
-        fi
-        java -jar thoryn.jar "${apply_args[@]}"
+        java -jar thoryn.jar provision plan --file "$FILE"
+        java -jar thoryn.jar provision apply --file "$FILE" --yes
 
-        # The receipt is the portable, secret-free record of what was provisioned.
-        java -jar thoryn.jar examples receipt "$RECIPE" --output json > receipt.json
-        echo "----- receipt -----"
-        cat receipt.json
-        echo "-------------------"
+        # The receipt is written next to the file as <name>.receipt.json — the secret-free ownership ledger.
+        receipt="$(dirname "$FILE")/$(basename "${FILE%.*}").receipt.json"
+        test -f "$receipt" || { echo "::error::no receipt at $receipt after apply." >&2; exit 1; }
+        echo "----- receipt ($receipt) -----"
+        cat "$receipt"
+        echo "------------------------------"
 
-        receipt_slug="$(jq -r '.workspace.slug // ""' receipt.json)"
-        [ -n "$receipt_slug" ] || receipt_slug="$slug"
-        client="$(jq -r '[.resources[] | select(.kind=="application") | .id] | first // ""' receipt.json)"
-
+        environment="$(jq -r '[.resources[] | select(.kind=="environment") | .attributes.slug] | first // ""' "$receipt")"
+        client="$(jq -r '[.resources[] | select(.kind=="application") | .id] | first // ""' "$receipt")"
         # Per-tenant issuer: hub.<env> -> <slug>.hub.<env> (mirrors ThorynConfig.tenantIssuer).
-        tenant_issuer="$HUB"
-        if [ -n "$receipt_slug" ]; then
-          tenant_issuer="$(printf '%s' "$HUB" | sed -E "s#://hub\.#://${receipt_slug}.hub.#")"
-        fi
+        tenant_issuer="$(printf '%s' "$HUB" | sed -E "s#://hub\.#://${slug}.hub.#")"
 
         {
-          echo "workspace-slug=$receipt_slug"
+          echo "workspace-slug=$slug"
+          echo "environment=$environment"
           echo "client-id=$client"
           echo "issuer=$tenant_issuer"
+          echo "receipt=$receipt"
         } >> "$GITHUB_OUTPUT"
+        echo "Provisioned client '$client' in workspace '$slug'${environment:+ (environment $environment)} — issuer $tenant_issuer."
 
-        echo "Provisioned ephemeral client '$client' in workspace '$receipt_slug' (issuer $tenant_issuer)."
-
-    # MANDATORY teardown — runs even when a previous step failed, so a failed run never
-    # leaks an ephemeral OAuth client. The recipe teardown deletes ONLY the client; the
-    # standing workspace and standing user are untouched. Teardown reads the local run
-    # state written by `apply`, so it needs no ids passed in; it is a no-op (best-effort)
-    # if `apply` never ran.
-    - name: Teardown (delete the ephemeral client)
-      if: always()
+    # MANDATORY teardown — runs even when a previous step failed, so a failed run never leaks a
+    # sandbox. `destroy` removes ONLY what the receipt owns (child-first; adopted resources are left in
+    # place), so the standing workspace and anything not created by this file are never touched.
+    - name: Teardown (thoryn provision destroy)
+      if: always() && inputs.destroy == 'true'
       shell: bash
       env:
-        RECIPE: ${{ inputs.recipe }}
+        FILE: ${{ inputs.file }}
+        CONFIRM: ${{ inputs.confirm }}
         THORYN_CI_PLAINTEXT_TOKENS: "1"
       run: |
         set -euo pipefail
-        java -jar thoryn.jar examples teardown "$RECIPE" || {
-          echo "::warning::teardown reported an error — verify no '${RECIPE}' client leaked in the standing workspace." >&2
+        [ -f thoryn.jar ] || { echo "no CLI jar — nothing was provisioned"; exit 0; }
+        args=(provision destroy --file "$FILE" --yes)
+        [ -n "${CONFIRM:-}" ] && args+=(--confirm "$CONFIRM")
+        java -jar thoryn.jar "${args[@]}" || {
+          echo "::warning::destroy reported an error — check 'thoryn env list' for a leaked sandbox owned by $FILE." >&2
           exit 0
         }

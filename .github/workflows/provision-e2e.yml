@@ -1,35 +1,26 @@
 name: provision-e2e
 
-# SSO-2951 (epic SSO-2947) — demo caller for the reusable provisioning Action
-# (.github/actions/provision). It configures the product as a real customer against
-# SHARED STAGING using only the real product APIs via the `thoryn` CLI, then deletes
-# what it created.
+# SSO-3090 (epic SSO-3087) — demo caller for the reusable provisioning Action
+# (.github/actions/provision). thoryn-cli DOGFOODS its own provisioning-as-code: the Action signs in
+# from the committed connection contract (`.thoryn/connection.json`, SSO-2951) and converges the
+# committed provisioning file (`.thoryn/provision.yaml`) with `thoryn provision apply` (SSO-3088/3089)
+# against SHARED STAGING, then `thoryn provision destroy`s it on exit. Real product APIs only.
 #
-# AS-CODE AUTH (SSO-2951): sign-in is driven by the committed connection contract
-# `.thoryn/connection.json` (SSO-2948), not by imperative bash + workflow inputs. The
-# Action runs `thoryn login --connection .thoryn/connection.json`; the CLI derives the
-# per-tenant issuer, gateway and scopes from the contract. The ONLY secret this workflow
-# injects is `THORYN_CLI_CI_CLIENT_SECRET` (the env var the contract's `auth.secretEnv`
-# names) — the client id, workspace and scopes are all in the committed contract.
+# The ONLY secret this workflow injects is `THORYN_CLI_CI_CLIENT_SECRET` (the env var the contract's
+# `auth.secretEnv` names) — the client id, workspace, scopes and the desired resources are all in the
+# committed `.thoryn/` files.
 #
-# The contract binds to the `thoryn` workspace and provisions an EPHEMERAL OAuth client
-# inside it (a customer-plane, tenant-scoped credential cannot create workspaces, so the
-# run does not mint a fresh one). The ephemeral client is the sole per-run resource; it is
-# deleted on exit.
+# The file provisions a SANDBOX environment (`cli-ci`) inside the `thoryn` workspace plus a loopback
+# OAuth client in it; destroy hard-deletes the sandbox (cascading the client). A leftover from a failed
+# run is ADOPTED by its slug on the next apply, never duplicated (see `.thoryn/provision.yaml`).
 #
-# Manual only (workflow_dispatch): it mutates a shared-staging workspace and needs the
-# THORYN_CLI_CI_CLIENT_SECRET secret, so it must not fire on push/PR. A nightly schedule
-# can be added once the prerequisites below are live.
+# Manual only (workflow_dispatch): it mutates a shared-staging workspace and needs the secret, so it
+# must not fire on push/PR. Requires a `cli-v*` release carrying `thoryn provision apply`
+# (cli-v0.11.0+) — pin one with the cli-version input until it is the latest.
 #
-# ONE-TIME OPERATOR SETUP (see `.thoryn/README.md` "One-time bootstrap"):
-#   * A founder mints the CI machine client once via the customer plane
-#     (`thoryn provision ci-identity`, SSO-2952) and pastes its clientId into
-#     `.thoryn/connection.json` (replacing the REPLACE_AFTER_BOOTSTRAP marker).
-#   * The `THORYN_CLI_CI_CLIENT_SECRET` repository secret is set to that client's secret.
-#
-# Until the machine client is minted + the contract's clientId filled in, this workflow is
-# expected to fail at sign-in. Do NOT wire it into a required gate before it is verified
-# green once by hand.
+# ONE-TIME OPERATOR SETUP (see `.thoryn/README.md` "One-time bootstrap"): a founder mints the CI
+# machine client once (`thoryn provision ci-identity`, SSO-2952), pastes its clientId into
+# `.thoryn/connection.json`, and sets the `THORYN_CLI_CI_CLIENT_SECRET` repository secret.
 
 on:
   workflow_dispatch:
@@ -38,12 +29,16 @@ on:
         description: "Hub base URL to provision against (supplied to the CLI as THORYN_HUB)."
         required: false
         default: "https://hub.stg.thoryn.org"
-      recipe:
-        description: "Bundled workspace-less recipe to apply."
+      cli-version:
+        description: "cli-v* release tag to run (default: latest). Needs cli-v0.11.0 or newer."
         required: false
-        default: "ci-signin"
+        default: ""
+      destroy:
+        description: "Destroy the provisioned sandbox on exit (\"true\"/\"false\")."
+        required: false
+        default: "true"
 
-# Serialize: never let two provisioning runs race on the shared workspace.
+# Serialize: never let two provisioning runs race on the shared workspace (the file's sandbox slug is fixed).
 concurrency:
   group: provision-e2e
   cancel-in-progress: false
@@ -55,23 +50,25 @@ jobs:
   provision:
     runs-on: ubuntu-latest
     steps:
-      - name: Check out thoryn-cli
+      - name: Check out thoryn-cli (the .thoryn/ files)
         uses: actions/checkout@v4
 
-      - name: Provision as a real customer (build + sign in from contract + apply + teardown)
+      - name: Provision as a real customer (sign in from contract + provision apply + destroy)
         id: provision
         uses: ./.github/actions/provision
         with:
           # The ONLY injected secret — the env var the connection contract's auth.secretEnv names.
           client-secret: ${{ secrets.THORYN_CLI_CI_CLIENT_SECRET }}
           hub: ${{ inputs.hub }}
-          recipe: ${{ inputs.recipe }}
+          cli-version: ${{ inputs.cli-version }}
+          destroy: ${{ inputs.destroy }}
 
-      # Downstream consumers use the Action's outputs. The teardown inside the Action
-      # runs on exit regardless, so the ephemeral client id is only valid for the life
-      # of the job (the workspace + issuer persist).
+      # Downstream consumers use the Action's outputs. The destroy inside the Action runs on exit, so
+      # the sandbox + client ids are only valid for the life of the job (the workspace + issuer persist).
       - name: Show provisioned identifiers
         run: |
           echo "workspace-slug = ${{ steps.provision.outputs.workspace-slug }}"
+          echo "environment    = ${{ steps.provision.outputs.environment }}"
           echo "client-id      = ${{ steps.provision.outputs.client-id }}"
           echo "issuer         = ${{ steps.provision.outputs.issuer }}"
+          echo "receipt        = ${{ steps.provision.outputs.receipt }}"
