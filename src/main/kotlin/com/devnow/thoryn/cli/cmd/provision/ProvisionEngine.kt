@@ -172,7 +172,7 @@ internal class ProvisionEngine(
         val envSlugs = mutableMapOf<String, String>()
         orderForApply(file.resources).forEach { r ->
             val owned = ownedByKey[r.key]
-            val change = probe(r, file, owned, envSlugs).let { c -> planGrants(r, c, planSlug(r, file, envSlugs)) }
+            val change = probe(r, file, owned, envSlugs).let { c -> planGrants(r, c, planSlug(r, file, envSlugs), owned) }
             changes += change
             if (r.kind == ProvisionFile.KIND_ENVIRONMENT && change.liveId != null) {
                 // The RESOLVED slug (a `{{env.NAME}}` placeholder names a per-run sandbox), never the raw spec.
@@ -244,12 +244,12 @@ internal class ProvisionEngine(
      * (nothing exists yet); otherwise the object's live grants are listed and compared as a set. A
      * resource without a `grants:` block is left untouched (nothing is even read).
      */
-    private fun planGrants(r: ProvisionResource, change: PlannedChange, slug: String?): PlannedChange {
+    private fun planGrants(r: ProvisionResource, change: PlannedChange, slug: String?, owned: OwnedResource?): PlannedChange {
         val declared = r.grants ?: return change
         if (change.action == ChangeAction.CREATE || change.liveId == null) {
             return change.copy(grantAdds = declared.map { it.label })
         }
-        val (adds, removes) = grantDiff(r, declared, liveGrants(r, objectRef(r.kind, change.liveId, slug)))
+        val (adds, removes) = grantDiff(declared, liveGrants(r, objectRef(r.kind, change.liveId, slug)), owned?.grants.orEmpty())
         if (adds.isEmpty() && removes.isEmpty()) return change
         val note = "; grants: +${adds.size} −${removes.size}"
         return change.copy(reason = change.reason + note, grantAdds = adds, grantRemoves = removes)
@@ -286,7 +286,17 @@ internal class ProvisionEngine(
         fun record(o: OwnedResource) {
             // Replace IN PLACE so the receipt keeps creation order (destroy removes child-first by it).
             val i = owned.indexOfFirst { it.key == o.key }
-            if (i >= 0) owned[i] = o else owned += o
+            // SSO-3119 — a resource write carries no grants; keep the grant ownership the receipt holds,
+            // so dropping a `grants:` block does not silently disown what this file granted.
+            val merged = if (i >= 0 && o.grants.isEmpty()) o.copy(grants = owned[i].grants) else o
+            if (i >= 0) owned[i] = merged else owned += merged
+            persist(current())
+        }
+        /** SSO-3119 — set the owned-grant set EXPLICITLY (it may legitimately become empty). */
+        fun recordGrants(key: String, grants: List<String>) {
+            val i = owned.indexOfFirst { it.key == key }
+            if (i < 0 || owned[i].grants == grants) return
+            owned[i] = owned[i].copy(grants = grants)
             persist(current())
         }
         undelivered.clear()
@@ -300,6 +310,9 @@ internal class ProvisionEngine(
         // dependency — a `grants:` block may name anything the file declares, in any order. Ownership is
         // still safe: every resource is recorded in the receipt by the time the pass runs, so a grant
         // failure loses nothing and a re-run converges the outstanding grants alone.
+        // The grants THIS FILE already owns per object, from the receipt as it stood before this pass —
+        // `record` rewrites the entry from the resource write, which carries no grants (SSO-3119).
+        val ownedGrantsByKey = receipt?.resources.orEmpty().associate { it.key to it.grants }
         val pendingGrants = mutableListOf<Pair<ProvisionResource, String>>()
         plan.changes.filter { it.resource != null }.forEach { change ->
             val r = change.resource!!
@@ -314,7 +327,9 @@ internal class ProvisionEngine(
                 pendingGrants += r to objectRef(r.kind, resolved.id, resolved.environment)
             }
         }
-        pendingGrants.forEach { (r, ref) -> convergeGrants(r, ref) }
+        pendingGrants.forEach { (r, ref) ->
+            recordGrants(r.key, convergeGrants(r, ref, ownedGrantsByKey[r.key].orEmpty()))
+        }
         // Prune: drop skipped entries from the receipt, remove the rest child-first.
         plan.changes.filter { it.action == ChangeAction.SKIP && it.owned != null && (it.owned.adopted || !deletable(it.owned.kind)) }.forEach { change ->
             owned.removeIf { it.key == change.owned!!.key }
@@ -642,22 +657,37 @@ internal class ProvisionEngine(
     }
 
     /**
-     * Adds = declared but not live; removes = live but not declared, EXCEPT the workspace admin userset
-     * (`workspace:<id>#admin`), which is never revoked whatever the file says.
+     * Adds = declared but not live.
+     *
+     * Removes = live, no longer declared, AND previously granted by THIS FILE ([owned], carried on the
+     * receipt) — SSO-3119. A `grants:` block converges what it placed itself, never what it merely found:
+     * the creator's own `member:<sub> manager` (SSO-3110 creator-becomes-manager) and any grant an admin
+     * made by hand survive an apply that does not mention them. Same rule [OwnedResource.adopted] states
+     * for resources; without it a CI apply would silently revoke the human who created the sandbox. The
+     * workspace admin userset (`workspace:<id>#admin`) stays excluded besides, as defence in depth.
      */
-    private fun grantDiff(r: ProvisionResource, declared: List<ProvisionGrant>, live: List<String>): Pair<List<String>, List<String>> {
+    private fun grantDiff(declared: List<ProvisionGrant>, live: List<String>, owned: List<String>): Pair<List<String>, List<String>> {
         val wanted = declared.map { it.label }.distinct()
         val have = live.distinct()
         val adds = wanted.filter { it !in have }
-        val removes = have.filter { it !in wanted && !AccessCommand.ADMIN_USERSET_PATTERN.matches(it.substringBefore(' ')) }
+        val removes = have.filter {
+            it !in wanted && it in owned && !AccessCommand.ADMIN_USERSET_PATTERN.matches(it.substringBefore(' '))
+        }
         return adds to removes
     }
 
-    /** Converge the `grants:` block on ONE owned object: list, POST the missing, DELETE the undeclared. */
-    private fun convergeGrants(r: ProvisionResource, ref: String) {
-        val declared = r.grants ?: return
-        val (adds, removes) = grantDiff(r, declared, liveGrants(r, ref))
-        if (adds.isEmpty() && removes.isEmpty()) return
+    /**
+     * Converge the `grants:` block on ONE object: list, POST the missing, DELETE the undeclared ones this
+     * file granted itself. Returns the grants the file owns AFTERWARDS — what it just POSTed, plus what it
+     * already owned and still declares and is still live — for the receipt (SSO-3119).
+     */
+    private fun convergeGrants(r: ProvisionResource, ref: String, owned: List<String>): List<String> {
+        val declared = r.grants ?: return owned
+        val live = liveGrants(r, ref)
+        val (adds, removes) = grantDiff(declared, live, owned)
+        val wanted = declared.map { it.label }.distinct()
+        val nextOwned = (owned.filter { it in live && it in wanted } + adds).distinct()
+        if (adds.isEmpty() && removes.isEmpty()) return nextOwned
         val client = clients(null)
         try {
             adds.forEach { label ->
@@ -673,6 +703,7 @@ internal class ProvisionEngine(
         } catch (ex: ProductApiException) {
             throw grantFailure(r, ex, AccessCommand.SCOPE_WRITE, "converge the grants on $ref")
         }
+        return nextOwned
     }
 
     /** Fail closed: a 403 `insufficient_scope` on the access API names the missing scope and the login line. */

@@ -237,8 +237,10 @@ class ProvisionCommandTest : CommandTestBase() {
         assertThat(api.writes).isEmpty()
 
         // Without tenant:access.write the apply fails closed with the scope named (the sandbox stays owned).
+        // SSO-3119 — drop the grant out-of-band so the declared one is an ADD again; a grant this file
+        // does not own is never revoked, so a stale one alone would give the apply nothing to write.
+        api.grants.removeIf { it["object"] == "environment:$envId" }
         api.denyGrantWrites = true
-        api.seedGrant("client:stale", "viewer", "environment:$envId")
         val denied = runCli("provision", "apply", "--file", file.path, "--gateway", baseUrl(), "--yes")
         assertThat(denied.exit).isNotEqualTo(0)
         assertThat(denied.err).contains("tenant:access.write").contains("thoryn login --scope tenant:access.write")
