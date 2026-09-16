@@ -19,6 +19,13 @@ on:
   pull_request:
   push:
     branches: [main]
+  # SSO-3120 — lets release.yml start this check on its own formula-bump PR. A PR opened with the
+  # workflow's GITHUB_TOKEN does NOT trigger `pull_request` workflows (GitHub suppresses recursive
+  # runs), so without a dispatch the required `build + unit tests` check would never report on it and
+  # the PR could never merge — by hand or by auto-merge. `workflow_dispatch` is the one event
+  # GITHUB_TOKEN is allowed to trigger, and its check run lands on the dispatched ref's head sha,
+  # which is what branch protection matches.
+  workflow_dispatch:
 
 # One in-flight run per ref; a new push supersedes the previous run.
 concurrency:

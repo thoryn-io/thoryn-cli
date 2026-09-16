@@ -35,9 +35,13 @@ on:
         required: false
         default: ""
       destroy:
-        description: "Destroy the provisioned sandbox on exit (\"true\"/\"false\")."
+        description: "Remove what the run created on exit (\"true\"/\"false\"). The sandbox itself is a long-lived fixture and is never removed."
         required: false
         default: "true"
+      foreign-environment-id:
+        description: "Id of an environment in the workspace that the CI identity must NOT reach (e.g. the workspace's production environment). When set, the run asserts a GET of it answers 404. Leave empty to assert list confinement only."
+        required: false
+        default: ""
 
 # Serialize: never let two provisioning runs race on the shared workspace (the file's sandbox slug is fixed).
 concurrency:
@@ -63,6 +67,43 @@ jobs:
           hub: ${{ inputs.hub }}
           cli-version: ${{ inputs.cli-version }}
           destroy: ${{ inputs.destroy }}
+
+      # SSO-3113 (epic SSO-3108) — prove the CI identity is CONFINED, not merely that it can do its job.
+      # The Action leaves the downloaded thoryn.jar and the signed-in session in the workspace.
+      #  1. Reads are confined (ADR 2026-09-15 §8): as cli-ci, `env list` must return exactly the sandbox
+      #     this identity manages. A workspace-wide identity would list the production environment too.
+      #  2. A foreign environment answers 404 — only meaningful when its EXISTENCE is known, because by
+      #     design a foreign environment and a nonexistent one are the same 404 from cli-ci's side. So the
+      #     id comes from a dispatch input set by someone who can see it, never a guessed or random id.
+      #     This is a GET, not a DELETE: if confinement were ever broken, a destructive probe would
+      #     destroy a real environment instead of failing the run.
+      - name: Assert the CI identity is confined (SSO-3113)
+        env:
+          FOREIGN_ENVIRONMENT_ID: ${{ inputs.foreign-environment-id }}
+          EXPECTED_SANDBOX: ${{ steps.provision.outputs.environment }}
+        run: |
+          set -euo pipefail
+          listed=$(java -jar thoryn.jar env list --output json | jq -r '(.data // .)[] | .slug' | sort)
+          echo "Environments visible to the CI identity:"; echo "$listed" | sed 's/^/  /'
+          if [ "$listed" != "$EXPECTED_SANDBOX" ]; then
+            echo "::error::confinement broken — expected the CI identity to see only '$EXPECTED_SANDBOX', saw: $(echo "$listed" | tr '\n' ' ')" >&2
+            exit 1
+          fi
+          if [ -z "$FOREIGN_ENVIRONMENT_ID" ]; then
+            echo "::notice::no foreign-environment-id supplied — list confinement asserted; foreign GET skipped."
+            exit 0
+          fi
+          set +e
+          body=$(java -jar thoryn.jar env get "$FOREIGN_ENVIRONMENT_ID" --output json)
+          rc=$?
+          set -e
+          status=$(echo "$body" | jq -r '.httpStatus // empty' 2>/dev/null || true)
+          if [ "$rc" -eq 0 ] || [ "$status" != "404" ]; then
+            echo "::error::confinement broken — GET of foreign environment answered rc=$rc httpStatus=${status:-none}, expected 404" >&2
+            echo "$body" >&2
+            exit 1
+          fi
+          echo "Foreign environment answered 404 — the CI identity cannot reach it."
 
       # Downstream consumers use the Action's outputs. The destroy inside the Action runs on exit, so
       # the sandbox + client ids are only valid for the life of the job (the workspace + issuer persist).
