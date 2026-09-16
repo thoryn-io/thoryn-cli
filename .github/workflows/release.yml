@@ -71,6 +71,55 @@ jobs:
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "version=${tag#cli-v}" >> "$GITHUB_OUTPUT"
 
+  # ── SSO-3120 — the release gate: the tagged tree's own unit suite. ─────────
+  #
+  # Branch protection makes `ci` (build + unit tests) a REQUIRED check before
+  # anything merges to `main` — but a `cli-v*` tag is pushed directly and answers
+  # to no protection rule, and every build leg below passes `-DskipTests`. So
+  # without this job nothing tests the code between an arbitrary commit and a
+  # customer's machine: the release binaries, and the Homebrew formula that
+  # `brew upgrade thoryn` follows.
+  #
+  # This re-runs the suite against the EXACT tagged tree rather than asking the
+  # Checks API whether some `ci` run once passed on that sha. That choice is
+  # deliberate: a sha query needs no less code, but it cannot see a `push: main`
+  # run still in flight when the tag lands, and `ci` sets
+  # `concurrency: cancel-in-progress: true`, so a superseded run ends
+  # `cancelled` rather than `success` (the SSO-3016 trap — always read the
+  # LATEST attempt). Re-running is also the stronger claim: it verifies the tree
+  # being released, not that some tree with this sha once passed.
+  #
+  # ~15s: MockWebServer only, no Testcontainers, no network. `native` and `jar`
+  # both gate on it, and `release` re-states the requirement because its own
+  # condition is `always()` (it tolerates a failed best-effort native leg, and
+  # must not tolerate this).
+  verify:
+    name: verify the tagged tree
+    needs: resolve
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.tag }}
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+      # Same command `ci` runs on every PR. `${revision}` defaults to
+      # 0.0.1-SNAPSHOT (SSO-2953); the version stamp belongs on the packaging
+      # legs below, not here — this job exists to run the tests.
+      - name: Build and test the tagged tree
+        run: ./mvnw -B -ntp verify
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: surefire-reports-release
+          path: target/surefire-reports/
+          if-no-files-found: ignore
+          retention-days: 7
+
   # ── GraalVM native-image binaries, one per OS/arch. ────────────────────────
   #
   # BEST-EFFORT (SSO-2936 resilience): every native leg is `continue-on-error`
@@ -81,7 +130,7 @@ jobs:
   # — it publishes whichever binaries actually built plus the always-required
   # `thoryn.jar`. `timeout-minutes` bounds a leg whose build hangs once running.
   native:
-    needs: resolve
+    needs: [resolve, verify]
     continue-on-error: true
     timeout-minutes: 60
     strategy:
@@ -150,7 +199,7 @@ jobs:
 
   # ── Fat jar — the stable `thoryn.jar` asset the examples CI consumes. ──────
   jar:
-    needs: resolve
+    needs: [resolve, verify]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -173,15 +222,16 @@ jobs:
 
   # ── Publish the release + bump the Homebrew formula. ───────────────────────
   #
-  # Requires resolve + jar to succeed (the jar is the asset thoryn-examples CI
-  # consumes, so it is non-negotiable). It does NOT require `native` to succeed:
+  # Requires resolve + verify + jar to succeed — `verify` is the SSO-3120 release
+  # gate (the tagged tree's unit suite) and `jar` is the asset thoryn-examples CI
+  # consumes, so both are non-negotiable. It does NOT require `native` to succeed:
   # `if: always()` lets publish proceed once the native matrix has SETTLED to any
   # terminal state, and it uploads whichever native binaries actually built. A
   # platform that failed / was skipped / never produced an artifact is simply
   # absent from the release, not a release-blocking failure.
   release:
-    needs: [resolve, native, jar]
-    if: ${{ always() && needs.resolve.result == 'success' && needs.jar.result == 'success' }}
+    needs: [resolve, verify, native, jar]
+    if: ${{ always() && needs.resolve.result == 'success' && needs.verify.result == 'success' && needs.jar.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
       # Check out the DEFAULT branch (not the tag) so the formula bump commit
