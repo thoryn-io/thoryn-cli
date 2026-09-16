@@ -130,8 +130,9 @@ internal class ProvisionEngine(
     val undeliveredSecrets: List<String> get() = undelivered.toList()
 
     /**
-     * SSO-3113 — the single channel a server-minted `client_secret` leaves the engine through (mirrors
-     * [MachineClientProvisioner.SecretSink]). [emit] returns `true` when delivered, `false` when refused
+     * SSO-3113 — the single channel a server-minted `client_secret` leaves the engine through (the same
+     * [SecretIo] channel `thoryn clients create` uses; it replaced the retired `provision ci-identity`
+     * bootstrap of SSO-2952). [emit] returns `true` when delivered, `false` when refused
      * (no `--secret-file` and a non-interactive stdout) — the resource is still recorded; `apply` then
      * exits [SecretIo.EXIT_NO_SECRET].
      */

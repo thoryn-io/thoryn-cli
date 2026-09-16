@@ -136,7 +136,6 @@ thoryn examples apply    <name> [--set k=v]… [--environment <slug>] [--yes]   
 thoryn examples share    <name> [--output <file>]   # SSO-2876 — export the secret-free receipt (notes if platform-signed)
 
 # Operator provisioning (SSO-2952) — bootstrap the CI machine identity (founder-run, once).
-thoryn provision ci-identity [--secret-file <path>] [--force-stdout] [--gateway <url>]   # mint the confidential client_credentials machine client; secret shown once via SecretIo
 
 # Provisioning-as-code (SSO-3088, epic SSO-3087) — converge the DESIRED STATE in .thoryn/provision.yaml
 # (resources with a stable `name`: environment, application, user, federationMember, and the
@@ -543,16 +542,16 @@ your `connection.json` declares in `auth.secretEnv`.
 Everything the run needs is either committed or minted once by a founder:
 
 ```bash
-# 0) Sign in interactively as a founder of the `thoryn` workspace (authorization-code + PKCE).
-thoryn login --issuer https://hub.stg.thoryn.org
-thoryn workspace switch thoryn
+# 0) Sign in interactively as an admin of the `thoryn` workspace (authorization-code + PKCE),
+#    requesting every scope the provisioning file grants — the hub only lets you grant what you hold.
+thoryn login --workspace thoryn --issuer https://hub.stg.thoryn.org --scope "<the file's scopes, incl. tenant:access.read tenant:access.write>"
 
-# 1) Mint the CI machine client (SSO-2952). The secret is shown ONCE, via SecretIo.
-thoryn provision ci-identity --secret-file ci.secret
+# 1) Apply. The declared confidential client is created and its secret delivered ONCE, via SecretIo.
+#    (SSO-3113 retired the imperative `provision ci-identity` bootstrap: the identity is a resource.)
+thoryn provision apply --file .thoryn/provision.yaml --secret-file ci.secret
 
-# 2) Paste the printed clientId into .thoryn/connection.json (auth.clientId) and commit.
-# 3) Set the GitHub secret THORYN_CLI_CI_CLIENT_SECRET to the contents of ci.secret; shred ci.secret.
-# 4) Dispatch provision-e2e — it converges .thoryn/provision.yaml and destroys it on exit.
+# 2) Set the GitHub secret named by auth.secretEnv to the contents of ci.secret; shred ci.secret.
+# 3) Dispatch provision-e2e — it converges .thoryn/provision.yaml and destroys it on exit.
 ```
 
 No standing test user and no standing sandbox are needed any more: the provisioning file

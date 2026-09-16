@@ -55,7 +55,7 @@ inputs:
       The client SECRET of the machine client named by the connection contract's `auth.clientId`.
       Pass it from a repository secret. NEVER a literal — this repo is public. Supplied to the CLI as
       the env var named by `secret-env`; never echoed, never an argv flag. See `.thoryn/README.md`
-      for the one-time bootstrap that mints it (`thoryn provision ci-identity`).
+      for the one-time bootstrap that mints it (`thoryn provision apply --secret-file`, SSO-3113).
     required: true
   secret-env:
     description: "NAME of the env var the connection contract's `auth.secretEnv` declares for the secret."

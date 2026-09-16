@@ -24,7 +24,6 @@ import java.util.concurrent.Callable
  * CI run.
  *
  * Subcommands:
- *  - `ci-identity` — mint the confidential `client_credentials` machine client (secret via [SecretIo]).
  *  - `plan` / `apply` / `destroy` — SSO-3088 (epic SSO-3087): provisioning-as-code over the
  *    `.thoryn/provision.yaml` desired-state file (see [ProvisionEngine]). `plan` shows what `apply`
  *    would do; `apply` converges (a second run is a no-op; `--prune` removes what the file dropped);
@@ -37,10 +36,9 @@ import java.util.concurrent.Callable
  */
 @Command(
     name = "provision",
-    description = ["Provisioning-as-code: plan / apply / destroy a .thoryn/provision.yaml; bootstrap the CI machine identity."],
+    description = ["Provisioning-as-code: plan / apply / destroy a .thoryn/provision.yaml."],
     mixinStandardHelpOptions = true,
     subcommands = [
-        ProvisionCommand.CiIdentitySubcommand::class,
         ProvisionCommand.PlanSubcommand::class,
         ProvisionCommand.ApplySubcommand::class,
         ProvisionCommand.DestroySubcommand::class,
@@ -50,7 +48,7 @@ class ProvisionCommand : Callable<Int> {
 
     override fun call(): Int {
         System.err.println("Usage: thoryn provision <subcommand>")
-        System.err.println("Subcommands: plan, apply, destroy, ci-identity")
+        System.err.println("Subcommands: plan, apply, destroy")
         return CommandSupport.EXIT_USAGE
     }
 
@@ -294,74 +292,4 @@ class ProvisionCommand : Callable<Int> {
         }
     }
 
-    /**
-     * `thoryn provision ci-identity [--secret-file <path>] [--force-stdout]`
-     *
-     * Mint the CI's confidential `client_credentials` machine client from the bundled declarative spec
-     * (`/provision/ci-identity.json`) — the same product-api `POST /api/v1/applications` call
-     * `thoryn clients create` makes. The one-shot `client_secret` is emitted through [SecretIo]: written
-     * to `--secret-file`, or printed to an interactive TTY with a WARN; a non-interactive stdout is
-     * refused unless `--force-stdout`. The secret never touches argv or a log.
-     *
-     * A founder runs this ONCE, signed into the `thoryn` workspace (browser OIDC + `workspace switch`),
-     * so the client is minted under that workspace's `tnt`.
-     */
-    @Command(
-        name = "ci-identity",
-        description = ["Mint the CI's confidential client_credentials machine client. The secret is shown once."],
-        mixinStandardHelpOptions = true,
-    )
-    class CiIdentitySubcommand : Callable<Int> {
-
-        @Option(names = ["--secret-file"], description = ["Write the minted client secret to this file (owner-only) instead of a TTY/pipe."])
-        var secretFile: File? = null
-
-        @Option(names = ["--force-stdout"], description = ["Allow printing the secret to a non-interactive stdout (pipe/redirect). Off by default."])
-        var forceStdout: Boolean = false
-
-        @Option(names = ["--gateway"], description = ["Override the gateway base URL (default: \${DEFAULT-VALUE})."], defaultValue = ThorynConfig.DEFAULT_GATEWAY)
-        var gateway: String = ThorynConfig.DEFAULT_GATEWAY
-
-        override fun call(): Int {
-            val tokens = CommandSupport.readTokens() ?: return CommandSupport.EXIT_NOT_SIGNED_IN
-            gateway = CommandSupport.resolveGateway(gateway, tokens) // SSO-2827 — default to the gateway you signed into
-            // Honour an active `workspace switch` so the client is minted under the founder's selected
-            // workspace (the `thoryn` tenant), exactly as `thoryn clients create` does.
-            val client = CommandSupport.gatewayClient(gateway, tokens)
-            val spec = try {
-                MachineClientSpec.ciIdentity()
-            } catch (ex: MachineClientProvisionException) {
-                System.err.println("Could not load the ci-identity provisioning spec: ${ex.message}")
-                return CommandSupport.EXIT_IO_ERROR
-            }
-            val provisioner = MachineClientProvisioner(
-                client,
-                MachineClientProvisioner.SecretSink.toSecretIo(secretFile, forceStdout),
-            )
-            return try {
-                val result = provisioner.provision(spec)
-                println("Machine client provisioned:")
-                println("  clientId: ${result.clientId}")
-                println("  scopes:   ${result.grantedScopes.joinToString(", ")}")
-                if (!result.secretDelivered) {
-                    System.err.println(
-                        "The machine client '${result.clientId}' was created but its secret could not be delivered — " +
-                            "re-run with --secret-file <path> (or --force-stdout).",
-                    )
-                    return SecretIo.EXIT_NO_SECRET
-                }
-                println()
-                println("Next: paste the clientId into .thoryn/connection.json (auth.clientId), and the secret into the")
-                println("THORYN_CLI_CI_CLIENT_SECRET GitHub secret, then shred the secret file. See .thoryn/README.md.")
-                CommandSupport.EXIT_OK
-            } catch (ex: MachineClientProvisionException) {
-                System.err.println("Could not provision the CI machine client: ${ex.message}")
-                CommandSupport.EXIT_HTTP_ERROR
-            } catch (ex: ProductApiException) {
-                CommandSupport.renderError(OutputFormat.TABLE, ex, requiredScope = "tenant:applications.write")
-            } catch (ex: Exception) {
-                CommandSupport.renderRequestFailure(ex, gateway)
-            }
-        }
-    }
 }

@@ -363,9 +363,10 @@ class RecipeInterpreterTest : CommandTestBase() {
 
     @Test
     fun `clients createMachine is no longer an example-recipe action`() {
-        // SSO-2952 — secret-bearing machine-client provisioning was relocated to `thoryn provision
-        // ci-identity` (see ProvisionCiIdentityTest). A recipe still naming the reverted action is
-        // rejected by the interpreter as an unsupported action — no network call is made.
+        // SSO-2952 — secret-bearing machine-client provisioning was relocated off this surface; since
+        // SSO-3113 it is a provisioning-file resource minted by `provision apply --secret-file` (see
+        // ProvisionEngineSecretsTest). A recipe still naming the reverted action is rejected by the
+        // interpreter as an unsupported action — no network call is made.
         val ctx = context()
         val recipe = Recipe(
             JsonMapper.builder().build().readTree(
