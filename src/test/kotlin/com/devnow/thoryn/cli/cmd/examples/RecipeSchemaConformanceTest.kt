@@ -114,9 +114,10 @@ class RecipeSchemaConformanceTest {
     @Test
     fun `clients createMachine is NOT an example-recipe step action`() {
         // SSO-2952 — secret-bearing machine-client provisioning was relocated OFF the example-recipe
-        // surface into the dedicated `thoryn provision ci-identity` operator command, reverting the
-        // SSO-2950 allowlist widening. A recipe that tries to mint a machine client is now rejected —
-        // the closed allowlist keeps every recipe DATA producing a secret-free receipt.
+        // surface, reverting the SSO-2950 allowlist widening; SSO-3113 then retired the `provision
+        // ci-identity` command it moved to, so a machine client is DECLARED in a provisioning file and
+        // minted by `provision apply --secret-file`. Either way a recipe that tries to mint one is
+        // rejected — the closed allowlist keeps every recipe DATA producing a secret-free receipt.
         assertThat(allowlist("steps", "action")).doesNotContain("clients.createMachine")
         assertThat(allowlist("verify", "assert")).doesNotContain("clients.createMachine")
         assertThat(allowlist("teardown", "action")).doesNotContain("clients.createMachine")

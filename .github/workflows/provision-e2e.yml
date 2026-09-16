@@ -19,7 +19,8 @@ name: provision-e2e
 # (cli-v0.11.0+) — pin one with the cli-version input until it is the latest.
 #
 # ONE-TIME OPERATOR SETUP (see `.thoryn/README.md` "One-time bootstrap"): a founder mints the CI
-# machine client once (`thoryn provision ci-identity`, SSO-2952), pastes its clientId into
+# machine client once (it is declared in the provisioning file; `thoryn provision apply --secret-file`
+# delivers its one-time secret, SSO-3113), pastes its clientId into
 # `.thoryn/connection.json`, and sets the `THORYN_CLI_CI_CLIENT_SECRET` repository secret.
 
 on:

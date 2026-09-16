@@ -26,10 +26,6 @@
         "comment": "SSO-2948 — the connection contract schema, bundled beside the recipe schema for reference/validation. Referenced by ConnectionSchemaConformanceTest; native-image strips un-referenced resources so it must be listed explicitly."
       },
       {
-        "pattern": "^provision/ci-identity\\.json$",
-        "comment": "SSO-2952 — the declarative ci-identity machine-client spec read at runtime by `thoryn provision ci-identity` (MachineClientSpec.load). native-image strips un-referenced resources, so list it explicitly."
-      },
-      {
         "pattern": "^provision/provision\\.schema\\.json$",
         "comment": "SSO-3088 — the provisioning-file schema (.thoryn/provision.yaml), bundled beside the recipe + connection schemas for reference/validation. native-image strips un-referenced resources, so list it explicitly."
       },

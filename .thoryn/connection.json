@@ -6,17 +6,15 @@
   },
   "auth": {
     "method": "client_credentials",
-    "clientId": "app-63a0f52f-3d6",
+    "clientId": "cli-ci",
     "secretEnv": "THORYN_CLI_CI_CLIENT_SECRET",
     "scopes": [
-      "tenant:applications.write",
-      "tenant:applications.read",
-      "tenant:federation.write",
-      "tenant:federation.read",
-      "tenant:users.write",
-      "tenant:users.read",
+      "tenant:environments.read",
       "tenant:environments.write",
-      "tenant:environments.read"
+      "tenant:applications.read",
+      "tenant:applications.write",
+      "tenant:access.read",
+      "tenant:access.write"
     ]
   }
 }
