@@ -202,6 +202,9 @@ class ProvisionCommandTest : CommandTestBase() {
 
     @Test
     fun `apply converges a resource's grants and plan lists the grant changes`() {
+        // SSO-3119 — the fake resolves a `client:` subject before writing the tuple, as product-api does;
+        // this file declares no client, so the grant's subject has to exist already.
+        api.seedApplication(env = null, displayName = "CI identity", clientId = "cli-ci")
         val file = writeFile(
             "provision.yaml",
             """
@@ -234,8 +237,10 @@ class ProvisionCommandTest : CommandTestBase() {
         assertThat(api.writes).isEmpty()
 
         // Without tenant:access.write the apply fails closed with the scope named (the sandbox stays owned).
+        // SSO-3119 — drop the grant out-of-band so the declared one is an ADD again; a grant this file
+        // does not own is never revoked, so a stale one alone would give the apply nothing to write.
+        api.grants.removeIf { it["object"] == "environment:$envId" }
         api.denyGrantWrites = true
-        api.seedGrant("client:stale", "viewer", "environment:$envId")
         val denied = runCli("provision", "apply", "--file", file.path, "--gateway", baseUrl(), "--yes")
         assertThat(denied.exit).isNotEqualTo(0)
         assertThat(denied.err).contains("tenant:access.write").contains("thoryn login --scope tenant:access.write")

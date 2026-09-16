@@ -42,6 +42,15 @@ internal data class OwnedResource(
     val environment: String? = null,
     val attributes: Map<String, String> = emptyMap(),
     /**
+     * SSO-3119 — the access grants (`<subject> <relation>`) THIS FILE created on this object, so a later
+     * apply revokes only what it granted itself. The same "only removes what it created" rule [adopted]
+     * states for resources: a grant the file merely found live (the creator's own `member:<sub> manager`
+     * from SSO-3110's creator-becomes-manager, a grant an admin placed by hand) is never revoked, even
+     * when the file's `grants:` block does not mention it. Absent on a pre-SSO-3119 receipt ⇒ the file
+     * owns no grant yet ⇒ it revokes nothing, which is the safe direction.
+     */
+    val grants: List<String> = emptyList(),
+    /**
      * SSO-3089 — true when the resource already existed (matched live by its converge key) and was
      * ADOPTED under management rather than created by this file. `apply` converges it, but `destroy`
      * / `--prune` NEVER delete it: the CLI only removes what it created.

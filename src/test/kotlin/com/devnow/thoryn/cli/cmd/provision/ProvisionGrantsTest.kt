@@ -24,7 +24,13 @@ class ProvisionGrantsTest : CommandTestBase() {
     private val console = ByteArrayOutputStream()
 
     @BeforeEach
-    fun mount() { server.dispatcher = api }
+    fun mount() {
+        server.dispatcher = api
+        // SSO-3119 — the fake resolves a `client:` subject before it writes a tuple, as product-api does
+        // (AccessGrantService.subjectBelongsToWorkspace). The fixtures below grant to `client:cli-ci`, so
+        // that identity has to exist; the case where the SAME file declares it is its own test.
+        api.seedApplication(env = null, displayName = "CI identity", clientId = "cli-ci")
+    }
 
     private fun engine() = ProvisionEngine(
         clients = { slug -> ProductApiClient(gateway = baseUrl(), tokens = Tokens(accessToken = "AT-test"), environmentSlug = slug) },
@@ -74,11 +80,11 @@ class ProvisionGrantsTest : CommandTestBase() {
         val receipt = apply(f, null)
         val envId = receipt.resources[0].id
         val clientId = receipt.resources[1].id
-        // Each grant follows its own object's create; the object ref is the receipt id (the singleton by its env slug).
+        // SSO-3119 — every resource is created first, then every grant, in declaration order; the object
+        // ref is the receipt id (the singleton by its env slug).
         assertThat(writes()).containsExactly(
-            "POST /api/v1/environments", "POST /api/v1/access/grants",
-            "POST /api/v1/applications", "POST /api/v1/access/grants",
-            "PUT /api/v1/login-methods", "POST /api/v1/access/grants",
+            "POST /api/v1/environments", "POST /api/v1/applications", "PUT /api/v1/login-methods",
+            "POST /api/v1/access/grants", "POST /api/v1/access/grants", "POST /api/v1/access/grants",
         )
         val grantPosts = api.writesTo("/api/v1/access/grants")
         assertThat(grantPosts.map { it.body }).containsExactly(
@@ -99,11 +105,18 @@ class ProvisionGrantsTest : CommandTestBase() {
         assertThat(api.writes).isEmpty()
     }
 
+    /**
+     * SSO-3119 — a `grants:` block converges what the FILE placed, never what it merely found. The
+     * creator's own `member:<sub> manager` (SSO-3110 creator-becomes-manager) and an admin's hand-made
+     * grant survive an apply that does not mention them; only a grant a previous apply of this file
+     * POSTed, recorded on the receipt, is revoked when the file stops declaring it.
+     */
     @Test
-    fun `grants converge on an adopted object — missing added, undeclared removed on THAT object only, the admin userset never revoked`() {
+    fun `grants converge on an adopted object — missing added, a grant this file never made is left alone`() {
         val envId = api.seedEnvironment("ci-sbx", "CI sandbox")
         api.seedGrant("workspace:t-1#admin", "manager", "environment:$envId")
-        api.seedGrant("client:old-ci", "manager", "environment:$envId")
+        api.seedGrant("member:founder", "manager", "environment:$envId")  // creator-becomes-manager
+        api.seedGrant("client:old-ci", "manager", "environment:$envId")   // an admin's own grant
         api.seedGrant("client:old-ci", "manager", "environment:env-other") // an object the file does not own
         val f = file(
             """
@@ -120,15 +133,35 @@ class ProvisionGrantsTest : CommandTestBase() {
         val change = plan.changes.single()
         assertThat(change.action).isEqualTo(ChangeAction.ADOPT)
         assertThat(change.grantAdds).containsExactly("client:cli-ci manager")
-        assertThat(change.grantRemoves).containsExactly("client:old-ci manager")
-        assertThat(change.reason).contains("grants: +1 −1")
-        assertThat(change.toStructured()["grants"]).isEqualTo(mapOf("add" to listOf("client:cli-ci manager"), "remove" to listOf("client:old-ci manager")))
+        assertThat(change.grantRemoves).isEmpty()
+        assertThat(change.reason).contains("grants: +1 −0")
         assertThat(plan.hasChanges).isTrue()
 
-        apply(f, null)
-        assertThat(writes()).containsExactly("POST /api/v1/access/grants", "DELETE /api/v1/access/grants")
-        assertThat(api.writes[1].body).isEqualTo(mapOf("subject" to "client:old-ci", "relation" to "manager", "object" to "environment:$envId"))
-        assertThat(api.grantsOn("environment:$envId")).containsExactlyInAnyOrder("workspace:t-1#admin manager", "client:cli-ci manager")
+        val receipt = apply(f, null)
+        assertThat(writes()).containsExactly("POST /api/v1/access/grants")
+        assertThat(api.grantsOn("environment:$envId"))
+            .containsExactlyInAnyOrder("workspace:t-1#admin manager", "member:founder manager", "client:old-ci manager", "client:cli-ci manager")
+        // The receipt now records the ONE grant this file owns.
+        assertThat(receipt.resources.single().grants).containsExactly("client:cli-ci manager")
+
+        // Drop it from the file ⇒ it IS revoked (the file granted it); everything else still stands.
+        api.reset()
+        val dropped = file(
+            """
+            apiVersion: thoryn.io/provision/v1
+            resources:
+              - kind: environment
+                name: ci
+                spec: { slug: ci-sbx, displayName: "CI sandbox" }
+                grants: []
+            """,
+        )
+        val after = apply(dropped, receipt)
+        assertThat(writes()).containsExactly("DELETE /api/v1/access/grants")
+        assertThat(api.writes[0].body).isEqualTo(mapOf("subject" to "client:cli-ci", "relation" to "manager", "object" to "environment:$envId"))
+        assertThat(api.grantsOn("environment:$envId"))
+            .containsExactlyInAnyOrder("workspace:t-1#admin manager", "member:founder manager", "client:old-ci manager")
+        assertThat(after.resources.single().grants).isEmpty()
         assertThat(api.grantsOn("environment:env-other")).containsExactly("client:old-ci manager")
     }
 
@@ -152,15 +185,19 @@ class ProvisionGrantsTest : CommandTestBase() {
         assertThat(plan.changes.single().action).isEqualTo(ChangeAction.NOOP)
         assertThat(plan.changes.single().grantAdds).containsExactly("member:bob viewer")
         assertThat(plan.hasChanges).isTrue()
-        apply(extra, receipt)
+        val withBob = apply(extra, receipt)
         assertThat(writes()).containsExactly("POST /api/v1/access/grants")
+        assertThat(withBob.resources.single().grants).containsExactlyInAnyOrder("client:cli-ci manager", "member:bob viewer")
 
-        // `grants: []` ⇒ declared none: every revocable grant on the object is revoked.
+        // SSO-3119 — `grants: []` declares none, so every grant THIS FILE granted is revoked; a grant it
+        // never made (seeded here as an admin's own) is left standing.
         api.reset()
+        api.seedGrant("client:outsider", "viewer", "environment:$envId")
         val none = file("apiVersion: thoryn.io/provision/v1\nresources:\n  - { kind: environment, name: ci, spec: { slug: ci-sbx, displayName: \"CI sandbox\" }, grants: [] }\n")
-        apply(none, receipt)
+        val emptied = apply(none, withBob)
         assertThat(writes()).containsExactly("DELETE /api/v1/access/grants", "DELETE /api/v1/access/grants")
-        assertThat(api.grantsOn("environment:$envId")).isEmpty()
+        assertThat(api.grantsOn("environment:$envId")).containsExactly("client:outsider viewer")
+        assertThat(emptied.resources.single().grants).isEmpty()
     }
 
     @Test
@@ -185,6 +222,44 @@ class ProvisionGrantsTest : CommandTestBase() {
         assertThatThrownBy { engine().plan(f, persisted.last(), false) }
             .isInstanceOf(ProvisionException::class.java)
             .hasMessageContaining("tenant:access.read")
+    }
+
+    /**
+     * SSO-3119 — the regression the founder apply of `.thoryn/provision.yaml` hit live on 2026-09-16.
+     * [ProvisionEngine.orderForApply] converges environments BEFORE applications whatever order the file
+     * uses, so converging a `grants:` block the moment its own object resolved asked product-api to grant
+     * to `client:cli-ci` before this same file had created it — an opaque 404 (ADR 2026-09-15 §8), and a
+     * deadlock, since a re-run reaches the same grant before the same missing client.
+     */
+    @Test
+    fun `a grant may name a client the same file declares later — every resource is created before any grant`() {
+        val f = file(
+            """
+            apiVersion: thoryn.io/provision/v1
+            resources:
+              - kind: environment
+                name: ci
+                spec: { slug: ci-sbx, displayName: "CI sandbox" }
+                grants:
+                  - { subject: "client:own-ci", relation: manager }
+              - kind: application
+                name: identity
+                spec: { clientId: own-ci, displayName: "Own CI", clientType: confidential, grantTypes: [client_credentials] }
+            """,
+        )
+        val receipt = apply(f, null)
+        val envId = receipt.resources.first { it.key == "environment/ci" }.id
+        assertThat(receipt.resources.first { it.key == "application/identity" }.id).isEqualTo("own-ci")
+        assertThat(writes()).containsExactly(
+            "POST /api/v1/environments", "POST /api/v1/applications", "POST /api/v1/access/grants",
+        )
+        assertThat(api.grantsOn("environment:$envId")).containsExactly("client:own-ci manager")
+
+        // Converged: the next pass reads the grants and writes nothing.
+        api.reset()
+        assertThat(engine().plan(f, receipt, false).hasChanges).isFalse()
+        apply(f, receipt)
+        assertThat(api.writes).isEmpty()
     }
 
     @Test

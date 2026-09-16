@@ -12,6 +12,11 @@ HELP.md
 # file; secret-free, but per-account state like Terraform state — not committed by default).
 .thoryn/*.receipt.json
 
+# SSO-3119 — `--secret-file` output. `provision apply` / `clients create` write a one-time client
+# secret to the path you name, and the natural place to type is the repo you are standing in. A
+# credential must never reach a commit, so the extension is ignored outright.
+*.secret
+
 # GraalVM native-image build artifacts
 *.build_artifacts.txt
 /thoryn
