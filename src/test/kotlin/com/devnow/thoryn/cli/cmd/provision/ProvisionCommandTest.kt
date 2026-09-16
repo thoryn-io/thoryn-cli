@@ -202,6 +202,9 @@ class ProvisionCommandTest : CommandTestBase() {
 
     @Test
     fun `apply converges a resource's grants and plan lists the grant changes`() {
+        // SSO-3119 — the fake resolves a `client:` subject before writing the tuple, as product-api does;
+        // this file declares no client, so the grant's subject has to exist already.
+        api.seedApplication(env = null, displayName = "CI identity", clientId = "cli-ci")
         val file = writeFile(
             "provision.yaml",
             """

@@ -49,8 +49,14 @@ internal class FakeProductApi : Dispatcher() {
     fun seedEnvironment(slug: String, name: String = slug): String =
         "env-${++seq}".also { environments += mutableMapOf("id" to it, "slug" to slug, "name" to name, "kind" to "sandbox", "suspended" to false) }
 
-    fun seedApplication(env: String?, displayName: String, redirectUris: List<String> = listOf("http://127.0.0.1/callback")): String =
-        "app-${++seq}".also { applications += mutableMapOf("clientId" to it, "displayName" to displayName, "redirectUris" to redirectUris, "status" to "active", "_env" to env) }
+    /** [clientId] pins the id (a file may declare a fixed one); otherwise the fake allocates `app-<n>`. */
+    fun seedApplication(
+        env: String?,
+        displayName: String,
+        redirectUris: List<String> = listOf("http://127.0.0.1/callback"),
+        clientId: String? = null,
+    ): String =
+        (clientId ?: "app-${++seq}").also { applications += mutableMapOf("clientId" to it, "displayName" to displayName, "redirectUris" to redirectUris, "status" to "active", "_env" to env) }
 
     fun seedGrant(subject: String, relation: String, objectRef: String) {
         grants += mutableMapOf("subject" to subject, "relation" to relation, "object" to objectRef, "createdAt" to "2026-09-15T00:00:00Z")
@@ -109,7 +115,12 @@ internal class FakeProductApi : Dispatcher() {
             // ── applications ──
             route == "/api/v1/applications" && method == "GET" -> json(200, mapOf("data" to applications.filter { visible(it, env) }.map { public(it) }))
             route == "/api/v1/applications" && method == "POST" -> {
-                val id = "app-${++seq}"
+                // SSO-3104 / SSO-3119 — product-api honours a REQUESTED `clientId` (that is how the
+                // committed file pins `cli` / `cli-ci`); only an absent one is allocated. The fake used
+                // to overwrite it unconditionally, which hid both the fixed-id create and the grant that
+                // names it as a subject.
+                val id = (b["clientId"] as? String)?.takeIf { it.isNotBlank() } ?: "app-${++seq}"
+                if (applications.any { it["clientId"] == id }) return problem(409, "client_id_taken")
                 applications += (b + mapOf("clientId" to id, "status" to "active", "_env" to env)).toMutableMap()
                 // SSO-3113 — a CONFIDENTIAL client's one-shot secret rides ONLY on the create response (never on a later
                 // GET). product-api's `clientType` defaults to confidential, so only an explicit `public` is secret-less.
@@ -217,6 +228,16 @@ internal class FakeProductApi : Dispatcher() {
             route == "/api/v1/access/grants" && method == "POST" -> {
                 if (denyGrantWrites) return problem(403, "insufficient_scope")
                 if (listOf("subject", "relation", "object").any { (b[it] as? String).isNullOrBlank() }) return problem(400, "invalid_grant_shape")
+                // SSO-3119 — product-api resolves the SUBJECT in the workspace before it writes the tuple
+                // (AccessGrantService.subjectBelongsToWorkspace) and answers the opaque 404 of ADR
+                // 2026-09-15 §8 when it cannot. Modelling that is what makes the ordering regression
+                // visible here: a grant naming a client the same file has not created yet MUST fail.
+                // Only `client:` refs are checked — the fake carries no membership registry, so a
+                // `member:` subject is taken on trust.
+                val subjectRef = b["subject"].toString()
+                if (subjectRef.startsWith("client:") && applications.none { it["clientId"] == subjectRef.removePrefix("client:") }) {
+                    return problem(404, "not_found")
+                }
                 val existing = grants.firstOrNull { it["subject"] == b["subject"] && it["relation"] == b["relation"] && it["object"] == b["object"] }
                 if (existing != null) return json(200, existing)
                 seedGrant(b["subject"].toString(), b["relation"].toString(), b["object"].toString())

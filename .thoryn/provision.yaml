@@ -69,8 +69,10 @@ resources:
         - tenant:access.write
       requireAuthorizationConsent: false  # first-party: no consent screen for the platform's own CLI
 
-  # SSO-3113 (epic SSO-3108) — the CI machine identity. Declared BEFORE the sandbox on purpose: `apply`
-  # converges resources in file order, and the sandbox's `grants:` block names this client as its subject.
+  # SSO-3113 (epic SSO-3108) — the CI machine identity, named as the subject of the sandbox's `grants:`
+  # block below. Declaration order is presentation only: `apply` converges environments before
+  # applications whatever the file says, so SSO-3119 converges every `grants:` block in a second pass,
+  # after all resources exist — a grant may name any subject the file declares, in any order.
   - kind: application
     name: ci
     spec:

@@ -24,7 +24,13 @@ class ProvisionGrantsTest : CommandTestBase() {
     private val console = ByteArrayOutputStream()
 
     @BeforeEach
-    fun mount() { server.dispatcher = api }
+    fun mount() {
+        server.dispatcher = api
+        // SSO-3119 — the fake resolves a `client:` subject before it writes a tuple, as product-api does
+        // (AccessGrantService.subjectBelongsToWorkspace). The fixtures below grant to `client:cli-ci`, so
+        // that identity has to exist; the case where the SAME file declares it is its own test.
+        api.seedApplication(env = null, displayName = "CI identity", clientId = "cli-ci")
+    }
 
     private fun engine() = ProvisionEngine(
         clients = { slug -> ProductApiClient(gateway = baseUrl(), tokens = Tokens(accessToken = "AT-test"), environmentSlug = slug) },
@@ -74,11 +80,11 @@ class ProvisionGrantsTest : CommandTestBase() {
         val receipt = apply(f, null)
         val envId = receipt.resources[0].id
         val clientId = receipt.resources[1].id
-        // Each grant follows its own object's create; the object ref is the receipt id (the singleton by its env slug).
+        // SSO-3119 — every resource is created first, then every grant, in declaration order; the object
+        // ref is the receipt id (the singleton by its env slug).
         assertThat(writes()).containsExactly(
-            "POST /api/v1/environments", "POST /api/v1/access/grants",
-            "POST /api/v1/applications", "POST /api/v1/access/grants",
-            "PUT /api/v1/login-methods", "POST /api/v1/access/grants",
+            "POST /api/v1/environments", "POST /api/v1/applications", "PUT /api/v1/login-methods",
+            "POST /api/v1/access/grants", "POST /api/v1/access/grants", "POST /api/v1/access/grants",
         )
         val grantPosts = api.writesTo("/api/v1/access/grants")
         assertThat(grantPosts.map { it.body }).containsExactly(
@@ -185,6 +191,44 @@ class ProvisionGrantsTest : CommandTestBase() {
         assertThatThrownBy { engine().plan(f, persisted.last(), false) }
             .isInstanceOf(ProvisionException::class.java)
             .hasMessageContaining("tenant:access.read")
+    }
+
+    /**
+     * SSO-3119 — the regression the founder apply of `.thoryn/provision.yaml` hit live on 2026-09-16.
+     * [ProvisionEngine.orderForApply] converges environments BEFORE applications whatever order the file
+     * uses, so converging a `grants:` block the moment its own object resolved asked product-api to grant
+     * to `client:cli-ci` before this same file had created it — an opaque 404 (ADR 2026-09-15 §8), and a
+     * deadlock, since a re-run reaches the same grant before the same missing client.
+     */
+    @Test
+    fun `a grant may name a client the same file declares later — every resource is created before any grant`() {
+        val f = file(
+            """
+            apiVersion: thoryn.io/provision/v1
+            resources:
+              - kind: environment
+                name: ci
+                spec: { slug: ci-sbx, displayName: "CI sandbox" }
+                grants:
+                  - { subject: "client:own-ci", relation: manager }
+              - kind: application
+                name: identity
+                spec: { clientId: own-ci, displayName: "Own CI", clientType: confidential, grantTypes: [client_credentials] }
+            """,
+        )
+        val receipt = apply(f, null)
+        val envId = receipt.resources.first { it.key == "environment/ci" }.id
+        assertThat(receipt.resources.first { it.key == "application/identity" }.id).isEqualTo("own-ci")
+        assertThat(writes()).containsExactly(
+            "POST /api/v1/environments", "POST /api/v1/applications", "POST /api/v1/access/grants",
+        )
+        assertThat(api.grantsOn("environment:$envId")).containsExactly("client:own-ci manager")
+
+        // Converged: the next pass reads the grants and writes nothing.
+        api.reset()
+        assertThat(engine().plan(f, receipt, false).hasChanges).isFalse()
+        apply(f, receipt)
+        assertThat(api.writes).isEmpty()
     }
 
     @Test

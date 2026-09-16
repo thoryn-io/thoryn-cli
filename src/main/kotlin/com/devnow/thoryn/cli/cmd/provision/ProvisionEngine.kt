@@ -98,11 +98,13 @@ internal data class RemovalOutcome(val remaining: ProvisionReceipt, val failures
  * (it exists) and its clientId lands on [undeliveredSecrets] so `apply` can exit
  * [SecretIo.EXIT_NO_SECRET] and point at `thoryn clients rotate-secret`.
  *
- * **Grants (SSO-3113).** A resource's `grants:` block is converged like any other field: after the
- * resource resolves to a live id, the object's grants are listed (`GET /api/v1/access/grants?object=…`),
+ * **Grants (SSO-3113, ordering SSO-3119).** A resource's `grants:` block is converged in a SECOND pass,
+ * once EVERY resource in the file exists: the object's grants are listed (`GET /api/v1/access/grants?object=…`),
  * missing ones POSTed and ones the file no longer declares DELETEd — for THAT object only (never an
  * object the file does not own), never the workspace admin userset. The object ref derives from the
- * receipt id ([objectRef]). A session without `tenant:access.write` fails closed with a clear message.
+ * receipt id ([objectRef]). The second pass is what lets a block name a subject the same file declares
+ * under another kind or further down; converging inline would read the file's own kind ordering as a
+ * dependency order it never had. A session without `tenant:access.write` fails closed with a clear message.
  *
  * [clients] yields a tenant-scoped [ProductApiClient] bound to an environment slug (`null` ⇒ the
  * production plane); [persist] is invoked after every successful write so the receipt on disk always
@@ -256,10 +258,11 @@ internal class ProvisionEngine(
     // ── apply ────────────────────────────────────────────────────────────────────────────────────
 
     /**
-     * Execute [plan]: creates / updates / adopts in dependency order (environments first), then prunes.
-     * [confirmSlug] is the workspace slug confirming production-plane removals (refused up front when
-     * missing). Returns the receipt as it stands after the pass; throws on the first failed step (with
-     * everything before it already persisted).
+     * Execute [plan]: creates / updates / adopts in dependency order (environments first), then converges
+     * every `grants:` block (SSO-3119 — after all of them exist, so a grant may name any subject the file
+     * declares), then prunes. [confirmSlug] is the workspace slug confirming production-plane removals
+     * (refused up front when missing). Returns the receipt as it stands after the pass; throws on the
+     * first failed step (with everything before it already persisted).
      */
     fun apply(
         file: ProvisionFile,
@@ -287,6 +290,17 @@ internal class ProvisionEngine(
             persist(current())
         }
         undelivered.clear()
+        // SSO-3119 — grants converge in a SECOND pass, after EVERY resource in the file exists.
+        // product-api resolves a grant's SUBJECT (`client:<clientId>`, `member:<sub>`) in the workspace
+        // before it writes the tuple, and [orderForApply] converges environments ahead of applications —
+        // so converging a block inline, the moment its own object resolved, could name a client the same
+        // file had not created yet. That earns the opaque 404 of ADR 2026-09-15 §8 (one answer for an
+        // unknown object, an unknown subject and insufficient reach), and it DEADLOCKS: a re-run reaches
+        // the same grant before the same missing client. Deferring the whole block drops the ordering
+        // dependency — a `grants:` block may name anything the file declares, in any order. Ownership is
+        // still safe: every resource is recorded in the receipt by the time the pass runs, so a grant
+        // failure loses nothing and a re-run converges the outstanding grants alone.
+        val pendingGrants = mutableListOf<Pair<ProvisionResource, String>>()
         plan.changes.filter { it.resource != null }.forEach { change ->
             val r = change.resource!!
             val resolved: OwnedResource? = when (change.action) {
@@ -296,12 +310,11 @@ internal class ProvisionEngine(
                 ChangeAction.NOOP -> owned.firstOrNull { it.key == r.key }
                 else -> null
             }
-            // SSO-3113 — grants converge AFTER the resource exists (the object ref needs its id); the
-            // receipt already records the resource, so a grant failure never loses ownership.
             if (r.grants != null && resolved != null) {
-                convergeGrants(r, objectRef(r.kind, resolved.id, resolved.environment))
+                pendingGrants += r to objectRef(r.kind, resolved.id, resolved.environment)
             }
         }
+        pendingGrants.forEach { (r, ref) -> convergeGrants(r, ref) }
         // Prune: drop skipped entries from the receipt, remove the rest child-first.
         plan.changes.filter { it.action == ChangeAction.SKIP && it.owned != null && (it.owned.adopted || !deletable(it.owned.kind)) }.forEach { change ->
             owned.removeIf { it.key == change.owned!!.key }
