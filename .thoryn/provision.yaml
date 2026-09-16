@@ -12,6 +12,14 @@
 #    `thoryn provision apply` while switched into the `thoryn` workspace; every later `apply` (CI signs in
 #    as the CI machine client, whose receipt does not own it) ADOPTS it by its fixed `clientId` and
 #    converges its non-secret shape — adopted resources are never deleted by `destroy`.
+#  - `ci` (SSO-3113, epic SSO-3108): the CI machine identity `cli-ci` — a confidential
+#    `client_credentials` client on the PRODUCTION plane, holding ONLY the scopes needed to converge THIS
+#    file (environments + applications, read+write, plus `tenant:access.*` for the `grants:` block below),
+#    and granted `manager` on the `ci` SANDBOX — nothing else. Containment does the rest: managing the
+#    sandbox manages what lives inside it (the loopback client), and a machine client manages its own
+#    record by creation, so neither is restated as a grant. A founder mints it ONCE (the secret leaves
+#    through `--secret-file`, never the receipt); every later `apply` ADOPTS it, so CI can never delete
+#    the identity it signs in with.
 #  - What CI needs (SSO-3090): a throwaway SANDBOX environment inside the contract's workspace, and a
 #    public loopback OAuth client inside that sandbox. Both are environment-scoped, so `destroy` needs no
 #    production-plane confirmation: the sandbox hard-delete (confirmed with its own slug) cascades it.
@@ -61,11 +69,41 @@ resources:
         - tenant:access.write
       requireAuthorizationConsent: false  # first-party: no consent screen for the platform's own CLI
 
+  # SSO-3113 (epic SSO-3108) — the CI machine identity. Declared BEFORE the sandbox on purpose: `apply`
+  # converges resources in file order, and the sandbox's `grants:` block names this client as its subject.
+  - kind: application
+    name: ci
+    spec:
+      clientId: cli-ci                    # fixed id: `.thoryn/connection.json` signs CI in with it (step 2)
+      displayName: "thoryn-cli CI"
+      clientType: confidential            # client_credentials needs a secret; minted once, via --secret-file
+      grantTypes: [client_credentials]    # no human at the keyboard: no auth-code, no device-code, no refresh
+      # LEAST PRIVILEGE: exactly what converging THIS file needs, derived from the kinds it declares —
+      # `environment` -> tenant:environments.*, `application` -> tenant:applications.*, and the `grants:`
+      # block below -> tenant:access.* (read to plan the diff, write to converge it). Nothing else: the
+      # file declares no `user` and no `federationMember`, so the identity holds no users/federation reach
+      # (CiProvisionFileConformanceTest pins this set to the file's own contents).
+      scopes:
+        - tenant:environments.read
+        - tenant:environments.write
+        - tenant:applications.read
+        - tenant:applications.write
+        - tenant:access.read
+        - tenant:access.write
+      # No `grants:` here. A client is `manager` of its OWN record by creation (creator-becomes-manager);
+      # restating that would be noise, and anything wider would hand CI reach it must not have.
+
   - kind: environment
     name: ci
     spec:
       slug: cli-ci
       displayName: "thoryn-cli CI sandbox"
+    grants:
+      # SSO-3113 — the ONLY grant in this file: the CI identity manages this sandbox, and by containment
+      # everything inside it (the loopback client below). This is the whole of its reach — it is NOT a
+      # workspace admin, and nothing here grants the `cli` login client or `cli-ci` itself anything wider.
+      - subject: "client:cli-ci"
+        relation: manager
 
   - kind: application
     name: loopback-rp
