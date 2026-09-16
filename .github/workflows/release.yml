@@ -36,7 +36,8 @@ on:
         required: true
 
 permissions:
-  contents: write # create the release, upload assets, commit the formula bump
+  contents: write # create the release, upload assets, push the formula-bump branch
+  pull-requests: write # SSO-3120 — the formula bump lands as a PR, not a direct push to main
 
 jobs:
   # ── SSO-2928 fix: resolve the tag from the tag ref (push) or the required
@@ -246,22 +247,6 @@ jobs:
           merge-multiple: true
       - name: List downloaded assets
         run: ls -la assets
-      - name: Bump the Homebrew formula
-        run: bash scripts/release/bump-formula.sh "${{ needs.resolve.outputs.version }}" assets
-      - name: Commit the bumped formula to the default branch
-        env:
-          TAG: ${{ needs.resolve.outputs.tag }}
-        run: |
-          set -euo pipefail
-          if git diff --quiet -- Formula/thoryn.rb; then
-            echo "Formula/thoryn.rb already up to date — nothing to commit."
-          else
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add Formula/thoryn.rb
-            git commit -m "ci(release): SSO-2936 bump Homebrew formula to ${TAG}"
-            git push origin "HEAD:${{ github.event.repository.default_branch }}"
-          fi
       - name: Create the GitHub Release and upload assets
         env:
           GH_TOKEN: ${{ github.token }}
@@ -303,3 +288,60 @@ jobs:
 
               brew tap thoryn-io/thoryn-cli
               brew install thoryn"
+
+      # ── SSO-3120 — the formula bump lands as a PR, AFTER the release exists. ──
+      #
+      # This used to `git push origin HEAD:main` directly. Once `main` gained the
+      # required `build + unit tests` check, GitHub rejected that push outright:
+      #
+      #   remote: error: GH006: Protected branch update failed for refs/heads/main.
+      #   remote: - Required status check "build + unit tests" is expected.
+      #
+      # and because the push ran BEFORE `gh release create`, the whole job exited 1
+      # with the binaries built and NO release published. Found by a workflow_dispatch
+      # re-drive of cli-v0.15.0 (run 35062971615) rather than by the next real tag.
+      #
+      # Two changes, both deliberate:
+      #  1. Publishing now happens FIRST, so the customer-facing artifact is never
+      #     hostage to a formula bump. A failure here leaves the release out and the
+      #     formula stale — visible and recoverable, not a missing release.
+      #  2. The bump goes through a PR, so `main` keeps its gate. Weakening the
+      #     protection (or granting the bot a ruleset bypass) would have been the
+      #     other route; keeping the branch protected is worth one merge click.
+      #
+      # NOTE: repo auto-merge is currently OFF, so this PR needs a human merge.
+      # Enabling "Allow auto-merge" and adding `gh pr merge --auto --squash` below
+      # would close the loop without touching the protection rule.
+      - name: Bump the Homebrew formula
+        run: bash scripts/release/bump-formula.sh "${{ needs.resolve.outputs.version }}" assets
+      - name: Open a PR for the bumped formula
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- Formula/thoryn.rb; then
+            echo "Formula/thoryn.rb already up to date — nothing to open a PR for."
+            exit 0
+          fi
+          branch="ci/formula-bump-${TAG}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$branch"
+          git add Formula/thoryn.rb
+          git commit -m "ci(release): SSO-2936 bump Homebrew formula to ${TAG}"
+          # A re-drive of the same tag reuses the branch name; force is safe because
+          # the branch is machine-owned and carries exactly this one commit.
+          git push --force origin "$branch"
+          if gh pr view "$branch" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "PR for $branch already open — the force-push updated it."
+          else
+            gh pr create \
+              --repo "${{ github.repository }}" \
+              --base "${{ github.event.repository.default_branch }}" \
+              --head "$branch" \
+              --title "ci(release): SSO-2936 bump Homebrew formula to ${TAG}" \
+              --body "Automated by \`release.yml\` after publishing [\`${TAG}\`](https://github.com/${{ github.repository }}/releases/tag/${TAG}).
+
+          \`brew upgrade thoryn\` follows this formula, so the release is not reachable by Homebrew users until this merges."
+          fi
