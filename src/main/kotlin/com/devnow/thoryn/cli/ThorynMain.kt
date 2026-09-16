@@ -1,5 +1,6 @@
 package com.devnow.thoryn.cli
 
+import com.devnow.thoryn.cli.cmd.AccessCommand
 import com.devnow.thoryn.cli.cmd.AuditCommand
 import com.devnow.thoryn.cli.cmd.AuditReplayCommand
 import com.devnow.thoryn.cli.cmd.BrandingCommand
@@ -46,6 +47,8 @@ import kotlin.system.exitProcess
         FederationCommand::class,
         WorkspaceCommand::class,
         EnvironmentCommand::class,
+        // SSO-3113 — least-privilege access grants (`thoryn access grant|revoke|list|mine`).
+        AccessCommand::class,
         BrandingCommand::class,
         LoginFlowCommand::class,
         LoginMethodsCommand::class,

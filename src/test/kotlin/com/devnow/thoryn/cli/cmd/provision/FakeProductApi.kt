@@ -27,6 +27,15 @@ internal class FakeProductApi : Dispatcher() {
     val activeFlow = mutableMapOf<String?, Int>()
     /** SSO-3100 — the stored sign-in method allow-list per environment (absent ⇒ the default policy). */
     val loginMethods = mutableMapOf<String?, List<String>>()
+    /** SSO-3113 — access grants (`/api/v1/access/grants`, the SSO-3112 contract): `{subject, relation, object, createdAt}`. */
+    val grants = mutableListOf<MutableMap<String, Any?>>()
+    /** SSO-3113 — what `/api/v1/access/mine` answers for the caller (object refs). */
+    val mine = mutableListOf<String>()
+    /** SSO-3113 — simulate a token WITHOUT `tenant:access.write` / `tenant:access.read` (403 insufficient_scope). */
+    var denyGrantWrites = false
+    var denyGrantReads = false
+    /** SSO-3113 — the one-shot client secrets the fake minted for confidential applications, by clientId (test-side ledger only). */
+    val mintedSecrets = mutableMapOf<String, String>()
     private val supportedLoginMethods = listOf("password", "magic_link", "magic_code", "passkey", "totp", "sms")
     private var seq = 0
     private val mapper = JsonMapper.builder().addModule(kotlinModule()).build()
@@ -42,6 +51,17 @@ internal class FakeProductApi : Dispatcher() {
 
     fun seedApplication(env: String?, displayName: String, redirectUris: List<String> = listOf("http://127.0.0.1/callback")): String =
         "app-${++seq}".also { applications += mutableMapOf("clientId" to it, "displayName" to displayName, "redirectUris" to redirectUris, "status" to "active", "_env" to env) }
+
+    fun seedGrant(subject: String, relation: String, objectRef: String) {
+        grants += mutableMapOf("subject" to subject, "relation" to relation, "object" to objectRef, "createdAt" to "2026-09-15T00:00:00Z")
+    }
+
+    fun grantsOn(objectRef: String): List<String> = grants.filter { it["object"] == objectRef }.map { "${it["subject"]} ${it["relation"]}" }
+
+    private fun query(path: String): Map<String, String> =
+        path.substringAfter('?', "").split('&').filter { it.contains('=') }.associate { kv ->
+            kv.substringBefore('=') to java.net.URLDecoder.decode(kv.substringAfter('='), "UTF-8")
+        }
 
     private fun body(req: RecordedRequest): Map<String, Any?> {
         val raw = req.body.readUtf8()
@@ -66,7 +86,8 @@ internal class FakeProductApi : Dispatcher() {
         val route = path.substringBefore('?')
         val env = req.getHeader("X-Thoryn-Environment")
         val confirm = req.getHeader("X-Thoryn-Confirm")
-        val b = if (method == "GET" || method == "DELETE") emptyMap() else body(req)
+        // SSO-3113 — a DELETE may carry a JSON body (`DELETE /api/v1/access/grants`); `body` tolerates an empty one.
+        val b = if (method == "GET") emptyMap() else body(req)
         if (method != "GET") writes += Write(method, route, env, confirm, b)
         val seg = route.removePrefix("/api/v1/").split('/')
         return when {
@@ -90,7 +111,15 @@ internal class FakeProductApi : Dispatcher() {
             route == "/api/v1/applications" && method == "POST" -> {
                 val id = "app-${++seq}"
                 applications += (b + mapOf("clientId" to id, "status" to "active", "_env" to env)).toMutableMap()
-                json(201, public(applications.last()))
+                // SSO-3113 — a CONFIDENTIAL client's one-shot secret rides ONLY on the create response (never on a later
+                // GET). product-api's `clientType` defaults to confidential, so only an explicit `public` is secret-less.
+                val response = public(applications.last()).toMutableMap()
+                if (b["clientType"] != "public") {
+                    val secret = "minted-secret-$id"
+                    mintedSecrets[id] = secret
+                    response["clientSecret"] = secret
+                }
+                json(201, response)
             }
             seg[0] == "applications" && seg.size == 2 -> {
                 val a = applications.firstOrNull { it["clientId"] == seg[1] && visible(it, env) } ?: return problem(404, "not_found")
@@ -177,6 +206,31 @@ internal class FakeProductApi : Dispatcher() {
             route == "/api/v1/login-flows/activate" && method == "POST" -> {
                 val v = (b["version"] as Number).toInt(); activeFlow[env] = v
                 json(200, mapOf("version" to v, "status" to "active", "stages" to emptyList<Any>()))
+            }
+            // ── access grants (SSO-3113; the SSO-3112 /api/v1/access contract) ──
+            route == "/api/v1/access/grants" && method == "GET" -> {
+                if (denyGrantReads) return problem(403, "insufficient_scope")
+                val q = query(path)
+                val matching = grants.filter { g -> (q["object"] == null || g["object"] == q["object"]) && (q["subject"] == null || g["subject"] == q["subject"]) }
+                json(200, mapOf("data" to matching, "pagination" to mapOf("total" to matching.size, "nextCursor" to null)))
+            }
+            route == "/api/v1/access/grants" && method == "POST" -> {
+                if (denyGrantWrites) return problem(403, "insufficient_scope")
+                if (listOf("subject", "relation", "object").any { (b[it] as? String).isNullOrBlank() }) return problem(400, "invalid_grant_shape")
+                val existing = grants.firstOrNull { it["subject"] == b["subject"] && it["relation"] == b["relation"] && it["object"] == b["object"] }
+                if (existing != null) return json(200, existing)
+                seedGrant(b["subject"].toString(), b["relation"].toString(), b["object"].toString())
+                json(201, grants.last())
+            }
+            route == "/api/v1/access/grants" && method == "DELETE" -> {
+                if (denyGrantWrites) return problem(403, "insufficient_scope")
+                grants.removeIf { it["subject"] == b["subject"] && it["relation"] == b["relation"] && it["object"] == b["object"] }
+                MockResponse().setResponseCode(204)
+            }
+            route == "/api/v1/access/mine" && method == "GET" -> {
+                if (denyGrantReads) return problem(403, "insufficient_scope")
+                val q = query(path)
+                json(200, mapOf("data" to mine.filter { q["type"] == null || it.startsWith(q["type"] + ":") }))
             }
             // ── receipt attestation (SSO-2878; the recipe interpreter's best-effort signed layer) ──
             route == "/api/v1/attestations" && method == "POST" ->

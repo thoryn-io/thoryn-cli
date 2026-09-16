@@ -1,5 +1,6 @@
 package com.devnow.thoryn.cli.cmd.provision
 
+import com.devnow.thoryn.cli.cmd.AccessCommand
 import tools.jackson.databind.JsonNode
 import tools.jackson.databind.json.JsonMapper
 import tools.jackson.dataformat.yaml.YAMLMapper
@@ -21,9 +22,27 @@ internal data class ProvisionResource(
     val name: String,
     val environment: String?,
     val spec: Map<String, Any?>,
+    /**
+     * SSO-3113 — the least-privilege access grants declared ON this resource, converged with it (see
+     * [ProvisionGrant]). `null` ⇒ the file does not manage this object's grants (nothing is read or
+     * written); an empty list ⇒ the file declares NONE (every revocable grant on the object is revoked).
+     */
+    val grants: List<ProvisionGrant>? = null,
 ) {
     val isSingleton: Boolean get() = kind in ProvisionFile.SINGLETON_KINDS
     val key: String get() = "$kind/$name"
+}
+
+/**
+ * SSO-3113 (epic SSO-3108) — one grant on a resource: `subject` (`member:<sub>` / `client:<clientId>`)
+ * holds `relation` (`manager` / `viewer`) on the resource. The OBJECT half is not written in the file —
+ * it derives from the receipt id the resource resolves to (`environment:<id>`, `application:<clientId>`,
+ * `user:<id>`, `federation_member:<id>`, `<singleton>:<envSlug>`), so a grant can never point at an
+ * object the file does not own.
+ */
+internal data class ProvisionGrant(val subject: String, val relation: String) {
+    /** `<subject> <relation>` — the display / set-comparison form. */
+    val label: String get() = "$subject $relation"
 }
 
 /**
@@ -93,6 +112,9 @@ internal class ProvisionFile private constructor(
         /** A `spec` property name that would carry a secret VALUE — rejected; use `<key>Env`. */
         val SECRET_KEY_PATTERN = Regex("([Pp]assword|[Ss]ecret|[Tt]oken)$")
 
+        /** SSO-3113 — the relations a `grants:` entry may carry (the SSO-3112 contract; equals the schema enum). */
+        val GRANT_RELATIONS: Set<String> = AccessCommand.RELATIONS
+
         private val jsonMapper = JsonMapper.builder().addModule(kotlinModule()).build()
         private val yamlMapper = YAMLMapper.builder().addModule(kotlinModule()).build()
 
@@ -132,6 +154,9 @@ internal class ProvisionFile private constructor(
                     name = r["name"]?.takeIf { !it.isNull }?.asString()?.takeIf { it.isNotBlank() } ?: kind,
                     environment = r["environment"]?.takeIf { !it.isNull }?.asString()?.takeIf { it.isNotBlank() },
                     spec = spec,
+                    grants = r["grants"]?.takeIf { it.isArray() }?.toList()?.map { g ->
+                        ProvisionGrant(subject = g["subject"].asString().trim(), relation = g["relation"].asString().trim())
+                    },
                 )
             }
             return ProvisionFile(source = source, digest = sha256(bytes), resources = resources)
@@ -162,7 +187,7 @@ internal class ProvisionFile private constructor(
                     v += "$where must be an object"
                     return@forEachIndexed
                 }
-                rejectUnknownKeys(r, setOf("kind", "name", "environment", "spec"), where, v)
+                rejectUnknownKeys(r, setOf("kind", "name", "environment", "spec", "grants"), where, v)
                 val kind = r["kind"]?.takeIf { !it.isNull }?.asString()
                 if (kind == null || kind !in KINDS) {
                     v += "$where kind '$kind' not in the allowlist $KINDS"
@@ -190,6 +215,26 @@ internal class ProvisionFile private constructor(
                 }
                 REQUIRED_SPEC.getValue(kind).forEach { req ->
                     if (isMissing(spec[req])) v += "$where ($kind) spec.$req is required"
+                }
+                // SSO-3113 — `grants`: an array of { subject: <member|client>:<id>, relation: manager|viewer }, no duplicates.
+                r["grants"]?.takeIf { !it.isNull }?.let { grants ->
+                    if (!grants.isArray()) {
+                        v += "$where grants must be an array of { subject, relation }"
+                    } else {
+                        val seen = mutableSetOf<String>()
+                        grants.toList().forEachIndexed { gi, g ->
+                            val gw = "$where grants[$gi]"
+                            if (!g.isObject()) { v += "$gw must be an object { subject, relation }"; return@forEachIndexed }
+                            rejectUnknownKeys(g, setOf("subject", "relation"), gw, v)
+                            val subject = g["subject"]?.takeIf { it.isTextual() }?.asString()?.trim()
+                            val relation = g["relation"]?.takeIf { it.isTextual() }?.asString()?.trim()
+                            if (subject.isNullOrEmpty()) v += "$gw subject is required (member:<sub> | client:<clientId>)"
+                            else AccessCommand.validateSubject(subject)?.let { v += "$gw $it" }
+                            if (relation.isNullOrEmpty()) v += "$gw relation is required (${GRANT_RELATIONS.joinToString(" | ")})"
+                            else if (relation !in GRANT_RELATIONS) v += "$gw relation '$relation' must be one of ${GRANT_RELATIONS.joinToString(", ")}"
+                            if (subject != null && relation != null && !seen.add("$subject $relation")) v += "$gw duplicates grant '$subject $relation'"
+                        }
+                    }
                 }
                 // SSO-3100 — `loginMethods.methods` is the FULL allow-list: a non-empty array of method tokens.
                 if (kind == KIND_LOGIN_METHODS) spec["methods"]?.takeIf { it.isArray() }?.let { methods ->

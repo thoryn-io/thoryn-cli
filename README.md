@@ -149,9 +149,24 @@ thoryn provision ci-identity [--secret-file <path>] [--force-stdout] [--gateway 
 # band ⇒ re-created. Apply twice issues no writes. Secrets never enter the file — name the env var (`passwordEnv`,
 # `smtpPasswordEnv`, `clientSecretEnv`) or use `{{env.NAME}}`; they are resolved at apply and never
 # recorded. Production-plane removals need `--confirm <workspace-slug>` (the SSO-2413 gate).
-thoryn provision plan    [--file <path>] [--prune]                                  # read-only: what apply would create / remove
-thoryn provision apply   [--file <path>] [--prune] [--confirm <ws>] [--yes]        # converge; environments first, dependants into them
+thoryn provision plan    [--file <path>] [--prune]                                  # read-only: what apply would create / remove (+ grant changes)
+thoryn provision apply   [--file <path>] [--prune] [--confirm <ws>] [--yes] \
+                         [--secret-file <path>] [--force-stdout]                   # converge; environments first, dependants into them.
+                                             # SSO-3113 — a confidential application it CREATES gets a one-time client secret, delivered via
+                                             # SecretIo (--secret-file, or an interactive TTY; a pipe is refused unless --force-stdout); undeliverable
+                                             # ⇒ the client is still recorded, exit 65, `thoryn clients rotate-secret <id>` named. A resource's
+                                             # `grants:` block is converged with it (see "Least-privilege access grants").
 thoryn provision destroy [--file <path>|--receipt <path>] [--confirm <ws>] [--yes] # remove everything owned, child-first (sandbox hard-delete cascades)
+
+# Least-privilege access grants (SSO-3113, epic SSO-3108) — who may manage / view which resource.
+# Thin wrappers over product-api /api/v1/access (the SSO-3112 contract). Subjects: member:<sub> | client:<clientId>;
+# objects: workspace:<tenantId> | environment:<id> | application:<clientId> | user:<id> | federation_member:<id> |
+# email_provider:<envSlug> | login_theme:<envSlug> | login_flow:<envSlug> | login_methods:<envSlug>; relations: manager | viewer.
+# Scopes: tenant:access.read (list, mine) / tenant:access.write (grant, revoke).
+thoryn access grant  <subject> <relation> <object>   # POST   /api/v1/access/grants  (idempotent: 201, or 200 when it already exists)
+thoryn access revoke <subject> <relation> <object>   # DELETE /api/v1/access/grants  (grant identified in the JSON body; 204)
+thoryn access list   [--object <ref>] [--subject <ref>]   # GET /api/v1/access/grants?object=…|subject=…
+thoryn access mine   [--type <objectType>] [--relation <relation>]   # GET /api/v1/access/mine — the objects YOU hold a relation on
 ```
 
 > The supply-chain / verifiable-credential command tree was **removed** when the
@@ -189,6 +204,60 @@ ungated** — no `--confirm` needed there.
    the gateway); `create` also registers the new tenant in product-api.
  - `audit query` targets product-api's `/audit/events` surface
    (`tenant:audit.read`).
+
+### Least-privilege access grants (SSO-3113, epic SSO-3108)
+
+A **grant** is `subject → relation → object`: `client:cli-ci manager environment:<id>` says the
+machine client `cli-ci` may manage that one sandbox and nothing else. It is the unit a
+**least-privilege CI identity** is confined with — instead of a machine client holding every
+`tenant:*` scope across the whole workspace, it is made `manager` of exactly the sandbox it
+provisions. Two surfaces, one grammar:
+
+- **`thoryn access grant | revoke | list | mine`** — imperative, for a founder wiring things up
+  or inspecting who can reach what. `list` needs `--object` and/or `--subject`; `mine` answers
+  for the session's own subject (`{ "data": [ "environment:<id>", … ] }`).
+- **`grants:` on a resource in `provision.yaml`** — declarative, converged by `provision apply`
+  like any other field. The **object is implicit** (it derives from the receipt id the resource
+  resolves to — `environment:<id>`, `application:<clientId>`, `user:<id>`,
+  `federation_member:<id>`, and the per-environment singletons by their env slug —
+  `email_provider:<envSlug>`, `login_theme:…`, `login_flow:…`, `login_methods:…`), so a file can
+  never grant on an object it does not own:
+
+  ```yaml
+  - kind: environment
+    name: ci
+    spec: { slug: cli-ci, displayName: "thoryn-cli CI sandbox" }
+    grants:
+      - { subject: "client:cli-ci", relation: manager }   # the CI identity manages ONLY this sandbox
+  ```
+
+  After the resource exists (create / adopt / update / even a no-op), `apply` lists the object's
+  grants (`GET /api/v1/access/grants?object=…`), **POSTs the missing ones and DELETEs the ones the
+  file no longer declares — on that object only**. Grants on objects the file does not own are
+  never touched, and the workspace admin userset (`workspace:<id>#admin`) is never revoked. Omit
+  `grants:` to leave an object's grants unmanaged; `grants: []` declares none. `plan` prints the
+  grant diff (`grant + client:cli-ci manager`) and counts it. A session without
+  `tenant:access.write` **fails closed** with the scope named — the resource itself is already
+  recorded in the receipt by then, so nothing is lost; re-run after `thoryn login --scope
+  tenant:access.write` (or after granting the CI client that scope).
+
+The two scopes live in the `all-tenant-config` wildcard and in the committed `.thoryn/provision.yaml`
+`cli` client, but **not yet** in the default `thoryn login` scope set: the product side (SSO-3112)
+must deploy them to the hub first, or a default login would loop on `invalid_scope` (SSO-2278).
+Until then request them explicitly: `thoryn login --scope "tenant:access.read tenant:access.write"`.
+
+### A provisioned confidential client's secret (SSO-3113)
+
+A confidential `application` (product-api's default `clientType`; a `client_credentials` machine
+identity) is minted a **one-time `client_secret`** on create. `provision apply` routes it through
+the same `SecretIo` channel as `thoryn clients create`: written to `--secret-file <path>`
+(owner-only `0600`; a second confidential client in the same apply lands at `<path>.<clientId>`),
+or printed to an interactive TTY with a `WARNING`; a non-interactive stdout is refused unless
+`--force-stdout`. The secret never enters the receipt, the plan, or a log — receipts stay
+secret-free by construction. If it cannot be delivered the client is **still created and
+recorded** (it exists), and `apply` exits **65** naming
+`thoryn clients rotate-secret <clientId> --secret-file <path>` to mint a fresh one. `plan` marks
+such a create with `(a client secret will be minted and shown once)`.
 
 ## Secret-safety (SSO-1552)
 
@@ -532,6 +601,7 @@ thoryn-cli/
     │   │   ├── LoginCommand.kt + LogoutCommand.kt
     │   │   ├── CommandSupport.kt                            # SSO-1552 shared token/output/error helpers
     │   │   ├── SecretIo.kt + FileSecrets.kt                 # SSO-1552 secret-safety (no-echo / --secret-file)
+    │   │   ├── AccessCommand.kt                             # SSO-3113 `access grant|revoke|list|mine` (least-privilege grants)
     │   │   ├── ClientsCommand.kt                            # SSO-1552 clients CRUD + rotate-secret
     │   │   ├── FederationCommand.kt                         # SSO-1552 federation list/create/delete
     │   │   ├── WorkspaceCommand.kt                          # SSO-1552 workspace create/list/switch

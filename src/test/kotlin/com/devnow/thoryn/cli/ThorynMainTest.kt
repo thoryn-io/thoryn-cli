@@ -37,6 +37,8 @@ class ThorynMainTest {
         assertThat(out).contains("audit")
         // SSO-1553 — the tenant provisioning command tree is registered.
         assertThat(out).contains("tenant")
+        // SSO-3113 — least-privilege access grants.
+        assertThat(out).contains("access")
     }
 
     @Test
