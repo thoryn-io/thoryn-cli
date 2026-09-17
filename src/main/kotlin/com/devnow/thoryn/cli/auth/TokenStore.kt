@@ -33,6 +33,45 @@ interface TokenStore {
 }
 
 /**
+ * SSO-3147 — a read-once, write-through decorator over a [TokenStore].
+ *
+ * Within a single CLI process a command reads the token several times (`readTokens`, `ensureFresh`,
+ * `forceRefresh`, and the client build), and on the macOS keychain EACH underlying read is a
+ * separate OS authorization prompt — so an unsigned binary produced "loads of popups" per command.
+ * Caching the first read collapses that to at most one keychain access per process. [write] and
+ * [delete] keep the cache coherent (write-through / clear) so a refresh performed mid-command is
+ * reflected by later reads in the same process.
+ *
+ * Not shared across processes: each CLI invocation starts with an empty cache. The cached [Tokens]
+ * is already resident in JVM memory for the command's lifetime (every consumer holds it), so the
+ * cache adds no new exposure and is dropped when the process exits.
+ */
+class CachingTokenStore(val delegate: TokenStore) : TokenStore {
+    private var loaded = false
+    private var cachedTokens: Tokens? = null
+
+    override fun read(): Tokens? {
+        if (!loaded) {
+            cachedTokens = delegate.read()
+            loaded = true
+        }
+        return cachedTokens
+    }
+
+    override fun write(tokens: Tokens) {
+        delegate.write(tokens)
+        cachedTokens = tokens
+        loaded = true
+    }
+
+    override fun delete() {
+        delegate.delete()
+        cachedTokens = null
+        loaded = true
+    }
+}
+
+/**
  * Plaintext file [TokenStore]. Writes JSON to `~/.config/thoryn/tokens.json`
  * (Linux/macOS) or `%APPDATA%/thoryn/tokens.json` (Windows), POSIX 0600.
  *
@@ -152,19 +191,42 @@ object TokenStoreFactory {
      */
     internal var environment: (String) -> String? = { System.getenv(it) }
 
-    fun default(): TokenStore {
+    // SSO-3147 — the resolved store is process-memoised and wrapped in a [CachingTokenStore], so the
+    // several reads a single command performs (readTokens + ensureFresh + forceRefresh + client
+    // build) share ONE keychain access instead of one macOS authorization prompt each.
+    private var cached: TokenStore? = null
+
+    /**
+     * The [TokenStore] for the current environment, memoised for the process (see [CachingTokenStore]).
+     * The decision tree is in [build]; on the keychain path this returns a caching wrapper so a
+     * command reads the keychain at most once.
+     */
+    fun default(): TokenStore = cached ?: build().also { cached = it }
+
+    /**
+     * Drop the process-memoised store. Tests that swap [environment] / [keychainProvider] between
+     * cases MUST call this (in `@BeforeEach`) so `default()` is rebuilt against the new seams and no
+     * cached token leaks from a prior test.
+     */
+    internal fun resetForTests() {
+        cached = null
+    }
+
+    private fun build(): TokenStore {
         if (isPlaintextOptIn()) {
             log.warning(
                 "Using plaintext file token store. This violates ADR 2026-04-25 §4. " +
                     "Only safe in CI; set THORYN_CI_PLAINTEXT_TOKENS=1 to acknowledge.",
             )
-            return FileTokenStore()
+            return CachingTokenStore(FileTokenStore())
         }
 
+        // handleBackendUnavailable() either returns a FileTokenStore escape hatch or THROWS
+        // (TokenStoreUnavailableException) — the throw propagates before any caching wrap.
         return try {
-            KeychainTokenStore(keychainProvider())
+            CachingTokenStore(KeychainTokenStore(keychainProvider()))
         } catch (e: BackendNotSupportedException) {
-            handleBackendUnavailable(e)
+            CachingTokenStore(handleBackendUnavailable(e))
         }
     }
 

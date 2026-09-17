@@ -630,6 +630,30 @@ thoryn-cli/
 * All subcommands use only `java.net.http.HttpClient` + Jackson 3 + picocli,
   all of which are already native-image-ready.
 
+## macOS keychain prompts (SSO-3147)
+
+Tokens live in the OS keychain (ADR 2026-04-25 §4). On macOS the OS authorises each
+read of that item only for an app with a **stable, trusted code identity** — so an
+**unsigned** binary triggers a keychain-authorisation popup on every run (and a
+`brew upgrade` invalidates any "Always Allow" you granted, because the binary's
+identity changed).
+
+The durable fix is that the release now **code-signs + notarises** the macOS binary
+(`release.yml`, gated on the `MACOS_CERT_*` / `MACOS_NOTARY_*` repo secrets): a stable
+Developer ID identity makes "Always Allow" persist across upgrades — grant once, then
+silent. Within a single command the token is read once (in-process cache), so one
+command never fans out into several prompts.
+
+If you're on an unsigned build and want no keychain at all, opt into the plaintext
+file store (chmod-0600 JSON at `~/.config/thoryn/tokens.json`, or set `THORYN_TOKEN_FILE`):
+
+```bash
+export THORYN_CI_PLAINTEXT_TOKENS=1   # then: thoryn login
+```
+
+This trades OS-vault encryption for a 0600 file — fine on your own machine, weaker than
+the keychain. It is the same opt-in CI uses.
+
 ## Related
 
 * `docs/modules/ROOT/pages/cli/index.adoc` — top-level user docs

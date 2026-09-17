@@ -125,6 +125,9 @@ class ThorynCliE2ETest {
         TokenStoreFactory.environment = { key ->
             if (key == TokenStoreFactory.PLAINTEXT_OPT_IN_ENV_VAR) "1" else System.getenv(key)
         }
+        // SSO-3147 — default() is process-memoised; drop it so this test's store is built for its
+        // own tempHome and no cached token leaks from a prior case.
+        TokenStoreFactory.resetForTests()
     }
 
     @AfterEach
@@ -133,6 +136,7 @@ class ThorynCliE2ETest {
         gateway.shutdown()
         System.setProperty("user.home", originalUserHome ?: "")
         TokenStoreFactory.environment = originalEnvSeam
+        TokenStoreFactory.resetForTests()
         if (originalClientSecretProp == null) {
             System.clearProperty("THORYN_CLIENT_SECRET")
         } else {

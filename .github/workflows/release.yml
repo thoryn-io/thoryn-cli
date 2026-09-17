@@ -193,6 +193,69 @@ jobs:
           else
             cp target/thoryn "dist/${{ matrix.asset }}"
           fi
+      # SSO-3147 — code-sign (+ notarize) the macOS binary so its Developer ID code identity is
+      # STABLE. That stability is what makes a user's keychain "Always Allow" ACL persist across a
+      # `brew upgrade`, so the token store stops re-prompting on every run (a one-time grant, then
+      # silent). Secrets-gated and BEST-EFFORT — matching the per-platform tolerance this job already
+      # has: with no signing secrets the binary is published UNSIGNED (no failure), and the keychain
+      # re-prompt persists until the secrets are configured.
+      #
+      # Required repo secrets (App Store Connect API-key notarisation):
+      #   MACOS_CERT_P12_BASE64   base64 of the Developer ID Application certificate (.p12)
+      #   MACOS_CERT_PASSWORD     the .p12 export password
+      #   MACOS_SIGN_IDENTITY     e.g. "Developer ID Application: Thoryn ... (TEAMID)"
+      #   MACOS_NOTARY_KEY_P8_BASE64 / MACOS_NOTARY_KEY_ID / MACOS_NOTARY_KEY_ISSUER  notarytool API key
+      - name: Code-sign and notarize (macOS)
+        if: runner.os == 'macOS'
+        env:
+          BIN: dist/${{ matrix.asset }}
+          MACOS_CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+          MACOS_NOTARY_KEY_P8_BASE64: ${{ secrets.MACOS_NOTARY_KEY_P8_BASE64 }}
+          MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          MACOS_NOTARY_KEY_ISSUER: ${{ secrets.MACOS_NOTARY_KEY_ISSUER }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${MACOS_CERT_P12_BASE64:-}" ] || [ -z "${MACOS_SIGN_IDENTITY:-}" ]; then
+            echo "::warning::No macOS signing secrets set — publishing UNSIGNED. The keychain re-prompt (SSO-3147) persists until MACOS_CERT_* / MACOS_SIGN_IDENTITY are configured."
+            exit 0
+          fi
+
+          # 1) Import the Developer ID Application cert into a throwaway keychain (deleted at the end).
+          KEYCHAIN="$RUNNER_TEMP/thoryn-signing.keychain-db"
+          KEYCHAIN_PW="$(openssl rand -base64 24)"
+          security create-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+          security set-keychain-settings -lut 3600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+          echo "$MACOS_CERT_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign
+          # Let codesign use the imported key without an interactive prompt on the runner.
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PW" "$KEYCHAIN" >/dev/null
+          # Put our keychain first in the user search list so codesign resolves the identity.
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | sed -e 's/"//g')
+
+          # 2) Sign: hardened runtime + secure timestamp. The stable Developer ID designated
+          #    requirement is the part that makes the user's keychain "Always Allow" stick.
+          codesign --force --options runtime --timestamp --sign "$MACOS_SIGN_IDENTITY" "$BIN"
+          codesign --verify --strict --verbose=2 "$BIN"
+
+          # 3) Notarize (App Store Connect API key). A bare Mach-O cannot be stapled, so Gatekeeper
+          #    verifies the ticket online on first run; the SIGNATURE is what the keychain fix needs.
+          if [ -n "${MACOS_NOTARY_KEY_P8_BASE64:-}" ] && [ -n "${MACOS_NOTARY_KEY_ID:-}" ] && [ -n "${MACOS_NOTARY_KEY_ISSUER:-}" ]; then
+            echo "$MACOS_NOTARY_KEY_P8_BASE64" | base64 --decode > "$RUNNER_TEMP/notary.p8"
+            ditto -c -k --keepParent "$BIN" "$RUNNER_TEMP/notary.zip"
+            xcrun notarytool submit "$RUNNER_TEMP/notary.zip" \
+              --key "$RUNNER_TEMP/notary.p8" --key-id "$MACOS_NOTARY_KEY_ID" --issuer "$MACOS_NOTARY_KEY_ISSUER" \
+              --wait --timeout 20m
+          else
+            echo "::warning::Signed but NOT notarized (no MACOS_NOTARY_* secrets). Gatekeeper may warn on first run; the keychain fix only needs the signature."
+          fi
+
+          # 4) Tear down the throwaway keychain + decoded secrets.
+          security delete-keychain "$KEYCHAIN" || true
+          rm -f "$RUNNER_TEMP/cert.p12" "$RUNNER_TEMP/notary.p8" "$RUNNER_TEMP/notary.zip" || true
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset }}
