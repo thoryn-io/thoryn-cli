@@ -424,11 +424,11 @@ sign in on the real hosted screens and land on the protected page, which shows y
 ID-token claims. Nothing is added to oathy's deployed services — the app runs only
 for the duration of `run`.
 
-**`ci-signin`** (SSO-2944) was the **workspace-less** sibling CI used to provision an
-ephemeral loopback client inside a standing workspace. **Retired for CI use by SSO-3090** —
-this repo's own CI now converges `.thoryn/provision.yaml` with `thoryn provision apply`
-(see below). The bundled recipe stays shipped only until the `thoryn-examples`
-conformance workflow moves to provisioning files (SSO-3091); do not build on it.
+The former **`ci-signin`** recipe (SSO-2944, the workspace-less CI sibling) is **retired**
+(SSO-3092): this repo's own CI converges `.thoryn/provision.yaml` with `thoryn provision apply`
+(see below), and the `thoryn-examples` scenarios provision through their recipes' `provision:`
+file. A recipe that needs a throwaway environment inside the workspace you signed in to declares
+it in its provisioning file instead.
 
 **Recipes reference a provisioning file (SSO-3100, epic SSO-3087).** The provisioning file
 (`provision.yaml`, schema `src/main/resources/provision/provision.schema.json`) is **leading**
