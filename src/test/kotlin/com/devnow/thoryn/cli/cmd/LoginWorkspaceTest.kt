@@ -5,23 +5,31 @@ import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.api.Test
 
 /**
- * SSO-3104 — interactive sign-in (loopback / device-code) happens ON A WORKSPACE: `--workspace <slug>`
- * (or THORYN_WORKSPACE) is required and the issuer becomes the workspace's tenant hub. The shared
+ * SSO-3104 — interactive sign-in (loopback / device-code) happens ON A WORKSPACE: `--workspace <slug>`,
+ * else THORYN_WORKSPACE, else the platform default `thoryn` (SSO-3138); the issuer becomes the
+ * workspace's tenant hub. The shared
  * default tenant is not a sign-in target any more, and the CLI's own login client is `cli`, provisioned
  * in the `thoryn` workspace from this repo's `.thoryn/provision.yaml`.
  */
 class LoginWorkspaceTest : CommandTestBase() {
 
     @Test
-    fun `an interactive login without a workspace is refused before any network activity`() {
-        val (exit, _, err) = runCli("login", "--issuer", "https://hub.stg.thoryn.org")
-        assertThat(exit).isEqualTo(LoginCommand.EXIT_USAGE)
-        assertThat(err).contains("no workspace selected").contains("--workspace <slug>").contains(ThorynConfig.WORKSPACE_ENV)
-        assertThat(server.requestCount).isEqualTo(0)
+    fun `the platform default workspace is thoryn and a tenant is never the fallback`() {
+        assertThat(ThorynConfig.DEFAULT_WORKSPACE).isEqualTo("thoryn")
+        assertThat(ThorynConfig.DEFAULT_WORKSPACE).isNotEqualTo("default")
+        assertThat(ThorynConfig.tenantIssuer("https://hub.stg.thoryn.org", ThorynConfig.DEFAULT_WORKSPACE))
+            .isEqualTo("https://thoryn.hub.stg.thoryn.org")
+    }
 
-        val (deviceExit, _, deviceErr) = runCli("login", "--device-code", "--issuer", "https://hub.stg.thoryn.org")
-        assertThat(deviceExit).isEqualTo(LoginCommand.EXIT_USAGE)
-        assertThat(deviceErr).contains("no workspace selected")
+    @Test
+    fun `an interactive login without a workspace no longer refuses and announces the default workspace`() {
+        // SSO-3138 — no --workspace and no THORYN_WORKSPACE: sign in on `thoryn` instead of refusing.
+        // Device-code is used so the command fails fast against the (unreachable) test issuer without
+        // opening a browser; what matters is that it got PAST workspace selection.
+        val (exit, _, err) = runCli("login", "--device-code", "--issuer", "http://127.0.0.1:9", "--dev")
+        assertThat(err).doesNotContain("no workspace selected")
+        assertThat(err).contains("Signing in on the default workspace 'thoryn'").contains("--workspace <slug>").contains(ThorynConfig.WORKSPACE_ENV)
+        assertThat(exit).isNotEqualTo(LoginCommand.EXIT_USAGE)
     }
 
     @Test
