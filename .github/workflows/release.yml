@@ -38,6 +38,7 @@ on:
 permissions:
   contents: write # create the release, upload assets, push the formula-bump branch
   pull-requests: write # SSO-3120 — the formula bump lands as a PR, not a direct push to main
+  actions: write # SSO-3120 — dispatch `ci` on that PR (a GITHUB_TOKEN-opened PR triggers no workflows)
 
 jobs:
   # ── SSO-2928 fix: resolve the tag from the tag ref (push) or the required
@@ -309,9 +310,10 @@ jobs:
       #     protection (or granting the bot a ruleset bypass) would have been the
       #     other route; keeping the branch protected is worth one merge click.
       #
-      # NOTE: repo auto-merge is currently OFF, so this PR needs a human merge.
-      # Enabling "Allow auto-merge" and adding `gh pr merge --auto --squash` below
-      # would close the loop without touching the protection rule.
+      # Auto-merge (product owner, 2026-09-16; repo "Allow auto-merge" is on). The PR still passes the
+      # required `build + unit tests` check like any other — but a PR opened with GITHUB_TOKEN triggers
+      # NO workflows, so this step dispatches `ci` on the branch itself; otherwise the check never
+      # reports and the PR is stuck for good. Auto-merge then lands it once that run is green.
       - name: Bump the Homebrew formula
         run: bash scripts/release/bump-formula.sh "${{ needs.resolve.outputs.version }}" assets
       - name: Open a PR for the bumped formula
@@ -333,7 +335,7 @@ jobs:
           # A re-drive of the same tag reuses the branch name; force is safe because
           # the branch is machine-owned and carries exactly this one commit.
           git push --force origin "$branch"
-          if gh pr view "$branch" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+          if gh pr view "$branch" --repo "${{ github.repository }}" --json state -q .state 2>/dev/null | grep -q OPEN; then
             echo "PR for $branch already open — the force-push updated it."
           else
             gh pr create \
@@ -345,3 +347,7 @@ jobs:
 
           \`brew upgrade thoryn\` follows this formula, so the release is not reachable by Homebrew users until this merges."
           fi
+          # Start the required check on the branch head (see the note above), then queue auto-merge.
+          gh workflow run ci.yml --repo "${{ github.repository }}" --ref "$branch"
+          gh pr merge "$branch" --repo "${{ github.repository }}" --auto --squash
+          echo "Formula PR for $TAG: ci dispatched on $branch, auto-merge queued."
