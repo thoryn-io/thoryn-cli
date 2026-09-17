@@ -38,6 +38,7 @@ on:
 permissions:
   contents: write # create the release, upload assets, push the formula-bump branch
   pull-requests: write # SSO-3120 — the formula bump lands as a PR, not a direct push to main
+  actions: write # SSO-3120 — approve the parked `ci` run on the formula PR (fallback: dispatch `ci`)
 
 jobs:
   # ── SSO-2928 fix: resolve the tag from the tag ref (push) or the required
@@ -309,9 +310,10 @@ jobs:
       #     protection (or granting the bot a ruleset bypass) would have been the
       #     other route; keeping the branch protected is worth one merge click.
       #
-      # NOTE: repo auto-merge is currently OFF, so this PR needs a human merge.
-      # Enabling "Allow auto-merge" and adding `gh pr merge --auto --squash` below
-      # would close the loop without touching the protection rule.
+      # Auto-merge (product owner, 2026-09-16; repo "Allow auto-merge" is on). The PR still passes the
+      # required `build + unit tests` check like any other. A PR opened with GITHUB_TOKEN gets its
+      # `pull_request` ci run PARKED as action_required, so this step approves that run (see below);
+      # auto-merge then lands the PR once it is green.
       - name: Bump the Homebrew formula
         run: bash scripts/release/bump-formula.sh "${{ needs.resolve.outputs.version }}" assets
       - name: Open a PR for the bumped formula
@@ -333,7 +335,7 @@ jobs:
           # A re-drive of the same tag reuses the branch name; force is safe because
           # the branch is machine-owned and carries exactly this one commit.
           git push --force origin "$branch"
-          if gh pr view "$branch" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+          if gh pr view "$branch" --repo "${{ github.repository }}" --json state -q .state 2>/dev/null | grep -q OPEN; then
             echo "PR for $branch already open — the force-push updated it."
           else
             gh pr create \
@@ -344,4 +346,35 @@ jobs:
               --body "Automated by \`release.yml\` after publishing [\`${TAG}\`](https://github.com/${{ github.repository }}/releases/tag/${TAG}).
 
           \`brew upgrade thoryn\` follows this formula, so the release is not reachable by Homebrew users until this merges."
+          fi
+          # Queue auto-merge first; it lands the PR the moment the required check is green.
+          gh pr merge "$branch" --repo "${{ github.repository }}" --auto --squash
+
+          # SSO-3120 — get the REQUIRED check to run on the PR itself. Observed on cli-v0.17.0: opening
+          # this PR with GITHUB_TOKEN does start a `pull_request` run of `ci`, but GitHub parks it as
+          # `action_required` (bot-authored PR awaiting approval). A separately dispatched `ci` run on the
+          # same sha went green, yet the PR stayed BLOCKED — the parked PR run is what protection waits on.
+          # So approve the parked run (POST /actions/runs/{id}/approve, needs `actions: write`) instead of
+          # dispatching a parallel one. Fallback: if no parked run appears or approval is refused, dispatch
+          # `ci` and print the exact manual command, so a stuck formula PR is loud rather than silent.
+          sha=$(git rev-parse HEAD)
+          run_id=""
+          for _ in $(seq 1 24); do
+            run_id=$(gh api "repos/${{ github.repository }}/actions/runs?event=pull_request&head_sha=${sha}" \
+              --jq '[.workflow_runs[] | select(.path == ".github/workflows/ci.yml")
+                     | select(.status == "action_required" or .conclusion == "action_required")][0].id // empty')
+            [ -n "$run_id" ] && break
+            ok=$(gh api "repos/${{ github.repository }}/actions/runs?event=pull_request&head_sha=${sha}" \
+              --jq '[.workflow_runs[] | select(.path == ".github/workflows/ci.yml")][0].id // empty')
+            if [ -n "$ok" ]; then
+              echo "ci already running on the formula PR (run $ok) — no approval needed."
+              exit 0
+            fi
+            sleep 5
+          done
+          if [ -n "$run_id" ] && gh api -X POST "repos/${{ github.repository }}/actions/runs/${run_id}/approve" >/dev/null; then
+            echo "Formula PR for $TAG: approved parked ci run $run_id on $branch; auto-merge queued."
+          else
+            echo "::warning::could not approve a parked ci run for $branch (run='${run_id:-none}') — dispatching ci instead. If the PR stays BLOCKED, run: gh api -X POST repos/${{ github.repository }}/actions/runs/<parked-run-id>/approve"
+            gh workflow run ci.yml --repo "${{ github.repository }}" --ref "$branch"
           fi

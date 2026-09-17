@@ -1,7 +1,7 @@
 # SSO-3090 (epic SSO-3087) — this repo's PROVISIONING-AS-CODE: the "what I own" half of `.thoryn/`,
 # next to `connection.json` ("who I am", SSO-2948). thoryn-cli is the REFERENCE CONSUMER of the
 # `thoryn provision plan | apply | destroy` verbs it ships (SSO-3088/3089): its own CI converges this
-# file against shared staging, runs against the result, and destroys it on exit. A customer binds a
+# file against shared staging, runs against the result, and removes what it created on exit. A customer binds a
 # repository to Thoryn the same way — the identical files, the identical verbs.
 #
 # What this file owns:
@@ -20,15 +20,21 @@
 #    record by creation, so neither is restated as a grant. A founder mints it ONCE (the secret leaves
 #    through `--secret-file`, never the receipt); every later `apply` ADOPTS it, so CI can never delete
 #    the identity it signs in with.
-#  - What CI needs (SSO-3090): a throwaway SANDBOX environment inside the contract's workspace, and a
-#    public loopback OAuth client inside that sandbox. Both are environment-scoped, so `destroy` needs no
-#    production-plane confirmation: the sandbox hard-delete (confirmed with its own slug) cascades it.
+#  - What CI needs (SSO-3090): a SANDBOX environment inside the contract's workspace, and a public
+#    loopback OAuth client inside that sandbox.
 #
-# Converge, not create: the environment slug is FIXED (`provision-e2e` serialises runs with a
-# concurrency group). If a previous run failed to destroy it, the next `apply` ADOPTS the leftover
-# sandbox by its slug instead of creating a second one — adopted resources are converged but never
-# deleted by `destroy`, so a leaked sandbox stays visible in `thoryn env list` until an operator removes
-# it (`thoryn env delete <id> --confirm cli-ci`). No secrets live here; none are needed.
+# The sandbox is a LONG-LIVED FIXTURE, not a per-run throwaway (settled by the product owner,
+# 2026-09-16). Creating a resource requires `manager` on its PARENT, and the parent of an environment
+# is the workspace — so the confined `cli-ci` identity structurally CANNOT create or delete an
+# environment. A founder creates the sandbox once (with this file); every CI run ADOPTS it by its fixed
+# slug and manages only what lives INSIDE it: the loopback client is created by each run and removed by
+# `destroy` on exit. Granting `cli-ci` manager on the WORKSPACE so it could create per-run sandboxes was
+# considered and rejected — by containment it would reach the whole production plane, including the
+# `cli` login client above, which is exactly what epic SSO-3108 exists to prevent.
+#
+# `provision-e2e` serialises runs with a concurrency group, so one fixed sandbox is enough. It also
+# asserts the confinement itself after every apply: as `cli-ci`, `thoryn env list` must return ONLY this
+# sandbox, and a GET of a foreign environment must answer 404. No secrets live here; none are needed.
 apiVersion: thoryn.io/provision/v1
 resources:
   # SSO-3104 — the `thoryn` CLI's login client, in the `thoryn` workspace (production plane).

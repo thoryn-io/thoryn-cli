@@ -551,7 +551,8 @@ thoryn login --workspace thoryn --issuer https://hub.stg.thoryn.org --scope "<th
 thoryn provision apply --file .thoryn/provision.yaml --secret-file ci.secret
 
 # 2) Set the GitHub secret named by auth.secretEnv to the contents of ci.secret; shred ci.secret.
-# 3) Dispatch provision-e2e — it converges .thoryn/provision.yaml and destroys it on exit.
+# 3) Dispatch provision-e2e — it converges .thoryn/provision.yaml, asserts the CI identity is confined,
+#    and removes what the run created on exit (the sandbox is a long-lived fixture and stays).
 ```
 
 No standing test user and no standing sandbox are needed any more: the provisioning file
