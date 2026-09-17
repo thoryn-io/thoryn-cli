@@ -74,7 +74,7 @@ class LoginCommand : Callable<Int> {
      */
     @Option(
         names = ["--workspace"],
-        description = ["Workspace slug to sign in on (interactive flows sign in at <slug>.<hub>). Default: \${env:THORYN_WORKSPACE}."],
+        description = ["Workspace slug to sign in on (interactive flows sign in at <slug>.<hub>). Default: \${env:THORYN_WORKSPACE}, else `thoryn`."],
         defaultValue = "\${env:THORYN_WORKSPACE}",
     )
     var workspace: String? = null
@@ -259,18 +259,18 @@ class LoginCommand : Callable<Int> {
     private var baseIssuer: String = ThorynConfig.DEFAULT_ISSUER
 
     /**
-     * SSO-3104 — resolve the interactive sign-in issuer: `--workspace` (or THORYN_WORKSPACE) is required
-     * and the issuer becomes the workspace's tenant hub. Returns false (after printing the guidance) when
-     * no workspace was named — the shared default tenant is not a sign-in target.
+     * SSO-3104 / SSO-3138 — resolve the interactive sign-in issuer: the issuer becomes the workspace's
+     * tenant hub. The workspace is `--workspace`, else THORYN_WORKSPACE, else the platform default
+     * [ThorynConfig.DEFAULT_WORKSPACE] (`thoryn`) — announced on stderr so a user who meant another
+     * workspace sees how to choose it. The shared `default` tenant is never a sign-in target.
      */
     private fun selectWorkspaceIssuer(): Boolean {
-        val slug = workspace?.trim()?.takeIf { it.isNotEmpty() }
-        if (slug == null) {
+        val explicit = workspace?.trim()?.takeIf { it.isNotEmpty() }
+        val slug = explicit ?: ThorynConfig.DEFAULT_WORKSPACE.also {
             System.err.println(
-                "Error: no workspace selected — sign in on your workspace with `thoryn login --workspace <slug>` " +
-                    "(or export ${ThorynConfig.WORKSPACE_ENV}). The shared default tenant is not a sign-in target.",
+                "Signing in on the default workspace '$it' — pass `--workspace <slug>` " +
+                    "(or export ${ThorynConfig.WORKSPACE_ENV}) to sign in on another workspace.",
             )
-            return false
         }
         baseIssuer = issuer
         issuer = ThorynConfig.tenantIssuer(issuer, slug)

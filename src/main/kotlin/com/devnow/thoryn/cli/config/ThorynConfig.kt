@@ -38,6 +38,13 @@ object ThorynConfig {
     const val WORKSPACE_ENV = "THORYN_WORKSPACE"
 
     /**
+     * SSO-3138 — the workspace an interactive `thoryn login` signs in on when neither `--workspace` nor
+     * [WORKSPACE_ENV] names one: the platform's own default workspace. An explicit choice always wins,
+     * and the shared `default` TENANT is still never a sign-in target.
+     */
+    const val DEFAULT_WORKSPACE = "thoryn"
+
+    /**
      * SSO-2870 — the reserved slug of a workspace's platform-managed PRODUCTION environment (mirrors
      * `core` `TrustedTenantIssuers.PRODUCTION_ENV_SLUG`). A CLI session with no explicit `env use`
      * selection resolves to this production plane, so `env list` marks it active by default.
