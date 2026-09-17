@@ -162,6 +162,7 @@ internal class RecipeInterpreter(
      */
     fun verifyReceipt(receipt: Receipt): List<VerifyResult> {
         workspace = WorkspaceCtx(receipt.workspace.slug ?: "", receipt.workspace.tenantId ?: "", null)
+        targetReceiptEnvironment(receipt)
         return receipt.verify.map { vr ->
             when (vr.assert) {
                 "applications.get" -> {
@@ -175,12 +176,24 @@ internal class RecipeInterpreter(
     }
 
     /**
+     * SSO-3148 — a separate `examples verify` invocation must re-read the resources on the plane the
+     * run PROVISIONED them into. The receipt records that environment (a provisioned or `env.create`
+     * sandbox slug; `null` ⇒ the production plane). Without this the re-read carried no
+     * `X-Thoryn-Environment` header, resolved the production plane, and every sandbox-plane resource
+     * read 404 — reported as drift although the config was intact.
+     */
+    private fun targetReceiptEnvironment(receipt: Receipt) {
+        effectiveEnvironmentSlug = receipt.environment ?: environmentSlug
+    }
+
+    /**
      * SSO-2878 — verify a receipt's platform attestation OFFLINE: fetch the JWKS and check the detached
      * JWS over the canonical payload. `null` when the receipt carries no attestation.
      */
     fun verifyAttestation(receipt: Receipt): Es256JwsVerifier.Status? {
         val att = receipt.attestation ?: return null
         workspace = WorkspaceCtx(receipt.workspace.slug ?: "", receipt.workspace.tenantId ?: "", null)
+        targetReceiptEnvironment(receipt)
         return try {
             val jwks = tenantClient().attestationJwks()
             Es256JwsVerifier.verify(jwks, att.kid, att.signature, att.canonicalPayload)
