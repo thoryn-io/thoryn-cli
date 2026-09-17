@@ -34,12 +34,15 @@ class TokenStoreFactoryTest {
         // crashed previous test in the same JVM.
         TokenStoreFactory.environment = originalEnv
         TokenStoreFactory.keychainProvider = originalProvider
+        // SSO-3147 — default() is process-memoised; drop it so each case rebuilds against its seams.
+        TokenStoreFactory.resetForTests()
     }
 
     @AfterEach
     fun restoreSeams() {
         TokenStoreFactory.environment = originalEnv
         TokenStoreFactory.keychainProvider = originalProvider
+        TokenStoreFactory.resetForTests()
     }
 
     @Test
@@ -49,7 +52,7 @@ class TokenStoreFactoryTest {
 
         val store = TokenStoreFactory.default()
 
-        assertThat(store).isInstanceOf(FileTokenStore::class.java)
+        assertThat((store as CachingTokenStore).delegate).isInstanceOf(FileTokenStore::class.java)
     }
 
     @Test
@@ -59,7 +62,7 @@ class TokenStoreFactoryTest {
 
         val store = TokenStoreFactory.default()
 
-        assertThat(store).isInstanceOf(KeychainTokenStore::class.java)
+        assertThat((store as CachingTokenStore).delegate).isInstanceOf(KeychainTokenStore::class.java)
     }
 
     @Test
@@ -73,7 +76,7 @@ class TokenStoreFactoryTest {
 
         val store = TokenStoreFactory.default()
 
-        assertThat(store).isInstanceOf(FileTokenStore::class.java)
+        assertThat((store as CachingTokenStore).delegate).isInstanceOf(FileTokenStore::class.java)
     }
 
     @Test
@@ -104,7 +107,7 @@ class TokenStoreFactoryTest {
 
         val store = TokenStoreFactory.default()
 
-        assertThat(store).isInstanceOf(FileTokenStore::class.java)
+        assertThat((store as CachingTokenStore).delegate).isInstanceOf(FileTokenStore::class.java)
         assertThat(keychainCreated).isFalse()
     }
 
@@ -117,7 +120,7 @@ class TokenStoreFactoryTest {
 
         val store = TokenStoreFactory.default()
 
-        assertThat(store).isInstanceOf(KeychainTokenStore::class.java)
+        assertThat((store as CachingTokenStore).delegate).isInstanceOf(KeychainTokenStore::class.java)
     }
 
     @Test

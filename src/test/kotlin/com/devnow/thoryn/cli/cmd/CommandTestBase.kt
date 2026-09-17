@@ -44,6 +44,9 @@ abstract class CommandTestBase {
         TokenStoreFactory.environment = { key ->
             if (key == TokenStoreFactory.PLAINTEXT_OPT_IN_ENV_VAR) "1" else System.getenv(key)
         }
+        // SSO-3147 — default() is process-memoised; drop it BEFORE seedTokens so this test's writes
+        // (and later reads) hit a store built for THIS test's tempHome, not a prior case's.
+        TokenStoreFactory.resetForTests()
         seedTokens(Tokens(accessToken = "AT-test", refreshToken = "RT-test"))
     }
 
@@ -52,6 +55,7 @@ abstract class CommandTestBase {
         server.shutdown()
         System.setProperty("user.home", originalUserHome ?: "")
         TokenStoreFactory.environment = originalEnvSeam
+        TokenStoreFactory.resetForTests()
     }
 
     protected fun clearTokens() {
