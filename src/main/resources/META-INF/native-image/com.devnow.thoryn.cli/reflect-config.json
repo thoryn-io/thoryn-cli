@@ -36,6 +36,15 @@
     "allPublicFields": true
   },
   {
+    "name": "com.devnow.thoryn.cli.auth.StoredDpopKey",
+    "allDeclaredConstructors": true,
+    "allPublicConstructors": true,
+    "allDeclaredMethods": true,
+    "allPublicMethods": true,
+    "allDeclaredFields": true,
+    "allPublicFields": true
+  },
+  {
     "name": "com.devnow.thoryn.cli.cmd.SelectedWorkspace",
     "allDeclaredConstructors": true,
     "allPublicConstructors": true,

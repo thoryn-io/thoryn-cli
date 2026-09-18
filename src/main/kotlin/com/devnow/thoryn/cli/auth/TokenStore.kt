@@ -189,7 +189,11 @@ object TokenStoreFactory {
         )
     }
 
-    private fun isPlaintextOptIn(): Boolean =
+    /**
+     * SSO-3199 — also consulted by [DpopKeyStoreFactory] so the DPoP private key is stored in exactly
+     * the same backend as the tokens it proves possession for (never a weaker one).
+     */
+    internal fun isPlaintextOptIn(): Boolean =
         environment(PLAINTEXT_OPT_IN_ENV_VAR)?.isNotBlank() == true
 }
 

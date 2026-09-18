@@ -6,6 +6,7 @@ import com.devnow.thoryn.cli.auth.ClientCredentialsException
 import com.devnow.thoryn.cli.auth.ClientCredentialsFlow
 import com.devnow.thoryn.cli.auth.DeviceCodeException
 import com.devnow.thoryn.cli.auth.DeviceCodeFlow
+import com.devnow.thoryn.cli.auth.Dpop
 import com.devnow.thoryn.cli.auth.EcPrivateKeyJwtSigner
 import com.devnow.thoryn.cli.auth.HttpSender
 import com.devnow.thoryn.cli.auth.IssuerUrlValidationException
@@ -25,7 +26,6 @@ import com.devnow.thoryn.cli.config.ThorynConfig
 import picocli.CommandLine.Command
 import picocli.CommandLine.Option
 import java.io.File
-import java.net.http.HttpClient
 import java.time.Duration
 import java.util.concurrent.Callable
 
@@ -781,12 +781,13 @@ class LoginCommand : Callable<Int> {
         return 0
     }
 
-    private fun realHttpSender(): HttpSender {
-        val client = HttpClient.newBuilder()
-            .connectTimeout(Duration.ofSeconds(10))
-            .build()
-        return HttpSender { request, handler -> client.send(request, handler) }
-    }
+    /**
+     * SSO-3199 — every login token-endpoint round-trip (authorization-code redemption, device-code
+     * polling, client-credentials, workload identity) goes out with an RFC 9449 DPoP proof, so the hub
+     * can bind `cnf.jkt` into the issued access token. Degrades to a plain sender when no secure store
+     * for the DPoP key is available.
+     */
+    private fun realHttpSender(): HttpSender = Dpop.sender(Duration.ofSeconds(10))
 
     private fun urlEncode(s: String): String =
         java.net.URLEncoder.encode(s, Charsets.UTF_8)
