@@ -32,6 +32,9 @@ data class Tokens(
     // secret is NEVER persisted (it lives only in the CI environment).
     val authMode: String? = null,
     val clientId: String? = null,
+    // SSO-3182 — the workspace slug an interactive login signed in on (`thoryn login --workspace <slug>`),
+    // so a session that can no longer be renewed can print the exact re-login line. Not a secret.
+    val workspace: String? = null,
 ) {
     companion object {
         /** SSO-2941 — [authMode] value marking a non-interactive API-key / client-credentials session. */

@@ -42,10 +42,10 @@ import java.util.concurrent.Callable
 )
 class StatusCommand : Callable<Int> {
 
-    @Option(names = ["--hub"], description = ["Override the hub base URL (default: signed-in hub, else \${DEFAULT-VALUE})."], defaultValue = ThorynConfig.DEFAULT_HUB)
+    @Option(names = ["--hub"], description = ["Override the hub base URL (default: the hub recorded at `thoryn login`)."], defaultValue = ThorynConfig.DEFAULT_HUB)
     var hub: String = ThorynConfig.DEFAULT_HUB
 
-    @Option(names = ["--gateway"], description = ["Override the gateway base URL (default: signed-in gateway, else \${DEFAULT-VALUE})."], defaultValue = ThorynConfig.DEFAULT_GATEWAY)
+    @Option(names = ["--gateway"], description = ["Override the customer-plane gateway URL (default: the gateway recorded at `thoryn login`)."], defaultValue = ThorynConfig.DEFAULT_GATEWAY)
     var gateway: String = ThorynConfig.DEFAULT_GATEWAY
 
     @Option(names = ["--output"])

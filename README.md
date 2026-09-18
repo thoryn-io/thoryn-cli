@@ -47,7 +47,7 @@ the stable asset name the `thoryn-examples` conformance CI consumes.
 ## Command tree
 
 ```
-thoryn login --workspace <slug>              # Auth code + PKCE (loopback) or --device-code — ON your workspace (SSO-3104)
+thoryn login --workspace <slug> [--issuer https://hub.<env>]  # Auth code + PKCE (loopback) or --device-code — ON your workspace (SSO-3104)
 thoryn login --client-credentials [--client-id <id>] # SSO-1553/2941 — non-interactive API key (CI); THORYN_API_KEY=<id>:<secret>, auto re-mints on expiry
 thoryn login --status
 thoryn logout
@@ -240,10 +240,10 @@ provisions. Two surfaces, one grammar:
   recorded in the receipt by then, so nothing is lost; re-run after `thoryn login --scope
   tenant:access.write` (or after granting the CI client that scope).
 
-The two scopes live in the `all-tenant-config` wildcard and in the committed `.thoryn/provision.yaml`
-`cli` client, but **not yet** in the default `thoryn login` scope set: the product side (SSO-3112)
-must deploy them to the hub first, or a default login would loop on `invalid_scope` (SSO-2278).
-Until then request them explicitly: `thoryn login --scope "tenant:access.read tenant:access.write"`.
+Since SSO-3182 the two scopes are part of the DEFAULT `thoryn login` scope set (the default set is
+exactly the `cli` login client's registered scopes in `.thoryn/provision.yaml`, which the product side
+deployed to the hub under SSO-3112), so a bare `thoryn login --workspace <slug>` can converge a file
+with `grants:` — no hand-typed `--scope` list.
 
 ### A provisioned confidential client's secret (SSO-3113)
 
@@ -282,18 +282,38 @@ or land in shell history:
 
 ## Authentication
 
+### Which platform? (SSO-3182)
+
+The CLI has **no built-in hub** — it never defaults to `localhost`. `thoryn login` resolves the hub
+BASE URL (`https://hub.<env>`) in this order:
+
+1. `--issuer <url>`;
+2. the `THORYN_HUB` environment variable;
+3. the hub of your previous sign-in on this machine (so after the first `--issuer` login,
+   `thoryn login --workspace <slug>` alone reaches the same platform);
+4. a production hub baked into the release — **not set yet** (the production domain is a product
+   decision; `ThorynConfig.PLATFORM_HUB`).
+
+With none of them the command exits 65 and tells you how to name one — it does not dial anything.
+
 ```bash
-# Default scopes (SSO-1552): openid offline_access plus the tenant-config set
-# (tenant:applications.{read,write}, tenant:federation.{read,write},
-# tenant:audit.read, tenant:environments.{read,write}, tenant:email.{read,write},
-# tenant:idp.{read,write}) so `clients`, `federation`, `audit`, `env` (SSO-2870),
-# `workspace email-provider`, and `branding` (SSO-3037) work out of the box.
-# `workspace` rides on SCOPE_openid (the hub /account surface). The hub drops any
-# scope the tenant admin doesn't actually hold.
+thoryn login --workspace thoryn --issuer https://hub.stg.thoryn.org   # Thoryn staging
+export THORYN_HUB=https://hub.stg.thoryn.org && thoryn login --workspace thoryn
+thoryn login --workspace dev --issuer http://localhost:54702          # a hub on your own machine
+```
+
+```bash
+# Default scopes (SSO-3182): EXACTLY the `cli` login client's registered set — openid,
+# offline_access and the whole tenant-config surface (applications, clients, users,
+# federation, audit, environments, email, idp, access). A bare login therefore authorizes
+# `clients`, `federation`, `audit`, `env`, `workspace email-provider`, `branding`, `access`
+# and `provision apply` (including a file's `grants:` block) with no --scope list.
+# `workspace` rides on SCOPE_openid (the hub /account surface). The hub mints only the
+# scopes the signing-in admin actually holds.
 # SSO-3104 — sign-in is always ON A WORKSPACE (`https://<slug>.hub.<env>`, client `cli`,
 # provisioned in the `thoryn` workspace by this repo's .thoryn/provision.yaml); the shared
 # default tenant is not a sign-in target. `--workspace` or `export THORYN_WORKSPACE=<slug>`.
-thoryn login --workspace thoryn
+thoryn login --workspace thoryn --issuer https://hub.stg.thoryn.org
 
 # Grab the whole tenant-config scope set explicitly.
 thoryn login --workspace thoryn --scope all-tenant-config
@@ -390,14 +410,39 @@ gateway alongside the token, so the other commands default to them — you do
 **not** need to repeat `--hub` / `--gateway` on every call after signing in:
 
 ```bash
-thoryn login --issuer https://acme.hub.stg.thoryn.org   # records hub + gateway for the session
-thoryn workspace list                                    # uses the session hub, no --hub needed
-thoryn clients list                                      # uses the session gateway, no --gateway needed
+thoryn login --workspace acme --issuer https://hub.stg.thoryn.org  # records hub + gateway for the session
+thoryn workspace list                                              # uses the session hub, no --hub needed
+thoryn clients list                                                # uses the session gateway, no --gateway needed
 ```
+
+The session also remembers the WORKSPACE it signed in on, so when it can no longer be renewed the CLI
+prints the exact line to fix it (`Run \`thoryn login --workspace acme\``) instead of a bare `HTTP 401`.
 
 The gateway is derived from the hub host (`hub.<env>` → `api.<env>`); for a
 non-standard topology set it explicitly at login with `--gateway <url>`. An
 explicit `--hub` / `--gateway` on any command still overrides the session.
+
+## Session renewal (SSO-2834 / SSO-2861 / SSO-3182)
+
+The access token lives ~15 minutes. When a session carries a refresh token (interactive logins ask for
+`offline_access`), the CLI renews it transparently — proactively near expiry and reactively on a `401`
+— **before** a command runs and before a `workspace switch` token exchange, so a switched workspace
+never outlives the home session. A client-credentials / API-key session has no refresh token by
+design (RFC 6749 §4.4.3) and is re-minted from `THORYN_API_KEY` / `THORYN_CLIENT_SECRET`.
+
+When renewal is impossible the CLI now says so, once, with the exact command:
+
+```
+Your sign-in session has expired and carries no refresh token, so it cannot be renewed.
+Run `thoryn login --workspace thoryn` to sign in again.
+```
+
+**Caveat (hub-side).** The authorization server issues **no refresh token to a public client on the
+authorization-code grant** (Spring Authorization Server's `OAuth2RefreshTokenGenerator`), and the CLI's
+`cli` login client is a public RFC 8252 native client. A loopback `thoryn login` session therefore ends
+at the access-token expiry today; `thoryn login --device-code` sessions do receive a refresh token and
+renew. The CLI prints a note right after a sign-in that received none. Making public-client
+authorization-code logins refreshable (rotation + replay detection, OAuth 2.1 §4.3.1) is a hub change.
 
 ## Examples (SSO-2830)
 
@@ -542,9 +587,10 @@ your `connection.json` declares in `auth.secretEnv`.
 Everything the run needs is either committed or minted once by a founder:
 
 ```bash
-# 0) Sign in interactively as an admin of the `thoryn` workspace (authorization-code + PKCE),
-#    requesting every scope the provisioning file grants — the hub only lets you grant what you hold.
-thoryn login --workspace thoryn --issuer https://hub.stg.thoryn.org --scope "<the file's scopes, incl. tenant:access.read tenant:access.write>"
+# 0) Sign in interactively as an admin of the `thoryn` workspace (authorization-code + PKCE). The
+#    default scope set already covers every scope the provisioning file grants (SSO-3182); the hub
+#    only lets you grant what you hold.
+thoryn login --workspace thoryn --issuer https://hub.stg.thoryn.org
 
 # 1) Apply. The declared confidential client is created and its secret delivered ONCE, via SecretIo.
 #    (SSO-3113 retired the imperative `provision ci-identity` bootstrap: the identity is a resource.)

@@ -1,21 +1,107 @@
 package com.devnow.thoryn.cli.config
 
 /**
- * Default endpoints baked into the CLI binary.
+ * Endpoints, defaults and env knobs baked into the CLI binary.
  *
- * Production builds will overwrite these via `-D` properties or a generated
- * `oathy.properties` resource at release time. For local development the
- * defaults point at `localhost` services so a developer can `thoryn login`
- * against a hub running on their own machine.
+ * SSO-3182 — a released CLI has NO localhost default for the platform it signs in to. `thoryn login`
+ * resolves the hub BASE URL ([resolveHubBase]) from, in order: `--issuer`, the [HUB_ENV] env var
+ * (`THORYN_HUB`), the hub of the previous session on this machine, and finally the baked-in
+ * [PLATFORM_HUB] — which stays `null` until the production platform domain is live (a product
+ * decision). With none of them, login fails fast with guidance instead of silently opening
+ * `http://localhost:54702/oauth2/authorize` (what 0.17/0.18 did).
  *
- * Known environments (override via `--issuer` and `--gateway`):
+ * Known platforms:
  *
- *  - Local dev: `http://localhost:54702` (hub) and `http://localhost:8991` (gateway)
- *  - Staging:   `https://hub.stg.thoryn.org` (hub) and the matching staging gateway
- *  - Production (TBD)
+ *  - Staging:    `https://hub.stg.thoryn.org` ([STAGING_ISSUER]) / `https://api.stg.thoryn.org`
+ *  - Local dev:  `http://localhost:54702` ([LOCAL_DEV_HUB]) / `http://localhost:8991` — pass
+ *    `--issuer http://localhost:54702` (or export THORYN_HUB) explicitly
+ *  - Production: not live yet ([PLATFORM_HUB] is `null`)
  */
 object ThorynConfig {
-    const val DEFAULT_ISSUER = "http://localhost:54702"
+    /** SSO-3182 — the local-dev hub (a hub running on the developer's machine). Never an implicit default for login. */
+    const val LOCAL_DEV_HUB = "http://localhost:54702"
+
+    /**
+     * SSO-3182 — the env var naming the hub BASE URL (`https://hub.<env>`) `thoryn login` signs in to when
+     * `--issuer` is not passed. The same name the connection contract's `workspace.hubBaseUrlEnv` defaults to.
+     */
+    const val HUB_ENV = "THORYN_HUB"
+
+    /**
+     * SSO-3182 — the production platform's hub base URL baked into a release, or `null` while the
+     * production domain is not live. OPEN QUESTION (product owner): set this to the production hub
+     * (`deploy/helm/thoryn/values-production.yaml` scaffolds `https://hub.thoryn.org`) once it serves
+     * traffic — then a bare `thoryn login --workspace <slug>` reaches `https://<slug>.hub.thoryn.org`.
+     */
+    val PLATFORM_HUB: String? = null
+
+    /** SSO-3182 — where a resolved hub base came from (for the one-line notice `thoryn login` prints). */
+    enum class HubSource { FLAG, ENV, PREVIOUS_SESSION, PLATFORM }
+
+    data class HubBase(val url: String, val source: HubSource)
+
+    /**
+     * SSO-3182 — resolve the hub BASE URL `thoryn login` signs in to, or null when nothing names one:
+     *  1. [explicit] (`--issuer`);
+     *  2. the [HUB_ENV] (`THORYN_HUB`) system property, then environment variable;
+     *  3. the base hub of the previous session on this machine ([previousSessionIssuer], the stored
+     *     tenant issuer, normalised by [baseHubOf]) — so `thoryn login --workspace thoryn` after the first
+     *     `--issuer` sign-in reuses the same platform, which is what the "run `thoryn login`" recovery
+     *     hints rely on;
+     *  4. the baked-in [platformHub] ([PLATFORM_HUB]).
+     */
+    fun resolveHubBase(
+        explicit: String?,
+        previousSessionIssuer: String?,
+        env: (String) -> String? = { System.getProperty(it) ?: System.getenv(it) },
+        platformHub: String? = PLATFORM_HUB,
+    ): HubBase? {
+        explicit?.trim()?.trimEnd('/')?.takeIf { it.isNotEmpty() }?.let { return HubBase(it, HubSource.FLAG) }
+        env(HUB_ENV)?.trim()?.trimEnd('/')?.takeIf { it.isNotEmpty() }?.let { return HubBase(it, HubSource.ENV) }
+        previousSessionIssuer?.takeIf { it.isNotBlank() }?.let { return HubBase(baseHubOf(it), HubSource.PREVIOUS_SESSION) }
+        platformHub?.trim()?.trimEnd('/')?.takeIf { it.isNotEmpty() }?.let { return HubBase(it, HubSource.PLATFORM) }
+        return null
+    }
+
+    /**
+     * SSO-3182 — the hub BASE of an issuer: a tenant issuer `https://<slug>.hub.<env>` becomes
+     * `https://hub.<env>`; a base hub (`hub.<env>`) or a single-host local hub is returned unchanged.
+     */
+    fun baseHubOf(issuer: String): String {
+        val trimmed = issuer.trim().trimEnd('/')
+        return try {
+            val uri = java.net.URI(trimmed)
+            val host = uri.host ?: return trimmed
+            val idx = host.indexOf(".hub.")
+            if (idx <= 0) return trimmed
+            java.net.URI(uri.scheme, uri.userInfo, host.substring(idx + 1), uri.port, null, null, null)
+                .toString()
+                .trimEnd('/')
+        } catch (_: Exception) {
+            trimmed
+        }
+    }
+
+    /** SSO-3182 — the workspace slug of a tenant issuer `https://<slug>.hub.<env>`, else null. */
+    fun workspaceOfIssuer(issuer: String?): String? {
+        if (issuer.isNullOrBlank()) return null
+        return try {
+            val host = java.net.URI(issuer.trim()).host ?: return null
+            val idx = host.indexOf(".hub.")
+            if (idx <= 0) null else host.substring(0, idx)
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /** SSO-3182 — the guidance `thoryn login` prints when no hub could be resolved. */
+    val NO_HUB_GUIDANCE: String =
+        """
+        Error: no Thoryn platform selected — this CLI has no built-in hub yet.
+        Name the hub base URL once; later sign-ins on this machine reuse it:
+            thoryn login --workspace <slug> --issuer $STAGING_ISSUER      # Thoryn staging
+        or export $HUB_ENV=$STAGING_ISSUER. For a hub on your own machine: --issuer $LOCAL_DEV_HUB
+        """.trimIndent()
 
     /**
      * SSO-2821 — the default OAuth client id for `thoryn login`.
@@ -183,33 +269,40 @@ object ThorynConfig {
     }
 
     /**
-     * Default scope set requested by `thoryn login`.
+     * Default scope set requested by an interactive `thoryn login`.
      *
-     * SSO-1552 — the device-flow login requests the tenant-configuration scopes
-     * (`tenant:applications.{read,write}`, `tenant:federation.{read,write}`,
-     * `tenant:audit.read`) so the `clients`, `federation`, and `audit` command
-     * trees are authorized out of the box. `workspace` create/list ride on
-     * `SCOPE_openid` (the hub `/account/[*]` surface) and need no extra scope.
-     * The legacy workforce-era `tenant:clients.read` / `tenant:users.read` are
-     * retained so `thoryn clients list` against an older deployment keeps
-     * working; the hub drops scopes the tenant admin doesn't hold.
+     * SSO-3182 — EXACTLY the scope set the CLI's login client `cli` is registered with (declared in this
+     * repo's `.thoryn/provision.yaml`; `CiProvisionFileConformanceTest` pins the two equal), so a bare
+     * `thoryn login` authorizes every command — including `provision apply` of a file with `grants:`
+     * (`tenant:access.write`), login themes / methods / flows (`tenant:idp.*`) and an email provider
+     * (`tenant:email.*`) — without a hand-typed `--scope`. Requesting a scope the client does NOT hold is
+     * an `invalid_scope` sign-in failure (SSO-2278), which is why the set is pinned to the client's. The
+     * hub mints only the subset the signing-in admin actually holds, so a broad request grants nothing
+     * extra. `workspace` create/list ride on `SCOPE_openid` (the hub `/account/[*]` surface).
+     *
+     * History: SSO-1552 (tenant-config set), SSO-2870 (`environments.*`), SSO-2917 (`email.*`),
+     * SSO-3037 (`idp.*`), SSO-3113 (`access.*`, held back from the default until SSO-3112 deployed the
+     * grant to the hub — hub V161; the `cli` client carries it from `.thoryn/provision.yaml`).
      */
     const val DEFAULT_SCOPE =
         "openid offline_access " +
             "tenant:applications.read tenant:applications.write " +
+            "tenant:clients.read " +
+            "tenant:users.read tenant:users.write " +
             "tenant:federation.read tenant:federation.write " +
             "tenant:audit.read " +
-            // SSO-2870 — the environment select/manage surface (`thoryn env`). Granted to the
-            // thoryn-cli client in hub V119; the hub drops it for an admin who doesn't hold it.
             "tenant:environments.read tenant:environments.write " +
-            "tenant:clients.read tenant:users.read"
+            "tenant:email.read tenant:email.write " +
+            "tenant:idp.read tenant:idp.write " +
+            "tenant:access.read tenant:access.write"
 
     /**
-     * Default hub base URL for the workspace surface (`/account/[*]`), which is
-     * NOT routed through the api-gateway. `thoryn workspace` commands default to
-     * the same value as `--issuer` and can be overridden with `--hub`.
+     * The `--hub` / `--gateway` "not given" sentinel of the post-login commands (SSO-2827): they use the
+     * hub / gateway RECORDED AT `thoryn login` ([com.devnow.thoryn.cli.cmd.CommandSupport.resolveHub]).
+     * The local-dev value is reached only with no session at all — and every such command needs a
+     * session first (`Not signed in. Run thoryn login`), so it is never a silent production default.
      */
-    const val DEFAULT_HUB = DEFAULT_ISSUER
+    const val DEFAULT_HUB = LOCAL_DEV_HUB
 
     /**
      * Client secret read from the `THORYN_CLIENT_SECRET` env var. The hub's

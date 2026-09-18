@@ -68,7 +68,7 @@ class AccessCommand : Callable<Int> {
         @Parameters(index = "2", paramLabel = "<object>", description = ["Object: <type>:<id>, e.g. environment:<id>, application:<clientId>."])
         lateinit var objectRef: String
 
-        @Option(names = ["--gateway"], description = ["Override the gateway base URL (default: \${DEFAULT-VALUE})."], defaultValue = ThorynConfig.DEFAULT_GATEWAY)
+        @Option(names = ["--gateway"], description = ["Override the customer-plane gateway URL (default: the gateway recorded at `thoryn login`)."], defaultValue = ThorynConfig.DEFAULT_GATEWAY)
         var gateway: String = ThorynConfig.DEFAULT_GATEWAY
 
         @Option(names = ["--output"], description = ["Output format: json|yaml|table (default: table)."])
@@ -106,7 +106,7 @@ class AccessCommand : Callable<Int> {
         @Parameters(index = "2", paramLabel = "<object>", description = ["Object: <type>:<id>."])
         lateinit var objectRef: String
 
-        @Option(names = ["--gateway"], description = ["Override the gateway base URL (default: \${DEFAULT-VALUE})."], defaultValue = ThorynConfig.DEFAULT_GATEWAY)
+        @Option(names = ["--gateway"], description = ["Override the customer-plane gateway URL (default: the gateway recorded at `thoryn login`)."], defaultValue = ThorynConfig.DEFAULT_GATEWAY)
         var gateway: String = ThorynConfig.DEFAULT_GATEWAY
 
         @Option(names = ["--output"], description = ["Output format: json|yaml|table (default: table)."])
@@ -145,7 +145,7 @@ class AccessCommand : Callable<Int> {
         @Option(names = ["--subject"], description = ["Subject ref (member:<sub> | client:<clientId>) whose grants to list."])
         var subject: String? = null
 
-        @Option(names = ["--gateway"], description = ["Override the gateway base URL (default: \${DEFAULT-VALUE})."], defaultValue = ThorynConfig.DEFAULT_GATEWAY)
+        @Option(names = ["--gateway"], description = ["Override the customer-plane gateway URL (default: the gateway recorded at `thoryn login`)."], defaultValue = ThorynConfig.DEFAULT_GATEWAY)
         var gateway: String = ThorynConfig.DEFAULT_GATEWAY
 
         @Option(names = ["--output"], description = ["Output format: json|yaml|table (default: table)."])
@@ -186,7 +186,7 @@ class AccessCommand : Callable<Int> {
         @Option(names = ["--relation"], description = ["Relation filter: manager or viewer."])
         var relation: String? = null
 
-        @Option(names = ["--gateway"], description = ["Override the gateway base URL (default: \${DEFAULT-VALUE})."], defaultValue = ThorynConfig.DEFAULT_GATEWAY)
+        @Option(names = ["--gateway"], description = ["Override the customer-plane gateway URL (default: the gateway recorded at `thoryn login`)."], defaultValue = ThorynConfig.DEFAULT_GATEWAY)
         var gateway: String = ThorynConfig.DEFAULT_GATEWAY
 
         @Option(names = ["--output"], description = ["Output format: json|yaml|table (default: table)."])
