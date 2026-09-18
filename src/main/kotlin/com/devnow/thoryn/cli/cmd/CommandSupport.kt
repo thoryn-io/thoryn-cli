@@ -163,7 +163,13 @@ internal object CommandSupport {
 
         val initial = mint()
         if (initial == null) {
-            err.println("Could not enter workspace '${selected.slug}' — your session may have expired. Run `thoryn login`.")
+            // SSO-3182 — name the HOME session that could not be renewed and the exact re-login line
+            // (the old text said only "Run `thoryn login`", which on a thoryn-homed session re-ran the
+            // same workspace-less login the user had already done).
+            err.println(
+                "Could not enter workspace '${selected.slug}': the sign-in session could not be renewed. " +
+                    "Run `${LoginCommand.reLoginCommand(baseTokens)}` and retry.",
+            )
         }
         return ProductApiClient(
             gateway = gateway,
@@ -236,21 +242,59 @@ internal object CommandSupport {
         if (current.authMode == Tokens.AUTH_MODE_CLIENT_CREDENTIALS) {
             return reMintClientCredentials(current, err)
         }
+        // SSO-3182 — an interactive session with NO refresh token: nothing to renew with. Before this,
+        // the CLI failed silently here and the command surfaced a bare `Error: HTTP 401`, with no hint
+        // that the fix was a fresh sign-in. Say so once per process, with the exact command.
+        warnOnce(err) {
+            "Your sign-in session has expired and carries no refresh token, so it cannot be renewed. " +
+                "Run `${LoginCommand.reLoginCommand(current)}` to sign in again."
+        }
         return null
+    }
+
+    /** SSO-3182 — a session-expiry hint is printed at most once per process (a command can retry many calls). */
+    @Volatile
+    private var sessionHintPrinted: Boolean = false
+
+    private fun warnOnce(err: PrintStream, message: () -> String) {
+        if (sessionHintPrinted) return
+        sessionHintPrinted = true
+        err.println(message())
+    }
+
+    /** Test seam — reset the once-per-process hint latch. */
+    internal fun resetSessionHintForTest() {
+        sessionHintPrinted = false
     }
 
     /** SSO-2834 — redeem the stored refresh token (RFC 6749 §6). Null when there is no issuer or the redemption fails. */
     private fun refreshViaRefreshToken(current: Tokens, refreshToken: String, err: PrintStream): Tokens? {
         val issuer = current.issuer?.takeIf { it.isNotBlank() } ?: return null
         return try {
-            val refreshed = RefreshTokenFlow(issuer = issuer, sender = realHttpSender(), clientId = sessionClientId(current))
+            val refreshed = RefreshTokenFlow(
+                issuer = issuer,
+                sender = realHttpSender(),
+                clientId = sessionClientId(current),
+                // SSO-3182 — a CONFIDENTIAL login client must authenticate the refresh the same way the
+                // login and the `workspace switch` exchange do; sending client_id only made the hub answer
+                // `invalid_client`. Null (the public `cli` client) keeps the client_id-only form.
+                clientSecret = ThorynConfig.resolveClientSecret(),
+            )
                 .refresh(refreshToken)
                 // Preserve the CLI-local session hosts + client (not returned by /oauth2/token).
-                .copy(issuer = current.issuer, gateway = current.gateway, clientId = current.clientId)
+                .copy(
+                    issuer = current.issuer,
+                    gateway = current.gateway,
+                    clientId = current.clientId,
+                    workspace = current.workspace,
+                )
             runCatching { TokenStoreFactory.default().write(refreshed) }
             refreshed
         } catch (e: Exception) {
-            err.println("Could not refresh the session token (${e.message}); run `thoryn login` if the command fails.")
+            warnOnce(err) {
+                "Could not renew your sign-in session (${e.message}). " +
+                    "Run `${LoginCommand.reLoginCommand(current)}` to sign in again."
+            }
             null
         }
     }
@@ -292,6 +336,7 @@ internal object CommandSupport {
                     gateway = current.gateway,
                     authMode = Tokens.AUTH_MODE_CLIENT_CREDENTIALS,
                     clientId = clientId,
+                    workspace = current.workspace,
                 )
             runCatching { TokenStoreFactory.default().write(minted) }
             minted
@@ -313,7 +358,8 @@ internal object CommandSupport {
      * SSO-2827 — resolve the hub base URL with precedence:
      *   1. an explicit, non-default `--hub`;
      *   2. the hub recorded in the session at login ([Tokens.issuer]);
-     *   3. the built-in local-dev default ([ThorynConfig.DEFAULT_HUB]).
+     *   3. the local-dev sentinel ([ThorynConfig.DEFAULT_HUB]) — reached only with no session at all,
+     *      and every command that resolves a host needs a session first.
      *
      * An explicit `--hub` equal to the local-dev default is treated as "unset" so
      * a signed-in session still wins — passing the localhost default while signed
