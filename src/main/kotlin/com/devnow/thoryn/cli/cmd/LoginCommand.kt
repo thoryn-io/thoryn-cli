@@ -58,12 +58,23 @@ import java.util.concurrent.Callable
 )
 class LoginCommand : Callable<Int> {
 
+    /**
+     * SSO-3182 — the hub BASE URL of the platform to sign in to (`https://hub.<env>`). No localhost default:
+     * unset, it resolves from `THORYN_HUB`, then the previous session's hub, then the baked-in production
+     * hub (none yet) — see [ThorynConfig.resolveHubBase]. Nothing resolved ⇒ fail fast with guidance.
+     */
     @Option(
         names = ["--issuer"],
-        description = ["Override the hub BASE URL (default: \${DEFAULT-VALUE}); interactive sign-in happens on <workspace>.<hub>."],
-        defaultValue = ThorynConfig.DEFAULT_ISSUER,
+        description = [
+            "Hub BASE URL of the Thoryn platform, e.g. ${ThorynConfig.STAGING_ISSUER} (staging). " +
+                "Interactive sign-in happens on <workspace>.<hub>. Default: \$${ThorynConfig.HUB_ENV}, else the hub of " +
+                "your previous sign-in on this machine.",
+        ],
     )
-    var issuer: String = ThorynConfig.DEFAULT_ISSUER
+    var issuerOption: String? = null
+
+    /** The resolved issuer the flows use: the hub base, then (interactive flows) the workspace's tenant hub. */
+    private var issuer: String = ""
 
     /**
      * SSO-3104 — the workspace an interactive sign-in (loopback / device-code) happens on: the issuer
@@ -88,7 +99,7 @@ class LoginCommand : Callable<Int> {
      */
     @Option(
         names = ["--gateway"],
-        description = ["Override the customer-plane gateway URL recorded for this session. Default: derived from --issuer (hub.<env> -> api.<env>), else http://localhost:8991."],
+        description = ["Override the customer-plane gateway URL recorded for this session. Default: derived from the hub (hub.<env> -> api.<env>)."],
     )
     var gateway: String? = null
 
@@ -251,12 +262,40 @@ class LoginCommand : Callable<Int> {
             issuer = issuer,
             // SSO-3104 — remember which client signed in, so refresh / workspace exchange use the same one.
             clientId = tokens.clientId ?: clientId,
+            // SSO-3182 — remember the workspace, so an unrenewable session prints the exact re-login line.
+            workspace = signedInWorkspace,
             // The gateway derives from the hub BASE (`hub.<env>` → `api.<env>`), never from a tenant host.
             gateway = gateway?.takeIf { it.isNotBlank() } ?: ThorynConfig.gatewayForIssuer(baseIssuer),
         )
 
-    /** The hub base URL as given on the command line (before any workspace prefixing). */
-    private var baseIssuer: String = ThorynConfig.DEFAULT_ISSUER
+    /** The hub base URL (before any workspace prefixing). */
+    private var baseIssuer: String = ""
+
+    /** SSO-3182 — the workspace an interactive flow signed in on (null for the machine flows). */
+    private var signedInWorkspace: String? = null
+
+    /**
+     * SSO-3182 — resolve the hub base ([ThorynConfig.resolveHubBase]) into [issuer] / [baseIssuer], or
+     * print the no-platform guidance and return false. A hub taken from `THORYN_HUB` or the previous
+     * session is announced on stderr so the user sees which platform they are signing in to.
+     */
+    private fun resolveIssuer(): Boolean {
+        val previous = runCatching { tokenStore.read() }.getOrNull()?.issuer
+        val hub = ThorynConfig.resolveHubBase(issuerOption, previous)
+        if (hub == null) {
+            System.err.println(ThorynConfig.NO_HUB_GUIDANCE)
+            return false
+        }
+        when (hub.source) {
+            ThorynConfig.HubSource.ENV -> System.err.println("Using hub ${hub.url} (from ${ThorynConfig.HUB_ENV}).")
+            ThorynConfig.HubSource.PREVIOUS_SESSION ->
+                System.err.println("Using hub ${hub.url} (from your previous sign-in; pass --issuer to choose another).")
+            else -> Unit
+        }
+        issuer = hub.url
+        baseIssuer = hub.url
+        return true
+    }
 
     /**
      * SSO-3104 / SSO-3138 — resolve the interactive sign-in issuer: the issuer becomes the workspace's
@@ -273,6 +312,7 @@ class LoginCommand : Callable<Int> {
             )
         }
         baseIssuer = issuer
+        signedInWorkspace = slug
         issuer = ThorynConfig.tenantIssuer(issuer, slug)
         return true
     }
@@ -293,6 +333,8 @@ class LoginCommand : Callable<Int> {
         if (connectionFile != null) {
             return runConnectionFlow(connectionFile!!)
         }
+        // SSO-3182 — no localhost default: resolve the platform's hub or fail fast with guidance.
+        if (!resolveIssuer()) return EXIT_USAGE
         // SSO-1145: validate the issuer URL before any network activity begins.
         try {
             IssuerUrlValidator.validate(issuer, devMode)
@@ -423,7 +465,7 @@ class LoginCommand : Callable<Int> {
     private fun runConnectionFlow(file: File): Int {
         // The contract is the single source of the binding — refuse to also honour the manual flags.
         val conflicting = buildList {
-            if (issuer != ThorynConfig.DEFAULT_ISSUER) add("--issuer")
+            if (issuerOption != null) add("--issuer")
             if (!gateway.isNullOrBlank()) add("--gateway")
             if (scope != ThorynConfig.DEFAULT_SCOPE) add("--scope")
             if (clientId != ThorynConfig.DEFAULT_CLIENT_ID) add("--client-id")
@@ -447,8 +489,16 @@ class LoginCommand : Callable<Int> {
         }
 
         // Resolve the hub base from the env var the contract names (-D property first, then env, so
-        // tests and `java -jar -D…` work), falling back to the CLI's baked-in default hub.
-        val hubBase = resolveNamedEnv(connection.hubBaseUrlEnv) ?: ThorynConfig.DEFAULT_ISSUER
+        // tests and `java -jar -D…` work), falling back to the CLI's baked-in platform hub. SSO-3182 — no
+        // localhost fallback: with neither, fail closed naming the env var.
+        val hubBase = resolveNamedEnv(connection.hubBaseUrlEnv) ?: ThorynConfig.PLATFORM_HUB ?: run {
+            System.err.println(
+                "Error: the hub base URL env var '${connection.hubBaseUrlEnv}' (named by the connection's " +
+                    "workspace.hubBaseUrlEnv) is unset or empty. Export it, e.g. " +
+                    "${connection.hubBaseUrlEnv}=${ThorynConfig.STAGING_ISSUER}.",
+            )
+            return EXIT_USAGE
+        }
         val derivedIssuer = ThorynConfig.tenantIssuer(hubBase, connection.slug)
         val derivedGateway = ThorynConfig.gatewayForIssuer(hubBase)
 
@@ -602,6 +652,7 @@ class LoginCommand : Callable<Int> {
             SelectedWorkspaceStore().clear()
             println()
             println("Signed in.")
+            noRefreshTokenNotice(tokens, expandedScope(), deviceCode = true)?.let { System.err.println(it) }
             0
         } catch (e: DeviceCodeException) {
             System.err.println()
@@ -692,6 +743,7 @@ class LoginCommand : Callable<Int> {
             println()
             println("Signed in.")
             tokens.scope?.let { println("Scopes: $it") }
+            noRefreshTokenNotice(tokens, expandedScope(), deviceCode = false)?.let { System.err.println(it) }
             EXIT_OK
         } catch (e: LoopbackTimeoutException) {
             System.err.println("Sign-in timed out: ${e.message}")
@@ -718,10 +770,10 @@ class LoginCommand : Callable<Int> {
         when {
             exp == null -> println("Signed in (access-token expiry unknown).")
             exp <= now && canRefresh -> println("Signed in — access token expired; it will auto-refresh on the next command.")
-            exp <= now -> println("Signed in — access token EXPIRED. Run `thoryn login` to re-authenticate.")
+            exp <= now -> println("Signed in — access token EXPIRED. Run `${reLoginCommand(tokens)}` to re-authenticate.")
             else -> {
                 val mins = (exp - now) / 60
-                val suffix = if (canRefresh) ", auto-refreshes near expiry" else ""
+                val suffix = if (canRefresh) ", auto-refreshes near expiry" else ", no refresh token — run `${reLoginCommand(tokens)}` when it expires"
                 println("Signed in — access token valid for ${mins}m$suffix.")
             }
         }
@@ -740,6 +792,33 @@ class LoginCommand : Callable<Int> {
         java.net.URLEncoder.encode(s, Charsets.UTF_8)
 
     companion object {
+        /**
+         * SSO-3182 — the exact re-login line for a session: `thoryn login --workspace <slug>` when the
+         * session recorded (or its tenant issuer names) a workspace, else plain `thoryn login`.
+         */
+        internal fun reLoginCommand(tokens: Tokens?): String {
+            val slug = tokens?.workspace?.takeIf { it.isNotBlank() } ?: ThorynConfig.workspaceOfIssuer(tokens?.issuer)
+            return if (slug != null) "thoryn login --workspace $slug" else "thoryn login"
+        }
+
+        /**
+         * SSO-3182 — the notice printed after an interactive sign-in that asked for `offline_access` but got
+         * NO refresh token back. The hub (Spring Authorization Server's `OAuth2RefreshTokenGenerator`) issues
+         * none to a PUBLIC client on the authorization-code grant, so a loopback session of the public `cli`
+         * client silently ended at the ~15-minute access-token expiry — the `HTTP 401` / "Could not enter
+         * workspace" symptom of SSO-3182. Device-code grants do receive one. Null when a refresh token was
+         * issued or `offline_access` was not requested.
+         */
+        internal fun noRefreshTokenNotice(tokens: Tokens, requestedScope: String, deviceCode: Boolean): String? {
+            if (!tokens.refreshToken.isNullOrBlank()) return null
+            if ("offline_access" !in requestedScope.split(' ', ',')) return null
+            val remaining = tokens.expiresAtEpochSecond?.let { (it - System.currentTimeMillis() / 1000) / 60 }
+                ?.takeIf { it >= 0 }?.let { " (in about ${it}m)" }.orEmpty()
+            val alternative = if (deviceCode) "" else " `thoryn login --device-code` sessions do renew."
+            return "Note: the hub issued no refresh token for this sign-in, so this session cannot renew itself — " +
+                "it ends when the access token expires$remaining; run `thoryn login` again then.$alternative"
+        }
+
         const val EXIT_OK = 0
         const val EXIT_USAGE = 65
         const val EXIT_DEVICE_CODE_FAILED = 70

@@ -489,10 +489,10 @@ class ExamplesCommand : Callable<Int> {
         @Parameters(index = "0", arity = "0..1", description = ["Example name (optional when only one exists)."])
         var name: String? = null
 
-        @Option(names = ["--hub"], description = ["Override the hub base URL. Defaults to the hub you signed into, else http://localhost:54702."])
+        @Option(names = ["--hub"], description = ["Override the hub base URL. Defaults to the hub recorded at `thoryn login`."])
         var hub: String = ThorynConfig.DEFAULT_HUB
 
-        @Option(names = ["--gateway"], description = ["Override the gateway base URL. Defaults to the gateway you signed into, else http://localhost:8991."])
+        @Option(names = ["--gateway"], description = ["Override the customer-plane gateway URL. Defaults to the gateway recorded at `thoryn login`."])
         var gateway: String = ThorynConfig.DEFAULT_GATEWAY
 
         override fun call(): Int {

@@ -58,7 +58,7 @@ class EmailProviderCommand : Callable<Int> {
     @Command(name = "get", description = ["Show the workspace's configured email provider (never the password)."], mixinStandardHelpOptions = true)
     class GetSubcommand : Callable<Int> {
 
-        @Option(names = ["--gateway"], description = ["Override the gateway base URL (default: \${DEFAULT-VALUE})."], defaultValue = ThorynConfig.DEFAULT_GATEWAY)
+        @Option(names = ["--gateway"], description = ["Override the customer-plane gateway URL (default: the gateway recorded at `thoryn login`)."], defaultValue = ThorynConfig.DEFAULT_GATEWAY)
         var gateway: String = ThorynConfig.DEFAULT_GATEWAY
 
         @Option(names = ["--output"], description = ["Output format: json|yaml|table (default: table)."])
@@ -218,7 +218,7 @@ class EmailProviderCommand : Callable<Int> {
         @Option(names = ["--to"], description = ["Send a real test email to this address (through your own SMTP server). Omit for a connect-only check."])
         var to: String? = null
 
-        @Option(names = ["--gateway"], description = ["Override the gateway base URL (default: \${DEFAULT-VALUE})."], defaultValue = ThorynConfig.DEFAULT_GATEWAY)
+        @Option(names = ["--gateway"], description = ["Override the customer-plane gateway URL (default: the gateway recorded at `thoryn login`)."], defaultValue = ThorynConfig.DEFAULT_GATEWAY)
         var gateway: String = ThorynConfig.DEFAULT_GATEWAY
 
         @Option(names = ["--output"], description = ["Output format: json|yaml|table (default: table)."])

@@ -34,11 +34,23 @@ class ScopeRegistryTest {
     }
 
     @Test
-    fun `the access scopes are deliberately NOT in the default login scope until the product side deploys them`() {
-        // SSO-2278 — a default login requesting a scope the hub's client has not been granted yet is an
-        // invalid_scope loop for every user; the cut-over (after SSO-3112) adds them to DEFAULT_SCOPE.
-        assertThat(com.devnow.thoryn.cli.config.ThorynConfig.DEFAULT_SCOPE.split(' '))
-            .doesNotContain("tenant:access.read", "tenant:access.write")
+    fun `the default login scope covers every scope the CLI can need, including access and idp`() {
+        // SSO-3182 — a bare `thoryn login` must authorize `provision apply` of a file with `grants:`
+        // (tenant:access.write) and login themes/methods/flows (tenant:idp.*): the founder had to hand-type
+        // the full --scope list because the default set omitted them. Safe because the set is EXACTLY the
+        // `cli` login client's registered scopes (CiProvisionFileConformanceTest pins the two equal) — the
+        // hub validates requested ⊆ registered and mints only what the admin holds (SSO-2278 ordering: the
+        // hub-side grant, V161 + `.thoryn/provision.yaml`, deploys before a CLI requesting it is released).
+        val default = com.devnow.thoryn.cli.config.ThorynConfig.DEFAULT_SCOPE.split(' ')
+        assertThat(default).contains(
+            "openid", "offline_access",
+            "tenant:access.read", "tenant:access.write",
+            "tenant:idp.read", "tenant:idp.write",
+            "tenant:email.read", "tenant:email.write",
+            "tenant:environments.read", "tenant:environments.write",
+        )
+        assertThat(default).containsAll(ScopeRegistry.TENANT_CONFIG_SCOPES)
+        assertThat(default).doesNotHaveDuplicates()
     }
 
     @Test

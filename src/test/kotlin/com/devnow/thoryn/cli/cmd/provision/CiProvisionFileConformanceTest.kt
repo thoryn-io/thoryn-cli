@@ -47,8 +47,10 @@ class CiProvisionFileConformanceTest {
         assertThat(cli.spec["redirectUris"]).isEqualTo(listOf("http://127.0.0.1/callback", "http://[::1]/callback"))
         assertThat(cli.spec["requireAuthorizationConsent"]).isEqualTo(false)
         // Everything a bare `thoryn login` requests is grantable by the client (else: invalid_scope loop).
+        // SSO-3182 — and the two are now EXACTLY equal: the default login scope IS the client's registered
+        // set, so no command is left un-authorized by a bare login and no login can over-request.
         val granted = (cli.spec["scopes"] as List<*>).map { it.toString() }.toSet()
-        assertThat(granted).containsAll(ThorynConfig.DEFAULT_SCOPE.split(" "))
+        assertThat(granted).isEqualTo(ThorynConfig.DEFAULT_SCOPE.split(" ").toSet())
         // …and nothing the CLI can never ask for: the grant is exactly openid + offline_access + the
         // tenant scopes referenced anywhere in the CLI's own sources (a founder must hold each to grant it).
         val requestable = requestableTenantScopes()
