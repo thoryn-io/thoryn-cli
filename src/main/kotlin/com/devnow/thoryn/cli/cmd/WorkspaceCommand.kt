@@ -1,6 +1,7 @@
 package com.devnow.thoryn.cli.cmd
 
 import com.devnow.thoryn.cli.api.ProductApiException
+import com.devnow.thoryn.cli.auth.Dpop
 import com.devnow.thoryn.cli.auth.HttpSender
 import com.devnow.thoryn.cli.auth.TokenExchangeException
 import com.devnow.thoryn.cli.auth.TokenExchangeFlow
@@ -11,7 +12,6 @@ import picocli.CommandLine.Option
 import picocli.CommandLine.Parameters
 import tools.jackson.databind.JsonNode
 import java.net.URI
-import java.net.http.HttpClient
 import java.nio.file.Files
 import java.nio.file.Path
 import java.time.Duration
@@ -211,10 +211,12 @@ class WorkspaceCommand : Callable<Int> {
         /** Test seam: where the selected-workspace marker is persisted. */
         internal var store: SelectedWorkspaceStore = SelectedWorkspaceStore()
 
-        /** Test seam: HTTP sender for the token exchange. */
-        internal var sender: HttpSender = HttpSender { request, handler ->
-            HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build().send(request, handler)
-        }
+        /**
+         * Test seam: HTTP sender for the token exchange. SSO-3199 — the real one attaches an RFC 9449
+         * DPoP proof (and handles a `use_dpop_nonce` challenge) so the exchanged workspace token is
+         * sender-constrained to the same installation key as the session it came from.
+         */
+        internal var sender: HttpSender = Dpop.sender(Duration.ofSeconds(10))
 
         override fun call(): Int {
             val format = CommandSupport.parseFormat(outputRaw) ?: return CommandSupport.EXIT_USAGE

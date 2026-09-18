@@ -4,6 +4,7 @@ import com.devnow.thoryn.cli.api.ProductApiClient
 import com.devnow.thoryn.cli.api.ProductApiException
 import com.devnow.thoryn.cli.auth.ClientCredentialsException
 import com.devnow.thoryn.cli.auth.ClientCredentialsFlow
+import com.devnow.thoryn.cli.auth.Dpop
 import com.devnow.thoryn.cli.auth.HttpSender
 import com.devnow.thoryn.cli.auth.RefreshTokenFlow
 import com.devnow.thoryn.cli.auth.ScopeRegistry
@@ -16,7 +17,6 @@ import com.devnow.thoryn.cli.output.OutputFormat
 import com.devnow.thoryn.cli.output.Printers
 import tools.jackson.databind.JsonNode
 import java.io.PrintStream
-import java.net.http.HttpClient
 import java.time.Duration
 
 /**
@@ -100,6 +100,9 @@ internal object CommandSupport {
             // target a specific environment — the same escape hatch `thoryn examples --environment`
             // uses for provisioning. Null keeps the base-tenant/production-plane behaviour.
             environmentSlug = environmentSlug?.takeIf { it.isNotBlank() },
+            // SSO-3199 — RFC 9449 proof on every request; the presentation scheme still follows the
+            // token the hub issued (Bearer until the `cli` client is flipped to dpop_required).
+            dpop = Dpop.session(),
         )
 
     /**
@@ -178,6 +181,7 @@ internal object CommandSupport {
             tokens = initial ?: Tokens(accessToken = ""),
             reauthenticate = { mint() },
             environmentSlug = environmentSlug, // SSO-2870 — ride the selected environment on every request.
+            dpop = Dpop.session(), // SSO-3199 — RFC 9449 proof on every request.
         )
     }
 
@@ -349,10 +353,12 @@ internal object CommandSupport {
         }
     }
 
-    private fun realHttpSender(): HttpSender {
-        val client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(15)).build()
-        return HttpSender { request, handler -> client.send(request, handler) }
-    }
+    /**
+     * SSO-3199 — the token-endpoint sender. [Dpop.sender] attaches an RFC 9449 proof to every request
+     * (refresh, workspace-switch exchange, client-credentials re-mint) and performs the single
+     * `use_dpop_nonce` retry; with no DPoP key store available it degrades to a plain sender.
+     */
+    private fun realHttpSender(): HttpSender = Dpop.sender(Duration.ofSeconds(15))
 
     /**
      * SSO-2827 — resolve the hub base URL with precedence:

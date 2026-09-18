@@ -50,7 +50,8 @@ the stable asset name the `thoryn-examples` conformance CI consumes.
 thoryn login --workspace <slug> [--issuer https://hub.<env>]  # Auth code + PKCE (loopback) or --device-code — ON your workspace (SSO-3104)
 thoryn login --client-credentials [--client-id <id>] # SSO-1553/2941 — non-interactive API key (CI); THORYN_API_KEY=<id>:<secret>, auto re-mints on expiry
 thoryn login --status
-thoryn logout
+thoryn logout [--rotate-key]                 # SSO-3199 — --rotate-key also discards this machine's DPoP key
+thoryn whoami                                # SSO-2860/3199 — identity, scopes, expiry + the DPoP key thumbprint
 
 # Tenant configuration (SSO-1552) — thin wrappers over product-api via the gateway.
 thoryn clients list                          # OAuth clients (product-api /api/v1/applications)
@@ -403,6 +404,61 @@ The fallback writes a chmod-0600 JSON file to
 `%APPDATA%/thoryn/tokens.json` (Windows). Override the path with
 `THORYN_TOKEN_FILE=/path/to/tokens.json`.
 
+The **DPoP key** (below) follows the same rules and the same opt-in: a second
+keychain entry (service `thoryn`, account `dpop-key`), or `dpop-key.json` beside
+the token file under the CI fallback (`THORYN_DPOP_KEY_FILE` overrides the path).
+Without a keychain and without the opt-in the CLI refuses to write the private
+key in plaintext and simply sends no DPoP proof.
+
+## Sender-constrained tokens (DPoP, SSO-3199)
+
+The CLI proves possession of a private key on every token request and every API
+call, per [RFC 9449](https://www.rfc-editor.org/rfc/rfc9449). An access token
+the hub binds to that key (`cnf.jkt`) is useless to anyone who steals the token
+alone — which is the residual risk refresh-token rotation cannot close (RFC 9700
+§2.2.2 accepts *either* rotation *or* sender-constraining; Thoryn ships both).
+
+**What happens, concretely.**
+
+* On first use the CLI generates a **per-installation** EC P-256 (ES256) key pair
+  and stores the private key in the same secure store as your tokens. It is never
+  printed, never written to a receipt, and never leaves the machine — only the
+  public JWK travels, inside the proof.
+* Every request to `/oauth2/token` (login code redemption, `refresh_token`, the
+  workspace-switch exchange, device-code polling, client-credentials) and every
+  hub / gateway API call carries a freshly signed `DPoP:` proof JWT
+  (`typ: dpop+jwt`, `jwk`, `htm`, `htu`, `iat`, `jti`, plus `ath` when a bound
+  token is presented).
+* If a server demands a nonce (`use_dpop_nonce`, RFC 9449 §8) the CLI caches the
+  `DPoP-Nonce` per origin and retries the request once, automatically.
+* The token is presented as `Authorization: DPoP <token>` **only when the hub
+  answered `token_type: DPoP`**; otherwise it stays `Bearer`. That is what makes
+  this release safe against a hub that does not require DPoP yet.
+
+```bash
+thoryn whoami --output table
+# …
+# dpopKeyThumbprint  9mS2kYy-DWpqq30jZyJGHTN0d2HglBV3uiguA4IZcOC
+# dpopBound          no (bearer token — the hub does not bind this client's tokens yet)
+```
+
+Once the hub marks the `cli` client `dpop_required` and binds `cnf.jkt`,
+`dpopBound` reads `yes (cnf.jkt matches this installation's key)`. A `MISMATCH`
+means the stored token belongs to another installation (or the key was rotated
+since it was issued) — run `thoryn login` again.
+
+**Rotating the key.** `thoryn logout` keeps the key by default: on its own it
+authorises nothing, and keeping it means your next login re-binds to the same
+`jkt`. `thoryn logout --rotate-key` discards it, so the next login generates a
+new one and every token bound to the old thumbprint stops working — the right
+move when handing the machine on or if the key may have leaked.
+
+**Hub-side flip.** Requiring proofs is the *other half* of SSO-3199 and lives in
+`oathy` (step 2): flip `dpop_required=true` on the `cli` client and require
+`cnf.jkt`-bound tokens at product-api / api-gateway. It is deliberately a
+separate, later change so CLIs released before it keep working; the minimum CLI
+version for the flip is the first `cli-v*` release containing this feature.
+
 ## Session endpoints (SSO-2827)
 
 `thoryn login` records the hub issuer (`--issuer`) and the customer-plane
@@ -639,6 +695,8 @@ thoryn-cli/
     │   │   ├── LoopbackRedirectServer.kt                    # RFC 8252 §7.3
     │   │   ├── PkceUtil.kt                                  # RFC 7636
     │   │   ├── TokenStore.kt + KeychainTokenStore.kt        # ADR 2026-04-25 §4
+    │   │   ├── DpopKey.kt + DpopKeyStore.kt                 # SSO-3199 RFC 9449 installation key (ES256)
+    │   │   ├── DpopSession.kt                               # SSO-3199 proof JWTs + DPoP-Nonce retry
     │   │   ├── Tokens.kt
     │   │   └── ScopeRegistry.kt                             # SSO-959 scope wildcards
     │   ├── api/
@@ -675,6 +733,11 @@ thoryn-cli/
   `src/main/resources/META-INF/native-image/com.devnow.thoryn.cli/`.
 * All subcommands use only `java.net.http.HttpClient` + Jackson 3 + picocli,
   all of which are already native-image-ready.
+* DPoP (SSO-3199) adds no dependency: the proof is signed with the JDK's own
+  `KeyPairGenerator("EC")` / `Signature("SHA256withECDSA")`. Key *generation* is
+  the one new JCA surface (verification via `SHA256withECDSA` already shipped in
+  `Es256JwsVerifier`); `StoredDpopKey` is registered in `reflect-config.json`
+  alongside `Tokens` so the keychain payload (de)serialises in the native image.
 
 ## Related
 

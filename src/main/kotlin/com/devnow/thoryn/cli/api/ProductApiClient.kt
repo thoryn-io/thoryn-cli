@@ -1,5 +1,6 @@
 package com.devnow.thoryn.cli.api
 
+import com.devnow.thoryn.cli.auth.DpopSession
 import com.devnow.thoryn.cli.auth.Tokens
 import tools.jackson.databind.JsonNode
 import tools.jackson.databind.ObjectMapper
@@ -64,6 +65,15 @@ class ProductApiClient(
      * the header only for a tenant-admin token and only for an environment the caller's own `tnt` owns.
      */
     private val environmentSlug: String? = null,
+    /**
+     * SSO-3199 — the installation's DPoP session (RFC 9449). When present every request carries a
+     * `DPoP:` proof header (with the `ath` access-token binding once the token is presented under the
+     * `DPoP` scheme), and a `use_dpop_nonce` challenge is retried once. Null ⇒ no proof, i.e. the
+     * pre-SSO-3199 wire shape — which is what every test fixture and every already-minted-token caller
+     * keeps. **The presentation scheme is server-driven**: `DPoP` only when the token response said
+     * `token_type: DPoP`, `Bearer` otherwise, so nothing changes until the hub flips the `cli` client.
+     */
+    private val dpop: DpopSession? = null,
 ) {
 
     /** Current bearer material; swapped in place by the reactive refresh-on-401 retry. */
@@ -852,14 +862,23 @@ class ProductApiClient(
         handler: HttpResponse.BodyHandler<T>,
         build: (accessToken: String) -> HttpRequest,
     ): HttpResponse<T> {
-        val first = http.send(build(tokens.accessToken), handler)
+        val first = sendProofed(build(tokens.accessToken), handler)
         if (first.statusCode() != 401) return first
         val reauth = reauthenticate ?: return first
         val refreshed = runCatching { reauth() }.getOrNull() ?: return first
         if (refreshed.accessToken == tokens.accessToken) return first
         tokens = refreshed
-        return http.send(build(tokens.accessToken), handler)
+        return sendProofed(build(tokens.accessToken), handler)
     }
+
+    /**
+     * SSO-3199 — send through the DPoP session when one is wired (proof header + a single
+     * `use_dpop_nonce` retry, RFC 9449 §8); otherwise send the request untouched. A nonce challenge is
+     * therefore resolved BEFORE [sendAuthed]'s `401` refresh path sees the response, so the two
+     * retry mechanisms never compound.
+     */
+    private fun <T> sendProofed(request: HttpRequest, handler: HttpResponse.BodyHandler<T>): HttpResponse<T> =
+        dpop?.send(request) { decorated -> http.send(decorated, handler) } ?: http.send(request, handler)
 
     private fun baseRequest(path: String): HttpRequest.Builder {
         val uri = URI.create("${gateway.trimEnd('/')}$path")
@@ -871,9 +890,15 @@ class ProductApiClient(
         return builder
     }
 
-    /** Attach the bearer for [accessToken] — applied per-send so a refreshed token is used on retry. */
+    /**
+     * Attach the credential for [accessToken] — applied per-send so a refreshed token is used on retry.
+     *
+     * SSO-3199 — the scheme follows the token the hub issued: `DPoP` when the token response carried
+     * `token_type: DPoP` (RFC 9449 §7.1), `Bearer` otherwise. The CLI never *chooses* `DPoP` on its own,
+     * which is what keeps it working against a hub (and resource servers) that do not yet bind tokens.
+     */
     private fun HttpRequest.Builder.authed(accessToken: String): HttpRequest.Builder =
-        header("Authorization", "Bearer $accessToken")
+        header("Authorization", "${DpopSession.schemeFor(tokens)} $accessToken")
 
     private fun encode(s: String): String = URLEncoder.encode(s, Charsets.UTF_8)
 

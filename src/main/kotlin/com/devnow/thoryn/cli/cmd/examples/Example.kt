@@ -1,7 +1,7 @@
 package com.devnow.thoryn.cli.cmd.examples
 
 import com.devnow.thoryn.cli.api.ProductApiClient
-import com.devnow.thoryn.cli.auth.HttpSender
+import com.devnow.thoryn.cli.auth.Dpop
 import com.devnow.thoryn.cli.cmd.examples.recipe.Recipe
 import com.devnow.thoryn.cli.cmd.examples.recipe.RecipeException
 import com.devnow.thoryn.cli.cmd.examples.recipe.RecipeExample
@@ -10,7 +10,6 @@ import com.devnow.thoryn.cli.auth.Tokens
 import com.devnow.thoryn.cli.cmd.CommandSupport
 import com.devnow.thoryn.cli.config.ThorynConfig
 import java.io.PrintStream
-import java.net.http.HttpClient
 
 /**
  * SSO-2830 — a runnable, in-boundary product example.
@@ -76,6 +75,7 @@ internal class ExampleContext(
             tokens = CommandSupport.ensureFresh(tokens),
             reauthenticate = { CommandSupport.forceRefresh() },
             environmentSlug = environmentSlug,
+            dpop = Dpop.session(), // SSO-3199 — RFC 9449 proof on every request.
         )
 
     /**
@@ -96,7 +96,12 @@ internal class ExampleContext(
         // one-shot, non-refreshable provisioning credential; it must be sent verbatim.
         // SSO-2876: [environmentSlug] rides as X-Thoryn-Environment so a recipe provisions into the
         // caller-chosen environment (e.g. a sandbox) rather than the production plane.
-        ProductApiClient(gateway = gateway, tokens = Tokens(accessToken = provisioningToken), environmentSlug = environmentSlug)
+        ProductApiClient(
+            gateway = gateway,
+            tokens = Tokens(accessToken = provisioningToken),
+            environmentSlug = environmentSlug,
+            dpop = Dpop.session(), // SSO-3199 — RFC 9449 proof on every request.
+        )
 
     /**
      * SSO-2831 — a gateway client scoped to the target workspace named by [tenantIssuer]
@@ -117,12 +122,19 @@ internal class ExampleContext(
             clientSecret = null,
             subjectToken = tokens.accessToken,
             targetResource = tenantIssuer,
-            sender = HttpSender { request, handler -> HttpClient.newHttpClient().send(request, handler) },
+            // SSO-3199 — the exchange goes out with an RFC 9449 DPoP proof, like every other
+            // token-endpoint round-trip the CLI makes.
+            sender = Dpop.sender(),
         ).run()
         // SSO-2876 — send the exchanged workspace token VERBATIM (as the provisioning path does; do NOT
         // route through ensureFresh, which would read the base session token from the store and discard
         // this one — the SSO-2841 trap) and ride the caller-chosen environment as X-Thoryn-Environment.
-        return ProductApiClient(gateway = gateway, tokens = exchanged, environmentSlug = environmentSlug)
+        return ProductApiClient(
+            gateway = gateway,
+            tokens = exchanged,
+            environmentSlug = environmentSlug,
+            dpop = Dpop.session(), // SSO-3199 — RFC 9449 proof on every request.
+        )
     }
 
     /** Emit a numbered step heading so the walkthrough reads as a sequence. */
