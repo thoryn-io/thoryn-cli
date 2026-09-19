@@ -3,6 +3,7 @@ package com.devnow.thoryn.cli.cmd
 import com.devnow.thoryn.cli.api.ProductApiException
 import com.devnow.thoryn.cli.config.ThorynConfig
 import com.devnow.thoryn.cli.output.OutputFormat
+import com.devnow.thoryn.cli.output.Timestamps
 import picocli.CommandLine.Command
 import picocli.CommandLine.Option
 import picocli.CommandLine.Parameters
@@ -186,7 +187,9 @@ class DevicesCommand : Callable<Int> {
                 named.size > 1 -> {
                     System.err.println("More than one device is called '$device'. Revoke it by id:")
                     named.forEach {
-                        System.err.println("  ${it.textOrNull("id")}  (last seen ${it.textOrNull("lastSeenAt") ?: "never"})")
+                        System.err.println(
+                            "  ${it.textOrNull("id")}  (last seen ${Timestamps.render(it["lastSeenAt"]) ?: "never"})",
+                        )
                     }
                     null
                 }
@@ -224,7 +227,11 @@ class DevicesCommand : Callable<Int> {
             device.textOrNull("id") ?: "-",
             state(device),
             sessionCount(device),
-            device.textOrNull("lastSeenAt") ?: "-",
+            // SSO-3275 — NOT `asString()`: the hub declares `lastSeenAt` as an `Instant`, and the
+            // released CLI printed whatever that hub's Jackson put on the wire — live, an epoch
+            // (`LAST SEEN 1789848418`), which answers nobody's question. [Timestamps] decides the
+            // rendering, and accepts every shape an `Instant` serialises to.
+            Timestamps.render(device["lastSeenAt"]) ?: "-",
             workspaces(device),
             device.textOrNull("clientId") ?: "-",
             device["recentNetworks"]?.takeIf { it.isArray }?.joinToString(", ") { it.asString() } ?: "-",

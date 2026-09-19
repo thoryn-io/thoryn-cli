@@ -183,6 +183,56 @@ jobs:
           else
             ./mvnw -q -Pnative -Drevision="${{ needs.resolve.outputs.version }}" -DskipTests package
           fi
+      # ── SSO-3276 — the built macOS binary's Secure Enclave rung must reach a
+      #    real answer, never a reflection error. ───────────────────────────────
+      #
+      # cli-v0.23.0 shipped reporting `secure_element unavailable: Can't create
+      # an instance of class com.sun.jna.ptr.PointerByReference, requires a
+      # public no-arg constructor`: the image carried no reflection entry for
+      # JNA's ByReference family, so the SSO-3227 rung died on its first native
+      # call — before the SSO-3242 code-signing question could even arise, and
+      # silently, on every customer's Mac. Only a REAL native binary shows that,
+      # which is why this lives here rather than in the unit suite.
+      #
+      # Two things this step must get right or it passes vacuously:
+      #   * a PTY — the rung refuses non-interactively (presence cannot be
+      #     proven without a human), so on a bare CI shell it would never reach
+      #     JNA at all. `python3 -c 'pty.spawn(…)'` rather than `script(1)`:
+      #     BSD `script` reads the terminal attributes of ITS OWN stdin and dies
+      #     with `tcgetattr/ioctl: Operation not supported` when stdin is not a
+      #     tty, which is exactly a CI shell. `pty.spawn` guards that call and
+      #     allocates the pty regardless (verified locally against both a
+      #     regressed and a fixed binary);
+      #   * a token file — `whoami` exits early when signed out. The token is a
+      #     dummy and nothing here talks to a hub; this stays fully offline.
+      #
+      # The assertion is deliberately narrow. ANY capability answer passes — no
+      # key yet, no enclave in the VM, or errSecMissingEntitlement (that one is
+      # SSO-3242's business). A missing-metadata failure does not.
+      - name: Smoke — the Secure Enclave rung reaches a real answer, not a reflection error (SSO-3276)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -uo pipefail
+          printf '{"accessToken":"smoke","refreshToken":"smoke"}' > "$RUNNER_TEMP/tokens.json"
+          export THORYN_CI_PLAINTEXT_TOKENS=1
+          export THORYN_TOKEN_FILE="$RUNNER_TEMP/tokens.json"
+          export THORYN_DPOP_KEY_FILE="$RUNNER_TEMP/dpop-key.json"
+          python3 -c "import pty,sys; pty.spawn([sys.argv[1],'whoami'])" ./target/thoryn 2>&1 \
+            | tr -d '\r' | tee "$RUNNER_TEMP/whoami.txt" || true
+          line="$(grep 'dpopKeyClass' "$RUNNER_TEMP/whoami.txt" || true)"
+          if [ -z "$line" ]; then
+            echo "::error::thoryn whoami printed no dpopKeyClass line — the key-class ladder did not run at all."
+            exit 1
+          fi
+          echo "dpopKeyClass -> $line"
+          case "$line" in
+            *NoSuchMethodException*|*"Can't create an instance"*|*ClassNotFoundException*|*MissingReflectionRegistration*|*"Unable to instantiate"*)
+              echo "::error::the native image is missing reflection metadata for the Secure Enclave backend's JNA types (SSO-3276): $line"
+              exit 1
+              ;;
+          esac
+          echo "OK — the enclave rung reached a real capability answer."
       - name: Stage the binary under its release-asset name
         shell: bash
         run: |

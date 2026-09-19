@@ -292,6 +292,96 @@
     "allPublicMethods": true
   },
   {
+    "comment": "SSO-3276 — JNA's ptr.*ByReference types, which JNA instantiates REFLECTIVELY. Every one of them extends com.sun.jna.PointerType, which implements NativeMapped, so the first call through a binding whose signature mentions one makes JNA build a NativeMappedConverter for it — and that constructor calls com.sun.jna.Klass.newInstance(type), i.e. type.getDeclaredConstructor().newInstance(). Without the constructor registered here the native image answers NoSuchMethodException, which is exactly what the released cli-v0.23.0 darwin-arm64 binary reported: `secure_element unavailable: Can't create an instance of class com.sun.jna.ptr.PointerByReference, requires a public no-arg constructor`. The Secure Enclave rung (SSO-3227) therefore died on its first native call, before it could reach the SSO-3242 code-signing/entitlement question. NOT covered upstream: the GraalVM reachability-metadata repository's jna metadata (5.8.0, the `latest` entry, which covers our 5.13.0) registers com.sun.jna.PointerType and friends for FIELDS and JNI but declares NO constructors and NO com.sun.jna.ptr.* type at all — verified against the shipped metadata. java-keyring never hit this because its Security.framework bindings take only Pointer / Pointer[] / byte[]; PointerByReference is the CLI's own first NativeMapped parameter (SecItemCopyMatching, SecKeyCreateRandomKey, …). The whole family is registered rather than only PointerByReference: the trap is the NativeMapped-in-a-signature bug class, not one symbol, and the next binding that takes an IntByReference must not have to rediscover this.",
+    "name": "com.sun.jna.ptr.ByReference",
+    "allDeclaredConstructors": true,
+    "allPublicConstructors": true,
+    "allDeclaredMethods": true,
+    "allPublicMethods": true,
+    "allDeclaredFields": true
+  },
+  {
+    "name": "com.sun.jna.ptr.PointerByReference",
+    "allDeclaredConstructors": true,
+    "allPublicConstructors": true,
+    "allDeclaredMethods": true,
+    "allPublicMethods": true,
+    "allDeclaredFields": true
+  },
+  {
+    "name": "com.sun.jna.ptr.IntByReference",
+    "allDeclaredConstructors": true,
+    "allPublicConstructors": true,
+    "allDeclaredMethods": true,
+    "allPublicMethods": true,
+    "allDeclaredFields": true
+  },
+  {
+    "name": "com.sun.jna.ptr.LongByReference",
+    "allDeclaredConstructors": true,
+    "allPublicConstructors": true,
+    "allDeclaredMethods": true,
+    "allPublicMethods": true,
+    "allDeclaredFields": true
+  },
+  {
+    "name": "com.sun.jna.ptr.NativeLongByReference",
+    "allDeclaredConstructors": true,
+    "allPublicConstructors": true,
+    "allDeclaredMethods": true,
+    "allPublicMethods": true,
+    "allDeclaredFields": true
+  },
+  {
+    "name": "com.sun.jna.ptr.ByteByReference",
+    "allDeclaredConstructors": true,
+    "allPublicConstructors": true,
+    "allDeclaredMethods": true,
+    "allPublicMethods": true,
+    "allDeclaredFields": true
+  },
+  {
+    "name": "com.sun.jna.ptr.ShortByReference",
+    "allDeclaredConstructors": true,
+    "allPublicConstructors": true,
+    "allDeclaredMethods": true,
+    "allPublicMethods": true,
+    "allDeclaredFields": true
+  },
+  {
+    "name": "com.sun.jna.ptr.FloatByReference",
+    "allDeclaredConstructors": true,
+    "allPublicConstructors": true,
+    "allDeclaredMethods": true,
+    "allPublicMethods": true,
+    "allDeclaredFields": true
+  },
+  {
+    "name": "com.sun.jna.ptr.DoubleByReference",
+    "allDeclaredConstructors": true,
+    "allPublicConstructors": true,
+    "allDeclaredMethods": true,
+    "allPublicMethods": true,
+    "allDeclaredFields": true
+  },
+  {
+    "comment": "SSO-3276 — the two JNA base types the ptr family and the CLI's own bindings pass through. The reachability metadata registers these for fields + JNI but not for construction; NativeMappedConverter reaches them by the same route.",
+    "name": "com.sun.jna.PointerType",
+    "allDeclaredConstructors": true,
+    "allPublicConstructors": true,
+    "allDeclaredMethods": true,
+    "allPublicMethods": true,
+    "allDeclaredFields": true
+  },
+  {
+    "name": "com.sun.jna.Pointer",
+    "allDeclaredConstructors": true,
+    "allPublicConstructors": true,
+    "allDeclaredMethods": true,
+    "allPublicMethods": true,
+    "allDeclaredFields": true
+  },
+  {
     "name": "com.devnow.thoryn.cli.auth.SecureEnclave$CoreFoundationLib",
     "allDeclaredConstructors": true,
     "allPublicConstructors": true,
