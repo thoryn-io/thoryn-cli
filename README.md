@@ -424,16 +424,36 @@ alone — which is the residual risk refresh-token rotation cannot close (RFC 97
   and stores the private key in the same secure store as your tokens. It is never
   printed, never written to a receipt, and never leaves the machine — only the
   public JWK travels, inside the proof.
+* **Only against a platform that advertises DPoP** (SSO-3221). Before attaching a
+  proof to a token request the CLI reads the hub's
+  `/.well-known/openid-configuration` and looks for a non-empty
+  `dpop_signing_alg_values_supported` — the field RFC 9449 §5.1 defines as the
+  advertisement of DPoP support. One small `GET`, memoised per hub for the life
+  of the process, and only on a command that reaches the token endpoint. No
+  advertisement — or an unreachable hub — means no proof, which is exactly the
+  wire shape of a CLI that had never heard of DPoP.
 * Every request to `/oauth2/token` (login code redemption, `refresh_token`, the
   workspace-switch exchange, device-code polling, client-credentials) and every
-  hub / gateway API call carries a freshly signed `DPoP:` proof JWT
+  hub / gateway API call then carries a freshly signed `DPoP:` proof JWT
   (`typ: dpop+jwt`, `jwk`, `htm`, `htu`, `iat`, `jti`, plus `ath` when a bound
   token is presented).
 * If a server demands a nonce (`use_dpop_nonce`, RFC 9449 §8) the CLI caches the
   `DPoP-Nonce` per origin and retries the request once, automatically.
 * The token is presented as `Authorization: DPoP <token>` **only when the hub
-  answered `token_type: DPoP`**; otherwise it stays `Bearer`. That is what makes
-  this release safe against a hub that does not require DPoP yet.
+  answered `token_type: DPoP`**; otherwise it stays `Bearer`.
+
+> **Why the capability check exists.** `cli-v0.20.0` shipped the proof without
+> one, on the argument that the presentation scheme is server-driven so nothing
+> changes until the hub flips the `cli` client. That was true of the CLI and
+> wrong about the hub: Spring Authorization Server binds the token and answers
+> `token_type: DPoP` **as soon as a valid proof arrives**, whatever the client's
+> `dpop_required` flag says. So the CLI's own proof flipped the answer, the CLI
+> faithfully followed its own flip, and it began presenting `DPoP <token>` to
+> resource servers that did not accept the scheme — every customer-plane call
+> answered `401`, and every scheduled thoryn-examples run went red from
+> 2026-09-19 04:23 UTC. The hub half of SSO-3221 stops binding unless the client
+> opted in; this check is the redundant client half, because a released binary
+> outlives any single platform version.
 
 ```bash
 thoryn whoami --output table
@@ -697,6 +717,7 @@ thoryn-cli/
     │   │   ├── TokenStore.kt + KeychainTokenStore.kt        # ADR 2026-04-25 §4
     │   │   ├── DpopKey.kt + DpopKeyStore.kt                 # SSO-3199 RFC 9449 installation key (ES256)
     │   │   ├── DpopSession.kt                               # SSO-3199 proof JWTs + DPoP-Nonce retry
+    │   │   ├── DpopCapability.kt                            # SSO-3221 send proofs only where discovery advertises DPoP
     │   │   ├── Tokens.kt
     │   │   └── ScopeRegistry.kt                             # SSO-959 scope wildcards
     │   ├── api/

@@ -1,6 +1,7 @@
 package com.devnow.thoryn.cli.cmd
 
 import com.devnow.thoryn.cli.ThorynMain
+import com.devnow.thoryn.cli.auth.DpopCapability
 import com.devnow.thoryn.cli.auth.FileTokenStore
 import com.devnow.thoryn.cli.auth.TokenStoreFactory
 import com.devnow.thoryn.cli.auth.Tokens
@@ -45,6 +46,12 @@ abstract class CommandTestBase {
             if (key == TokenStoreFactory.PLAINTEXT_OPT_IN_ENV_VAR) "1" else System.getenv(key)
         }
         seedTokens(Tokens(accessToken = "AT-test", refreshToken = "RT-test"))
+        // SSO-3221 — the CLI asks the hub whether it supports DPoP before attaching a proof. These
+        // fixtures serve no discovery document, so `false` is the answer the real probe would give
+        // them; stubbing it states that explicitly instead of firing an HTTP GET into a queue-based
+        // mock, where it would be answered by whichever response the test enqueued for its own call.
+        // The gate itself is covered by `DpopCapabilityGateTest`.
+        DpopCapability.probe = { false }
     }
 
     @AfterEach
@@ -52,6 +59,7 @@ abstract class CommandTestBase {
         server.shutdown()
         System.setProperty("user.home", originalUserHome ?: "")
         TokenStoreFactory.environment = originalEnvSeam
+        DpopCapability.resetForTest()
     }
 
     protected fun clearTokens() {

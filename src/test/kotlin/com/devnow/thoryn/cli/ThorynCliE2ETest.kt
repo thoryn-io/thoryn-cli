@@ -1,5 +1,6 @@
 package com.devnow.thoryn.cli
 
+import com.devnow.thoryn.cli.auth.DpopCapability
 import com.devnow.thoryn.cli.auth.TokenStoreFactory
 import okhttp3.mockwebserver.Dispatcher
 import okhttp3.mockwebserver.MockResponse
@@ -125,12 +126,19 @@ class ThorynCliE2ETest {
         TokenStoreFactory.environment = { key ->
             if (key == TokenStoreFactory.PLAINTEXT_OPT_IN_ENV_VAR) "1" else System.getenv(key)
         }
+
+        // SSO-3221 — the CLI asks the hub whether it supports DPoP before attaching a proof. This
+        // fixture's hub serves no discovery document, so `false` is the answer the real probe would
+        // give it; stubbing it states that explicitly rather than firing an HTTP GET into a
+        // queue-based mock. The gate itself is covered by `DpopCapabilityGateTest`.
+        DpopCapability.probe = { false }
     }
 
     @AfterEach
     fun tearDown() {
         hub.shutdown()
         gateway.shutdown()
+        DpopCapability.resetForTest()
         System.setProperty("user.home", originalUserHome ?: "")
         TokenStoreFactory.environment = originalEnvSeam
         if (originalClientSecretProp == null) {
