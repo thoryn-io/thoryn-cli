@@ -53,6 +53,10 @@ class WhoamiCommand : Callable<Int> {
         // SSO-3228 — the name this machine's key is registered under, recorded at login. Absent for
         // a session whose token is not bound, or one signed in by a CLI that did not register.
         val deviceName = tokens.deviceName?.takeIf { it.isNotBlank() }
+        // SSO-3227 — WHICH protection class that key has. The difference between "this token cannot be
+        // replayed from another machine" and "…and malware running as me cannot sign proofs either" is
+        // exactly the key class, so it is reported rather than left to be assumed.
+        val keyClassLine = runCatching { dpopKeyClass() }.getOrNull()
 
         val node: JsonNode = mapper.createObjectNode().apply {
             put("subject", claims["sub"]?.asString())
@@ -70,6 +74,8 @@ class WhoamiCommand : Callable<Int> {
             // SSO-3199 — RFC 9449. `dpopKeyThumbprint` is this installation's `jkt`; `dpopBound` says
             // whether the stored access token is sender-constrained to it (`cnf.jkt`, minted by the hub).
             keyThumbprint?.let { put("dpopKeyThumbprint", it) }
+            // SSO-3227 — the key's protection class, plus why anything stronger was passed over.
+            keyClassLine?.let { put("dpopKeyClass", it) }
             put("dpopBound", dpopBinding(tokens.tokenType, boundThumbprint, keyThumbprint))
             // SSO-3228 — which DEVICE this is, so `thoryn devices revoke <name>` names something the
             // user has already seen. `id` is what a revoke takes when two machines share a name.
@@ -92,12 +98,27 @@ class WhoamiCommand : Callable<Int> {
                 "tokenExpiresAt" to n["tokenExpiresAt"]?.asString(),
                 "tokenStatus" to n["tokenStatus"]?.asString(),
                 "dpopKeyThumbprint" to n["dpopKeyThumbprint"]?.asString(),
+                "dpopKeyClass" to n["dpopKeyClass"]?.asString(),
                 "dpopBound" to n["dpopBound"]?.asString(),
                 "device" to n["device"]?.asString(),
                 "deviceId" to n["deviceId"]?.asString(),
             ).filter { it.second != null }
         })
         return CommandSupport.EXIT_OK
+    }
+
+    /**
+     * SSO-3227 — one line describing where the DPoP private key lives, and — when it is not in the
+     * secure element — why not. The "why not" is the useful half: *"software key in the OS keychain
+     * (secure element: this binary is not code-signed …)"* tells an operator what to fix, where a bare
+     * "software" tells them nothing.
+     */
+    private fun dpopKeyClass(): String {
+        val resolution = Dpop.resolution()
+        val active = resolution.keyClass
+        val label = "${active.wireValue} — ${active.description}"
+        val strongerSkipped = resolution.skipped.firstOrNull() ?: return label
+        return "$label (${strongerSkipped.first.wireValue} unavailable: ${strongerSkipped.second})"
     }
 
     /**

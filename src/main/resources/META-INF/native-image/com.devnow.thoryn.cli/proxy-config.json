@@ -1,0 +1,12 @@
+[
+  {
+    "comment": "SSO-3227 — JNA implements a `Library` interface with a java.lang.reflect.Proxy, which native-image must be told about ahead of time or Native.load() fails at runtime with a ClassNotFoundException for the proxy class. These three are the CLI's own direct bindings: Security.framework + CoreFoundation for the macOS Secure Enclave DPoP key, and libc's isatty(3) for the interactive-terminal check that gates the user-presence prompt.",
+    "interfaces": ["com.devnow.thoryn.cli.auth.SecureEnclave$CoreFoundationLib"]
+  },
+  {
+    "interfaces": ["com.devnow.thoryn.cli.auth.SecureEnclave$SecurityLib"]
+  },
+  {
+    "interfaces": ["com.devnow.thoryn.cli.auth.Tty$LibC"]
+  }
+]

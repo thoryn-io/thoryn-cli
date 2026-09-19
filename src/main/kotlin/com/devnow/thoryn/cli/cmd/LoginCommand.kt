@@ -854,7 +854,12 @@ class LoginCommand : Callable<Int> {
      * something we could not then prove.
      */
     private fun dpopJkt(): String? =
-        if (DpopCapability.advertisedBy(issuer.trimEnd('/'))) Dpop.session()?.thumbprint else null
+        // SSO-3227 — `provision = true`: this is THE moment a machine with a secure element is allowed
+        // to create its hardware-bound key. Only the login path passes it, which is what makes the
+        // migration safe: an installation already running on a software key keeps signing with it for
+        // the life of the current session (its live token is bound to that `jkt`), and the upgrade
+        // lands on the next sign-in rather than mid-command. See Dpop.session.
+        if (DpopCapability.advertisedBy(issuer.trimEnd('/'))) Dpop.session(provision = true)?.thumbprint else null
 
     companion object {
         /**

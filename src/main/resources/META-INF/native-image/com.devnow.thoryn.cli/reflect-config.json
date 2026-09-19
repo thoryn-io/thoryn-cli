@@ -290,5 +290,26 @@
     "allPublicConstructors": true,
     "allDeclaredMethods": true,
     "allPublicMethods": true
+  },
+  {
+    "name": "com.devnow.thoryn.cli.auth.SecureEnclave$CoreFoundationLib",
+    "allDeclaredConstructors": true,
+    "allPublicConstructors": true,
+    "allDeclaredMethods": true,
+    "allPublicMethods": true
+  },
+  {
+    "name": "com.devnow.thoryn.cli.auth.SecureEnclave$SecurityLib",
+    "allDeclaredConstructors": true,
+    "allPublicConstructors": true,
+    "allDeclaredMethods": true,
+    "allPublicMethods": true
+  },
+  {
+    "name": "com.devnow.thoryn.cli.auth.Tty$LibC",
+    "allDeclaredConstructors": true,
+    "allPublicConstructors": true,
+    "allDeclaredMethods": true,
+    "allPublicMethods": true
   }
 ]

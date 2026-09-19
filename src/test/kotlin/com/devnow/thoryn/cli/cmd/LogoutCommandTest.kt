@@ -35,7 +35,11 @@ class LogoutCommandTest : CommandTestBase() {
         assertThat(exit).isEqualTo(0)
         assertThat(FileTokenStore().read()).isNull()
         assertThat(out).contains("Signed out")
-        assertThat(out).contains("DPoP key kept (jkt $jkt)")
+        // SSO-3227 — the line now names the key's protection class alongside the thumbprint, so the
+        // last thing shown before a machine is handed on says WHAT was kept, not merely that
+        // something was. On a test JVM that is always the software keychain (Tty is pinned
+        // non-interactive, so the hardware rung never engages).
+        assertThat(out).contains("DPoP key kept (jkt $jkt, software_keychain)")
         assertThat(FileDpopKeyStore().read()).isNotNull()
         // The stored private key must never reach the terminal.
         assertThat(out).doesNotContain(FileDpopKeyStore().read()!!.privateKeyPkcs8)

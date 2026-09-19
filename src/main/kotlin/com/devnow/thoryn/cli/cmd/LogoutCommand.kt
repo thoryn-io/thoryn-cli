@@ -56,9 +56,15 @@ class LogoutCommand : Callable<Int> {
                 else "No DPoP key was stored; the next `thoryn login` generates one.",
             )
         } else {
-            val thumbprint = runCatching { Dpop.session()?.thumbprint }.getOrNull()
-            if (thumbprint != null) {
-                out.println("DPoP key kept (jkt $thumbprint). Use `--rotate-key` to generate a new one.")
+            val session = runCatching { Dpop.session() }.getOrNull()
+            if (session != null) {
+                // SSO-3227 — name the protection class too: "kept" means something different for a
+                // non-exportable hardware key than for a software one, and this is the last line the
+                // user sees before handing the machine on.
+                out.println(
+                    "DPoP key kept (jkt ${session.thumbprint}, ${session.key.keyClass.wireValue}). " +
+                        "Use `--rotate-key` to generate a new one.",
+                )
             }
         }
         return 0

@@ -1,5 +1,6 @@
 package com.devnow.thoryn.cli.cmd
 
+import com.devnow.thoryn.cli.auth.Dpop
 import com.devnow.thoryn.cli.auth.JwtClaims
 import com.devnow.thoryn.cli.auth.TokenStoreFactory
 import com.devnow.thoryn.cli.auth.Tokens
@@ -95,6 +96,13 @@ class StatusCommand : Callable<Int> {
             }
             if (tokens != null) put("authAccepted", authAccepted)
             put("tokenStatus", tokenStatus)
+            // SSO-3227 — the protection class of this installation's DPoP key (RFC 9449). Reported here
+            // as well as in `whoami` because `status` is the command an operator runs to ask "is this
+            // machine set up the way we require?", and the key class is part of that answer. Cheap and
+            // offline: a capability lookup, never a key creation and never a user-presence prompt.
+            runCatching { Dpop.resolution().keyClass }.getOrNull()?.let {
+                put("dpopKeyClass", "${it.wireValue} — ${it.description}")
+            }
         }
 
         CommandSupport.emitRecord(format, node, { n: JsonNode ->
@@ -113,6 +121,7 @@ class StatusCommand : Callable<Int> {
                 "activeEnvironment" to n["activeEnvironment"]?.asString(),
                 "authAccepted" to n["authAccepted"]?.asBoolean(),
                 "tokenStatus" to n["tokenStatus"]?.asString(),
+                "dpopKeyClass" to n["dpopKeyClass"]?.asString(),
             ).filter { it.second != null }
         })
 
