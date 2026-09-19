@@ -1,7 +1,9 @@
 package com.devnow.thoryn.cli.cmd
 
+import com.devnow.thoryn.cli.api.ProductApiException
 import com.devnow.thoryn.cli.auth.Dpop
 import com.devnow.thoryn.cli.auth.JwtClaims
+import com.devnow.thoryn.cli.config.ThorynConfig
 import picocli.CommandLine.Command
 import picocli.CommandLine.Option
 import tools.jackson.databind.JsonNode
@@ -18,6 +20,12 @@ import java.util.concurrent.Callable
  * from the access token's (unverified, display-only) claims via [JwtClaims]; everything else is on
  * the [com.devnow.thoryn.cli.auth.Tokens] record. The raw token is never printed.
  *
+ * SSO-3271 adds `--check`, the one online part: it asks the hub for THIS device's `state` and the
+ * sessions bound to its key. Opt-in, because offline is a promise worth keeping — and because it is
+ * the only way to learn what the local token cannot say. A device revoked from another machine
+ * leaves an access token that still validates locally until it expires, so `tokenStatus: valid`
+ * beside `deviceState: revoked` is both possible and exactly what you need to see.
+ *
  * - **1 (not signed in)** when there is no token — run `thoryn login`.
  * - **0** with the identity in the requested `--output` format (`table` key/value, `json`, `yaml`).
  */
@@ -30,6 +38,28 @@ class WhoamiCommand : Callable<Int> {
 
     @Option(names = ["--output"])
     var outputRaw: String? = null
+
+    /**
+     * SSO-3271 — ask the hub what it thinks of THIS device, instead of answering from the local
+     * token alone.
+     *
+     * Opt-in because everything else here is offline and that is a promise worth keeping. It is
+     * also the only way to learn the one thing the local token cannot tell you: a device revoked
+     * from elsewhere leaves an access token that still looks perfectly valid until it expires, so
+     * `tokenStatus: valid` and `deviceState: revoked` is a real and important combination.
+     */
+    @Option(
+        names = ["--check"],
+        description = ["Ask the hub for this device's state and sessions (the only online part of whoami)."],
+    )
+    var check: Boolean = false
+
+    @Option(
+        names = ["--hub"],
+        description = ["With --check: override the hub base URL (default: the hub recorded at `thoryn login`)."],
+        defaultValue = ThorynConfig.DEFAULT_HUB,
+    )
+    var hub: String = ThorynConfig.DEFAULT_HUB
 
     override fun call(): Int {
         val format = CommandSupport.parseFormat(outputRaw) ?: return CommandSupport.EXIT_USAGE
@@ -58,7 +88,7 @@ class WhoamiCommand : Callable<Int> {
         // exactly the key class, so it is reported rather than left to be assumed.
         val keyClassLine = runCatching { dpopKeyClass() }.getOrNull()
 
-        val node: JsonNode = mapper.createObjectNode().apply {
+        val node = mapper.createObjectNode().apply {
             put("subject", claims["sub"]?.asString())
             put("tenant", claims["tnt"]?.asString())
             activeWorkspace?.let { put("activeWorkspace", it) }
@@ -83,6 +113,28 @@ class WhoamiCommand : Callable<Int> {
             tokens.deviceId?.takeIf { it.isNotBlank() }?.let { put("deviceId", it) }
         }
 
+        // SSO-3271 — the hub's view of this device, when asked for. Everything above stayed offline.
+        if (check) {
+            hub = CommandSupport.resolveHub(hub, tokens)
+            val client = CommandSupport.client(hub, tokens)
+            try {
+                val mine = thisDevice(client.listDevices(), boundThumbprint ?: keyThumbprint, deviceName)
+                if (mine == null) {
+                    // Honest rather than convenient: the hub knows no device for this key. Usually a
+                    // session that predates device registration; occasionally a key registered on
+                    // another workspace. Either way, inventing a state would be worse than saying so.
+                    node.put("deviceState", "unknown (the hub has no device for this installation's key)")
+                } else {
+                    node.put("deviceState", mine.textOrNull("state") ?: "unknown")
+                    mine["sessions"]?.takeIf { !it.isNull }?.let { node.set("deviceSessions", it) }
+                }
+            } catch (ex: ProductApiException) {
+                return CommandSupport.renderError(format, ex)
+            } catch (ex: Exception) {
+                return CommandSupport.renderRequestFailure(ex, hub)
+            }
+        }
+
         CommandSupport.emitRecord(format, node, { n: JsonNode ->
             listOf(
                 "subject" to n["subject"]?.asString(),
@@ -102,10 +154,43 @@ class WhoamiCommand : Callable<Int> {
                 "dpopBound" to n["dpopBound"]?.asString(),
                 "device" to n["device"]?.asString(),
                 "deviceId" to n["deviceId"]?.asString(),
+                "deviceState" to n["deviceState"]?.asString(),
+                "deviceSessions" to n["deviceSessions"]?.let(::describeSessions),
             ).filter { it.second != null }
         })
         return CommandSupport.EXIT_OK
     }
+
+    /**
+     * The entry in `GET /account/devices` that is THIS installation, matched by key thumbprint.
+     *
+     * The thumbprint is the identity that matters: it is what the token is bound to and what a
+     * revoke acts on. The locally-recorded device NAME is only a fallback for a session whose token
+     * is not bound yet (pre-cutover), and it is deliberately only used when it matches exactly one
+     * device — two machines may share a name, and naming the wrong one here would be a lie about
+     * which machine is signed in.
+     */
+    private fun thisDevice(body: JsonNode, thumbprint: String?, deviceName: String?): JsonNode? {
+        val devices = DevicesCommand.devicesOf(body)
+        thumbprint?.let { jkt -> devices.firstOrNull { it.textOrNull("jkt") == jkt }?.let { return it } }
+        return deviceName?.let { name -> devices.filter { it.textOrNull("name") == name }.singleOrNull() }
+    }
+
+    /** `2 live (acme/production)` — the one-line form of the `sessions` object for the table view. */
+    private fun describeSessions(sessions: JsonNode): String {
+        val active = sessions["active"]?.takeIf { !it.isNull }?.asInt() ?: return "unknown"
+        val workspaces = sessions["workspaces"]?.takeIf { it.isArray }
+            ?.mapNotNull { entry ->
+                val tenant = entry.textOrNull("tenantSlug") ?: return@mapNotNull null
+                entry.textOrNull("environmentSlug")?.let { "$tenant/$it" } ?: tenant
+            }
+            .orEmpty()
+        return if (workspaces.isEmpty()) "$active live" else "$active live (${workspaces.joinToString(", ")})"
+    }
+
+    /** A string field, or null when absent or JSON `null` — see `DevicesCommand`'s note on `NullNode`. */
+    private fun JsonNode.textOrNull(field: String): String? =
+        this[field]?.takeIf { !it.isNull }?.asString()?.takeIf { it.isNotEmpty() }
 
     /**
      * SSO-3227 — one line describing where the DPoP private key lives, and — when it is not in the

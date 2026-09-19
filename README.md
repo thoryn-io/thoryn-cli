@@ -51,8 +51,8 @@ thoryn login --workspace <slug> [--issuer https://hub.<env>]  # Auth code + PKCE
 thoryn login --client-credentials [--client-id <id>] # SSO-1553/2941 — non-interactive API key (CI); THORYN_API_KEY=<id>:<secret>, auto re-mints on expiry
 thoryn login --status
 thoryn logout [--rotate-key]                 # SSO-3199 — --rotate-key also discards this machine's DPoP key
-thoryn whoami                                # SSO-2860/3199/3228 — identity, scopes, expiry, the DPoP key thumbprint + this device's name
-thoryn devices list                          # SSO-3228 — the machines signed in to your account, with each key's recent networks
+thoryn whoami [--check]                      # SSO-2860/3199/3228 — identity, scopes, expiry, DPoP key + device (--check: this device's server-side state)
+thoryn devices list                          # SSO-3228/3271 — your machines: state, live sessions, workspaces, recent networks
 thoryn devices revoke <id|name> [--reason r] # Ends THAT machine's sessions and refuses its key; your other devices keep working
 
 # Tenant configuration (SSO-1552) — thin wrappers over product-api via the gateway.
@@ -546,11 +546,36 @@ hostname by default, `thoryn login --device-name "alice work laptop"` to choose:
 
 ```bash
 thoryn devices list
-# NAME         ID    CLIENT  LAST SEEN             NETWORKS                STATUS
-# alice-mbp    d-1   cli     2026-09-19T09:41:00Z  203.0.113, 198.51.100   active
-# (unregistered)  -  cli     2026-08-30T17:15:00Z  192.0.2                 unregistered
+# NAME            ID   STATE       SESSIONS  LAST SEEN             WORKSPACES               NETWORKS
+# alice-mbp       d-1  signed_in   2         2026-09-19T09:41:00Z  acme/production, acme/blue  203.0.113
+# spare-desktop   d-2  idle        0         2026-09-02T11:00:00Z  -                        198.51.100
+# (unregistered)  -    unregistered 1        2026-08-30T17:15:00Z  acme/production          192.0.2
 
 thoryn devices revoke alice-mbp --reason "left on a train"
+```
+
+**STATE** (SSO-3271) is what the device is doing now — `signed_in` (live sessions
+are bound to its key), `idle` (registered, none live), `revoked`, or
+`unregistered` (a key with no device record). **SESSIONS** counts the live ones and
+**WORKSPACES** names the workspace and plane each belongs to. A session is live
+while it still holds an unexpired refresh or access token, so a machine whose
+refresh token lapsed weeks ago reads `idle` — and revoking it may still report
+ending sessions, because a revoke clears the dead rows too.
+
+Against a hub older than SSO-3271 those columns read `-`: the CLI reads the new
+fields tolerantly and never guesses `signed_in` from registration alone.
+
+`thoryn whoami --check` asks the hub the same question about **this** machine. It
+is the one online part of `whoami`, and opt-in for that reason — but it is the
+only way to see a device someone revoked from elsewhere, because the access token
+in your keychain goes on looking valid until it expires:
+
+```bash
+thoryn whoami --check --output table
+# ...
+# tokenStatus      valid (expires in 0h 42m)
+# deviceState      revoked
+# deviceSessions   0 live
 ```
 
 Revoking ends **that machine's** sessions and refuses its key from then on; every
