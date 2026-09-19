@@ -7,6 +7,7 @@ import com.devnow.thoryn.cli.auth.ClientCredentialsFlow
 import com.devnow.thoryn.cli.auth.DeviceCodeException
 import com.devnow.thoryn.cli.auth.DeviceCodeFlow
 import com.devnow.thoryn.cli.auth.Dpop
+import com.devnow.thoryn.cli.auth.DpopCapability
 import com.devnow.thoryn.cli.auth.EcPrivateKeyJwtSigner
 import com.devnow.thoryn.cli.auth.HttpSender
 import com.devnow.thoryn.cli.auth.IssuerUrlValidationException
@@ -680,17 +681,15 @@ class LoginCommand : Callable<Int> {
         return try {
             server.start()
             val redirectUri = server.redirectUri
-            val authorizeUrl = buildString {
-                append(issuer.trimEnd('/'))
-                append("/oauth2/authorize")
-                append("?response_type=code")
-                append("&client_id=").append(urlEncode(clientId))
-                append("&redirect_uri=").append(urlEncode(redirectUri))
-                append("&scope=").append(urlEncode(expandedScope()))
-                append("&code_challenge=").append(urlEncode(challenge))
-                append("&code_challenge_method=S256")
-                append("&state=").append(urlEncode(state))
-            }
+            val authorizeUrl = authorizeUrl(
+                issuer = issuer,
+                clientId = clientId,
+                redirectUri = redirectUri,
+                scope = expandedScope(),
+                codeChallenge = challenge,
+                state = state,
+                dpopJkt = dpopJkt(),
+            )
 
             println("Opening your browser to sign in…")
             println("If it doesn't open, visit this URL:")
@@ -792,6 +791,44 @@ class LoginCommand : Callable<Int> {
     private fun urlEncode(s: String): String =
         java.net.URLEncoder.encode(s, Charsets.UTF_8)
 
+    /**
+     * SSO-3225 — the RFC 9449 §10 `dpop_jkt` for this authorize request: the RFC 7638 thumbprint of
+     * the installation key that will sign the proof on the token request, or null when no proof
+     * will be sent.
+     *
+     * ## Why the authorize request needs this at all
+     *
+     * Since SSO-3199 the ACCESS TOKEN is bound to whichever key signs the token-request proof. The
+     * authorization CODE was bound to nothing — and this flow puts the code on a **literal-loopback
+     * redirect** (RFC 8252 §7.3): `http://127.0.0.1:<port>`, in the clear, on a machine that may be
+     * running other software. Anything that can read that redirect could redeem the code with its
+     * OWN key and receive a token sender-constrained to the attacker. `dpop_jkt` names our key on
+     * the way IN, so the hub can refuse a redemption by any other key (`invalid_grant`).
+     *
+     * PKCE already guards this leg, and the two compose rather than overlap: PKCE's `code_verifier`
+     * is a secret held in this process's memory for one run, `dpop_jkt` binds to the long-lived
+     * keychain key that the resulting token is bound to anyway.
+     *
+     * ## The gate is the same one the proof itself uses
+     *
+     * [DpopCapability] — the hub must advertise `dpop_signing_alg_values_supported` — and it is
+     * asked FIRST, exactly as in [Dpop.sender]: on a platform that does not do DPoP this must not
+     * touch the key store, so no key is generated and no "DPoP is disabled" warning is printed for
+     * a feature that would not have been used. Sending `dpop_jkt` to a hub that ignores unknown
+     * authorize parameters would be harmless, but a hub that validates them strictly would reject
+     * the sign-in outright, and a released binary meets platforms older than itself.
+     *
+     * The memo key matches: `DpopCapability.hubBaseOf("<issuer>/oauth2/token")` strips the endpoint
+     * path back to this same base, so the authorize probe and the later token-request probe share
+     * one answer and one HTTP call.
+     *
+     * Null when the platform does not advertise DPoP, or when no key store is available — in both
+     * cases no proof will ride on the token request either, so naming a key would bind the code to
+     * something we could not then prove.
+     */
+    private fun dpopJkt(): String? =
+        if (DpopCapability.advertisedBy(issuer.trimEnd('/'))) Dpop.session()?.thumbprint else null
+
     companion object {
         /**
          * SSO-3182 — the exact re-login line for a session: `thoryn login --workspace <slug>` when the
@@ -819,6 +856,40 @@ class LoginCommand : Callable<Int> {
             return "Note: the hub issued no refresh token for this sign-in, so this session cannot renew itself — " +
                 "it ends when the access token expires$remaining; run `thoryn login` again then.$alternative"
         }
+
+        /**
+         * SSO-2820 / SSO-3225 — the `/oauth2/authorize` URL for the interactive loopback sign-in.
+         *
+         * Extracted from the flow so the wire shape can be asserted directly: every parameter here
+         * is a protocol commitment, and [dpopJkt] in particular is a security binding whose absence
+         * is silent (RFC 9449 §10 — a code that names no key is redeemable by any key, which is
+         * exactly the pre-SSO-3225 behaviour and looks identical from the outside).
+         *
+         * [dpopJkt] null omits the parameter entirely rather than sending an empty one: "no key
+         * named" and "a key named badly" are very different requests to the hub.
+         */
+        internal fun authorizeUrl(
+            issuer: String,
+            clientId: String,
+            redirectUri: String,
+            scope: String,
+            codeChallenge: String,
+            state: String,
+            dpopJkt: String?,
+        ): String = buildString {
+            append(issuer.trimEnd('/'))
+            append("/oauth2/authorize")
+            append("?response_type=code")
+            append("&client_id=").append(encode(clientId))
+            append("&redirect_uri=").append(encode(redirectUri))
+            append("&scope=").append(encode(scope))
+            append("&code_challenge=").append(encode(codeChallenge))
+            append("&code_challenge_method=S256")
+            append("&state=").append(encode(state))
+            dpopJkt?.takeIf { it.isNotBlank() }?.let { append("&dpop_jkt=").append(encode(it)) }
+        }
+
+        private fun encode(s: String): String = java.net.URLEncoder.encode(s, Charsets.UTF_8)
 
         const val EXIT_OK = 0
         const val EXIT_USAGE = 65
