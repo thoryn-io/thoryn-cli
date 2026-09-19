@@ -469,6 +469,21 @@ Once the hub marks the `cli` client `dpop_required` and binds `cnf.jkt`,
 means the stored token belongs to another installation (or the key was rotated
 since it was issued) — run `thoryn login` again.
 
+**Rotating the key.** `thoryn logout` keeps the key by default: on its own it
+authorises nothing, and keeping it means your next login re-binds to the same
+`jkt`. `thoryn logout --rotate-key` discards it, so the next login generates a
+new one and every token bound to the old thumbprint stops working — the right
+move when handing the machine on or if the key may have leaked. It does not
+revoke the **device** record that named the old key (see below); the next login
+registers the new key as a new device, and the stale row is worth clearing with
+`thoryn devices revoke <id>`.
+
+**Hub-side flip.** Requiring proofs is the *other half* of SSO-3199 and lives in
+`oathy` (step 2): flip `dpop_required=true` on the `cli` client and require
+`cnf.jkt`-bound tokens at product-api / api-gateway. It is deliberately a
+separate, later change so CLIs released before it keep working; the minimum CLI
+version for the flip is the first `cli-v*` release containing this feature.
+
 ### Devices (SSO-3228)
 
 The key stays on the machine, so it stands in for the machine. When a login
@@ -493,18 +508,6 @@ the platform's own per-key anomaly signals read.
 Registration never fails a sign-in: against a hub that does not have the endpoint,
 or when the token is not bound, the CLI notes it on stderr and you are signed in
 regardless — `thoryn devices list` simply shows that key as unregistered.
-
-**Rotating the key.** `thoryn logout` keeps the key by default: on its own it
-authorises nothing, and keeping it means your next login re-binds to the same
-`jkt`. `thoryn logout --rotate-key` discards it, so the next login generates a
-new one and every token bound to the old thumbprint stops working — the right
-move when handing the machine on or if the key may have leaked.
-
-**Hub-side flip.** Requiring proofs is the *other half* of SSO-3199 and lives in
-`oathy` (step 2): flip `dpop_required=true` on the `cli` client and require
-`cnf.jkt`-bound tokens at product-api / api-gateway. It is deliberately a
-separate, later change so CLIs released before it keep working; the minimum CLI
-version for the flip is the first `cli-v*` release containing this feature.
 
 ### Key classes — where the private key lives (SSO-3227)
 
