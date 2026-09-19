@@ -412,6 +412,60 @@ the token file under the CI fallback (`THORYN_DPOP_KEY_FILE` overrides the path)
 Without a keychain and without the opt-in the CLI refuses to write the private
 key in plaintext and simply sends no DPoP proof.
 
+## Pushed authorization requests (PAR, SSO-3234)
+
+When the hub advertises `pushed_authorization_request_endpoint` in its discovery
+document, `thoryn login` sends the authorization request **back-channel** —
+straight from the CLI to the hub over TLS — and opens the browser at a URL that
+carries nothing but `client_id` and an opaque, single-use `request_uri`
+([RFC 9126](https://www.rfc-editor.org/rfc/rfc9126)):
+
+```
+POST https://<workspace>.hub.<env>/oauth2/par
+  response_type=code&client_id=cli&redirect_uri=http://127.0.0.1:<port>/callback
+  &scope=…&state=…&code_challenge=…&code_challenge_method=S256[&dpop_jkt=…]
+  → 201 {"request_uri":"urn:ietf:params:oauth:request_uri:…","expires_in":90}
+
+https://<workspace>.hub.<env>/oauth2/authorize?client_id=cli&request_uri=urn%3A…
+```
+
+Without it, every one of those parameters travels through the browser: its
+address bar, its history, its extensions, and anything on the path. The scopes
+you are asking for, your loopback `redirect_uri`, PKCE's `code_challenge` and the
+`dpop_jkt` naming your device key are all things you would rather nothing there
+could read or rewrite. PAR is the FAPI 2.0 baseline for the same reason.
+
+The CLI is a **public** client (`token_endpoint_auth_method=none`), so per
+RFC 9126 §2 its `client_id` is the whole of its authentication on that POST; if a
+client secret is configured, the push uses HTTP Basic instead.
+
+The DPoP key is named with `dpop_jkt` in the POST body — RFC 9449 §10.1's first
+mechanism, not the proof-header alternative — and it is the *same* key the login
+path provisions and the token-request proof later signs with, whichever rung of
+the [key ladder](#sender-constrained-tokens-dpop-sso-3199) it came from. The
+authorize parameters are resolved once and then handed to whichever carrier is in
+use, so the binding cannot differ between the two. The push itself carries no
+proof header: the two mechanisms are an either/or (§10.1 requires them to agree
+when both are sent), and a proof on a request that is not a grant would spend a
+single-use `jti` for nothing.
+
+**What happens when it is not available.** A hub that advertises no PAR endpoint,
+a `5xx`, or a connection failure all fall back to the plain authorize URL with one
+note on stderr — an older platform and an unwell one both still sign you in. A
+**4xx does not fall back**: the hub understood the push and rejected it, so the
+sign-in fails with the hub's error code. Retrying front-channel would hide a real
+misconfiguration, and would let anything able to forge a single `400` strip PAR
+off every sign-in and put the parameters back in the browser.
+
+`thoryn status` tells you which one you will get:
+
+```bash
+thoryn status --output json
+# …
+# pushesAuthorizationRequest          true
+# pushedAuthorizationRequestEndpoint  https://acme.hub.stg.thoryn.org/oauth2/par
+```
+
 ## Sender-constrained tokens (DPoP, SSO-3199)
 
 The CLI proves possession of a private key on every token request and every API

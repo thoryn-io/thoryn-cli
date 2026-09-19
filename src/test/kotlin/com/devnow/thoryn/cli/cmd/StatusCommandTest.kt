@@ -37,6 +37,43 @@ class StatusCommandTest : CommandTestBase() {
         assertThat(json["authAccepted"]).isEqualTo(true)
     }
 
+    /**
+     * SSO-3234 — `status` reports whether the next `thoryn login` will PUSH its authorization
+     * request (RFC 9126). The CLI pushes exactly when the hub advertises the endpoint, so the
+     * advertisement IS the behaviour — and it is read off the discovery document the hub probe
+     * already fetched, not from a second request.
+     */
+    @Test
+    fun `reports that login will push its authorization request when the hub advertises PAR`() {
+        server.enqueue(
+            jsonResponse(
+                200,
+                """{"issuer":"https://hub","pushed_authorization_request_endpoint":"https://hub/oauth2/par"}""",
+            ),
+        )
+        server.enqueue(jsonResponse(200, """{"items":[]}"""))
+
+        val (exit, out, _) = runCli("status", "--hub", baseUrl(), "--gateway", baseUrl(), "--output", "json")
+
+        assertThat(exit).isEqualTo(0)
+        val json = parseJson(out)
+        assertThat(json["pushesAuthorizationRequest"]).isEqualTo(true)
+        assertThat(json["pushedAuthorizationRequestEndpoint"]).isEqualTo("https://hub/oauth2/par")
+    }
+
+    @Test
+    fun `reports no pushing against a hub that does not advertise PAR`() {
+        server.enqueue(jsonResponse(200, """{"issuer":"https://hub"}"""))
+        server.enqueue(jsonResponse(200, """{"items":[]}"""))
+
+        val (exit, out, _) = runCli("status", "--hub", baseUrl(), "--gateway", baseUrl(), "--output", "json")
+
+        assertThat(exit).isEqualTo(0)
+        val json = parseJson(out)
+        assertThat(json["pushesAuthorizationRequest"]).isEqualTo(false)
+        assertThat(json).doesNotContainKey("pushedAuthorizationRequestEndpoint")
+    }
+
     @Test
     fun `a 401 from the gateway is reachable but auth not accepted`() {
         server.enqueue(jsonResponse(200, """{"issuer":"https://hub"}"""))
