@@ -33,14 +33,22 @@ import java.util.concurrent.ConcurrentHashMap
  *   DPoP-bound access token, i.e. when its `Authorization` header uses the `DPoP` scheme (§7.1).
  * - `nonce` is added when the server has handed one out for that origin (see below).
  *
- * ## Backwards compatibility — why this is safe before the hub requires DPoP
+ * ## Backwards compatibility — SSO-3221 corrects what SSO-3199 assumed here
  *
- * The hub accepts a proof **optionally** today (`token_settings_dpop_required` is false for the `cli`
- * client until the oathy-side flip): a proof present ⇒ the access token gains `cnf.jkt`; absent ⇒ a plain
- * bearer token. So sending a proof changes nothing until the flip. The presentation scheme is driven by
- * the server, not by the CLI: [authorizationScheme] returns `DPoP` **only** when the token response said
- * `token_type: DPoP`, and `Bearer` otherwise — so against today's hub and today's resource servers (which
- * have no DPoP support yet) the CLI keeps sending `Authorization: Bearer …` exactly as before.
+ * SSO-3199 shipped this ahead of the platform on the argument that *the presentation scheme is
+ * server-driven*: [schemeFor] returns `DPoP` only when the token response said `token_type: DPoP`,
+ * so the CLI would keep sending `Authorization: Bearer` until the hub flipped the `cli` client.
+ *
+ * **That was true of the CLI and wrong about the hub.** Spring Authorization Server binds the token
+ * to the proof's key and answers `token_type: DPoP` whenever a valid proof is present — it never
+ * consults `token_settings_dpop_required`. So the CLI's own proof flipped the answer, the CLI
+ * faithfully followed its own flip, and it began presenting `DPoP <token>` to resource servers that
+ * did not accept the scheme. Every scheduled thoryn-examples run went red from 2026-09-19 04:23 UTC.
+ *
+ * The correction is [DpopCapability]: a proof rides on a token request **only when the hub
+ * advertises DPoP support** in its discovery document. Everything else here is unchanged — the
+ * scheme is still server-driven, and a machine with no usable key store still degrades to sending
+ * no proof.
  *
  * ## Nonce handling (§8)
  *
@@ -269,11 +277,29 @@ object Dpop {
      * A real [HttpSender] (the seam the token flows take) that attaches a DPoP proof to every request
      * and performs the single `use_dpop_nonce` retry. Falls back to a plain sender when no session is
      * available, so the flows behave exactly as they did before SSO-3199.
+     *
+     * ## SSO-3221 — and only to a platform that advertises DPoP
+     *
+     * The proof is withheld unless the hub this request is aimed at publishes
+     * [DpopCapability.DISCOVERY_FIELD] (RFC 9449 §5.1). Sending one to a platform that does not
+     * understand DPoP is what broke the fleet on 2026-09-19: the hub bound the token purely because
+     * a proof arrived, answered `token_type: DPoP`, the CLI's scheme followed, and every resource
+     * server that did not accept the scheme returned 401. See [DpopCapability].
+     *
+     * **The gate is here and not on API calls, deliberately.** The token endpoint is where a proof
+     * causes something — it is what makes the hub bind and retype the response. On a gateway call
+     * the proof is an extra header next to an `Authorization` whose scheme is already decided by
+     * the token the hub issued; a server that does not know DPoP ignores it, and a server that does
+     * needs it the moment the token is bound. Gating there would buy nothing and would cost a hub
+     * round-trip on every command that runs on a still-fresh token.
      */
     fun sender(timeout: Duration = Duration.ofSeconds(15)): HttpSender {
         val client = HttpClient.newBuilder().connectTimeout(timeout).build()
         return HttpSender { request, handler ->
-            val session = session()
+            // Capability first: on a platform that does not advertise DPoP this must not touch the
+            // key store at all — no key generated on first use, and no "DPoP is disabled" warning
+            // about a feature that would not have been used anyway.
+            val session = if (DpopCapability.advertisedBy(DpopCapability.hubBaseOf(request.uri()))) session() else null
             if (session == null) client.send(request, handler)
             else session.send(request) { decorated -> client.send(decorated, handler) }
         }

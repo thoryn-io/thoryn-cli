@@ -28,12 +28,19 @@ class DpopTokenEndpointTest {
         server = MockWebServer().also { it.start() }
         Dpop.resetForTest()
         Dpop.storeProvider = { InMemoryStore() }
+        // SSO-3221 — a proof now rides only on a hub that ADVERTISES DPoP. This suite is about the
+        // shape of the proof once it is sent, so it declares the platform supports it rather than
+        // enqueueing a discovery document ahead of every token response. Whether the CLI asks at
+        // all, and what it does with each answer, is `DpopCapabilityGateTest`.
+        DpopCapability.resetForTest()
+        DpopCapability.seedForTest(issuer(), advertised = true)
     }
 
     @AfterEach
     fun tearDown() {
         server.shutdown()
         Dpop.resetForTest()
+        DpopCapability.resetForTest()
     }
 
     private fun issuer(): String = server.url("/").toString().trimEnd('/')
