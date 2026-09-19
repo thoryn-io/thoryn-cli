@@ -75,7 +75,17 @@ class DpopSession(
      * cached nonce for the URI's origin is included when present.
      */
     fun proof(method: String, uri: URI, accessToken: String? = null): String {
-        val header = """{"typ":"dpop+jwt","alg":"ES256","jwk":${key.publicJwkJson}}"""
+        // SSO-3227 — `key_class` is a TELEMETRY HINT AND NOTHING ELSE. It is self-asserted by the
+        // client, sits outside the signature's semantics, and any server that made an authorization
+        // decision on it would be trusting an attacker-chosen string. It is here because the platform
+        // wants to see how much of the fleet is on hardware-backed keys, and because verifying that
+        // the hub tolerates it was cheap: run against Spring Authorization Server's real proof parser
+        // (`DPoPProofJwtDecoderFactory`, spring-security-oauth2-jose 7.1.1 — the same artefact oathy's
+        // hub resolves), a proof carrying this header decodes exactly as one without it, because
+        // Nimbus routes unrecognised header members to custom params and the `typ`/`jwk` validators
+        // never look at them. See the SSO-3227 PR for the transcript.
+        val header =
+            """{"typ":"dpop+jwt","alg":"ES256","jwk":${key.publicJwkJson},"key_class":"${key.keyClass.wireValue}"}"""
         val claims = buildString {
             append("""{"htm":"""").append(method.uppercase()).append('"')
             append(""","htu":"""").append(jsonEscape(htu(uri))).append('"')
@@ -206,8 +216,26 @@ object Dpop {
     internal var clock: () -> Instant = { Instant.now() }
     internal var jtiSource: () -> String = { UUID.randomUUID().toString() }
 
+    /**
+     * SSO-3227 — the provider ladder, strongest first. A test that overrides [storeProvider] is
+     * overriding the *software* rung, which is why the ladder is rebuilt from it rather than captured.
+     */
+    internal var ladder: () -> List<DpopKeyProvider> = {
+        listOf(
+            SecureElementDpopKeyProvider(clock = clock),
+            SoftwareKeychainDpopKeyProvider(storeProvider = storeProvider, clock = clock),
+            EphemeralDpopKeyProvider(clock = clock),
+        )
+    }
+
     @Volatile
     private var cached: DpopSession? = null
+
+    @Volatile
+    private var cachedResolution: DpopKeyProviders.Resolution? = null
+
+    @Volatile
+    private var provisioned: Boolean = false
 
     @Volatile
     private var unavailable: Boolean = false
@@ -216,21 +244,55 @@ object Dpop {
     private var warned: Boolean = false
 
     /**
-     * The installation's DPoP session, or null when no secure store is available (see the object doc).
-     * A one-line warning is printed at most once per process in that case.
+     * SSO-3227 — the key that will actually sign, its protection class, and the reason each stronger
+     * class was passed over. Memoised for the process; drives `thoryn whoami` / `thoryn status` and is
+     * safe to call when signed out.
+     *
+     * Deliberately resolved by *loading*, not by asking: see [DpopKeyProviders.resolve]. A class is
+     * only reported once a key of that class is in hand, so the line `whoami` prints is the protection
+     * a session actually has rather than the protection the machine might in principle offer.
      */
     @Synchronized
-    fun session(err: PrintStream = System.err): DpopSession? {
+    internal fun resolution(provision: Boolean = false): DpopKeyProviders.Resolution =
+        cachedResolution ?: DpopKeyProviders.resolve(ladder(), provision).also { cachedResolution = it }
+
+    /**
+     * SSO-3227 — the protection class of the key this installation signs with, or null when no proof
+     * can be minted at all (the non-persistent degrade). Display-only.
+     */
+    fun keyClass(): DpopKeyClass? = runCatching { resolution().keyClass.takeIf { it.persistent } }.getOrNull()
+
+    /**
+     * The installation's DPoP session, or null when no *persistent* key can be had (see the object
+     * doc). A one-line warning is printed at most once per process in that case.
+     *
+     * @param provision SSO-3227 — allow a provider to CREATE a key it does not have yet. Only the
+     *   `thoryn login` path passes true, so a routine command can never provision a hardware key
+     *   mid-session and silently re-bind: an existing session keeps the key its token is bound to,
+     *   and the upgrade lands on the next login, exactly as the story requires.
+     */
+    @Synchronized
+    @JvmOverloads
+    fun session(err: PrintStream = System.err, provision: Boolean = false): DpopSession? {
+        // A provisioning pass may legitimately supersede a weaker key chosen earlier in this process
+        // (whoami-then-login inside one `examples apply`, say) — so re-select once when asked.
+        if (provision && !provisioned) {
+            provisioned = true
+            cached = null
+            cachedResolution = null
+            unavailable = false
+        }
         cached?.let { return it }
         if (unavailable) return null
         return try {
-            val store = storeProvider()
-            val stored = store.read()
-            val key = if (stored != null) {
-                runCatching { DpopKey.fromStored(stored) }.getOrNull() ?: generateAndStore(store)
-            } else {
-                generateAndStore(store)
-            }
+            val resolved = resolution(provision)
+            // No persistent key anywhere on the ladder. An in-memory key cannot honour a `cnf.jkt`
+            // minted at login on the NEXT command, so binding a token to one would be worse than not
+            // binding at all: degrade to no proof — the pre-SSO-3199 wire shape — and say why.
+            val key = resolved.key ?: throw TokenStoreUnavailableException(
+                resolved.skipped.lastOrNull { it.first.persistent }?.second
+                    ?: resolved.keyClass.description,
+            )
             DpopSession(key, clock, jtiSource).also { cached = it }
         } catch (e: Exception) {
             unavailable = true
@@ -245,20 +307,24 @@ object Dpop {
         }
     }
 
-    private fun generateAndStore(store: DpopKeyStore): DpopKey =
-        DpopKey.generate(clock()).also { store.write(it.toStored()) }
-
     /**
      * Delete the stored key so the next command generates a fresh one — `thoryn logout --rotate-key`.
      * Returns true when a key was present. The hub side needs no cleanup: a `cnf.jkt` only ever binds a
      * token, and the tokens are being discarded in the same breath.
+     *
+     * SSO-3227 — this asks **every** rung of the ladder to delete, not just the one currently
+     * selected. A machine can hold both a Secure Enclave key and an older software key (that is
+     * exactly the state a migration leaves behind, and the state a `--rotate-key` after losing a
+     * laptop has to clean up), so "rotate" has to mean *no key of any class survives*. The recorded
+     * presence timestamp goes with them.
      */
     @Synchronized
     fun rotate(): Boolean {
-        val store = runCatching { storeProvider() }.getOrNull() ?: return false
-        val had = runCatching { store.read() }.getOrNull() != null
-        runCatching { store.delete() }
+        val had = ladder().map { provider -> runCatching { provider.delete() }.getOrDefault(false) }.any { it }
+        runCatching { UserPresence.clear() }
         cached = null
+        cachedResolution = null
+        provisioned = false
         unavailable = false
         return had
     }
@@ -266,11 +332,19 @@ object Dpop {
     /** Test seam — drop the cached session / warning latch between tests. */
     internal fun resetForTest() {
         cached = null
+        cachedResolution = null
+        provisioned = false
         unavailable = false
         warned = false
         clock = { Instant.now() }
         jtiSource = { UUID.randomUUID().toString() }
         storeProvider = { DpopKeyStoreFactory.default() }
+        DpopKeyProviders.resetForTest()
+        UserPresence.resetForTest()
+        // SSO-3227 — a test JVM is never a place to raise a biometric prompt. Surefire forks with
+        // pipes, so `Tty.interactive()` would answer false anyway; pinning it makes that a guarantee
+        // rather than an accident of how the suite happens to be launched.
+        Tty.override = false
     }
 
     /**

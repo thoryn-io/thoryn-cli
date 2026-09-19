@@ -506,6 +506,93 @@ move when handing the machine on or if the key may have leaked.
 separate, later change so CLIs released before it keep working; the minimum CLI
 version for the flip is the first `cli-v*` release containing this feature.
 
+### Key classes — where the private key lives (SSO-3227)
+
+DPoP stops **token** theft: a stolen access token is useless without a proof
+signed by your key. It does not, on its own, stop malware running as you on your
+own workstation — that can simply ask the keychain to sign proofs. The answer is
+a key the keychain cannot hand over and a signature that needs a human. The CLI
+now picks the strongest option the machine actually supports and **tells you
+which one it got**:
+
+| class | where the private key lives | what it buys |
+|---|---|---|
+| `secure_element` | Apple Secure Enclave (macOS) | non-exportable — the key material never exists outside the secure hardware — and every signature requires user presence (Touch ID, Watch, or your password) |
+| `software_keychain` | OS keychain (the SSO-3199 behaviour) | protects against token theft; a process running as you can still ask the keychain to sign |
+| `ephemeral` | process memory only | nothing — see below |
+
+```bash
+thoryn whoami --output table
+# …
+# dpopKeyThumbprint  9mS2kYy-DWpqq30jZyJGHTN0d2HglBV3uiguA4IZcOC
+# dpopKeyClass       software_keychain — software key in the OS keychain (secure_element unavailable: …)
+# dpopBound          yes (cnf.jkt matches this installation's key)
+```
+
+`thoryn status` reports `dpopKeyClass` too. When the CLI falls back, the line
+carries **why** the stronger class was passed over — that reason is the half you
+can act on.
+
+**`ephemeral` never sends a proof.** A key that dies with the process cannot
+honour a `cnf.jkt` minted at login on your *next* command, so binding a token to
+one would break every subsequent invocation. On a machine with neither a secure
+element nor a usable keychain the CLI therefore sends **no** proof at all — the
+pre-SSO-3199 wire shape — and says so once. The class exists so `whoami` can
+name that state rather than report nothing.
+
+**Presence prompts: once per session, not per request.** All the proofs one
+command mints (a token request plus its API calls) go through one key handle, so
+a command asks at most once. Across commands the CLI keeps a timestamp of the
+last presence-backed signature and stays quiet inside an idle window — 15 minutes
+by default, `THORYN_DPOP_PRESENCE_IDLE_MINUTES` to change it — after which it
+prints one line explaining the prompt you are about to see. Note the honest
+boundary: *macOS* decides when LocalAuthentication actually shows its dialog, and
+because each `thoryn` invocation is a separate short-lived process, the only
+supported way to widen OS-side reuse (an `LAContext`) cannot outlive one command
+either. Cross-process presence reuse needs a resident agent and is a follow-up.
+
+**Never in CI.** A hardware key is refused outright when there is no interactive
+terminal — `CI` is set, `THORYN_NON_INTERACTIVE` is set, or stdin/stderr are not
+TTYs — because a pipeline cannot answer a fingerprint prompt. The CLI degrades to
+the software keychain with a one-line notice rather than hanging on a dialog
+nobody will see. (The check is `isatty(3)`, not `System.console() != null`: since
+JDK 19 the latter returns non-null on a pipe, and `Console.isTerminal()` — the
+correct API — is JDK 22, while this project ships on JDK 21.)
+
+**Migration is on login, never mid-session.** An existing software key keeps
+working untouched. Only `thoryn login` is allowed to *create* a hardware key, so
+a session already signing with a software key keeps the key its live token is
+bound to, and the upgrade lands on the next sign-in. `thoryn logout
+--rotate-key` deletes the key of **every** class, plus the presence timestamp —
+a migrated machine can hold both, and "rotate" has to mean nothing survives.
+
+**Per-OS status, honestly.**
+
+* **macOS — implemented.** Secure Enclave P-256 via `Security.framework`
+  (`kSecAttrTokenIDSecureEnclave`, `SecAccessControlCreateWithFlags` with
+  `kSecAccessControlPrivateKeyUsage | kSecAccessControlUserPresence`, signing
+  through `SecKeyCreateSignature`), bound with JNA — already a dependency, already
+  in the native image, already how the keychain backend calls the same framework.
+  **It does not engage in a released binary yet:** persisting a Secure Enclave key
+  needs the calling binary to be code-signed with a keychain-access-group
+  entitlement, and the published `thoryn` binaries are not signed or notarised.
+  Without it macOS returns `errSecMissingEntitlement (-34018)` on the *store*
+  step, the CLI reports that as the skip reason, and you get the software key.
+  Code-signing the macOS binary is the follow-up that switches this on.
+* **Windows / Linux — not built.** TPM via the Windows Hello platform crypto
+  provider, and TPM2 via `tpm2-pkcs11`, are the intended backends. They are not
+  stubbed in: neither can be built or exercised on the machine this was written
+  on, and a backend that has never run is a claim rather than an implementation.
+  They report `this platform has no supported secure element` and slot into the
+  same `DpopKeyProvider` seam when they land, with nothing above it changing.
+
+**`key_class` on the wire is telemetry only.** The proof header carries a
+`key_class` hint so the platform can see how much of the fleet is hardware-backed.
+It is **self-asserted by the client and must never be trusted**: any server making
+an authorization decision on it would be trusting an attacker-chosen string. It
+was verified to be safe to send against Spring Authorization Server's real proof
+parser (`DPoPProofJwtDecoderFactory`) before being added.
+
 ## Session endpoints (SSO-2827)
 
 `thoryn login` records the hub issuer (`--issuer`) and the customer-plane

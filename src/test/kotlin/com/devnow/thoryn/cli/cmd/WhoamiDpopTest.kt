@@ -83,6 +83,23 @@ class WhoamiDpopTest : CommandTestBase() {
     }
 
     @Test
+    fun `whoami reports the key's protection class and why the secure element was passed over`() {
+        // SSO-3227 — the security property a session actually has is the key CLASS, not merely that a
+        // key exists. Reporting only "here is a jkt" would let an installation believe it has the
+        // hardware guarantee when it silently fell back. The skip reason is the actionable half.
+        seedTokens(Tokens(accessToken = jwt("""{"sub":"u"}"""), expiresAtEpochSecond = Instant.now().epochSecond + 3600))
+
+        val (exit, out, _) = runCli("whoami", "--output", "json")
+
+        assertThat(exit).isEqualTo(0)
+        val keyClass = parseJson(out)["dpopKeyClass"].toString()
+        // The test JVM is pinned non-interactive (see Dpop.resetForTest), so the ladder must land on
+        // the software rung and say that user presence could not be proven here.
+        assertThat(keyClass).startsWith("software_keychain — ")
+        assertThat(keyClass).contains("secure_element unavailable")
+    }
+
+    @Test
     fun `whoami never prints the private key`() {
         seedTokens(Tokens(accessToken = jwt("""{"sub":"u"}"""), expiresAtEpochSecond = Instant.now().epochSecond + 3600))
 
