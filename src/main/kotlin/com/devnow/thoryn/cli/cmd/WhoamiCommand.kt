@@ -50,6 +50,9 @@ class WhoamiCommand : Callable<Int> {
         // Only the PUBLIC thumbprint is ever surfaced: the private key never leaves the secure store.
         val keyThumbprint = runCatching { Dpop.session()?.thumbprint }.getOrNull()
         val boundThumbprint = claims["cnf"]?.get("jkt")?.asString()
+        // SSO-3228 — the name this machine's key is registered under, recorded at login. Absent for
+        // a session whose token is not bound, or one signed in by a CLI that did not register.
+        val deviceName = tokens.deviceName?.takeIf { it.isNotBlank() }
 
         val node: JsonNode = mapper.createObjectNode().apply {
             put("subject", claims["sub"]?.asString())
@@ -68,6 +71,10 @@ class WhoamiCommand : Callable<Int> {
             // whether the stored access token is sender-constrained to it (`cnf.jkt`, minted by the hub).
             keyThumbprint?.let { put("dpopKeyThumbprint", it) }
             put("dpopBound", dpopBinding(tokens.tokenType, boundThumbprint, keyThumbprint))
+            // SSO-3228 — which DEVICE this is, so `thoryn devices revoke <name>` names something the
+            // user has already seen. `id` is what a revoke takes when two machines share a name.
+            deviceName?.let { put("device", it) }
+            tokens.deviceId?.takeIf { it.isNotBlank() }?.let { put("deviceId", it) }
         }
 
         CommandSupport.emitRecord(format, node, { n: JsonNode ->
@@ -86,6 +93,8 @@ class WhoamiCommand : Callable<Int> {
                 "tokenStatus" to n["tokenStatus"]?.asString(),
                 "dpopKeyThumbprint" to n["dpopKeyThumbprint"]?.asString(),
                 "dpopBound" to n["dpopBound"]?.asString(),
+                "device" to n["device"]?.asString(),
+                "deviceId" to n["deviceId"]?.asString(),
             ).filter { it.second != null }
         })
         return CommandSupport.EXIT_OK

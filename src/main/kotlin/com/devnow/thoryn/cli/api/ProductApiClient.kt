@@ -433,6 +433,28 @@ class ProductApiClient(
     fun deleteFederationMember(memberId: String, confirmSlug: String? = null): Unit =
         deleteNoContent("/api/v1/federation-members/${encode(memberId)}", confirmSlug)
 
+    // ── Devices (SSO-3228; hub /account/devices — NOT behind the gateway) ─────
+    //
+    // A registered DPoP key is a named DEVICE the owner can see and revoke. Like the workspace
+    // surface these live on the HUB behind `SCOPE_openid`, so they are called against a client whose
+    // base URL is the hub issuer. Registration additionally needs the request to be DPoP-presented —
+    // which it is whenever the session token is bound, because the scheme follows the token.
+
+    /**
+     * `POST /account/devices` — register (or re-describe) the key THIS session's token is bound to.
+     * Idempotent per key: a re-login updates the name rather than creating a second device.
+     */
+    fun registerDevice(body: Map<String, Any?>): JsonNode =
+        post("/account/devices", body)
+
+    /** `GET /account/devices` — the caller's own devices, each with its key's recent activity. */
+    fun listDevices(): JsonNode =
+        get("/account/devices")
+
+    /** `POST /account/devices/{id}/revoke` — end one device and the sessions its key holds. */
+    fun revokeDevice(deviceId: String, reason: String?): JsonNode =
+        post("/account/devices/${encode(deviceId)}/revoke", mapOf("reason" to reason))
+
     // ── Workspace (SSO-1552; hub /account/[*] — NOT behind the gateway) ────────
     //
     // The hub's workspace surface is gated by `SCOPE_openid` only (any signed-in
