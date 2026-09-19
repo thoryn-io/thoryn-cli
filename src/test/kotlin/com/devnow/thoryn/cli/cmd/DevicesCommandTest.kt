@@ -138,6 +138,102 @@ class DevicesCommandTest : CommandTestBase() {
         assertThat(err).contains("never been registered")
     }
 
+    // ── session state (SSO-3271) ──────────────────────────────────────────────
+
+    private val withSessions = """
+        {"devices":[
+          {"id":"d-1","jkt":"JKT-1","name":"alice-mbp","registered":true,"clientId":"cli",
+           "state":"signed_in",
+           "sessions":{"active":2,"lastIssuedAt":"2026-09-19T09:41:00Z",
+                       "refreshExpiresAt":"2026-10-19T09:41:00Z",
+                       "workspaces":[{"tenantSlug":"acme","environmentSlug":"production","lastSeenAt":"2026-09-19T09:41:00Z"},
+                                     {"tenantSlug":"acme","environmentSlug":"blue","lastSeenAt":"2026-09-18T09:41:00Z"}]},
+           "lastSeenAt":"2026-09-19T09:41:00Z","recentNetworks":["203.0.113"],"revokedAt":null},
+          {"id":"d-2","jkt":"JKT-2","name":"spare","registered":true,"clientId":"cli",
+           "state":"idle","sessions":{"active":0,"lastIssuedAt":null,"refreshExpiresAt":null,"workspaces":[]},
+           "lastSeenAt":"2026-09-02T11:00:00Z","recentNetworks":[],"revokedAt":null}
+        ]}
+    """.trimIndent()
+
+    @Test
+    fun `list shows the state, the live session count and the workspaces each one is in`() {
+        server.enqueue(jsonResponse(200, withSessions))
+
+        val (exit, out, _) = runCli("devices", "list", "--hub", baseUrl())
+
+        assertThat(exit).isEqualTo(0)
+        assertThat(out).contains("STATE").contains("SESSIONS").contains("WORKSPACES")
+        assertThat(out).contains("signed_in").contains("acme/production").contains("acme/blue")
+        assertThat(out)
+            .describedAs("a registered machine holding nothing live is idle, not signed in")
+            .contains("idle")
+    }
+
+    @Test
+    fun `the json output carries the sessions object verbatim for a script to read`() {
+        server.enqueue(jsonResponse(200, withSessions))
+
+        val (exit, out, _) = runCli("devices", "list", "--hub", baseUrl(), "--output", "json")
+
+        assertThat(exit).isEqualTo(0)
+        assertThat(out).contains("\"state\"").contains("\"refreshExpiresAt\"").contains("\"tenantSlug\"")
+    }
+
+    @Test
+    fun `an older hub that sends no session fields still lists, with the columns blank`() {
+        // The SSO-3228 response shape, unchanged. A CLI that required the new fields would break
+        // every user whose hub had not been upgraded yet — and a `state` GUESSED from `registered`
+        // would be worse, since registration is not a session.
+        server.enqueue(jsonResponse(200, twoDevices))
+
+        val (exit, out, _) = runCli("devices", "list", "--hub", baseUrl())
+
+        assertThat(exit).isEqualTo(0)
+        assertThat(out).contains("alice-mbp")
+        assertThat(out)
+            .describedAs("no sessions reported reads as unknown, never as zero")
+            .contains("-")
+        assertThat(out)
+            .describedAs("without `state` the old fields still answer registered / unregistered")
+            .contains("registered")
+        assertThat(out).doesNotContain("signed_in")
+    }
+
+    @Test
+    fun `a null sessions object is read as absent, not as a present value`() {
+        // `node["sessions"]` answers a NullNode for an explicit JSON null — not Kotlin's null. The
+        // SSO-3228 version of this mistake made an unregistered key look revoked.
+        server.enqueue(
+            jsonResponse(
+                200,
+                """{"devices":[{"id":"d-1","name":"alice-mbp","registered":true,"state":null,"sessions":null,
+                    "lastSeenAt":"2026-09-19T09:41:00Z"}]}""".trimIndent(),
+            ),
+        )
+
+        val (exit, out, _) = runCli("devices", "list", "--hub", baseUrl())
+
+        assertThat(exit).isEqualTo(0)
+        assertThat(out).contains("alice-mbp").contains("registered")
+    }
+
+    @Test
+    fun `a revoked device reads revoked with no sessions`() {
+        server.enqueue(
+            jsonResponse(
+                200,
+                """{"devices":[{"id":"d-1","name":"old-laptop","registered":true,"state":"revoked",
+                    "sessions":{"active":0,"workspaces":[]},"revokedAt":"2026-09-18T10:00:00Z",
+                    "lastSeenAt":"2026-08-30T17:15:00Z"}]}""".trimIndent(),
+            ),
+        )
+
+        val (exit, out, _) = runCli("devices", "list", "--hub", baseUrl())
+
+        assertThat(exit).isEqualTo(0)
+        assertThat(out).contains("revoked")
+    }
+
     @Test
     fun `not signed in is guidance, not a stack trace`() {
         clearTokens()

@@ -17,8 +17,11 @@ import java.util.concurrent.Callable
  * OS keychain, and the tokens it receives are sender-constrained to that key. The key therefore
  * stands in for the machine, and registering it gives it a name you can recognise and revoke.
  *
- *  - `list`   — GET hub `/account/devices`: your devices, when each was last seen, and the coarse
- *    networks its key is known on (the SSO-3229 per-key activity, carried in the same response).
+ *  - `list`   — GET hub `/account/devices`: your devices, when each was last seen, the coarse
+ *    networks its key is known on (the SSO-3229 per-key activity, carried in the same response),
+ *    and — SSO-3271 — what each one is doing now: its `state` (`signed_in` / `idle` / `revoked` /
+ *    `unregistered`), how many live sessions are bound to its key, and which workspace and plane
+ *    each belongs to.
  *  - `revoke` — POST hub `/account/devices/{id}/revoke`: ends that machine's sessions and refuses
  *    its key from then on. **Your other machines are untouched** — that is the whole point, and the
  *    difference from signing out everywhere.
@@ -30,6 +33,12 @@ import java.util.concurrent.Callable
  * A key you have used but never registered — one minted by an older CLI — still appears, marked
  * unregistered. It carries no id, so it cannot be revoked individually; signing in again from that
  * machine registers it.
+ *
+ * **Every session field is read tolerantly.** A hub older than SSO-3271 sends no `state` and no
+ * `sessions`, and those columns then read `-` rather than the command failing or inventing a value.
+ * Tolerantly means `NullNode`-aware too: `node["x"]` answers a `NullNode` for an explicit JSON
+ * `null`, which is not Kotlin's null — the SSO-3228 lesson that made an unregistered key look
+ * revoked and sent a revoke to `/account/devices/null/revoke`.
  */
 @Command(
     name = "devices",
@@ -192,7 +201,9 @@ class DevicesCommand : Callable<Int> {
 
     companion object {
 
-        val LIST_HEADERS: List<String> = listOf("NAME", "ID", "CLIENT", "LAST SEEN", "NETWORKS", "STATUS")
+        val LIST_HEADERS: List<String> = listOf(
+            "NAME", "ID", "STATE", "SESSIONS", "LAST SEEN", "WORKSPACES", "CLIENT", "NETWORKS",
+        )
 
         /** The `devices` array of a `GET /account/devices` response — see the unwrap note above. */
         fun devicesOf(body: JsonNode): List<JsonNode> =
@@ -211,16 +222,44 @@ class DevicesCommand : Callable<Int> {
         fun deviceRow(device: JsonNode): List<Any?> = listOf(
             device.textOrNull("name") ?: "(unregistered)",
             device.textOrNull("id") ?: "-",
-            device.textOrNull("clientId") ?: "-",
+            state(device),
+            sessionCount(device),
             device.textOrNull("lastSeenAt") ?: "-",
+            workspaces(device),
+            device.textOrNull("clientId") ?: "-",
             device["recentNetworks"]?.takeIf { it.isArray }?.joinToString(", ") { it.asString() } ?: "-",
-            status(device),
         )
 
-        private fun status(device: JsonNode): String = when {
+        /**
+         * SSO-3271 — what the device is doing, as the hub reports it.
+         *
+         * Read tolerantly: an older hub sends no `state`, and the column then falls back to what
+         * SSO-3228's fields alone can say — revoked, unregistered, or registered. It never guesses
+         * `signed_in`, because registration is not a session and claiming otherwise is exactly the
+         * confusion this field exists to end.
+         */
+        private fun state(device: JsonNode): String = device.textOrNull("state") ?: when {
             device.textOrNull("revokedAt") != null -> "revoked"
             device["registered"]?.takeIf { !it.isNull }?.asBoolean() == false -> "unregistered"
-            else -> "active"
+            else -> "registered"
+        }
+
+        /** The live sessions bound to this device's key; `-` when the hub does not report them. */
+        private fun sessionCount(device: JsonNode): String =
+            device["sessions"]?.takeIf { !it.isNull }?.get("active")?.takeIf { !it.isNull }?.asInt()?.toString()
+                ?: "-"
+
+        /** Which workspace and plane each live session belongs to (`acme/production`). */
+        private fun workspaces(device: JsonNode): String {
+            val entries = device["sessions"]?.takeIf { !it.isNull }
+                ?.get("workspaces")?.takeIf { it.isArray }
+                ?: return "-"
+            val rendered = entries.mapNotNull { entry ->
+                val tenant = entry.textOrNull("tenantSlug") ?: return@mapNotNull null
+                val environment = entry.textOrNull("environmentSlug")
+                if (environment == null) tenant else "$tenant/$environment"
+            }
+            return rendered.takeIf { it.isNotEmpty() }?.joinToString(", ") ?: "-"
         }
 
         /**
