@@ -7,6 +7,7 @@ import com.devnow.thoryn.cli.cmd.BrandingCommand
 import com.devnow.thoryn.cli.cmd.LoginFlowCommand
 import com.devnow.thoryn.cli.cmd.LoginMethodsCommand
 import com.devnow.thoryn.cli.cmd.ClientsCommand
+import com.devnow.thoryn.cli.cmd.DevicesCommand
 import com.devnow.thoryn.cli.cmd.DiagCommand
 import com.devnow.thoryn.cli.cmd.EnvironmentCommand
 import com.devnow.thoryn.cli.cmd.FederationCommand
@@ -43,6 +44,8 @@ import kotlin.system.exitProcess
         LogoutCommand::class,
         WhoamiCommand::class,
         StatusCommand::class,
+        // SSO-3228 — the machines signed in to your account (DPoP keys as named devices).
+        DevicesCommand::class,
         ClientsCommand::class,
         FederationCommand::class,
         WorkspaceCommand::class,

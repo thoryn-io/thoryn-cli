@@ -51,7 +51,9 @@ thoryn login --workspace <slug> [--issuer https://hub.<env>]  # Auth code + PKCE
 thoryn login --client-credentials [--client-id <id>] # SSO-1553/2941 — non-interactive API key (CI); THORYN_API_KEY=<id>:<secret>, auto re-mints on expiry
 thoryn login --status
 thoryn logout [--rotate-key]                 # SSO-3199 — --rotate-key also discards this machine's DPoP key
-thoryn whoami                                # SSO-2860/3199 — identity, scopes, expiry + the DPoP key thumbprint
+thoryn whoami                                # SSO-2860/3199/3228 — identity, scopes, expiry, the DPoP key thumbprint + this device's name
+thoryn devices list                          # SSO-3228 — the machines signed in to your account, with each key's recent networks
+thoryn devices revoke <id|name> [--reason r] # Ends THAT machine's sessions and refuses its key; your other devices keep working
 
 # Tenant configuration (SSO-1552) — thin wrappers over product-api via the gateway.
 thoryn clients list                          # OAuth clients (product-api /api/v1/applications)
@@ -466,6 +468,31 @@ Once the hub marks the `cli` client `dpop_required` and binds `cnf.jkt`,
 `dpopBound` reads `yes (cnf.jkt matches this installation's key)`. A `MISMATCH`
 means the stored token belongs to another installation (or the key was rotated
 since it was issued) — run `thoryn login` again.
+
+### Devices (SSO-3228)
+
+The key stays on the machine, so it stands in for the machine. When a login
+produces a **bound** token, the CLI registers that key as a named **device** —
+hostname by default, `thoryn login --device-name "alice work laptop"` to choose:
+
+```bash
+thoryn devices list
+# NAME         ID    CLIENT  LAST SEEN             NETWORKS                STATUS
+# alice-mbp    d-1   cli     2026-09-19T09:41:00Z  203.0.113, 198.51.100   active
+# (unregistered)  -  cli     2026-08-30T17:15:00Z  192.0.2                 unregistered
+
+thoryn devices revoke alice-mbp --reason "left on a train"
+```
+
+Revoking ends **that machine's** sessions and refuses its key from then on; every
+other machine you are signed in on keeps working. It cannot be undone for that
+key — signing in from that machine again generates a new key and registers a new
+device. The networks are coarse prefixes (IPv4 /24, IPv6 /48), the same record
+the platform's own per-key anomaly signals read.
+
+Registration never fails a sign-in: against a hub that does not have the endpoint,
+or when the token is not bound, the CLI notes it on stderr and you are signed in
+regardless — `thoryn devices list` simply shows that key as unregistered.
 
 **Rotating the key.** `thoryn logout` keeps the key by default: on its own it
 authorises nothing, and keeping it means your next login re-binds to the same

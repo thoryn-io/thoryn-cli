@@ -251,7 +251,34 @@ class LoginCommand : Callable<Int> {
     )
     var devMode: Boolean = false
 
+    /**
+     * SSO-3228 — what to call THIS machine in `thoryn devices list`. Defaults to the hostname, which
+     * is what most people recognise; override it when the hostname is a CI-generated string or when
+     * you hold several machines with the same one.
+     */
+    @Option(
+        names = ["--device-name"],
+        description = ["Name this machine in `thoryn devices list` (default: this machine's hostname)."],
+    )
+    var deviceName: String? = null
+
     private val tokenStore: TokenStore = TokenStoreFactory.default()
+
+    /**
+     * SSO-3228 — persist a freshly-minted session, registering this machine's DPoP key as a named
+     * device when the token is sender-constrained to it.
+     *
+     * Every sign-in path funnels through here so registration cannot be forgotten on one of them.
+     * It runs AFTER the session is stored: the registration call authenticates with the very token
+     * just written, and a hub that refuses (or does not have the endpoint) must not cost the user
+     * their sign-in — see [DeviceRegistrar].
+     */
+    private fun persistSession(tokens: Tokens): Tokens {
+        tokenStore.write(tokens)
+        val registered = DeviceRegistrar.register(tokens, deviceName)
+        if (registered !== tokens) tokenStore.write(registered)
+        return registered
+    }
 
     /**
      * SSO-2827 — stamp the hub issuer + gateway this login used onto the token
@@ -398,7 +425,7 @@ class LoginCommand : Callable<Int> {
             // client id (NOT the secret) so `CommandSupport.forceRefresh` can re-mint a fresh token
             // on expiry from the env-supplied secret, rather than a refresh_token redemption (a
             // client_credentials grant returns no refresh token — RFC 6749 §4.4.3).
-            tokenStore.write(
+            persistSession(
                 withSession(tokens).copy(
                     authMode = Tokens.AUTH_MODE_CLIENT_CREDENTIALS,
                     clientId = creds.clientId,
@@ -532,7 +559,7 @@ class LoginCommand : Callable<Int> {
 
         return try {
             val tokens = flow.run(requestedScope)
-            tokenStore.write(
+            persistSession(
                 tokens.copy(
                     issuer = derivedIssuer,
                     gateway = derivedGateway,
@@ -606,7 +633,7 @@ class LoginCommand : Callable<Int> {
 
         return try {
             val tokens = flow.run(requestedScope)
-            tokenStore.write(withSession(tokens))
+            persistSession(withSession(tokens))
             SelectedWorkspaceStore().clear()
             println("Signed in (workload-identity / '$wifClientId' in tenant '$wifTenantSlug').")
             tokens.scope?.let { println("Scopes: $it") }
@@ -647,7 +674,7 @@ class LoginCommand : Callable<Int> {
                 println()
                 println("Waiting for sign-in (expires in ${authorization.expiresIn / 60} minutes)…")
             }
-            tokenStore.write(withSession(tokens))
+            persistSession(withSession(tokens))
             // SSO-2863 — a fresh login resets the base tenant; drop any stale `workspace switch`
             // selection so later commands don't silently re-exchange into an old workspace.
             SelectedWorkspaceStore().clear()
@@ -735,7 +762,7 @@ class LoginCommand : Callable<Int> {
                 devMode = devMode,
             )
             val tokens = flow.exchange(code)
-            tokenStore.write(withSession(tokens))
+            persistSession(withSession(tokens))
             // SSO-2863 — a fresh login resets the base tenant; drop any stale `workspace switch`
             // selection so later commands don't silently re-exchange into an old workspace.
             SelectedWorkspaceStore().clear()

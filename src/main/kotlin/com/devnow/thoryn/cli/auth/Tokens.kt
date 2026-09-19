@@ -35,6 +35,13 @@ data class Tokens(
     // SSO-3182 — the workspace slug an interactive login signed in on (`thoryn login --workspace <slug>`),
     // so a session that can no longer be renewed can print the exact re-login line. Not a secret.
     val workspace: String? = null,
+    // SSO-3228 — the DEVICE this installation's DPoP key is registered as, recorded when a bound
+    // login registers it. `deviceId` is what `thoryn devices revoke` names; `deviceName` is what
+    // `thoryn whoami` prints. Both null for an unbound session, for a CLI that has not registered
+    // yet, or when registration was refused — the session works either way. Neither is a secret:
+    // the id is an opaque identifier and the name is the one the user chose.
+    val deviceId: String? = null,
+    val deviceName: String? = null,
 ) {
     companion object {
         /** SSO-2941 — [authMode] value marking a non-interactive API-key / client-credentials session. */
