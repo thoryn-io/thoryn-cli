@@ -2,6 +2,7 @@ package com.devnow.thoryn.cli.cmd
 
 import com.devnow.thoryn.cli.auth.Dpop
 import com.devnow.thoryn.cli.auth.JwtClaims
+import com.devnow.thoryn.cli.auth.ParCapability
 import com.devnow.thoryn.cli.auth.TokenStoreFactory
 import com.devnow.thoryn.cli.auth.Tokens
 import com.devnow.thoryn.cli.config.ThorynConfig
@@ -23,7 +24,10 @@ import java.util.concurrent.Callable
  *
  * Probes the two hosts the CLI talks to and reports reachability + latency:
  *  - **hub** — a `GET {hub}/.well-known/openid-configuration` (unauthenticated OIDC discovery);
- *    `200` means the hub is healthy.
+ *    `200` means the hub is healthy. SSO-3234 — the same response answers whether the next
+ *    `thoryn login` will PUSH its authorization request (RFC 9126): the CLI pushes exactly when
+ *    the hub advertises `pushed_authorization_request_endpoint`, so reporting the advertisement
+ *    reports the behaviour, from the one document that decides it and without a second request.
  *  - **gateway** — a `GET {gateway}/api/v1/applications` carrying the CURRENT stored bearer (if
  *    any). Any HTTP response means the gateway is reachable; a `401` means the token was rejected,
  *    anything else (`200/403/404`) means the gateway accepted it.
@@ -62,7 +66,7 @@ class StatusCommand : Callable<Int> {
         gateway = CommandSupport.resolveGateway(gateway, tokens)
 
         val http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(PROBE_TIMEOUT_SECONDS)).build()
-        val hubProbe = probe(http, "${hub.trimEnd('/')}/.well-known/openid-configuration", bearer = null)
+        val hubProbe = probe(http, "${hub.trimEnd('/')}/.well-known/openid-configuration", bearer = null, keepBody = true)
         val gwProbe = probe(http, "${gateway.trimEnd('/')}/api/v1/applications", bearer = tokens?.accessToken)
 
         val claims = tokens?.let { JwtClaims.of(it.accessToken) }
@@ -82,6 +86,11 @@ class StatusCommand : Callable<Int> {
             put("hub", hub)
             put("hubStatus", hubProbe.label)
             hubProbe.latencyMs?.let { put("hubLatencyMs", it) }
+            // SSO-3234 — RFC 9126: whether `thoryn login` pushes, read off the discovery document the
+            // hub probe already fetched. Absent field = this hub does not offer PAR, so the CLI will
+            // send the parameters on the authorize URL.
+            ParCapability.endpointIn(hubProbe.body)?.let { put("pushedAuthorizationRequestEndpoint", it) }
+            put("pushesAuthorizationRequest", ParCapability.endpointIn(hubProbe.body) != null)
             put("gateway", gateway)
             put("gatewayStatus", gwProbe.label)
             gwProbe.latencyMs?.let { put("gatewayLatencyMs", it) }
@@ -111,6 +120,8 @@ class StatusCommand : Callable<Int> {
                 "hub" to n["hub"]?.asString(),
                 "hubStatus" to n["hubStatus"]?.asString(),
                 "hubLatencyMs" to n["hubLatencyMs"]?.asLong(),
+                "pushesAuthorizationRequest" to n["pushesAuthorizationRequest"]?.asBoolean(),
+                "pushedAuthorizationRequestEndpoint" to n["pushedAuthorizationRequestEndpoint"]?.asString(),
                 "gateway" to n["gateway"]?.asString(),
                 "gatewayStatus" to n["gatewayStatus"]?.asString(),
                 "gatewayLatencyMs" to n["gatewayLatencyMs"]?.asLong(),
@@ -128,10 +139,19 @@ class StatusCommand : Callable<Int> {
         return if (ok) CommandSupport.EXIT_OK else CommandSupport.EXIT_IO_ERROR
     }
 
-    /** Result of one reachability probe: [reachable] is true when we got any HTTP response. */
-    private class ProbeResult(val reachable: Boolean, val httpStatus: Int, val label: String, val latencyMs: Long?)
+    /**
+     * Result of one reachability probe: [reachable] is true when we got any HTTP response.
+     * [body] is present only for probes asked to keep it (the hub's discovery document).
+     */
+    private class ProbeResult(
+        val reachable: Boolean,
+        val httpStatus: Int,
+        val label: String,
+        val latencyMs: Long?,
+        val body: String? = null,
+    )
 
-    private fun probe(http: HttpClient, url: String, bearer: String?): ProbeResult {
+    private fun probe(http: HttpClient, url: String, bearer: String?, keepBody: Boolean = false): ProbeResult {
         val builder = HttpRequest.newBuilder(URI.create(url))
             .timeout(Duration.ofSeconds(PROBE_TIMEOUT_SECONDS))
             .header("Accept", "application/json")
@@ -139,9 +159,19 @@ class StatusCommand : Callable<Int> {
         if (bearer != null) builder.header("Authorization", "Bearer $bearer")
         val start = System.nanoTime()
         return try {
-            val response = http.send(builder.build(), HttpResponse.BodyHandlers.discarding())
+            val response = if (keepBody) {
+                http.send(builder.build(), HttpResponse.BodyHandlers.ofString())
+            } else {
+                http.send(builder.build(), HttpResponse.BodyHandlers.discarding())
+            }
             val ms = (System.nanoTime() - start) / 1_000_000
-            ProbeResult(reachable = true, httpStatus = response.statusCode(), label = "HTTP ${response.statusCode()}", latencyMs = ms)
+            ProbeResult(
+                reachable = true,
+                httpStatus = response.statusCode(),
+                label = "HTTP ${response.statusCode()}",
+                latencyMs = ms,
+                body = response.body() as? String,
+            )
         } catch (e: Exception) {
             ProbeResult(reachable = false, httpStatus = -1, label = "unreachable — ${CommandSupport.describeThrowable(e)}", latencyMs = null)
         }

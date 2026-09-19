@@ -14,7 +14,10 @@ import com.devnow.thoryn.cli.auth.IssuerUrlValidationException
 import com.devnow.thoryn.cli.auth.IssuerUrlValidator
 import com.devnow.thoryn.cli.auth.LoopbackRedirectServer
 import com.devnow.thoryn.cli.auth.LoopbackTimeoutException
+import com.devnow.thoryn.cli.auth.ParCapability
+import com.devnow.thoryn.cli.auth.ParPushResult
 import com.devnow.thoryn.cli.auth.PkceUtil
+import com.devnow.thoryn.cli.auth.PushedAuthorizationRequestFlow
 import com.devnow.thoryn.cli.auth.ScopeRegistry
 import com.devnow.thoryn.cli.auth.TokenStore
 import com.devnow.thoryn.cli.auth.TokenStoreFactory
@@ -27,6 +30,7 @@ import com.devnow.thoryn.cli.config.ThorynConfig
 import picocli.CommandLine.Command
 import picocli.CommandLine.Option
 import java.io.File
+import java.io.PrintStream
 import java.time.Duration
 import java.util.concurrent.Callable
 
@@ -708,8 +712,7 @@ class LoginCommand : Callable<Int> {
         return try {
             server.start()
             val redirectUri = server.redirectUri
-            val authorizeUrl = authorizeUrl(
-                issuer = issuer,
+            val parameters = authorizeParameters(
                 clientId = clientId,
                 redirectUri = redirectUri,
                 scope = expandedScope(),
@@ -717,6 +720,10 @@ class LoginCommand : Callable<Int> {
                 state = state,
                 dpopJkt = dpopJkt(),
             )
+            // SSO-3234 — push the parameters back-channel when the hub advertises PAR (RFC 9126),
+            // so the browser carries only `client_id` + an opaque request_uri.
+            val carried = carryAuthorizeRequest(parameters) ?: return EXIT_LOOPBACK_FAILED
+            val authorizeUrl = carried.authorizeUrl
 
             println("Opening your browser to sign in…")
             println("If it doesn't open, visit this URL:")
@@ -724,9 +731,12 @@ class LoginCommand : Callable<Int> {
             println("    $authorizeUrl")
             println()
             BrowserLauncher.open(authorizeUrl)
-            println("Waiting for the sign-in redirect (${LOOPBACK_TIMEOUT.toMinutes()} min)…")
+            // RFC 9126 §2.2 — the pushed request expires; waiting past that would leave the user
+            // staring at a page whose request_uri the hub has already dropped.
+            val wait = carried.wait
+            println("Waiting for the sign-in redirect (${humanWait(wait)})…")
 
-            val params = server.awaitCallback(LOOPBACK_TIMEOUT)
+            val params = server.awaitCallback(wait)
 
             // RFC 6749 §4.1.2.1 — the AS may redirect back with an error instead of a code.
             params["error"]?.let { err ->
@@ -861,7 +871,86 @@ class LoginCommand : Callable<Int> {
         // lands on the next sign-in rather than mid-command. See Dpop.session.
         if (DpopCapability.advertisedBy(issuer.trimEnd('/'))) Dpop.session(provision = true)?.thumbprint else null
 
+    /**
+     * SSO-3234 — decides how this authorize request travels, and returns the URL to open.
+     * Thin wrapper over [carryAuthorizeRequest] with this command's resolved issuer, client and
+     * credential; the decision itself lives in the companion so it can be asserted directly.
+     */
+    private fun carryAuthorizeRequest(parameters: List<Pair<String, String>>): CarriedAuthorizeRequest? =
+        carryAuthorizeRequest(
+            issuer = issuer,
+            clientId = clientId,
+            parameters = parameters,
+            clientSecret = ThorynConfig.resolveClientSecret() ?: clientSecretFile
+                ?.takeIf { it.isFile }
+                ?.readText()
+                ?.trim()
+                ?.takeIf { it.isNotBlank() },
+        )
+
     companion object {
+
+        /** How the authorize request reached the browser, and how long that leaves us to wait. */
+        internal class CarriedAuthorizeRequest(val authorizeUrl: String, val wait: Duration, val pushed: Boolean)
+
+        /**
+         * SSO-3234 — decides how an authorize request travels, and returns the URL to open.
+         *
+         * When the hub advertises `pushed_authorization_request_endpoint` (RFC 9126 §5) the
+         * parameters go back-channel and the browser carries only `client_id` + the opaque
+         * `request_uri` (§4). Otherwise — and when the push could not be DELIVERED — the parameters
+         * ride the URL as they always have, so a released binary keeps working against a hub that
+         * does not offer PAR and against one that is momentarily unwell.
+         *
+         * **A 4xx is not a reason to fall back.** It means the hub understood the push and rejected
+         * it. Falling back would hide a real misconfiguration behind a sign-in that half-works —
+         * and, worse, would hand anything able to forge a single `400` a way to strip PAR off every
+         * sign-in and put the parameters back in the browser, which is precisely the exposure PAR
+         * exists to remove. Returns null, which the caller turns into a failed login.
+         *
+         * The wait is clipped to the pushed request's own `expires_in` when the hub names a shorter
+         * one than [LOOPBACK_TIMEOUT]: the `request_uri` is single-use and expiring (§2.2, §4), so
+         * waiting past it only produces a more confusing failure later.
+         */
+        internal fun carryAuthorizeRequest(
+            issuer: String,
+            clientId: String,
+            parameters: List<Pair<String, String>>,
+            clientSecret: String? = null,
+            err: PrintStream = System.err,
+        ): CarriedAuthorizeRequest? {
+            val parEndpoint = ParCapability.endpointFor(issuer.trimEnd('/'))
+                ?: return CarriedAuthorizeRequest(authorizeUrl(issuer, parameters), LOOPBACK_TIMEOUT, pushed = false)
+
+            // The push deliberately does NOT go through `realHttpSender()`: that sender attaches a
+            // DPoP proof to anything on this host, and RFC 9449 §10.1's two mechanisms are an
+            // either/or. `dpop_jkt` is already in `parameters`. See PushedAuthorizationRequestFlow.
+            return when (val result = PushedAuthorizationRequestFlow(parEndpoint).push(parameters, clientSecret)) {
+                is ParPushResult.Pushed -> CarriedAuthorizeRequest(
+                    authorizeUrl = authorizeUrlForRequestUri(issuer, clientId, result.requestUri),
+                    wait = waitFor(result.expiresIn),
+                    pushed = true,
+                )
+
+                is ParPushResult.Unavailable -> {
+                    err.println(
+                        "Note: could not push the authorization request (${result.reason}); " +
+                            "continuing with the parameters on the authorize URL.",
+                    )
+                    CarriedAuthorizeRequest(authorizeUrl(issuer, parameters), LOOPBACK_TIMEOUT, pushed = false)
+                }
+
+                is ParPushResult.Refused -> {
+                    val detail = listOfNotNull(result.errorCode, result.description).joinToString(" — ")
+                    err.println(
+                        "Sign-in failed: the hub rejected the pushed authorization request " +
+                            "(HTTP ${result.status}${if (detail.isNotBlank()) ": $detail" else ""}).",
+                    )
+                    null
+                }
+            }
+        }
+
         /**
          * SSO-3182 — the exact re-login line for a session: `thoryn login --workspace <slug>` when the
          * session recorded (or its tenant issuer names) a workspace, else plain `thoryn login`.
@@ -908,17 +997,65 @@ class LoginCommand : Callable<Int> {
             codeChallenge: String,
             state: String,
             dpopJkt: String?,
-        ): String = buildString {
+        ): String = authorizeUrl(
+            issuer,
+            authorizeParameters(clientId, redirectUri, scope, codeChallenge, state, dpopJkt),
+        )
+
+        /**
+         * SSO-3234 — the authorize request as an ordered parameter list, which is the shape RFC 9126
+         * §2.1 wants in the POST body and the shape the plain authorize URL is built from.
+         *
+         * One list, two carriers: whichever way the request travels, it is the same request. That is
+         * what keeps a parameter from being present front-channel and missing back-channel — the
+         * failure mode that would make `dpop_jkt` (RFC 9449 §10) or PKCE silently stop binding.
+         */
+        internal fun authorizeParameters(
+            clientId: String,
+            redirectUri: String,
+            scope: String,
+            codeChallenge: String,
+            state: String,
+            dpopJkt: String?,
+        ): List<Pair<String, String>> = buildList {
+            add("response_type" to "code")
+            add("client_id" to clientId)
+            add("redirect_uri" to redirectUri)
+            add("scope" to scope)
+            add("code_challenge" to codeChallenge)
+            add("code_challenge_method" to "S256")
+            add("state" to state)
+            // Null omits it entirely rather than sending an empty one: "no key named" and "a key
+            // named badly" are very different requests to the hub.
+            dpopJkt?.takeIf { it.isNotBlank() }?.let { add("dpop_jkt" to it) }
+        }
+
+        /** The front-channel carrier: every parameter on the URL the browser opens. */
+        internal fun authorizeUrl(issuer: String, parameters: List<Pair<String, String>>): String = buildString {
             append(issuer.trimEnd('/'))
-            append("/oauth2/authorize")
-            append("?response_type=code")
-            append("&client_id=").append(encode(clientId))
-            append("&redirect_uri=").append(encode(redirectUri))
-            append("&scope=").append(encode(scope))
-            append("&code_challenge=").append(encode(codeChallenge))
-            append("&code_challenge_method=S256")
-            append("&state=").append(encode(state))
-            dpopJkt?.takeIf { it.isNotBlank() }?.let { append("&dpop_jkt=").append(encode(it)) }
+            append("/oauth2/authorize?")
+            append(parameters.joinToString("&") { (k, v) -> "${encode(k)}=${encode(v)}" })
+        }
+
+        /**
+         * SSO-3234 — the back-channel carrier: RFC 9126 §4's authorize URL, which carries **only**
+         * `client_id` and the opaque `request_uri`. Nothing else belongs here — a parameter repeated
+         * alongside `request_uri` is at best ignored and at worst a second, conflicting request.
+         */
+        internal fun authorizeUrlForRequestUri(issuer: String, clientId: String, requestUri: String): String =
+            "${issuer.trimEnd('/')}/oauth2/authorize" +
+                "?client_id=${encode(clientId)}" +
+                "&request_uri=${encode(requestUri)}"
+
+        /** The loopback wait, clipped to a pushed request's lifetime when the hub named a shorter one. */
+        internal fun waitFor(expiresInSeconds: Long?): Duration {
+            val expiry = expiresInSeconds?.takeIf { it > 0 }?.let { Duration.ofSeconds(it) } ?: return LOOPBACK_TIMEOUT
+            return if (expiry < LOOPBACK_TIMEOUT) expiry else LOOPBACK_TIMEOUT
+        }
+
+        internal fun humanWait(wait: Duration): String {
+            val minutes = wait.toMinutes()
+            return if (minutes >= 1) "$minutes min" else "${wait.toSeconds()}s"
         }
 
         private fun encode(s: String): String = java.net.URLEncoder.encode(s, Charsets.UTF_8)
