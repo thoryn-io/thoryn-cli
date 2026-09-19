@@ -149,11 +149,32 @@ class DpopKeyProviderTest {
     fun `a non-interactive invocation never selects the secure element`() {
         // The whole point: a CI runner cannot answer a fingerprint prompt, so the hardware rung must
         // refuse itself BEFORE any native call rather than hanging a pipeline on a dialog.
+        //
+        // The platform is pinned rather than read, deliberately. CI runs on Linux, where a real
+        // platform check answers "no secure element" first and this test would pass without ever
+        // exercising the rule it exists to protect — on the very machine the rule protects.
         Tty.override = false
 
-        val status = SecureElementDpopKeyProvider(interactive = { Tty.interactive() }).status()
+        val status = SecureElementDpopKeyProvider(
+            interactive = { Tty.interactive() },
+            secureElementPlatform = { true },
+        ).status()
 
         assertThat(status).isEqualTo(ProviderStatus.Unavailable(SecureElementUnavailable.NON_INTERACTIVE))
+    }
+
+    @Test
+    fun `a platform with no secure element says so, before asking about terminals`() {
+        // Ordering matters for the message: "no supported secure element" is the useful answer on
+        // Linux/Windows today, and it must not be masked by an unrelated complaint about the terminal.
+        Tty.override = false
+
+        val status = SecureElementDpopKeyProvider(
+            interactive = { Tty.interactive() },
+            secureElementPlatform = { false },
+        ).status()
+
+        assertThat(status).isEqualTo(ProviderStatus.Unavailable(SecureElementUnavailable.NOT_SUPPORTED))
     }
 
     @Test

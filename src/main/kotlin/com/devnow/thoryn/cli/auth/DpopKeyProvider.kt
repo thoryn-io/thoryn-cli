@@ -63,12 +63,19 @@ internal class SecureElementDpopKeyProvider(
     private val applicationTag: String = SecureEnclave.APPLICATION_TAG,
     private val interactive: () -> Boolean = { Tty.interactive() },
     private val clock: () -> Instant = { Instant.now() },
+    /**
+     * Whether this machine has a secure-element backend at all. A seam rather than a direct
+     * [SecureEnclave.isMacOs] call so the **non-interactive refusal can be tested on every OS** — that
+     * rule is what keeps CI from blocking on a prompt, and CI runs on Linux, where a platform check
+     * would short-circuit the test into never exercising it.
+     */
+    private val secureElementPlatform: () -> Boolean = { SecureEnclave.isMacOs() },
 ) : DpopKeyProvider {
 
     override val keyClass: DpopKeyClass = DpopKeyClass.SECURE_ELEMENT
 
     override fun status(): ProviderStatus {
-        if (!SecureEnclave.isMacOs()) return ProviderStatus.Unavailable(SecureElementUnavailable.NOT_SUPPORTED)
+        if (!secureElementPlatform()) return ProviderStatus.Unavailable(SecureElementUnavailable.NOT_SUPPORTED)
         // Presence cannot be proven without a human, so a hardware key is unusable in CI even when the
         // enclave is right there. Checked before any native call: cheap, and it keeps CI off this path.
         if (!interactive()) return ProviderStatus.Unavailable(SecureElementUnavailable.NON_INTERACTIVE)
@@ -83,7 +90,7 @@ internal class SecureElementDpopKeyProvider(
         val existing = SecureEnclave.findKey(applicationTag)
         val keyRef: Pointer = when {
             existing != null -> existing
-            provision -> SecureEnclave.createKey(applicationTag)
+            provision -> create()
             else -> throw SecureElementException("no Secure Enclave key for this installation yet", null)
         }
         val publicKey = DpopKey.publicKeyFromX963(SecureEnclave.publicPoint(keyRef))
@@ -96,7 +103,23 @@ internal class SecureElementDpopKeyProvider(
     }
 
     override fun delete(): Boolean =
-        if (!SecureEnclave.isMacOs()) false else runCatching { SecureEnclave.deleteKey(applicationTag) }.getOrDefault(false)
+        if (!secureElementPlatform()) false else runCatching { SecureEnclave.deleteKey(applicationTag) }.getOrDefault(false)
+
+    /**
+     * Create the key, translating the one failure that is expected rather than exceptional into words
+     * that name the fix. `errSecMissingEntitlement` means the binary is not code-signed with a
+     * keychain-access-group entitlement — true of every released `thoryn` binary today — and the raw
+     * "could not be created or stored (OSStatus -34018)" tells a user nothing they can act on, while
+     * this reason reaches them verbatim through the ladder's skip list.
+     */
+    private fun create(): Pointer = try {
+        SecureEnclave.createKey(applicationTag)
+    } catch (e: SecureElementException) {
+        if (e.osStatus == SecureEnclave.ERR_SEC_MISSING_ENTITLEMENT) {
+            throw SecureElementException(SecureElementUnavailable.MISSING_ENTITLEMENT, e.osStatus)
+        }
+        throw e
+    }
 }
 
 /**
@@ -116,7 +139,28 @@ internal class SecureEnclaveSigner(
 
     override fun signDer(signingInput: ByteArray): ByteArray {
         UserPresence.announceIfDue(err)
-        val signature = SecureEnclave.sign(keyRef, signingInput)
+        val signature = try {
+            SecureEnclave.sign(keyRef, signingInput)
+        } catch (e: SecureElementException) {
+            // Declining the prompt is a DECISION, not a fault: fail the command with a sentence that
+            // says what happened and how to proceed. Deliberately NOT a fall-back to the software key —
+            // quietly signing with a weaker key after the user declined to prove presence would undo
+            // the whole guarantee, and would do it invisibly.
+            throw when (e.osStatus) {
+                SecureEnclave.ERR_SEC_USER_CANCELED -> SecureElementException(
+                    "the presence check was cancelled, so this request was not signed. Run the command " +
+                        "again and approve the prompt, or use `thoryn logout --rotate-key` to drop back " +
+                        "to a software key.",
+                    e.osStatus,
+                )
+                SecureEnclave.ERR_SEC_AUTH_FAILED -> SecureElementException(
+                    "your presence could not be verified, so this request was not signed. Try again, or " +
+                        "unlock the machine and retry.",
+                    e.osStatus,
+                )
+                else -> e
+            }
+        }
         // Only a signature the enclave actually produced proves presence was satisfied.
         UserPresence.recordVerified()
         return signature

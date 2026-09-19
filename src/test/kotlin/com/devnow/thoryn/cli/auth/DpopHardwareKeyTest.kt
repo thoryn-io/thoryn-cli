@@ -172,6 +172,39 @@ class DpopHardwareKeyTest {
             .hasMessageContaining("non-exportable")
     }
 
+    // ── declining the prompt ─────────────────────────────────────────────────
+
+    @Test
+    fun `a cancelled presence check fails the request rather than silently signing with a weaker key`() {
+        // The tempting "helpful" behaviour — fall back to the software key when the user declines — would
+        // undo the entire guarantee, invisibly. Declining must fail, and say so in a sentence.
+        val signer = object : DpopSigner {
+            override fun signDer(signingInput: ByteArray): ByteArray =
+                throw SecureElementException("the Secure Enclave refused to sign", SecureEnclave.ERR_SEC_USER_CANCELED)
+        }
+        val pair = p256()
+        val key = DpopKey.hardware(signer, DpopKey.publicKeyFromX963(x963(pair.public as ECPublicKey)), Instant.EPOCH)
+
+        assertThatThrownBy { DpopSession(key).proof("GET", URI.create("https://api.example.test/x")) }
+            .isInstanceOf(SecureElementException::class.java)
+    }
+
+    @Test
+    fun `the OSStatus codes the CLI translates are the documented ones`() {
+        // Pinned because they are magic numbers copied from SecBase.h — a typo here would turn a
+        // cancelled prompt into an unexplained stack trace.
+        assertThat(SecureEnclave.ERR_SEC_MISSING_ENTITLEMENT).isEqualTo(-34018)
+        assertThat(SecureEnclave.ERR_SEC_USER_CANCELED).isEqualTo(-128)
+        assertThat(SecureEnclave.ERR_SEC_AUTH_FAILED).isEqualTo(-25293)
+    }
+
+    @Test
+    fun `a SecureElementException carries its OSStatus in the message`() {
+        // The ladder surfaces this message verbatim as the skip reason, so the code has to travel with it.
+        assertThat(SecureElementException("nope", -34018).message).contains("nope").contains("-34018")
+        assertThat(SecureElementException("nope", null).message).isEqualTo("nope")
+    }
+
     // ── cadence, through the real signer wrapper ─────────────────────────────
 
     @Test
