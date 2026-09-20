@@ -527,10 +527,10 @@ since it was issued) — run `thoryn login` again.
 authorises nothing, and keeping it means your next login re-binds to the same
 `jkt`. `thoryn logout --rotate-key` discards it, so the next login generates a
 new one and every token bound to the old thumbprint stops working — the right
-move when handing the machine on or if the key may have leaked. It does not
-revoke the **device** record that named the old key (see below); the next login
-registers the new key as a new device, and the stale row is worth clearing with
-`thoryn devices revoke <id>`.
+move when handing the machine on or if the key may have leaked. It also **revokes
+the device record that named the old key** (SSO-3270), so the account's device
+list does not go on offering a machine that can no longer sign anything; the next
+login registers the new key as a new device under the same name.
 
 **Hub-side flip.** Requiring proofs is the *other half* of SSO-3199 and lives in
 `oathy` (step 2): flip `dpop_required=true` on the `cli` client and require
@@ -576,7 +576,17 @@ thoryn whoami --check --output table
 # tokenStatus      valid (expires in 0h 42m)
 # deviceState      revoked
 # deviceSessions   0 live
+# Notice: this device is revoked — the current access token is accepted until
+#   2026-09-20T10:16:44Z; the next refresh will be refused. Run `thoryn login`
+#   to register a new device.
 ```
+
+Those two lines are both true and read as a contradiction, so `--check` explains
+them (SSO-3279): a resource server checks the token's signature and expiry, not
+the device register, so the token in your keychain keeps working until it expires
+— what is already gone is the renewal. The exit code is unchanged (nothing has
+failed yet), and `--output json|yaml` carries the sentence as a `deviceNotice`
+field rather than as prose a script would have to match on.
 
 Revoking ends **that machine's** sessions and refuses its key from then on; every
 other machine you are signed in on keeps working. It cannot be undone for that
@@ -587,6 +597,24 @@ the platform's own per-key anomaly signals read.
 Registration never fails a sign-in: against a hub that does not have the endpoint,
 or when the token is not bound, the CLI notes it on stderr and you are signed in
 regardless — `thoryn devices list` simply shows that key as unregistered.
+
+**Rotating the key revokes this device; the next login registers a new one**
+(SSO-3270). The device record names the key, so discarding the key without it
+would leave a row for a machine that can no longer sign anything:
+
+```bash
+thoryn logout --rotate-key
+# Signed out (local tokens cleared).
+# Device 'alice-mbp' revoked at the hub (2 sessions ended).
+# DPoP key discarded — the next `thoryn login` generates a new one.
+```
+
+The revoke goes out **before** the key is discarded, because the hub requires it
+to be signed by the very key being retired. Nothing there can fail the logout: an
+unreachable hub, an already-ended session or an already-revoked device each print
+one note naming `thoryn devices revoke <id>` to finish the job from another
+machine, and the sign-out completes regardless. Plain `thoryn logout` keeps the
+key, so it keeps the device — the next login re-binds to the same `jkt`.
 
 ### Key classes — where the private key lives (SSO-3227)
 

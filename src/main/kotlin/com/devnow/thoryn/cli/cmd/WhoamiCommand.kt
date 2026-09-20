@@ -4,6 +4,7 @@ import com.devnow.thoryn.cli.api.ProductApiException
 import com.devnow.thoryn.cli.auth.Dpop
 import com.devnow.thoryn.cli.auth.JwtClaims
 import com.devnow.thoryn.cli.config.ThorynConfig
+import com.devnow.thoryn.cli.output.OutputFormat
 import picocli.CommandLine.Command
 import picocli.CommandLine.Option
 import tools.jackson.databind.JsonNode
@@ -125,8 +126,14 @@ class WhoamiCommand : Callable<Int> {
                     // another workspace. Either way, inventing a state would be worse than saying so.
                     node.put("deviceState", "unknown (the hub has no device for this installation's key)")
                 } else {
-                    node.put("deviceState", mine.textOrNull("state") ?: "unknown")
+                    val deviceState = mine.textOrNull("state") ?: "unknown"
+                    node.put("deviceState", deviceState)
                     mine["sessions"]?.takeIf { !it.isNull }?.let { node.set("deviceSessions", it) }
+                    // SSO-3279 — `deviceState: revoked` beside `tokenStatus: valid` is the whole
+                    // reason `--check` exists, and on its own it reads like a contradiction. Say what
+                    // it means for the person in front of the terminal: the token in the keychain
+                    // goes on being accepted until it expires, and the renewal after that is refused.
+                    if (deviceState == DEVICE_STATE_REVOKED) node.put("deviceNotice", revokedNotice(expiresAtIso))
                 }
             } catch (ex: ProductApiException) {
                 return CommandSupport.renderError(format, ex)
@@ -158,8 +165,28 @@ class WhoamiCommand : Callable<Int> {
                 "deviceSessions" to n["deviceSessions"]?.let(::describeSessions),
             ).filter { it.second != null }
         })
+        // SSO-3279 — the notice is a SENTENCE, and a key/value row is the wrong shape for one: it
+        // would wrap inside a column and read as another field. So the table prints it after the
+        // record, marked, on stderr — while `--output json|yaml` carries it as `deviceNotice`, a
+        // field a script can branch on rather than a line it would have to match on text.
+        if (format == OutputFormat.TABLE) {
+            node["deviceNotice"]?.takeIf { !it.isNull }?.asString()?.let { System.err.println("Notice: $it") }
+        }
         return CommandSupport.EXIT_OK
     }
+
+    /**
+     * SSO-3279 — what a revoked device means for THIS session, in one sentence.
+     *
+     * Deliberately not an error and deliberately not an exit code: nothing has failed yet. The
+     * access token in the keychain still validates — a resource server checks its signature and
+     * expiry, not the device register — so every command keeps working until it expires. What is
+     * already gone is the renewal: the refresh is bound to a key the hub now refuses.
+     */
+    private fun revokedNotice(expiresAtIso: String?): String =
+        "this device is revoked — the current access token is accepted until " +
+            "${expiresAtIso ?: "it expires"}; the next refresh will be refused. " +
+            "Run `thoryn login` to register a new device."
 
     /**
      * The entry in `GET /account/devices` that is THIS installation, matched by key thumbprint.
@@ -248,5 +275,8 @@ class WhoamiCommand : Callable<Int> {
 
     private companion object {
         val mapper = ObjectMapper()
+
+        /** SSO-3271's wire value for a device the hub refuses — the one state that needs explaining. */
+        const val DEVICE_STATE_REVOKED = "revoked"
     }
 }

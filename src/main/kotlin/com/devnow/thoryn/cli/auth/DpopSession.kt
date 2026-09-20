@@ -309,8 +309,15 @@ object Dpop {
 
     /**
      * Delete the stored key so the next command generates a fresh one — `thoryn logout --rotate-key`.
-     * Returns true when a key was present. The hub side needs no cleanup: a `cnf.jkt` only ever binds a
-     * token, and the tokens are being discarded in the same breath.
+     * Returns true when a key was present.
+     *
+     * **SSO-3270 — the hub side DOES need cleanup, and the caller does it first.** This said the
+     * opposite, on the grounds that a `cnf.jkt` only ever binds a token and the tokens are discarded
+     * in the same breath. That answers the security question and no other: the `dpop_device` row
+     * registered for this key survives it, so the account's device list goes on offering a machine
+     * that can no longer sign anything. `logout` therefore runs
+     * [com.devnow.thoryn.cli.cmd.DeviceRetirement] BEFORE this — the revoke has to be signed by the
+     * very key this deletes, so afterwards is too late.
      *
      * SSO-3227 — this asks **every** rung of the ladder to delete, not just the one currently
      * selected. A machine can hold both a Secure Enclave key and an older software key (that is

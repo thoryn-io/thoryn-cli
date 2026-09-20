@@ -23,6 +23,12 @@ import java.util.concurrent.Callable
  * instead (the right move when handing the machine on, or when the key may have leaked); every token
  * bound to the old thumbprint becomes unusable at that moment. Only the PUBLIC thumbprint is ever
  * printed — the private key never leaves the secure store.
+ *
+ * **Retiring the device with it (SSO-3270).** Discarding the key orphans the hub-side device record
+ * that named it, so `--rotate-key` revokes that device FIRST — while the session and the key the
+ * call has to be signed by both still exist. See [DeviceRetirement] for the ordering and for why no
+ * failure there can stop a logout. Plain `logout` keeps the key, so it keeps the device: the next
+ * login re-binds to the same `jkt` and the same row.
  */
 @Command(
     name = "logout",
@@ -46,13 +52,25 @@ class LogoutCommand : Callable<Int> {
     private val tokenStore: TokenStore = TokenStoreFactory.default()
 
     override fun call(): Int {
+        // SSO-3270 — revoke, THEN discard the key, THEN clear the session. The revoke needs both of
+        // the things this command destroys: the session to authenticate with, and the key being
+        // retired to sign its DPoP proof. Reading the tokens before anything is deleted is what
+        // makes that order possible; the outcome is printed below, in reading order rather than
+        // execution order. Nothing here can fail the logout — see [DeviceRetirement].
+        val deviceNote = if (rotateKey) {
+            val tokens = runCatching { tokenStore.read() }.getOrNull()
+            DeviceRetirement.revokeRetiredDevice(tokens)
+        } else {
+            null
+        }
+        val rotated = if (rotateKey) Dpop.rotate() else null
         tokenStore.delete()
         out.println("Signed out (local tokens cleared).")
+        deviceNote?.let { out.println(it) }
 
         if (rotateKey) {
-            val had = Dpop.rotate()
             out.println(
-                if (had) "DPoP key discarded — the next `thoryn login` generates a new one."
+                if (rotated == true) "DPoP key discarded — the next `thoryn login` generates a new one."
                 else "No DPoP key was stored; the next `thoryn login` generates one.",
             )
         } else {

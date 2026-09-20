@@ -313,6 +313,70 @@ class DevicesCommandTest : CommandTestBase() {
         assertThat(out).contains("1789848418")
     }
 
+    // ── revokedAt (SSO-3279) ──────────────────────────────────────────────────
+
+    /**
+     * SSO-3275 routed the LAST SEEN **column** through [com.devnow.thoryn.cli.output.Timestamps] and
+     * left the revoke's own confirmation on `asString()`, so live against staging
+     * `thoryn devices revoke Mac.home` answered `revokedAt = 1789896884`. Same hub field type, same
+     * four wire shapes — and it is the line confirming an action the person has just taken, which
+     * makes it the worst place on the surface to print an epoch.
+     */
+    private fun revokedAtResponse(revokedAt: String) = jsonResponse(
+        200,
+        """{"id":"d-1","jkt":"JKT-1","name":"alice-mbp","revokedAt":$revokedAt,"revokedSessions":2}""",
+    )
+
+    @Test
+    fun `revoke renders revokedAt sent as an epoch as a timestamp and an age`() {
+        server.enqueue(jsonResponse(200, twoDevices))
+        server.enqueue(revokedAtResponse("1789896884"))
+
+        val (exit, out, _) = runCli("devices", "revoke", "d-1", "--hub", baseUrl())
+
+        assertThat(exit).isEqualTo(0)
+        assertThat(out)
+            .describedAs("the SSO-3279 report: `revokedAt = 1789896884`, seen live with cli-v0.24.0")
+            .doesNotContain("1789896884")
+        assertThat(out).contains("2026-09-20T09:34:44Z").contains("ago")
+    }
+
+    @Test
+    fun `revoke renders revokedAt sent as an ISO instant as the same moment`() {
+        server.enqueue(jsonResponse(200, twoDevices))
+        server.enqueue(revokedAtResponse(""""2026-09-20T09:34:44Z""""))
+
+        val (exit, out, _) = runCli("devices", "revoke", "d-1", "--hub", baseUrl())
+
+        assertThat(exit).isEqualTo(0)
+        assertThat(out).contains("2026-09-20T09:34:44Z").contains("ago")
+    }
+
+    @Test
+    fun `revoke json keeps the hub's own revokedAt, untouched by the table rendering`() {
+        // The SSO-3082 rule again: only the TABLE rendering is the CLI's to decide.
+        server.enqueue(jsonResponse(200, twoDevices))
+        server.enqueue(revokedAtResponse("1789896884"))
+
+        val (exit, out, _) = runCli("devices", "revoke", "d-1", "--hub", baseUrl(), "--output", "json")
+
+        assertThat(exit).isEqualTo(0)
+        assertThat(out).contains("1789896884")
+    }
+
+    @Test
+    fun `revoke shows an unrecognised revokedAt verbatim rather than dropping it`() {
+        server.enqueue(jsonResponse(200, twoDevices))
+        server.enqueue(revokedAtResponse(""""last tuesday""""))
+
+        val (exit, out, _) = runCli("devices", "revoke", "d-1", "--hub", baseUrl())
+
+        assertThat(exit).isEqualTo(0)
+        assertThat(out)
+            .describedAs("a hub's own value is shown even when the CLI cannot parse it — never guessed at")
+            .contains("last tuesday")
+    }
+
     @Test
     fun `not signed in is guidance, not a stack trace`() {
         clearTokens()
