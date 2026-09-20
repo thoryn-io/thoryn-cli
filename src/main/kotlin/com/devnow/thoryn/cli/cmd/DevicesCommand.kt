@@ -143,7 +143,12 @@ class DevicesCommand : Callable<Int> {
                     listOf(
                         "id" to n["id"]?.asString(),
                         "name" to n["name"]?.asString(),
-                        "revokedAt" to n["revokedAt"]?.asString(),
+                        // SSO-3279 — the SAME renderer the LAST SEEN column uses. SSO-3275 fixed the
+                        // list and left this line on `asString()`, so the confirmation of the action
+                        // a person had just taken printed `revokedAt = 1789896884`. The hub declares
+                        // `revokedAt` as an `Instant` and each hub's Jackson picks its own wire shape
+                        // for one; [Timestamps] decides the rendering and accepts all of them.
+                        "revokedAt" to Timestamps.render(n["revokedAt"]),
                         "revokedSessions" to n["revokedSessions"]?.asInt(),
                     )
                 })

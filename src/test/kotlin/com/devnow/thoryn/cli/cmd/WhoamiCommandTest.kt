@@ -190,4 +190,108 @@ class WhoamiCommandTest : CommandTestBase() {
         assertThat(exit).isEqualTo(0)
         assertThat(parseJson(out)["deviceState"]).isEqualTo("unknown")
     }
+
+    // ── the revoked-device notice (SSO-3279) ──────────────────────────────────
+
+    /**
+     * Seen live on staging with cli-v0.24.0: after revoking the CURRENT device, `--check` printed
+     * `deviceState revoked` immediately beside `tokenStatus valid (expires in 13m)` and said nothing
+     * more. Both lines are true and together they read as a contradiction — the notice is what turns
+     * them into one fact: the token in the keychain is accepted until it expires, and the renewal
+     * after that is already refused.
+     */
+    private fun revokedDeviceSession(): Long {
+        val expiresAt = Instant.now().epochSecond + 3600
+        seedTokens(
+            Tokens(
+                accessToken = jwt("""{"sub":"user-123","tnt":"acme","cnf":{"jkt":"JKT-1"}}"""),
+                expiresAtEpochSecond = expiresAt,
+                issuer = "https://hub.stg.thoryn.org",
+            ),
+        )
+        server.enqueue(
+            jsonResponse(
+                200,
+                """{"devices":[{"id":"d-1","jkt":"JKT-1","name":"alice-mbp","state":"revoked",
+                    "sessions":{"active":0,"workspaces":[]}}]}""".trimIndent(),
+            ),
+        )
+        return expiresAt
+    }
+
+    @Test
+    fun `--check on a revoked device carries the explanation as a json field, not as free text`() {
+        val expiresAt = revokedDeviceSession()
+
+        val (exit, out, _) = runCli("whoami", "--check", "--hub", baseUrl(), "--output", "json")
+
+        assertThat(exit)
+            .describedAs("nothing has failed yet — the exit code is unchanged")
+            .isEqualTo(0)
+        val json = parseJson(out)
+        assertThat(json["deviceNotice"].toString())
+            .contains("this device is revoked")
+            // The token's own expiry, so the sentence says until WHEN it keeps working.
+            .contains(Instant.ofEpochSecond(expiresAt).toString())
+            .contains("the next refresh will be refused")
+            .contains("thoryn login")
+        // A field is something a script can branch on; a line of prose on stdout is something it
+        // would have to match on text.
+        assertThat(json["tokenStatus"].toString()).contains("valid")
+    }
+
+    @Test
+    fun `--check prints the revoked notice after the fields, marked, on stderr`() {
+        revokedDeviceSession()
+
+        val (exit, out, err) = runCli("whoami", "--check", "--hub", baseUrl(), "--output", "table")
+
+        assertThat(exit).isEqualTo(0)
+        assertThat(err).contains("Notice: this device is revoked")
+        assertThat(out)
+            .describedAs("a sentence is the wrong shape for a key/value row — it goes after the record")
+            .contains("deviceState")
+            .doesNotContain("deviceNotice")
+    }
+
+    @Test
+    fun `a device that is not revoked gets no notice`() {
+        seedTokens(
+            Tokens(
+                accessToken = jwt("""{"sub":"user-123","tnt":"acme","cnf":{"jkt":"JKT-1"}}"""),
+                expiresAtEpochSecond = Instant.now().epochSecond + 3600,
+            ),
+        )
+        server.enqueue(
+            jsonResponse(
+                200,
+                """{"devices":[{"id":"d-1","jkt":"JKT-1","name":"alice-mbp","state":"signed_in",
+                    "sessions":{"active":1,"workspaces":[]}}]}""".trimIndent(),
+            ),
+        )
+
+        val (exit, out, err) = runCli("whoami", "--check", "--hub", baseUrl(), "--output", "json")
+
+        assertThat(exit).isEqualTo(0)
+        assertThat(parseJson(out)).doesNotContainKey("deviceNotice")
+        assertThat(err).doesNotContain("Notice:")
+    }
+
+    @Test
+    fun `a hub that knows no device for this key gets no revoked notice either`() {
+        // `unknown (…)` is not `revoked`: the honest "we were not told" must not be dressed up as a
+        // revocation, which would send someone re-running `thoryn login` for no reason.
+        seedTokens(
+            Tokens(
+                accessToken = jwt("""{"sub":"user-123","tnt":"acme","cnf":{"jkt":"JKT-NONE"}}"""),
+                expiresAtEpochSecond = Instant.now().epochSecond + 3600,
+            ),
+        )
+        server.enqueue(jsonResponse(200, """{"devices":[]}"""))
+
+        val (exit, out, _) = runCli("whoami", "--check", "--hub", baseUrl(), "--output", "json")
+
+        assertThat(exit).isEqualTo(0)
+        assertThat(parseJson(out)).doesNotContainKey("deviceNotice")
+    }
 }
