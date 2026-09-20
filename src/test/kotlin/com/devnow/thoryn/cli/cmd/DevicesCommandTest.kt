@@ -234,6 +234,85 @@ class DevicesCommandTest : CommandTestBase() {
         assertThat(out).contains("revoked")
     }
 
+    // ── LAST SEEN (SSO-3275) ──────────────────────────────────────────────────
+
+    /**
+     * The released cli-v0.23.0 printed `LAST SEEN 1789848418` against staging: the hub declares
+     * `DeviceView.lastSeenAt` as an `Instant`, and the CLI printed whatever that hub's Jackson put
+     * on the wire. Which of the four shapes a given hub sends is not the CLI's to assume — so each
+     * one is served here from the mock and must produce the same readable cell.
+     */
+    private fun oneDeviceLastSeen(lastSeenAt: String) = jsonResponse(
+        200,
+        """{"devices":[{"id":"d-1","jkt":"JKT-1","name":"alice-mbp","registered":true,"clientId":"cli",
+            "state":"signed_in","lastSeenAt":$lastSeenAt,"recentNetworks":["203.0.113"],"revokedAt":null}]}
+        """.trimIndent(),
+    )
+
+    @Test
+    fun `last seen sent as epoch seconds is rendered as a timestamp and an age, not as the epoch`() {
+        server.enqueue(oneDeviceLastSeen("1789848418"))
+
+        val (exit, out, _) = runCli("devices", "list", "--hub", baseUrl())
+
+        assertThat(exit).isEqualTo(0)
+        assertThat(out)
+            .describedAs("the SSO-3275 report: `LAST SEEN 1789848418` answers nobody's question")
+            .doesNotContain("1789848418")
+        assertThat(out).contains("2026-09-19T20:06:58Z").contains("ago")
+    }
+
+    @Test
+    fun `last seen sent as epoch millis is rendered as the same moment`() {
+        server.enqueue(oneDeviceLastSeen("1789848418000"))
+
+        val (exit, out, _) = runCli("devices", "list", "--hub", baseUrl())
+
+        assertThat(exit).isEqualTo(0)
+        assertThat(out).contains("2026-09-19T20:06:58Z").doesNotContain("1789848418000")
+    }
+
+    @Test
+    fun `last seen sent as seconds-with-nanos is rendered at seconds precision`() {
+        server.enqueue(oneDeviceLastSeen("1789848418.123456789"))
+
+        val (exit, out, _) = runCli("devices", "list", "--hub", baseUrl())
+
+        assertThat(exit).isEqualTo(0)
+        assertThat(out).contains("2026-09-19T20:06:58Z").doesNotContain("123456789")
+    }
+
+    @Test
+    fun `last seen sent as an ISO instant keeps the instant and gains the age`() {
+        server.enqueue(oneDeviceLastSeen(""""2026-09-19T09:41:00Z""""))
+
+        val (exit, out, _) = runCli("devices", "list", "--hub", baseUrl())
+
+        assertThat(exit).isEqualTo(0)
+        assertThat(out).contains("2026-09-19T09:41:00Z (").contains("ago")
+    }
+
+    @Test
+    fun `a device the hub reports no last-seen for reads as a dash, not as the epoch zero`() {
+        server.enqueue(oneDeviceLastSeen("null"))
+
+        val (exit, out, _) = runCli("devices", "list", "--hub", baseUrl())
+
+        assertThat(exit).isEqualTo(0)
+        assertThat(out).contains("alice-mbp").doesNotContain("1970-01-01")
+    }
+
+    @Test
+    fun `the json output still carries the hub's own value, untouched by the table rendering`() {
+        // The SSO-3082 rule: the CLI does not reshape a backend payload behind a script's back.
+        server.enqueue(oneDeviceLastSeen("1789848418"))
+
+        val (exit, out, _) = runCli("devices", "list", "--hub", baseUrl(), "--output", "json")
+
+        assertThat(exit).isEqualTo(0)
+        assertThat(out).contains("1789848418")
+    }
+
     @Test
     fun `not signed in is guidance, not a stack trace`() {
         clearTokens()
