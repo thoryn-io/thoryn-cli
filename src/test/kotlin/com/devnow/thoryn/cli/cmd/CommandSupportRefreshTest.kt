@@ -97,6 +97,38 @@ class CommandSupportRefreshTest : CommandTestBase() {
     }
 
     @Test
+    fun `a refresh refused for a revoked device names the key rotation, not another sign-in`() {
+        // SSO-3282 — the same `invalid_grant` code, a different remedy. Telling someone whose DEVICE
+        // was revoked to "sign in again" sends them round the very loop that produced the report:
+        // the login re-runs on the same refused key and fails too. Only the description separates
+        // the two cases, which is why the hub now sends one.
+        seedTokens(
+            Tokens(
+                accessToken = "AT-old",
+                refreshToken = "RT-bound-to-a-revoked-key",
+                expiresAtEpochSecond = expired,
+                issuer = baseUrl(),
+                workspace = "thoryn",
+            ),
+        )
+        server.enqueue(
+            jsonResponse(400, """{"error":"invalid_grant","error_description":"dpop_device_revoked"}"""),
+        )
+
+        val out = err()
+        val renewed = CommandSupport.forceRefresh(PrintStream(out))
+
+        assertThat(renewed).isNull()
+        val printed = out.toString()
+        assertThat(printed)
+            .describedAs("the one command that changes anything must be named: %s", printed)
+            .contains("thoryn logout --rotate-key")
+        assertThat(printed)
+            .describedAs("and the generic expiry line must NOT be what they read")
+            .doesNotContain("Could not renew your sign-in session")
+    }
+
+    @Test
     fun `a session with no refresh token says it cannot be renewed instead of a bare HTTP 401`() {
         // The hub issues NO refresh token to a PUBLIC client on the authorization-code grant, so a
         // loopback `thoryn login` session has none. The on-401 retry lands here: it must SAY that

@@ -69,6 +69,10 @@ class AuthorizationCodeFlow(
             throw AuthorizationCodeException(
                 "Hub returned ${response.statusCode()}: $errorCode",
                 oauthError = errorCode,
+                // SSO-3282 — the code alone cannot say WHICH `invalid_grant` this is; the
+                // description can, and a revoked device is the one the CLI can recover from
+                // without the person doing anything. See [RevokedDevice].
+                oauthErrorDescription = parseErrorDescription(response.body()),
             )
         }
         val map: Map<String, Any?> = mapper.readValue(response.body())
@@ -90,6 +94,14 @@ class AuthorizationCodeFlow(
         null
     }
 
+    /** SSO-3282 — RFC 6749 §5.2 `error_description`, when the hub sent one. */
+    private fun parseErrorDescription(body: String): String? = try {
+        val map: Map<String, Any?> = mapper.readValue(body)
+        (map["error_description"] as? String) ?: (map["detail"] as? String)
+    } catch (_: Exception) {
+        null
+    }
+
     private fun formEncode(pairs: List<Pair<String, String>>): String =
         pairs.joinToString("&") { (k, v) ->
             "${URLEncoder.encode(k, Charsets.UTF_8)}=${URLEncoder.encode(v, Charsets.UTF_8)}"
@@ -103,8 +115,13 @@ class AuthorizationCodeFlow(
  * Thrown on any authorization-code redemption failure. [oauthError] carries the RFC 6749 §5.2
  * machine error code (`invalid_grant` on a bad/expired code, `invalid_client` on bad client auth,
  * …), or `"unknown"` when the body was not parseable.
+ *
+ * SSO-3282 — [oauthErrorDescription] is the optional §5.2 companion, and is what separates the
+ * several failures that all answer `invalid_grant`. Today the CLI acts on exactly one value of it
+ * ([RevokedDevice.ERROR_DESCRIPTION]); null whenever the hub sent none.
  */
 class AuthorizationCodeException(
     message: String,
     val oauthError: String,
+    val oauthErrorDescription: String? = null,
 ) : RuntimeException(message)

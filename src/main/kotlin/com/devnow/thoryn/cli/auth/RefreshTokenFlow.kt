@@ -64,6 +64,9 @@ class RefreshTokenFlow(
             throw RefreshTokenException(
                 "Hub returned ${response.statusCode()}: $errorCode",
                 oauthError = errorCode,
+                // SSO-3282 — a renewal refused because the device was revoked is not an expired
+                // session, and telling someone to "sign in again" sends them round the same loop.
+                oauthErrorDescription = parseErrorDescription(response.body()),
             )
         }
         val map: Map<String, Any?> = mapper.readValue(response.body())
@@ -86,6 +89,14 @@ class RefreshTokenFlow(
         null
     }
 
+    /** SSO-3282 — RFC 6749 §5.2 `error_description`, when the hub sent one. */
+    private fun parseErrorDescription(body: String): String? = try {
+        val map: Map<String, Any?> = mapper.readValue(body)
+        (map["error_description"] as? String) ?: (map["detail"] as? String)
+    } catch (_: Exception) {
+        null
+    }
+
     private fun formEncode(pairs: List<Pair<String, String>>): String =
         pairs.joinToString("&") { (k, v) ->
             "${URLEncoder.encode(k, Charsets.UTF_8)}=${URLEncoder.encode(v, Charsets.UTF_8)}"
@@ -97,5 +108,15 @@ class RefreshTokenFlow(
     }
 }
 
-/** Thrown when the refresh-token redemption returns a non-200 (expired/revoked refresh token, …). */
-class RefreshTokenException(message: String, val oauthError: String) : RuntimeException(message)
+/**
+ * Thrown when the refresh-token redemption returns a non-200 (expired/revoked refresh token, …).
+ *
+ * SSO-3282 — [oauthErrorDescription] is the RFC 6749 §5.2 companion that separates the several
+ * failures answering `invalid_grant`; a revoked device needs different guidance from an expired
+ * session. Null whenever the hub sent none.
+ */
+class RefreshTokenException(
+    message: String,
+    val oauthError: String,
+    val oauthErrorDescription: String? = null,
+) : RuntimeException(message)
