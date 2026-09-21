@@ -18,6 +18,7 @@ import com.devnow.thoryn.cli.auth.ParCapability
 import com.devnow.thoryn.cli.auth.ParPushResult
 import com.devnow.thoryn.cli.auth.PkceUtil
 import com.devnow.thoryn.cli.auth.PushedAuthorizationRequestFlow
+import com.devnow.thoryn.cli.auth.RevokedDevice
 import com.devnow.thoryn.cli.auth.ScopeRegistry
 import com.devnow.thoryn.cli.auth.TokenStore
 import com.devnow.thoryn.cli.auth.TokenStoreFactory
@@ -703,8 +704,52 @@ class LoginCommand : Callable<Int> {
      * is available (`THORYN_CLIENT_SECRET` / `--client-secret-file`) the exchange authenticates the
      * client with HTTP Basic instead. No interactive secret prompt here — a loopback sign-in is
      * meant to be one keystroke.
+     *
+     * ## SSO-3282 — one automatic retry when the key's device was revoked
+     *
+     * A machine whose device has been revoked holds a key the hub refuses for every grant, so its
+     * sign-in fails at redemption and keeps failing however many times it is run: nothing about the
+     * key changes in between. The product owner met exactly this and had no way to learn that
+     * `thoryn logout --rotate-key` was the way out.
+     *
+     * When the hub names that case ([RevokedDevice.ERROR_DESCRIPTION] — a stable marker, not prose),
+     * this rotates the key and runs the WHOLE flow again, once. The whole flow, not just the
+     * redemption: the authorize request binds `dpop_jkt` to the key on the way IN (see [dpopJkt]),
+     * so a code obtained under the old key can only ever be redeemed by the old key. The second
+     * attempt therefore has to start from a new authorize/PAR carrying the NEW thumbprint.
+     *
+     * Once, and only on that marker. Any other failure is reported as before — retrying a sign-in
+     * on a guess costs the person a second browser round trip and tells them nothing.
      */
     private fun runLoopbackFlow(): Int {
+        revokedDeviceRefusal = false
+        val first = attemptLoopbackFlow()
+        if (!revokedDeviceRefusal) return first
+
+        System.err.println()
+        System.err.println(RevokedDevice.ROTATING_NOTICE)
+        // Rotate, and drop the session that died with the device — the next attempt is a fresh
+        // sign-in, and leaving a dead bundle on disk would only confuse a later `thoryn status`.
+        runCatching { Dpop.rotate() }
+        runCatching { tokenStore.delete() }
+        revokedDeviceRefusal = false
+        val second = attemptLoopbackFlow()
+        if (revokedDeviceRefusal) {
+            // Refused again on a brand-new key. That is not the case this recovery is for, so stop
+            // rather than loop: say what was already tried, so the next step is not "run it again".
+            System.err.println(
+                "Signing in still failed after generating a new key. Check `thoryn devices list` " +
+                    "from another machine, or contact your workspace admin.",
+            )
+        }
+        return second
+    }
+
+    /** SSO-3282 — set by [attemptLoopbackFlow] when the hub refused the redemption for a revoked device. */
+    private var revokedDeviceRefusal: Boolean = false
+
+    /** One pass of the loopback sign-in. See [runLoopbackFlow] for the retry that wraps it. */
+    private fun attemptLoopbackFlow(): Int {
         val verifier = PkceUtil.newCodeVerifier()
         val challenge = PkceUtil.codeChallenge(verifier)
         val state = PkceUtil.newState()
@@ -785,7 +830,11 @@ class LoginCommand : Callable<Int> {
             System.err.println("Sign-in timed out: ${e.message}")
             EXIT_LOOPBACK_FAILED
         } catch (e: AuthorizationCodeException) {
-            System.err.println("Sign-in failed: ${e.message}")
+            // SSO-3282 — flagged rather than handled here: the recovery has to restart the whole
+            // flow (new authorize/PAR under a new `dpop_jkt`), and this `finally` still has a
+            // loopback server to close. [runLoopbackFlow] owns the retry.
+            revokedDeviceRefusal = RevokedDevice.refused(e.oauthErrorDescription)
+            if (!revokedDeviceRefusal) System.err.println("Sign-in failed: ${e.message}")
             EXIT_LOOPBACK_FAILED
         } finally {
             server.close()

@@ -1,6 +1,9 @@
 package com.devnow.thoryn.cli.cmd
 
 import com.devnow.thoryn.cli.api.ProductApiException
+import com.devnow.thoryn.cli.auth.Dpop
+import com.devnow.thoryn.cli.auth.TokenStoreFactory
+import com.devnow.thoryn.cli.auth.Tokens
 import com.devnow.thoryn.cli.config.ThorynConfig
 import com.devnow.thoryn.cli.output.OutputFormat
 import com.devnow.thoryn.cli.output.Timestamps
@@ -136,8 +139,11 @@ class DevicesCommand : Callable<Int> {
             val client = CommandSupport.client(hub, tokens)
 
             return try {
-                val deviceId = resolveId(devicesOf(client.listDevices()))
-                    ?: return CommandSupport.EXIT_USAGE
+                val listed = devicesOf(client.listDevices())
+                val deviceId = resolveId(listed) ?: return CommandSupport.EXIT_USAGE
+                // SSO-3282 — decided BEFORE the revoke, from the listing, because afterwards the
+                // session this command authenticated with is dead and the list cannot be re-read.
+                val self = isThisInstallation(listed.firstOrNull { it.textOrNull("id") == deviceId }, tokens)
                 val body = client.revokeDevice(deviceId, reason)
                 CommandSupport.emitRecord(format, body, { n: JsonNode ->
                     listOf(
@@ -152,10 +158,26 @@ class DevicesCommand : Callable<Int> {
                         "revokedSessions" to n["revokedSessions"]?.asInt(),
                     )
                 })
+                // SSO-3282 — if that was THIS machine, its key is now refused for every grant, so
+                // finish the job locally: rotate the key and drop the dead session. Done whatever
+                // the output format — it is a change to this installation's state, not a rendering.
+                val rotated = if (self) retireOwnKey() else false
                 if (format == OutputFormat.TABLE) {
                     System.err.println(
-                        "Revoked. That machine's sessions are ended and its key is refused; your other " +
-                            "devices keep working. Signing in from it again registers a NEW device.",
+                        if (self) {
+                            "Revoked — that was this machine. Its key has been " +
+                                (if (rotated) "rotated" else "discarded") +
+                                " and this session cleared; run `thoryn login` to register it as a new device. " +
+                                "Your other devices keep working."
+                        } else {
+                            // SSO-3282 — this used to promise that signing in again registers a new
+                            // device, full stop. It does not: the revoked machine still holds the
+                            // refused key, so its next `thoryn login` fails until that key is
+                            // rotated. Say what is actually true, and name the step.
+                            "Revoked. That machine's sessions are ended and its key is refused; your other " +
+                                "devices keep working. On that machine, `thoryn logout --rotate-key` " +
+                                "replaces the refused key — signing in after that registers it as a NEW device."
+                        },
                     )
                 }
                 CommandSupport.EXIT_OK
@@ -164,6 +186,53 @@ class DevicesCommand : Callable<Int> {
             } catch (ex: Exception) {
                 CommandSupport.renderRequestFailure(ex, hub)
             }
+        }
+
+        /**
+         * SSO-3282 — is [device] the machine this command is being typed on?
+         *
+         * Matched on the device's `jkt` against this installation's own key thumbprint, because the
+         * key IS the machine: that is the value the hub binds tokens to and the value it refuses
+         * once the device is revoked. The session's recorded `deviceId` is the fallback for a hub
+         * that does not publish `jkt` in the listing, and is only ever a confirmation of the same
+         * fact — this installation registered that row at its last login.
+         *
+         * Answering false is the safe direction: the machine is then simply told what to run, which
+         * is where every machine stood before this change.
+         */
+        private fun isThisInstallation(device: JsonNode?, tokens: Tokens): Boolean {
+            if (device == null) return false
+            val jkt = device.textOrNull("jkt")
+            if (jkt != null) {
+                // Never `provision = true`: asking whether this is us must not CREATE a key (and on
+                // a machine with a secure element, must not raise a biometric prompt) as a
+                // side-effect of a question.
+                val mine = runCatching { Dpop.session()?.thumbprint }.getOrNull()
+                if (mine != null) return jkt == mine
+            }
+            val sessionDeviceId = tokens.deviceId?.takeIf { it.isNotBlank() } ?: return false
+            return device.textOrNull("id") == sessionDeviceId
+        }
+
+        /**
+         * SSO-3282 — discard the now-refused key and the session that died with it.
+         *
+         * **No second revoke.** [DeviceRetirement] exists for the logout path, where the device is
+         * still live and has to be told; here the hub has just revoked it on this very call, and
+         * asking again would only produce a needless round trip against a session that no longer
+         * authenticates anything.
+         *
+         * Neither step may fail the command: the revoke has already happened at the hub and
+         * reporting it as a failure would be a lie. A key that somehow survives is inert anyway —
+         * every grant it could attempt is refused — and the next `thoryn login` re-reads state from
+         * scratch.
+         *
+         * @return true when a key was actually there to rotate.
+         */
+        private fun retireOwnKey(): Boolean {
+            val rotated = runCatching { Dpop.rotate() }.getOrDefault(false)
+            runCatching { TokenStoreFactory.default().delete() }
+            return rotated
         }
 
         /**

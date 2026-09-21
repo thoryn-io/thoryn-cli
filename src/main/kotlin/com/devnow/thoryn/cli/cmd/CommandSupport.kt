@@ -6,7 +6,9 @@ import com.devnow.thoryn.cli.auth.ClientCredentialsException
 import com.devnow.thoryn.cli.auth.ClientCredentialsFlow
 import com.devnow.thoryn.cli.auth.Dpop
 import com.devnow.thoryn.cli.auth.HttpSender
+import com.devnow.thoryn.cli.auth.RefreshTokenException
 import com.devnow.thoryn.cli.auth.RefreshTokenFlow
+import com.devnow.thoryn.cli.auth.RevokedDevice
 import com.devnow.thoryn.cli.auth.ScopeRegistry
 import com.devnow.thoryn.cli.auth.TokenExchangeFlow
 import com.devnow.thoryn.cli.auth.TokenStoreFactory
@@ -296,8 +298,16 @@ internal object CommandSupport {
             refreshed
         } catch (e: Exception) {
             warnOnce(err) {
-                "Could not renew your sign-in session (${e.message}). " +
-                    "Run `${LoginCommand.reLoginCommand(current)}` to sign in again."
+                // SSO-3282 — a renewal refused because this machine's DEVICE was revoked is not an
+                // expired session, and the generic line sends the person round the very loop that
+                // produced the report: `thoryn login` re-runs on the same refused key and fails
+                // again. Name the one command that changes anything.
+                if (e is RefreshTokenException && RevokedDevice.refused(e.oauthErrorDescription)) {
+                    RevokedDevice.RENEWAL_GUIDANCE
+                } else {
+                    "Could not renew your sign-in session (${e.message}). " +
+                        "Run `${LoginCommand.reLoginCommand(current)}` to sign in again."
+                }
             }
             null
         }
