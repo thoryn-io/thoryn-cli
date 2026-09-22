@@ -141,7 +141,7 @@ class ExamplesCommand : Callable<Int> {
         @Parameters(index = "0", arity = "0..1", description = ["Example name (optional when only one exists)."])
         var name: String? = null
 
-        @Option(names = ["--hub"], description = ["Override the hub base URL."])
+        @Option(names = ["--issuer", "--hub"], description = ["Override the platform base issuer URL. Alias: --hub."])
         var hub: String = ThorynConfig.DEFAULT_HUB
 
         @Option(names = ["--gateway"], description = ["Override the gateway base URL."])
@@ -276,7 +276,7 @@ class ExamplesCommand : Callable<Int> {
         @Option(names = ["--yes"], description = ["Skip the confirmation prompt (for non-interactive use)."])
         var yes: Boolean = false
 
-        @Option(names = ["--hub"])
+        @Option(names = ["--issuer", "--hub"])
         var hub: String = ThorynConfig.DEFAULT_HUB
 
         @Option(names = ["--gateway"])
@@ -489,7 +489,7 @@ class ExamplesCommand : Callable<Int> {
         @Parameters(index = "0", arity = "0..1", description = ["Example name (optional when only one exists)."])
         var name: String? = null
 
-        @Option(names = ["--hub"], description = ["Override the hub base URL. Defaults to the hub recorded at `thoryn login`."])
+        @Option(names = ["--issuer", "--hub"], description = ["Override the platform base issuer URL. Defaults to the one recorded at `thoryn login`. Alias: --hub."])
         var hub: String = ThorynConfig.DEFAULT_HUB
 
         @Option(names = ["--gateway"], description = ["Override the customer-plane gateway URL. Defaults to the gateway recorded at `thoryn login`."])

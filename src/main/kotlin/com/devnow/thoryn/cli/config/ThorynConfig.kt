@@ -4,34 +4,107 @@ package com.devnow.thoryn.cli.config
  * Endpoints, defaults and env knobs baked into the CLI binary.
  *
  * SSO-3182 — a released CLI has NO localhost default for the platform it signs in to. `thoryn login`
- * resolves the hub BASE URL ([resolveHubBase]) from, in order: `--issuer`, the [HUB_ENV] env var
- * (`THORYN_HUB`), the hub of the previous session on this machine, and finally the baked-in
- * [PLATFORM_HUB] — which stays `null` until the production platform domain is live (a product
- * decision). With none of them, login fails fast with guidance instead of silently opening
- * `http://localhost:54702/oauth2/authorize` (what 0.17/0.18 did).
+ * resolves the platform BASE ISSUER ([resolveHubBase]) from, in order: `--issuer`, the [ISSUER_ENV]
+ * env var (`THORYN_ISSUER`, or its `THORYN_HUB` alias), the platform of the previous session on this
+ * machine, and finally the baked-in [PLATFORM_HUB] — which stays `null` until the production platform
+ * domain is live (a product decision). With none of them, login fails fast with guidance instead of
+ * silently opening `http://localhost:54702/oauth2/authorize` (what 0.17/0.18 did).
+ *
+ * SSO-3296 (epic SSO-3289) — the public authentication host moves from `{slug}.hub.<domain>` to
+ * `{slug}.auth.<domain>`. **Nothing in this file hard-codes the word.** Every composed host derives its
+ * label from the base issuer the CLI was pointed at ([DEFAULT_TENANT_HOST_LABELS], [labelIndex]), so
+ * one binary is correct before AND after the SSO-3297 staging cutover. The single value that must move
+ * at cutover is [STAGING_ISSUER], a convenience/help-text constant.
  *
  * Known platforms:
  *
  *  - Staging:    `https://hub.stg.thoryn.org` ([STAGING_ISSUER]) / `https://api.stg.thoryn.org`
+ *                — becomes `https://auth.stg.thoryn.org` at the SSO-3297 cutover
  *  - Local dev:  `http://localhost:54702` ([LOCAL_DEV_HUB]) / `http://localhost:8991` — pass
- *    `--issuer http://localhost:54702` (or export THORYN_HUB) explicitly
- *  - Production: not live yet ([PLATFORM_HUB] is `null`)
+ *    `--issuer http://localhost:54702` (or export THORYN_ISSUER) explicitly
+ *  - Production: not live yet ([PLATFORM_HUB] is `null`; it will be `https://auth.thoryn.io`)
  */
 object ThorynConfig {
     /** SSO-3182 — the local-dev hub (a hub running on the developer's machine). Never an implicit default for login. */
     const val LOCAL_DEV_HUB = "http://localhost:54702"
 
     /**
-     * SSO-3182 — the env var naming the hub BASE URL (`https://hub.<env>`) `thoryn login` signs in to when
-     * `--issuer` is not passed. The same name the connection contract's `workspace.hubBaseUrlEnv` defaults to.
+     * SSO-3296 — the env var naming the platform BASE ISSUER (`https://<label>.<env>`) `thoryn login`
+     * signs in to when `--issuer` is not passed. This is the DOCUMENTED name; [HUB_ENV] (`THORYN_HUB`)
+     * stays an accepted alias so recipes, CI connections and shell profiles written before the
+     * SSO-3289 host rename keep working unchanged.
+     */
+    const val ISSUER_ENV = "THORYN_ISSUER"
+
+    /**
+     * SSO-3182 — the legacy env var naming the hub BASE URL. Kept as a silent alias of [ISSUER_ENV]
+     * (SSO-3296): `THORYN_HUB` is a customer-facing spelling of an INTERNAL component word, which is
+     * the whole reason epic SSO-3289 exists. Still the name the connection contract's
+     * `workspace.hubBaseUrlEnv` defaults to, so connection files that omit the field keep resolving.
      */
     const val HUB_ENV = "THORYN_HUB"
 
     /**
-     * SSO-3182 — the production platform's hub base URL baked into a release, or `null` while the
-     * production domain is not live. OPEN QUESTION (product owner): set this to the production hub
-     * (`deploy/helm/thoryn/values-production.yaml` scaffolds `https://hub.thoryn.org`) once it serves
-     * traffic — then a bare `thoryn login --workspace <slug>` reaches `https://<slug>.hub.thoryn.org`.
+     * SSO-3296 — the env vars naming the platform base issuer, in resolution order. `THORYN_ISSUER`
+     * is the documented name; `THORYN_HUB` is the retained alias.
+     */
+    val ISSUER_ENV_NAMES = listOf(ISSUER_ENV, HUB_ENV)
+
+    /**
+     * SSO-3296 — the HOST LABEL separating a workspace slug from the platform apex in a public Thoryn
+     * host: `{slug}.{label}.{apex}` (e.g. `acme.auth.stg.thoryn.org`, base `auth.stg.thoryn.org`).
+     *
+     * The CLI **never assumes** a label. It READS the one already present in the base issuer it was
+     * pointed at (`--issuer`, [ISSUER_ENV]/[HUB_ENV], the previous session, [PLATFORM_HUB]) and reuses
+     * it when composing a workspace issuer, the gateway host or the sign-in host. That is what makes
+     * one binary correct on both sides of the SSO-3297 staging cutover with no flag, no discovery probe
+     * and no re-release: pointed at `https://hub.stg.thoryn.org` it composes `acme.hub.stg.thoryn.org`;
+     * pointed at `https://auth.stg.thoryn.org` it composes `acme.auth.stg.thoryn.org`.
+     *
+     * Per ADR `2026-09-22-public-issuer-host-auth-subdomain.md` `auth` is the public word and `hub`
+     * retires to being an internal component name. Both are recognised here because staging serves
+     * `hub.` until SSO-3297 flips `OAUTHY_TENANCY_PLATFORM_DOMAIN`; the hub advertises no host template
+     * in its discovery document (SSO-3291 deliberately added no new property), so the base issuer the
+     * operator already supplies is the only non-guessing source of the label.
+     */
+    val DEFAULT_TENANT_HOST_LABELS = listOf("auth", "hub")
+
+    /**
+     * SSO-3296 — escape hatch naming an ADDITIONAL host label to recognise, for a topology whose base
+     * host is neither `auth.` nor `hub.` (a bespoke deployment, or a future word) without waiting for a
+     * CLI release. Takes precedence over [DEFAULT_TENANT_HOST_LABELS]. A custom domain
+     * (`auth.acme.com`, epic SSO-3290) needs no label: such an issuer is passed through verbatim.
+     */
+    const val TENANT_HOST_LABEL_ENV = "THORYN_TENANT_HOST_LABEL"
+
+    /** SSO-3296 — the recognised host labels: [TENANT_HOST_LABEL_ENV] first, then the built-ins. */
+    fun tenantHostLabels(env: (String) -> String? = { System.getProperty(it) ?: System.getenv(it) }): List<String> {
+        val override = env(TENANT_HOST_LABEL_ENV)?.trim()?.lowercase()?.takeIf { it.isNotEmpty() }
+        return if (override == null) DEFAULT_TENANT_HOST_LABELS else listOf(override) + DEFAULT_TENANT_HOST_LABELS
+    }
+
+    /**
+     * SSO-3296 — index of the first host component that is a recognised platform label, else `-1`.
+     *
+     * `0` means [host] is a BASE host (`auth.stg.thoryn.org`); `1` means it is a WORKSPACE host
+     * (`acme.auth.stg.thoryn.org`) whose slug is the first component. Anything else — a deeper match,
+     * no match, `localhost`, an IP literal, a custom domain — is `-1`, and every helper below then
+     * leaves the URL alone rather than guessing a host.
+     */
+    internal fun labelIndex(host: String, labels: List<String> = tenantHostLabels()): Int {
+        val idx = host.lowercase().split('.').indexOfFirst { it in labels }
+        return if (idx == 0 || idx == 1) idx else -1
+    }
+
+    private fun withHost(uri: java.net.URI, host: String): String =
+        java.net.URI(uri.scheme, uri.userInfo, host, uri.port, null, null, null).toString().trimEnd('/')
+
+    /**
+     * SSO-3182 — the production platform's base issuer baked into a release, or `null` while the
+     * production domain is not live. OPEN QUESTION (product owner): set this once production serves
+     * traffic. SSO-3296 — per ADR `2026-09-22-public-issuer-host-auth-subdomain.md` the production
+     * value is `https://auth.thoryn.io`, so a bare `thoryn login --workspace <slug>` would then reach
+     * `https://<slug>.auth.thoryn.io`.
      */
     val PLATFORM_HUB: String? = null
 
@@ -43,7 +116,9 @@ object ThorynConfig {
     /**
      * SSO-3182 — resolve the hub BASE URL `thoryn login` signs in to, or null when nothing names one:
      *  1. [explicit] (`--issuer`);
-     *  2. the [HUB_ENV] (`THORYN_HUB`) system property, then environment variable;
+     *  2. the [ISSUER_ENV] (`THORYN_ISSUER`) system property then environment variable, else the
+     *     [HUB_ENV] (`THORYN_HUB`) alias (SSO-3296) — so a pre-rename shell profile or CI job that
+     *     exports only `THORYN_HUB` keeps resolving;
      *  3. the base hub of the previous session on this machine ([previousSessionIssuer], the stored
      *     tenant issuer, normalised by [baseHubOf]) — so `thoryn login --workspace thoryn` after the first
      *     `--issuer` sign-in reuses the same platform, which is what the "run `thoryn login`" recovery
@@ -57,50 +132,53 @@ object ThorynConfig {
         platformHub: String? = PLATFORM_HUB,
     ): HubBase? {
         explicit?.trim()?.trimEnd('/')?.takeIf { it.isNotEmpty() }?.let { return HubBase(it, HubSource.FLAG) }
-        env(HUB_ENV)?.trim()?.trimEnd('/')?.takeIf { it.isNotEmpty() }?.let { return HubBase(it, HubSource.ENV) }
+        for (name in ISSUER_ENV_NAMES) {
+            env(name)?.trim()?.trimEnd('/')?.takeIf { it.isNotEmpty() }?.let { return HubBase(it, HubSource.ENV) }
+        }
         previousSessionIssuer?.takeIf { it.isNotBlank() }?.let { return HubBase(baseHubOf(it), HubSource.PREVIOUS_SESSION) }
         platformHub?.trim()?.trimEnd('/')?.takeIf { it.isNotEmpty() }?.let { return HubBase(it, HubSource.PLATFORM) }
         return null
     }
 
     /**
-     * SSO-3182 — the hub BASE of an issuer: a tenant issuer `https://<slug>.hub.<env>` becomes
-     * `https://hub.<env>`; a base hub (`hub.<env>`) or a single-host local hub is returned unchanged.
+     * SSO-3182 — the platform BASE of an issuer: a workspace issuer `https://<slug>.<label>.<env>`
+     * becomes `https://<label>.<env>`; a base issuer (`<label>.<env>`) or a single-host local hub is
+     * returned unchanged. SSO-3296 — label-driven ([labelIndex]), so this holds for `auth.` and `hub.`.
      */
     fun baseHubOf(issuer: String): String {
         val trimmed = issuer.trim().trimEnd('/')
         return try {
             val uri = java.net.URI(trimmed)
             val host = uri.host ?: return trimmed
-            val idx = host.indexOf(".hub.")
-            if (idx <= 0) return trimmed
-            java.net.URI(uri.scheme, uri.userInfo, host.substring(idx + 1), uri.port, null, null, null)
-                .toString()
-                .trimEnd('/')
+            if (labelIndex(host) != 1) return trimmed
+            withHost(uri, host.substringAfter('.'))
         } catch (_: Exception) {
             trimmed
         }
     }
 
-    /** SSO-3182 — the workspace slug of a tenant issuer `https://<slug>.hub.<env>`, else null. */
+    /**
+     * SSO-3182 — the workspace slug of a workspace issuer `https://<slug>.<label>.<env>`, else null.
+     * SSO-3296 — label-driven, so `acme.auth.stg.thoryn.org` and `acme.hub.stg.thoryn.org` both yield
+     * `acme`, while a base issuer (`auth.stg.thoryn.org`) correctly yields null.
+     */
     fun workspaceOfIssuer(issuer: String?): String? {
         if (issuer.isNullOrBlank()) return null
         return try {
             val host = java.net.URI(issuer.trim()).host ?: return null
-            val idx = host.indexOf(".hub.")
-            if (idx <= 0) null else host.substring(0, idx)
+            if (labelIndex(host) != 1) null else host.substringBefore('.')
         } catch (_: Exception) {
             null
         }
     }
 
-    /** SSO-3182 — the guidance `thoryn login` prints when no hub could be resolved. */
+    /** SSO-3182 — the guidance `thoryn login` prints when no platform issuer could be resolved. */
     val NO_HUB_GUIDANCE: String =
         """
-        Error: no Thoryn platform selected — this CLI has no built-in hub yet.
-        Name the hub base URL once; later sign-ins on this machine reuse it:
+        Error: no Thoryn platform selected — this CLI has no built-in issuer yet.
+        Name the platform base issuer once; later sign-ins on this machine reuse it:
             thoryn login --workspace <slug> --issuer $STAGING_ISSUER      # Thoryn staging
-        or export $HUB_ENV=$STAGING_ISSUER. For a hub on your own machine: --issuer $LOCAL_DEV_HUB
+        or export $ISSUER_ENV=$STAGING_ISSUER. For a platform on your own machine: --issuer $LOCAL_DEV_HUB
         """.trimIndent()
 
     /**
@@ -118,8 +196,8 @@ object ThorynConfig {
 
     /**
      * SSO-3104 — the env var that names the workspace `thoryn login` signs in on when `--workspace` is
-     * not passed. Interactive sign-in is always ON A WORKSPACE (`https://<slug>.hub.<env>`): the shared
-     * default tenant is not a sign-in target any more.
+     * not passed. Interactive sign-in is always ON A WORKSPACE (`https://<slug>.<label>.<env>`): the
+     * shared default tenant is not a sign-in target any more.
      */
     const val WORKSPACE_ENV = "THORYN_WORKSPACE"
 
@@ -190,7 +268,16 @@ object ThorynConfig {
             "tenant:federation.read tenant:federation.write " +
             "tenant:users.read tenant:users.write"
 
-    /** Convenience constant — pass to `--issuer` to point the CLI at the staging hub. */
+    /**
+     * Convenience constant — pass to `--issuer` to point the CLI at the staging platform. Used ONLY in
+     * help text, the no-platform guidance and the connection error message; it is never a silent
+     * default, so changing it cannot re-point an existing session.
+     *
+     * **SSO-3297 CUTOVER — this is the CLI's one-line flip.** Staging serves `hub.stg.thoryn.org`
+     * until the big-bang deploy flips `OAUTHY_TENANCY_PLATFORM_DOMAIN`; on that day this becomes
+     * `https://auth.stg.thoryn.org` and nothing else in the CLI changes, because every composed host
+     * derives its label from the base issuer at runtime ([DEFAULT_TENANT_HOST_LABELS]).
+     */
     const val STAGING_ISSUER = "https://hub.stg.thoryn.org"
 
     /** The staging gateway (customer-plane ingress) matching [STAGING_ISSUER]. */
@@ -200,22 +287,22 @@ object ThorynConfig {
      * SSO-2827 — best-effort gateway base URL for a hub [issuer], used at
      * `thoryn login` to record the session's gateway when `--gateway` isn't given.
      *
-     * Thoryn deployments name the customer-plane gateway by swapping the `hub.`
-     * label of the hub host for `api.` (hub.stg.thoryn.org → api.stg.thoryn.org,
-     * hub.thoryn.org → api.thoryn.org), preserving scheme/port/path. A hub host
-     * that doesn't start with `hub.` (local dev `localhost`, or a bespoke
-     * topology) has no derivable gateway, so we fall back to [DEFAULT_GATEWAY];
-     * pass `thoryn login --gateway <url>` to set it explicitly there.
+     * Thoryn deployments name the customer-plane gateway by swapping the platform
+     * LABEL of the base issuer host for `api.` (auth.stg.thoryn.org →
+     * api.stg.thoryn.org, hub.stg.thoryn.org → api.stg.thoryn.org), preserving
+     * scheme/port/path. SSO-3296 — label-driven ([labelIndex]), so this holds on
+     * both sides of the SSO-3297 cutover; the customer plane's own host
+     * (`api.<env>`) is unchanged by that cutover (ADR §1). A host whose first
+     * component is not a recognised label (local dev `localhost`, a bespoke
+     * topology, a custom domain) has no derivable gateway, so we fall back to
+     * [DEFAULT_GATEWAY]; pass `thoryn login --gateway <url>` explicitly there.
      */
     fun gatewayForIssuer(issuer: String): String {
         return try {
             val uri = java.net.URI(issuer.trim().trimEnd('/'))
             val host = uri.host ?: return DEFAULT_GATEWAY
-            if (!host.startsWith("hub.")) return DEFAULT_GATEWAY
-            val apiHost = "api." + host.removePrefix("hub.")
-            java.net.URI(uri.scheme, uri.userInfo, apiHost, uri.port, null, null, null)
-                .toString()
-                .trimEnd('/')
+            if (labelIndex(host) != 0) return DEFAULT_GATEWAY
+            withHost(uri, "api." + host.substringAfter('.'))
         } catch (_: Exception) {
             DEFAULT_GATEWAY
         }
@@ -225,44 +312,72 @@ object ThorynConfig {
     const val DEFAULT_IDENTITY = "http://localhost:9099"
 
     /**
-     * SSO-2830 — the identity-service base host for a tenant `slug`, derived from the
-     * hub [issuer]. identity-service is tenant-scoped by REQUEST HOST (SSO-1920), so a
-     * user provisioned for tenant X can only sign in when the login leg hits
-     * `{slug}.identity.<env>`. Thoryn names the identity host by swapping the hub's
-     * `hub.` label for `identity.` (hub.stg.thoryn.org → identity.stg.thoryn.org) and
-     * prefixing the tenant slug (→ `{slug}.identity.stg.thoryn.org`), preserving
-     * scheme/port. A hub host that isn't `hub.<env>` (local dev) has no derivable
-     * identity host, so we fall back to [DEFAULT_IDENTITY] (no slug prefix locally).
+     * SSO-2830 — the identity-service base URL for a workspace `slug`, derived from the base
+     * [issuer]. identity-service is tenant-scoped by REQUEST HOST (SSO-1920), so a user provisioned
+     * for workspace X can only sign in when the login leg hits that workspace's directory host.
+     *
+     * SSO-3296 — the SHAPE follows the base issuer's label, so one binary is right on both sides of
+     * the SSO-3297 cutover:
+     *
+     *  - label `hub` (pre-cutover): the separate directory host, hub's `hub.` label swapped for
+     *    `identity.` and the slug prefixed — `https://{slug}.identity.stg.thoryn.org`.
+     *  - any other label (`auth`, or a [TENANT_HOST_LABEL_ENV] override): SAME-ORIGIN, identity
+     *    mounted under the reserved `/id` context path on the workspace host (ADR §2) —
+     *    `https://{slug}.auth.stg.thoryn.org/id`.
+     *
+     * A base host whose first component is not a recognised label (local dev) has no derivable
+     * directory host, so we fall back to [DEFAULT_IDENTITY] (no slug prefix locally).
      */
     fun tenantIdentityHost(issuer: String, slug: String): String {
         return try {
             val uri = java.net.URI(issuer.trim().trimEnd('/'))
             val host = uri.host ?: return DEFAULT_IDENTITY
-            if (!host.startsWith("hub.")) return DEFAULT_IDENTITY
-            val identityHost = "$slug.identity." + host.removePrefix("hub.")
-            java.net.URI(uri.scheme, uri.userInfo, identityHost, uri.port, null, null, null)
-                .toString()
-                .trimEnd('/')
+            if (labelIndex(host) != 0) return DEFAULT_IDENTITY
+            val label = host.substringBefore('.').lowercase()
+            val apex = host.substringAfter('.')
+            if (label == LEGACY_TENANT_HOST_LABEL) {
+                withHost(uri, "$slug.$LEGACY_IDENTITY_LABEL.$apex")
+            } else {
+                withHost(uri, "$slug.$host") + IDENTITY_CONTEXT_PATH
+            }
         } catch (_: Exception) {
             DEFAULT_IDENTITY
         }
     }
 
+    /** SSO-3296 — the pre-SSO-3297 host label, the only one with a SEPARATE directory host. */
+    const val LEGACY_TENANT_HOST_LABEL = "hub"
+
+    /** SSO-3296 — the label of the retired standalone identity host (`{slug}.identity.<env>`). */
+    const val LEGACY_IDENTITY_LABEL = "identity"
+
     /**
-     * SSO-2830 — the tenant hub issuer for a workspace `slug`, derived from the base
-     * hub [issuer] by prefixing the slug on the hub host (hub.stg.thoryn.org →
-     * `{slug}.hub.stg.thoryn.org`). This is the issuer a per-tenant relying party
-     * authenticates against so the minted token carries the tenant's `tnt` claim.
-     * A non-`hub.` host (local dev) is returned unchanged.
+     * SSO-3296 — the reserved path prefix identity-service is mounted under on the shared workspace
+     * host (its Spring `server.servlet.context-path`, ADR §2). Two characters, so it can never collide
+     * with a workspace or environment slug (`TrustedTenantIssuers.SLUG_PATTERN` has a 3-char floor).
+     */
+    const val IDENTITY_CONTEXT_PATH = "/id"
+
+    /**
+     * SSO-2830 — the WORKSPACE issuer for a `slug`, derived from the base [issuer] by prefixing the
+     * slug on the base host (auth.stg.thoryn.org → `{slug}.auth.stg.thoryn.org`). This is the issuer
+     * a per-workspace relying party authenticates against, so the minted token carries that
+     * workspace's `tnt` claim.
+     *
+     * SSO-3296 — the label is READ from [issuer] ([labelIndex]), never assumed, so this composes the
+     * `hub.` shape today and the `auth.` shape after the SSO-3297 cutover from the same binary. A base
+     * host whose first component is not a recognised label (local dev, a custom domain — ADR §5, where
+     * the issuer IS the custom host) is returned unchanged.
+     *
+     * The SANDBOX issuer keeps its PATH form — workspace issuer + `/{env}` (ADR §3) — and is composed
+     * by the caller, not here; only the host word moved.
      */
     fun tenantIssuer(issuer: String, slug: String): String {
         return try {
             val uri = java.net.URI(issuer.trim().trimEnd('/'))
             val host = uri.host ?: return issuer.trimEnd('/')
-            if (!host.startsWith("hub.")) return issuer.trimEnd('/')
-            java.net.URI(uri.scheme, uri.userInfo, "$slug.$host", uri.port, null, null, null)
-                .toString()
-                .trimEnd('/')
+            if (labelIndex(host) != 0) return issuer.trimEnd('/')
+            withHost(uri, "$slug.$host")
         } catch (_: Exception) {
             issuer.trimEnd('/')
         }

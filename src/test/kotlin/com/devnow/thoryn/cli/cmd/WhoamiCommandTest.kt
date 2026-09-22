@@ -109,7 +109,8 @@ class WhoamiCommandTest : CommandTestBase() {
             ),
         )
 
-        val (exit, out, _) = runCli("whoami", "--check", "--hub", baseUrl(), "--output", "json")
+        // SSO-3296 — `--issuer` is the documented spelling of `--hub`; both reach the same host.
+        val (exit, out, _) = runCli("whoami", "--check", "--issuer", baseUrl(), "--output", "json")
 
         assertThat(exit).isEqualTo(0)
         val json = parseJson(out)

@@ -21,8 +21,8 @@
 #      latest, or `cli-version`) — CI validates the actually-shipped artifact. The verbs this Action
 #      runs need cli-v0.11.0 or newer (the first release carrying `thoryn provision apply`).
 #   2. Signs in NON-INTERACTIVELY from the connection contract: `thoryn login --connection <file>`.
-#      The secret is supplied as the env var the contract NAMES; the hub base as the env var the
-#      contract names for it (THORYN_HUB). Issuer/gateway/scopes are derived by the CLI.
+#      The secret is supplied as the env var the contract NAMES; the base issuer as THORYN_ISSUER
+#      (SSO-3296's documented name) and its THORYN_HUB alias. Issuer/gateway/scopes derived by the CLI.
 #   3. `thoryn provision plan --file <file>` (read-only, printed for the log), then
 #      `thoryn provision apply --file <file> --yes`. The receipt the CLI writes NEXT TO the file
 #      (`<name>.receipt.json`, secret-free) is the ownership ledger.
@@ -69,10 +69,19 @@ inputs:
     description: "Path (in the caller's workspace) to the provisioning file `thoryn provision apply` converges."
     required: false
     default: ".thoryn/provision.yaml"
+  issuer:
+    description: >-
+      SSO-3296 — platform BASE ISSUER to provision against (`https://<label>.<env>`), the DOCUMENTED
+      name of the `hub` input. Supplied to the CLI as both THORYN_ISSUER and THORYN_HUB (the name this
+      repo's contract's `workspace.hubBaseUrlEnv` declares); the CLI derives the per-workspace issuer +
+      gateway from it, reusing whatever host label it carries. Empty ⇒ fall back to `hub`.
+    required: false
+    default: ""
   hub:
     description: >-
-      Hub BASE URL to provision against. Supplied to the CLI as THORYN_HUB (the name the contract's
-      `workspace.hubBaseUrlEnv` declares); the CLI derives the per-tenant issuer + gateway from it.
+      DEPRECATED alias of `issuer` (SSO-3296, epic SSO-3289 — `hub` is an internal component word).
+      Kept so callers pinned to this Action keep working. The default still names today's staging host;
+      the SSO-3297 cutover flips it to https://auth.stg.thoryn.org.
     required: false
     default: "https://hub.stg.thoryn.org"
   destroy:
@@ -105,7 +114,7 @@ outputs:
     description: "Client id of the (first) OAuth application the file provisioned."
     value: ${{ steps.apply.outputs.client-id }}
   issuer:
-    description: "Per-tenant OIDC issuer for the workspace (https://<slug>.hub.<env>)."
+    description: "Per-workspace OIDC issuer (https://<slug>.<label>.<env> — auth. after the SSO-3297 cutover)."
     value: ${{ steps.apply.outputs.issuer }}
   receipt:
     description: "Path of the secret-free provisioning receipt (<file-name>.receipt.json, next to the file)."
@@ -156,7 +165,10 @@ runs:
       env:
         SECRET_ENV: ${{ inputs.secret-env }}
         SECRET_VALUE: ${{ inputs.client-secret }}
-        THORYN_HUB: ${{ inputs.hub }}
+        # SSO-3296 — `issuer` wins; `hub` is the retained alias. Both env names are exported so a
+        # connection contract naming either one resolves.
+        THORYN_ISSUER: ${{ inputs.issuer != '' && inputs.issuer || inputs.hub }}
+        THORYN_HUB: ${{ inputs.issuer != '' && inputs.issuer || inputs.hub }}
         CONNECTION: ${{ inputs.connection }}
         # Headless runners have no OS keychain; this is the documented CI opt-in for the plaintext
         # file token store (chmod-0600 JSON under $HOME). The token lives only on the ephemeral runner.
@@ -178,7 +190,7 @@ runs:
         fi
         # Export the secret under the NAME the contract declares (never on argv, never echoed).
         export "$SECRET_ENV"="$SECRET_VALUE"
-        echo "Signing in from connection contract $CONNECTION (hub base $THORYN_HUB)."
+        echo "Signing in from connection contract $CONNECTION (base issuer $THORYN_ISSUER)."
         java -jar thoryn.jar login --connection "$CONNECTION"
         java -jar thoryn.jar login --status
 
@@ -189,7 +201,7 @@ runs:
       shell: bash
       env:
         FILE: ${{ inputs.file }}
-        HUB: ${{ inputs.hub }}
+        ISSUER: ${{ inputs.issuer != '' && inputs.issuer || inputs.hub }}
         CONNECTION: ${{ inputs.connection }}
         THORYN_CI_PLAINTEXT_TOKENS: "1"
       run: |
@@ -213,8 +225,10 @@ runs:
 
         environment="$(jq -r '[.resources[] | select(.kind=="environment") | .attributes.slug] | first // ""' "$receipt")"
         client="$(jq -r '[.resources[] | select(.kind=="application") | .id] | first // ""' "$receipt")"
-        # Per-tenant issuer: hub.<env> -> <slug>.hub.<env> (mirrors ThorynConfig.tenantIssuer).
-        tenant_issuer="$(printf '%s' "$HUB" | sed -E "s#://hub\.#://${slug}.hub.#")"
+        # Per-workspace issuer: <label>.<env> -> <slug>.<label>.<env> (mirrors ThorynConfig.tenantIssuer).
+        # SSO-3296 — the LABEL is captured from the base issuer, never hard-coded, so this is correct
+        # before and after the SSO-3297 cutover (hub. today, auth. after).
+        tenant_issuer="$(printf '%s' "$ISSUER" | sed -E "s#://(auth|hub)\.#://${slug}.\1.#")"
 
         {
           echo "workspace-slug=$slug"

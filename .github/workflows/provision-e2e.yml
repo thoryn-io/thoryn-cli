@@ -27,7 +27,7 @@ on:
   workflow_dispatch:
     inputs:
       hub:
-        description: "Hub base URL to provision against (supplied to the CLI as THORYN_HUB)."
+        description: "Platform base issuer to provision against (supplied to the CLI as THORYN_ISSUER + its THORYN_HUB alias)."
         required: false
         default: "https://hub.stg.thoryn.org"
       cli-version:

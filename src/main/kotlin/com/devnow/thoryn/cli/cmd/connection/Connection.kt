@@ -23,7 +23,11 @@ import java.io.File
 internal class Connection private constructor(
     /** Workspace slug — derives `https://<slug>.hub.<env>` and the matching gateway. */
     val slug: String,
-    /** NAME of the env var holding the hub base URL (default [DEFAULT_HUB_BASE_URL_ENV]). */
+    /**
+     * NAME of the env var holding the platform BASE ISSUER (default [DEFAULT_HUB_BASE_URL_ENV]).
+     * SSO-3296 — the default name additionally accepts the documented `THORYN_ISSUER` spelling; a name
+     * given EXPLICITLY here is read verbatim, so the confinement it expresses is never widened.
+     */
     val hubBaseUrlEnv: String,
     /** OAuth client id of the machine client (public). */
     val clientId: String,
@@ -37,7 +41,12 @@ internal class Connection private constructor(
         const val API_VERSION = "thoryn.io/connection/v1"
         const val AUTH_METHOD_CLIENT_CREDENTIALS = "client_credentials"
 
-        /** Default env var naming the hub base URL when `workspace.hubBaseUrlEnv` is omitted. */
+        /**
+         * Default env var naming the platform base issuer when `workspace.hubBaseUrlEnv` is omitted.
+         * SSO-3296 — kept at the pre-rename `THORYN_HUB` so existing contracts resolve unchanged;
+         * `ThorynConfig.ISSUER_ENV` (`THORYN_ISSUER`) is the documented spelling and is tried first
+         * when the contract leaves this field at its default.
+         */
         const val DEFAULT_HUB_BASE_URL_ENV = "THORYN_HUB"
 
         /** Bundled schema resource — the documented contract this loader validates against. */

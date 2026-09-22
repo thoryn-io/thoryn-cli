@@ -56,7 +56,7 @@ class WhoamiCommand : Callable<Int> {
     var check: Boolean = false
 
     @Option(
-        names = ["--hub"],
+        names = ["--issuer", "--hub"],
         description = ["With --check: override the hub base URL (default: the hub recorded at `thoryn login`)."],
         defaultValue = ThorynConfig.DEFAULT_HUB,
     )
