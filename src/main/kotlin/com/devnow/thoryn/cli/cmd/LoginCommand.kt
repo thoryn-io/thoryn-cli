@@ -65,16 +65,23 @@ import java.util.concurrent.Callable
 class LoginCommand : Callable<Int> {
 
     /**
-     * SSO-3182 — the hub BASE URL of the platform to sign in to (`https://hub.<env>`). No localhost default:
-     * unset, it resolves from `THORYN_HUB`, then the previous session's hub, then the baked-in production
-     * hub (none yet) — see [ThorynConfig.resolveHubBase]. Nothing resolved ⇒ fail fast with guidance.
+     * SSO-3182 — the platform BASE ISSUER to sign in to (`https://<label>.<env>`). No localhost default:
+     * unset, it resolves from `THORYN_ISSUER` (or its `THORYN_HUB` alias), then the previous session's
+     * platform, then the baked-in production issuer (none yet) — see [ThorynConfig.resolveHubBase].
+     * Nothing resolved ⇒ fail fast with guidance.
+     *
+     * SSO-3296 — `--issuer` is the documented spelling; `--hub` is kept as an accepted alias so recipes
+     * and CI written before the SSO-3289 host rename keep working. The workspace issuer is composed by
+     * reusing whatever host LABEL this value carries ([ThorynConfig.tenantIssuer]), so the same binary
+     * is correct before and after the SSO-3297 cutover.
      */
     @Option(
-        names = ["--issuer"],
+        names = ["--issuer", "--hub"],
         description = [
-            "Hub BASE URL of the Thoryn platform, e.g. ${ThorynConfig.STAGING_ISSUER} (staging). " +
-                "Interactive sign-in happens on <workspace>.<hub>. Default: \$${ThorynConfig.HUB_ENV}, else the hub of " +
-                "your previous sign-in on this machine.",
+            "Platform BASE ISSUER URL of the Thoryn platform, e.g. ${ThorynConfig.STAGING_ISSUER} (staging). " +
+                "Interactive sign-in happens on <workspace>.<issuer-host>. Default: " +
+                "\$${ThorynConfig.ISSUER_ENV} (alias \$${ThorynConfig.HUB_ENV}), else the platform of your " +
+                "previous sign-in on this machine. Alias: --hub.",
         ],
     )
     var issuerOption: String? = null
@@ -524,11 +531,20 @@ class LoginCommand : Callable<Int> {
         // Resolve the hub base from the env var the contract names (-D property first, then env, so
         // tests and `java -jar -D…` work), falling back to the CLI's baked-in platform hub. SSO-3182 — no
         // localhost fallback: with neither, fail closed naming the env var.
-        val hubBase = resolveNamedEnv(connection.hubBaseUrlEnv) ?: ThorynConfig.PLATFORM_HUB ?: run {
+        // SSO-3296 — when the contract leaves `workspace.hubBaseUrlEnv` at its default (`THORYN_HUB`,
+        // the pre-rename spelling) also accept the documented `THORYN_ISSUER`, so a CI job can move to
+        // the new name without editing every connection file. A contract that names a var EXPLICITLY
+        // is honoured exactly — no fallback, so the confinement the name expresses is not widened.
+        val hubBase = resolveConnectionIssuerBase(connection.hubBaseUrlEnv) ?: ThorynConfig.PLATFORM_HUB ?: run {
+            val names = if (connection.hubBaseUrlEnv == Connection.DEFAULT_HUB_BASE_URL_ENV) {
+                "'${ThorynConfig.ISSUER_ENV}' (or its '${ThorynConfig.HUB_ENV}' alias)"
+            } else {
+                "'${connection.hubBaseUrlEnv}'"
+            }
             System.err.println(
-                "Error: the hub base URL env var '${connection.hubBaseUrlEnv}' (named by the connection's " +
+                "Error: the platform base issuer env var $names (named by the connection's " +
                     "workspace.hubBaseUrlEnv) is unset or empty. Export it, e.g. " +
-                    "${connection.hubBaseUrlEnv}=${ThorynConfig.STAGING_ISSUER}.",
+                    "${ThorynConfig.ISSUER_ENV}=${ThorynConfig.STAGING_ISSUER}.",
             )
             return EXIT_USAGE
         }
@@ -588,6 +604,18 @@ class LoginCommand : Callable<Int> {
      * project-wide no-argv secret-resolution order, see [ThorynConfig.resolveClientSecret]). Returns
      * null when unset or blank so the caller can fail closed.
      */
+    /**
+     * SSO-3296 — the base issuer named by a connection contract's `workspace.hubBaseUrlEnv`. An
+     * explicitly-named var is read verbatim; the DEFAULT name (`THORYN_HUB`) additionally accepts the
+     * documented `THORYN_ISSUER` spelling first.
+     */
+    private fun resolveConnectionIssuerBase(name: String): String? =
+        if (name == Connection.DEFAULT_HUB_BASE_URL_ENV) {
+            ThorynConfig.ISSUER_ENV_NAMES.firstNotNullOfOrNull { resolveNamedEnv(it) }
+        } else {
+            resolveNamedEnv(name)
+        }
+
     private fun resolveNamedEnv(name: String): String? =
         System.getProperty(name)?.takeIf { it.isNotBlank() }
             ?: System.getenv(name)?.takeIf { it.isNotBlank() }

@@ -21,7 +21,7 @@ class LoginIssuerResolutionTest : CommandTestBase() {
 
     @AfterEach
     fun clearHubProperty() {
-        System.clearProperty(ThorynConfig.HUB_ENV)
+        ThorynConfig.ISSUER_ENV_NAMES.forEach { System.clearProperty(it) }
     }
 
     // ---- resolution order (unit) -------------------------------------------
@@ -54,7 +54,8 @@ class LoginIssuerResolutionTest : CommandTestBase() {
         // released binary must ask rather than guess — and must never guess localhost.
         assertThat(ThorynConfig.PLATFORM_HUB).isNull()
         assertThat(ThorynConfig.NO_HUB_GUIDANCE).doesNotContain("$/") // sanity: no unresolved template
-        assertThat(ThorynConfig.NO_HUB_GUIDANCE).contains(ThorynConfig.STAGING_ISSUER).contains(ThorynConfig.HUB_ENV)
+        // SSO-3296 — the guidance names the DOCUMENTED env var, `THORYN_ISSUER`.
+        assertThat(ThorynConfig.NO_HUB_GUIDANCE).contains(ThorynConfig.STAGING_ISSUER).contains(ThorynConfig.ISSUER_ENV)
     }
 
     @Test
@@ -70,8 +71,9 @@ class LoginIssuerResolutionTest : CommandTestBase() {
     // ---- end-to-end through the command ------------------------------------
 
     @Test
-    fun `login with no issuer, no THORYN_HUB and no previous session fails fast with guidance`() {
+    fun `login with no issuer, no issuer env var and no previous session fails fast with guidance`() {
         assumeTrue(System.getenv(ThorynConfig.HUB_ENV) == null, "THORYN_HUB is set in this environment")
+        assumeTrue(System.getenv(ThorynConfig.ISSUER_ENV) == null, "THORYN_ISSUER is set in this environment")
         clearTokens()
 
         val (exit, _, err) = runCli("login", "--workspace", "thoryn")
@@ -80,7 +82,7 @@ class LoginIssuerResolutionTest : CommandTestBase() {
         assertThat(err)
             .contains("no Thoryn platform selected")
             .contains("--issuer ${ThorynConfig.STAGING_ISSUER}")
-            .contains(ThorynConfig.HUB_ENV)
+            .contains(ThorynConfig.ISSUER_ENV)
         // Nothing was dialled — in particular not localhost:54702.
         assertThat(server.requestCount).isEqualTo(0)
     }
@@ -107,6 +109,24 @@ class LoginIssuerResolutionTest : CommandTestBase() {
         val (_, _, err) = runCli("login", "--device-code", "--workspace", "acme")
 
         assertThat(err).contains("Using hub ${baseUrl()}").contains(ThorynConfig.HUB_ENV)
+        assertThat(server.takeRequest().path).isEqualTo("/oauth2/device_authorization")
+    }
+
+    /**
+     * SSO-3296 — `THORYN_ISSUER` is the documented spelling of `THORYN_HUB`; both resolve, and the
+     * documented one WINS when both are set, so a CI job can adopt the new name without first
+     * unsetting the old one.
+     */
+    @Test
+    fun `THORYN_ISSUER names the platform, and wins over the THORYN_HUB alias`() {
+        clearTokens()
+        System.setProperty(ThorynConfig.ISSUER_ENV, baseUrl())
+        System.setProperty(ThorynConfig.HUB_ENV, "https://hub.wrong.example.org")
+        server.enqueue(jsonResponse(400, """{"error":"invalid_client"}"""))
+
+        val (_, _, err) = runCli("login", "--device-code", "--workspace", "acme")
+
+        assertThat(err).contains("Using hub ${baseUrl()}")
         assertThat(server.takeRequest().path).isEqualTo("/oauth2/device_authorization")
     }
 

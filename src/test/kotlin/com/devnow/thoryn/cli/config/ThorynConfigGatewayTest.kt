@@ -35,9 +35,25 @@ class ThorynConfigGatewayTest {
             .isEqualTo(ThorynConfig.DEFAULT_GATEWAY)
     }
 
+    /**
+     * SSO-3296 — `auth.` is a recognised platform label (epic SSO-3289), so an `auth.` base issuer
+     * derives its gateway exactly as a `hub.` one does. The customer-plane host itself does NOT move
+     * at the SSO-3297 cutover (ADR §1) — only the label it is derived FROM.
+     */
     @Test
-    fun `a non-hub host falls back to the default gateway`() {
-        assertThat(ThorynConfig.gatewayForIssuer("https://auth.example.com"))
+    fun `an auth base issuer derives the api gateway the same way a hub one does`() {
+        assertThat(ThorynConfig.gatewayForIssuer("https://auth.stg.thoryn.org"))
+            .isEqualTo("https://api.stg.thoryn.org")
+        assertThat(ThorynConfig.gatewayForIssuer("https://auth.thoryn.io"))
+            .isEqualTo("https://api.thoryn.io")
+    }
+
+    @Test
+    fun `a host with no recognised platform label falls back to the default gateway`() {
+        assertThat(ThorynConfig.gatewayForIssuer("https://idp.example.com"))
+            .isEqualTo(ThorynConfig.DEFAULT_GATEWAY)
+        // A WORKSPACE host is not a base host — the gateway is derived from the base only.
+        assertThat(ThorynConfig.gatewayForIssuer("https://acme.auth.stg.thoryn.org"))
             .isEqualTo(ThorynConfig.DEFAULT_GATEWAY)
     }
 

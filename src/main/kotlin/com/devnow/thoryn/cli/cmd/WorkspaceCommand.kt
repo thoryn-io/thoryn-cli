@@ -64,7 +64,7 @@ class WorkspaceCommand : Callable<Int> {
     @Command(name = "list", description = ["List the workspaces you own."], mixinStandardHelpOptions = true)
     class ListSubcommand : Callable<Int> {
 
-        @Option(names = ["--hub"], description = ["Override the hub base URL (default: the hub recorded at `thoryn login`)."], defaultValue = ThorynConfig.DEFAULT_HUB)
+        @Option(names = ["--issuer", "--hub"], description = ["Override the platform base issuer URL (default: the one recorded at `thoryn login`). Alias: --hub."], defaultValue = ThorynConfig.DEFAULT_HUB)
         var hub: String = ThorynConfig.DEFAULT_HUB
 
         @Option(names = ["--output"])
@@ -106,7 +106,7 @@ class WorkspaceCommand : Callable<Int> {
         @Option(names = ["--display-name"], description = ["Human-readable workspace name."], required = true)
         lateinit var displayName: String
 
-        @Option(names = ["--hub"], description = ["Override the hub base URL (default: the hub recorded at `thoryn login`)."], defaultValue = ThorynConfig.DEFAULT_HUB)
+        @Option(names = ["--issuer", "--hub"], description = ["Override the platform base issuer URL (default: the one recorded at `thoryn login`). Alias: --hub."], defaultValue = ThorynConfig.DEFAULT_HUB)
         var hub: String = ThorynConfig.DEFAULT_HUB
 
         @Option(names = ["--gateway"], description = ["Override the customer-plane gateway URL for the product-api tenant registration (default: the gateway recorded at `thoryn login`)."], defaultValue = ThorynConfig.DEFAULT_GATEWAY)
@@ -196,7 +196,7 @@ class WorkspaceCommand : Callable<Int> {
         @Parameters(index = "0", description = ["Workspace slug to switch into."])
         lateinit var slug: String
 
-        @Option(names = ["--hub"], description = ["Override the hub base URL (default: the hub recorded at `thoryn login`)."], defaultValue = ThorynConfig.DEFAULT_HUB)
+        @Option(names = ["--issuer", "--hub"], description = ["Override the platform base issuer URL (default: the one recorded at `thoryn login`). Alias: --hub."], defaultValue = ThorynConfig.DEFAULT_HUB)
         var hub: String = ThorynConfig.DEFAULT_HUB
 
         @Option(names = ["--client-id"], description = ["OAuth client id used for the switch exchange (default: the client this session signed in with)."])
@@ -313,7 +313,7 @@ class WorkspaceCommand : Callable<Int> {
         @Parameters(index = "0", description = ["Workspace slug to archive."])
         lateinit var slug: String
 
-        @Option(names = ["--hub"], description = ["Override the hub base URL. Defaults to the hub recorded at `thoryn login`."])
+        @Option(names = ["--issuer", "--hub"], description = ["Override the platform base issuer URL. Defaults to the one recorded at `thoryn login`. Alias: --hub."])
         var hub: String = ThorynConfig.DEFAULT_HUB
 
         @Option(names = ["--confirm"], description = [CommandSupport.CONFIRM_OPTION_DESC])
@@ -347,7 +347,7 @@ class WorkspaceCommand : Callable<Int> {
         @Parameters(index = "0", description = ["Workspace slug to reactivate."])
         lateinit var slug: String
 
-        @Option(names = ["--hub"], description = ["Override the hub base URL. Defaults to the hub recorded at `thoryn login`."])
+        @Option(names = ["--issuer", "--hub"], description = ["Override the platform base issuer URL. Defaults to the one recorded at `thoryn login`. Alias: --hub."])
         var hub: String = ThorynConfig.DEFAULT_HUB
 
         @Option(names = ["--output"])
@@ -393,7 +393,7 @@ class WorkspaceCommand : Callable<Int> {
         @Parameters(index = "0", description = ["Workspace slug to permanently delete."])
         lateinit var slug: String
 
-        @Option(names = ["--hub"], description = ["Override the hub base URL. Defaults to the hub recorded at `thoryn login`."])
+        @Option(names = ["--issuer", "--hub"], description = ["Override the platform base issuer URL. Defaults to the one recorded at `thoryn login`. Alias: --hub."])
         var hub: String = ThorynConfig.DEFAULT_HUB
 
         @Option(names = ["--confirm"], description = [CommandSupport.CONFIRM_OPTION_DESC])

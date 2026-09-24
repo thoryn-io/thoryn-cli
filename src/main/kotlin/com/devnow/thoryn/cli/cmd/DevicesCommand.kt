@@ -70,8 +70,8 @@ class DevicesCommand : Callable<Int> {
     class ListSubcommand : Callable<Int> {
 
         @Option(
-            names = ["--hub"],
-            description = ["Override the hub base URL (default: the hub recorded at `thoryn login`)."],
+            names = ["--issuer", "--hub"],
+            description = ["Override the platform base issuer URL (default: the one recorded at `thoryn login`). Alias: --hub."],
             defaultValue = ThorynConfig.DEFAULT_HUB,
         )
         var hub: String = ThorynConfig.DEFAULT_HUB
@@ -123,8 +123,8 @@ class DevicesCommand : Callable<Int> {
         var reason: String? = null
 
         @Option(
-            names = ["--hub"],
-            description = ["Override the hub base URL (default: the hub recorded at `thoryn login`)."],
+            names = ["--issuer", "--hub"],
+            description = ["Override the platform base issuer URL (default: the one recorded at `thoryn login`). Alias: --hub."],
             defaultValue = ThorynConfig.DEFAULT_HUB,
         )
         var hub: String = ThorynConfig.DEFAULT_HUB

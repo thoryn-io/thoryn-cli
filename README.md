@@ -287,23 +287,49 @@ or land in shell history:
 
 ### Which platform? (SSO-3182)
 
-The CLI has **no built-in hub** — it never defaults to `localhost`. `thoryn login` resolves the hub
-BASE URL (`https://hub.<env>`) in this order:
+The CLI has **no built-in issuer** — it never defaults to `localhost`. `thoryn login` resolves the
+platform BASE ISSUER (`https://<label>.<env>`) in this order:
 
 1. `--issuer <url>`;
-2. the `THORYN_HUB` environment variable;
-3. the hub of your previous sign-in on this machine (so after the first `--issuer` login,
+2. the `THORYN_ISSUER` environment variable (or its `THORYN_HUB` alias — see below);
+3. the platform of your previous sign-in on this machine (so after the first `--issuer` login,
    `thoryn login --workspace <slug>` alone reaches the same platform);
-4. a production hub baked into the release — **not set yet** (the production domain is a product
+4. a production issuer baked into the release — **not set yet** (the production domain is a product
    decision; `ThorynConfig.PLATFORM_HUB`).
 
 With none of them the command exits 65 and tells you how to name one — it does not dial anything.
 
 ```bash
 thoryn login --workspace thoryn --issuer https://hub.stg.thoryn.org   # Thoryn staging
-export THORYN_HUB=https://hub.stg.thoryn.org && thoryn login --workspace thoryn
-thoryn login --workspace dev --issuer http://localhost:54702          # a hub on your own machine
+export THORYN_ISSUER=https://hub.stg.thoryn.org && thoryn login --workspace thoryn
+thoryn login --workspace dev --issuer http://localhost:54702          # a platform on your own machine
 ```
+
+### `--issuer` / `THORYN_ISSUER` — and the host word (SSO-3296, epic SSO-3289)
+
+`--issuer` and `THORYN_ISSUER` are the **documented** names. `--hub` and `THORYN_HUB` remain accepted
+aliases everywhere, so recipes, connection contracts and CI written before the rename keep working
+unchanged — `hub` is the name of an internal component (a Maven module, a Helm chart, a Deployment),
+never something a customer should have to learn.
+
+The public authentication host is moving from `{slug}.hub.<domain>` to **`{slug}.auth.<domain>`**
+(ADR `2026-09-22-public-issuer-host-auth-subdomain.md`). **The CLI does not hard-code either word.**
+It reads the host label from whatever base issuer you point it at and reuses it:
+
+| You pass | The workspace issuer becomes | The sign-in screens are at |
+|---|---|---|
+| `--issuer https://hub.stg.thoryn.org` | `https://acme.hub.stg.thoryn.org` | `https://acme.identity.stg.thoryn.org` |
+| `--issuer https://auth.stg.thoryn.org` | `https://acme.auth.stg.thoryn.org` | `https://acme.auth.stg.thoryn.org/id` |
+
+So one binary is correct before **and** after the staging cutover (SSO-3297) — no flag to set, no
+re-release. Sandbox environments keep their **path** form either way:
+`https://acme.auth.stg.thoryn.org/{env}`.
+
+For a deployment whose base host uses neither word, name the label once with
+`THORYN_TENANT_HOST_LABEL=<label>`; `auth` and `hub` stay recognised alongside it.
+
+> **Staging today still serves `hub.stg.thoryn.org`.** The samples in this README use it deliberately.
+> They become `auth.stg.thoryn.org` when SSO-3297 flips `OAUTHY_TENANCY_PLATFORM_DOMAIN`.
 
 ```bash
 # Default scopes (SSO-3182): EXACTLY the `cli` login client's registered set — openid,
@@ -313,7 +339,7 @@ thoryn login --workspace dev --issuer http://localhost:54702          # a hub on
 # and `provision apply` (including a file's `grants:` block) with no --scope list.
 # `workspace` rides on SCOPE_openid (the hub /account surface). The hub mints only the
 # scopes the signing-in admin actually holds.
-# SSO-3104 — sign-in is always ON A WORKSPACE (`https://<slug>.hub.<env>`, client `cli`,
+# SSO-3104 — sign-in is always ON A WORKSPACE (`https://<slug>.<label>.<env>`, client `cli`,
 # provisioned in the `thoryn` workspace by this repo's .thoryn/provision.yaml); the shared
 # default tenant is not a sign-in target. `--workspace` or `export THORYN_WORKSPACE=<slug>`.
 thoryn login --workspace thoryn --issuer https://hub.stg.thoryn.org
@@ -373,7 +399,7 @@ validation are identical) — it does not call any new server endpoint:
 
 A client-credentials token carries no user; its `tnt` claim is minted by the hub
 from the tenant subdomain the token is requested against. Point `--issuer` at
-`https://<slug>.hub.<env>.thoryn.org` or product-api rejects the seed with `401
+`https://<slug>.<label>.<env>.thoryn.org` or product-api rejects the seed with `401
 missing_tnt_claim`.
 
 **Re-mint on expiry (SSO-2941).** A client-credentials token has no refresh token
@@ -421,12 +447,12 @@ carries nothing but `client_id` and an opaque, single-use `request_uri`
 ([RFC 9126](https://www.rfc-editor.org/rfc/rfc9126)):
 
 ```
-POST https://<workspace>.hub.<env>/oauth2/par
+POST https://<workspace>.<label>.<env>/oauth2/par
   response_type=code&client_id=cli&redirect_uri=http://127.0.0.1:<port>/callback
   &scope=…&state=…&code_challenge=…&code_challenge_method=S256[&dpop_jkt=…]
   → 201 {"request_uri":"urn:ietf:params:oauth:request_uri:…","expires_in":90}
 
-https://<workspace>.hub.<env>/oauth2/authorize?client_id=cli&request_uri=urn%3A…
+https://<workspace>.<label>.<env>/oauth2/authorize?client_id=cli&request_uri=urn%3A…
 ```
 
 Without it, every one of those parameters travels through the browser: its
@@ -705,22 +731,23 @@ parser (`DPoPProofJwtDecoderFactory`) before being added.
 
 ## Session endpoints (SSO-2827)
 
-`thoryn login` records the hub issuer (`--issuer`) and the customer-plane
+`thoryn login` records the platform issuer (`--issuer`) and the customer-plane
 gateway alongside the token, so the other commands default to them — you do
-**not** need to repeat `--hub` / `--gateway` on every call after signing in:
+**not** need to repeat `--issuer` / `--gateway` on every call after signing in:
 
 ```bash
-thoryn login --workspace acme --issuer https://hub.stg.thoryn.org  # records hub + gateway for the session
-thoryn workspace list                                              # uses the session hub, no --hub needed
+thoryn login --workspace acme --issuer https://hub.stg.thoryn.org  # records issuer + gateway for the session
+thoryn workspace list                                              # uses the session issuer, no --issuer needed
 thoryn clients list                                                # uses the session gateway, no --gateway needed
 ```
 
 The session also remembers the WORKSPACE it signed in on, so when it can no longer be renewed the CLI
 prints the exact line to fix it (`Run \`thoryn login --workspace acme\``) instead of a bare `HTTP 401`.
 
-The gateway is derived from the hub host (`hub.<env>` → `api.<env>`); for a
-non-standard topology set it explicitly at login with `--gateway <url>`. An
-explicit `--hub` / `--gateway` on any command still overrides the session.
+The gateway is derived from the base issuer host (`<label>.<env>` → `api.<env>`, so both
+`hub.stg.thoryn.org` and `auth.stg.thoryn.org` yield `api.stg.thoryn.org`); for a non-standard
+topology set it explicitly at login with `--gateway <url>`. An explicit `--issuer` (or its `--hub`
+alias) / `--gateway` on any command still overrides the session.
 
 ## Session renewal (SSO-2834 / SSO-2861 / SSO-3182)
 
@@ -921,7 +948,7 @@ java -jar target/thoryn.jar login --status
 # Requires GRAALVM_HOME (or JAVA_HOME) to point at a GraalVM distribution
 # with `native-image` installed.
 ./mvnw -Pnative -DskipTests package
-./target/thoryn workspace list --hub https://hub.stg.thoryn.org
+./target/thoryn workspace list --issuer https://hub.stg.thoryn.org
 ```
 
 ## Module layout
