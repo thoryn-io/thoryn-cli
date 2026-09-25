@@ -1,0 +1,1 @@
+{"detail":"Apex domains are not supported. Use a subdomain (for example auth.<your-domain>) and point it at the platform host with a CNAME record.","instance":"/api/v1/custom-domain","status":400,"title":"Bad Request","type":"https://thoryn.io/problems/domain_not_allowed","errorCode":"domain_not_allowed","reason":"apex_domain_not_supported"}

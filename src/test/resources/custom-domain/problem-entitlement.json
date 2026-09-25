@@ -1,0 +1,1 @@
+{"detail":"Custom domains are not enabled for this workspace. Contact Thoryn to enable them.","instance":"/api/v1/custom-domain","status":403,"title":"Forbidden","type":"https://thoryn.io/problems/entitlement_required","errorCode":"entitlement_required"}

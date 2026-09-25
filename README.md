@@ -169,6 +169,15 @@ thoryn access grant  <subject> <relation> <object>   # POST   /api/v1/access/gra
 thoryn access revoke <subject> <relation> <object>   # DELETE /api/v1/access/grants  (grant identified in the JSON body; 204)
 thoryn access list   [--object <ref>] [--subject <ref>]   # GET /api/v1/access/grants?object=…|subject=…
 thoryn access mine   [--type <objectType>] [--relation <relation>]   # GET /api/v1/access/mine — the objects YOU hold a relation on
+
+# Custom domain (SSO-3303, epic SSO-3290) — serve the workspace's sign-in (and its token issuer) on a host
+# you own, e.g. auth.acme.com. One per workspace; workspace admins only (others get 404). Needs the
+# feature enabled for the workspace by Thoryn (else 403 entitlement_required).
+# Scopes: tenant:domains.read (status) / tenant:domains.write (add, verify, remove).
+thoryn domain add <host> [--accept-re-sign-in]   # PUT    /api/v1/custom-domain — prints the TXT + CNAME records to create
+thoryn domain status                             # GET    /api/v1/custom-domain — state, records, issuer, certificate, last check
+thoryn domain verify                             # POST   /api/v1/custom-domain/verify — exit 4 while the DNS does not prove it yet
+thoryn domain remove [--yes]                     # DELETE /api/v1/custom-domain — asks for confirmation unless --yes
 ```
 
 > The supply-chain / verifiable-credential command tree was **removed** when the
@@ -206,6 +215,34 @@ ungated** — no `--confirm` needed there.
    the gateway); `create` also registers the new tenant in product-api.
  - `audit query` targets product-api's `/audit/events` surface
    (`tenant:audit.read`).
+
+### Custom domain (SSO-3303, epic SSO-3290)
+
+`thoryn domain …` manages the workspace's one custom domain through product-api's
+`/api/v1/custom-domain` (the workspace is always the one you are signed in to):
+
+```bash
+thoryn domain add auth.acme.com          # claim → PENDING; prints the two DNS records:
+#   TXT    _thoryn-verify.auth.acme.com   thoryn-verify=<challenge>    (proves ownership)
+#   CNAME  auth.acme.com                  <workspace>.auth.thoryn.io    (routes to the workspace)
+thoryn domain verify                     # PENDING/SUSPENDED → VERIFIED once both records resolve
+thoryn domain status                     # PENDING → VERIFIED → ACTIVE; SUSPENDED if a daily re-check fails
+thoryn domain remove --yes
+```
+
+- A custom domain **changes the workspace's issuer** once it is `ACTIVE`. If the workspace already has
+  production users, `add` is refused (`production_users_present`) until you pass `--accept-re-sign-in`;
+  the acceptance is recorded and audited.
+- Apex domains, IP addresses and Thoryn's own domains are refused (`domain_not_allowed`): use a
+  subdomain such as `auth.<your-domain>` and point it at the platform host with the CNAME.
+- `verify` exits `4` (not `2`) while the DNS does not prove the claim yet (`verification_failed`,
+  with `reason` `txt_record_missing` / `cname_missing` / `cname_mismatch`), so a script can poll it.
+- An unverified claim expires after 7 days (`claim_expired`); claim again for a new TXT value.
+- Every subcommand accepts `--output json|yaml|table`; `--json` is shorthand for `--output json`.
+- The scopes are part of the default `thoryn login` set. They are granted to the `cli` client by oathy
+  hub V181, which must be deployed before a CLI release that requests them.
+
+Full walkthrough: `docs/content/guides/custom-domain.mdx` in oathy (published at thoryn.org/docs).
 
 ### Least-privilege access grants (SSO-3113, epic SSO-3108)
 
@@ -334,9 +371,9 @@ For a deployment whose base host uses neither word, name the label once with
 ```bash
 # Default scopes (SSO-3182): EXACTLY the `cli` login client's registered set — openid,
 # offline_access and the whole tenant-config surface (applications, clients, users,
-# federation, audit, environments, email, idp, access). A bare login therefore authorizes
-# `clients`, `federation`, `audit`, `env`, `workspace email-provider`, `branding`, `access`
-# and `provision apply` (including a file's `grants:` block) with no --scope list.
+# federation, audit, environments, email, idp, access, domains). A bare login therefore authorizes
+# `clients`, `federation`, `audit`, `env`, `workspace email-provider`, `branding`, `access`,
+# `domain` and `provision apply` (including a file's `grants:` block) with no --scope list.
 # `workspace` rides on SCOPE_openid (the hub /account surface). The hub mints only the
 # scopes the signing-in admin actually holds.
 # SSO-3104 — sign-in is always ON A WORKSPACE (`https://<slug>.<label>.<env>`, client `cli`,

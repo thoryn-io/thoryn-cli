@@ -73,6 +73,10 @@ resources:
         # the product side (SSO-3112) has deployed the scopes; a founder re-applies this file after that.
         - tenant:access.read
         - tenant:access.write
+        # SSO-3303 — `thoryn domain …` (the workspace's custom domain). Granted to this client by oathy hub
+        # V181 before any CLI release requests it, so converging this file finds it already present.
+        - tenant:domains.read
+        - tenant:domains.write
       requireAuthorizationConsent: false  # first-party: no consent screen for the platform's own CLI
 
   # SSO-3113 (epic SSO-3108) — the CI machine identity, named as the subject of the sandbox's `grants:`

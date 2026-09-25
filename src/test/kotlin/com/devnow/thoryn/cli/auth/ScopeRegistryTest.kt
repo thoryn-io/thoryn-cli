@@ -31,6 +31,9 @@ class ScopeRegistryTest {
             // SSO-3113 — `access` grants + the provisioning file's `grants:` block.
             .contains("tenant:access.read")
             .contains("tenant:access.write")
+            // SSO-3303 — `domain` (the workspace's custom domain).
+            .contains("tenant:domains.read")
+            .contains("tenant:domains.write")
     }
 
     @Test
@@ -48,6 +51,7 @@ class ScopeRegistryTest {
             "tenant:idp.read", "tenant:idp.write",
             "tenant:email.read", "tenant:email.write",
             "tenant:environments.read", "tenant:environments.write",
+            "tenant:domains.read", "tenant:domains.write",
         )
         assertThat(default).containsAll(ScopeRegistry.TENANT_CONFIG_SCOPES)
         assertThat(default).doesNotHaveDuplicates()
