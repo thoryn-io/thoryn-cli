@@ -229,6 +229,39 @@ class DpopKeyProviderTest {
         assertThat(Dpop.keyClass()).isEqualTo(DpopKeyClass.SOFTWARE_KEYCHAIN)
     }
 
+    @Test
+    fun `resetForTest restores the production ladder, so a fake ladder cannot leak into later test classes`() {
+        // SSO-3339 — `resetForTest()` restored every Dpop seam except the ladder. A test in this class
+        // that left an ephemeral-only ladder behind made every DPoP test class surefire happened to
+        // run AFTER it resolve no persistent key (`session()` == null), so the suite passed or failed
+        // on filesystem class order alone: green in `ci`, red in the release's tagged-tree verify.
+        Dpop.ladder = { listOf(EphemeralDpopKeyProvider()) }
+
+        Dpop.resetForTest()
+        var stored: StoredDpopKey? = null
+        Dpop.storeProvider = {
+            object : DpopKeyStore {
+                override fun read(): StoredDpopKey? = stored
+                override fun write(key: StoredDpopKey) {
+                    stored = key
+                }
+                override fun delete() {
+                    stored = null
+                }
+            }
+        }
+
+        assertThat(Dpop.ladder().map { it.keyClass }).containsExactly(
+            DpopKeyClass.SECURE_ELEMENT,
+            DpopKeyClass.SOFTWARE_KEYCHAIN,
+            DpopKeyClass.EPHEMERAL,
+        )
+        // …and the restored ladder is built from the CURRENT store seam, not the one at reset time.
+        assertThat(Dpop.session()).isNotNull()
+        assertThat(Dpop.keyClass()).isEqualTo(DpopKeyClass.SOFTWARE_KEYCHAIN)
+        assertThat(stored).isNotNull()
+    }
+
     // ── provisioning only on login ───────────────────────────────────────────
 
     @Test

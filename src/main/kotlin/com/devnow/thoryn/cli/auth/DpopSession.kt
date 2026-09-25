@@ -220,13 +220,17 @@ object Dpop {
      * SSO-3227 — the provider ladder, strongest first. A test that overrides [storeProvider] is
      * overriding the *software* rung, which is why the ladder is rebuilt from it rather than captured.
      */
-    internal var ladder: () -> List<DpopKeyProvider> = {
-        listOf(
-            SecureElementDpopKeyProvider(clock = clock),
-            SoftwareKeychainDpopKeyProvider(storeProvider = storeProvider, clock = clock),
-            EphemeralDpopKeyProvider(clock = clock),
-        )
-    }
+    internal var ladder: () -> List<DpopKeyProvider> = { defaultLadder() }
+
+    /**
+     * The production ladder, built from the *current* [storeProvider] and [clock] seams. A named
+     * function rather than an inline lambda so [resetForTest] can restore it — see SSO-3339.
+     */
+    private fun defaultLadder(): List<DpopKeyProvider> = listOf(
+        SecureElementDpopKeyProvider(clock = clock),
+        SoftwareKeychainDpopKeyProvider(storeProvider = storeProvider, clock = clock),
+        EphemeralDpopKeyProvider(clock = clock),
+    )
 
     @Volatile
     private var cached: DpopSession? = null
@@ -346,6 +350,11 @@ object Dpop {
         clock = { Instant.now() }
         jtiSource = { UUID.randomUUID().toString() }
         storeProvider = { DpopKeyStoreFactory.default() }
+        // SSO-3339 — the ladder is a seam too. Leaving a test's fake / ephemeral-only ladder in place
+        // made every later DPoP test class in the JVM resolve no persistent key, so `session()` came
+        // back null — and whether that bit depended purely on surefire's filesystem class order,
+        // which is why `ci` passed and the release's `verify the tagged tree` failed on one commit.
+        ladder = { defaultLadder() }
         DpopKeyProviders.resetForTest()
         UserPresence.resetForTest()
         // SSO-3227 — a test JVM is never a place to raise a biometric prompt. Surefire forks with
