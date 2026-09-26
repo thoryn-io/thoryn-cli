@@ -299,6 +299,30 @@ class ProductApiClient(
     fun deleteEmailProvider(confirmSlug: String? = null): Unit =
         deleteNoContent("/api/v1/email-provider", confirmSlug)
 
+    // ── Custom domain (SSO-3303; product-api /api/v1/custom-domain) ─────────────────────
+    //
+    // The workspace's ONE custom domain (e.g. auth.acme.com): a singleton, workspace-level (the
+    // environment header this client sends has no effect on it). read → tenant:domains.read;
+    // write → tenant:domains.write (granted to the CLI's login clients by oathy hub V181). GET always
+    // answers 200 (state NONE when nothing is claimed); PUT claims (idempotent for the same host) and
+    // returns the TXT + CNAME records to create; POST /verify checks the DNS now; DELETE removes (204).
+
+    fun getCustomDomain(): JsonNode =
+        get("/api/v1/custom-domain")
+
+    /** `PUT /api/v1/custom-domain` — [acceptReSignIn] is the explicit one-time re-sign-in acceptance. */
+    fun putCustomDomain(domain: String, acceptReSignIn: Boolean): JsonNode =
+        put(
+            "/api/v1/custom-domain",
+            mapper.createObjectNode().put("domain", domain).put("acceptReSignIn", acceptReSignIn),
+        )
+
+    fun verifyCustomDomain(): JsonNode =
+        post("/api/v1/custom-domain/verify", emptyBody())
+
+    fun deleteCustomDomain(): Unit =
+        deleteNoContent("/api/v1/custom-domain")
+
     // ── Hosted-login branding (SSO-3037; product-api /api/v1/login-experience/branding) ─
     //
     // The per-(tenant, environment) branding of the hosted sign-in / register screens:

@@ -68,6 +68,11 @@ object ScopeRegistry {
         // requesting an unregistered scope is an invalid_scope loop (SSO-2278).
         "tenant:access.read",
         "tenant:access.write",
+        // custom domain — the workspace's own sign-in host (product-api /api/v1/custom-domain — SSO-3303;
+        // granted to `cli` / `thoryn-cli` by oathy hub V181). read gates `domain status`; write gates
+        // `domain add | verify | remove`.
+        "tenant:domains.read",
+        "tenant:domains.write",
     )
 
     /**

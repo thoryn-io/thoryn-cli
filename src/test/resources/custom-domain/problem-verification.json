@@ -1,0 +1,1 @@
+{"detail":"The domain has no CNAME record. Point it at the workspace's platform host.","instance":"/api/v1/custom-domain/verify","status":422,"title":"Unprocessable Entity","type":"https://thoryn.io/problems/verification_failed","errorCode":"verification_failed","reason":"cname_missing"}

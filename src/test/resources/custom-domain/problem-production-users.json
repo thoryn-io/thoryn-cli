@@ -1,0 +1,1 @@
+{"detail":"This workspace already has production users. A custom domain changes the workspace's issuer, so every production user must sign in again once. Repeat the request with acceptReSignIn=true to proceed.","instance":"/api/v1/custom-domain","status":409,"title":"Conflict","type":"https://thoryn.io/problems/production_users_present","errorCode":"production_users_present"}

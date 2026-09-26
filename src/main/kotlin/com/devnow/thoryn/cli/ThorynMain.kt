@@ -9,6 +9,7 @@ import com.devnow.thoryn.cli.cmd.LoginMethodsCommand
 import com.devnow.thoryn.cli.cmd.ClientsCommand
 import com.devnow.thoryn.cli.cmd.DevicesCommand
 import com.devnow.thoryn.cli.cmd.DiagCommand
+import com.devnow.thoryn.cli.cmd.DomainCommand
 import com.devnow.thoryn.cli.cmd.EnvironmentCommand
 import com.devnow.thoryn.cli.cmd.FederationCommand
 import com.devnow.thoryn.cli.cmd.LoginCommand
@@ -52,6 +53,8 @@ import kotlin.system.exitProcess
         EnvironmentCommand::class,
         // SSO-3113 — least-privilege access grants (`thoryn access grant|revoke|list|mine`).
         AccessCommand::class,
+        // SSO-3303 — the workspace's custom domain (`thoryn domain add|status|verify|remove`).
+        DomainCommand::class,
         BrandingCommand::class,
         LoginFlowCommand::class,
         LoginMethodsCommand::class,
