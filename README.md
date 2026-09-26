@@ -178,6 +178,14 @@ thoryn domain add <host> [--accept-re-sign-in]   # PUT    /api/v1/custom-domain 
 thoryn domain status                             # GET    /api/v1/custom-domain — state, records, issuer, certificate, last check
 thoryn domain verify                             # POST   /api/v1/custom-domain/verify — exit 4 while the DNS does not prove it yet
 thoryn domain remove [--yes]                     # DELETE /api/v1/custom-domain — asks for confirmation unless --yes
+
+# On-demand signing-key rotation (SSO-3369) — a new version of one of the SELECTED environment's keys
+# (suspected leak, own schedule). --kind sign-in (token signing key; the hub rotates at once) |
+# security-events (SSF / webhook / DSAR / veto signing key; its rotator acts within ~2 minutes).
+# Workspace admins only (others get 404). Scopes: tenant:keys.rotate (rotate) / tenant:keys.read (rotations).
+thoryn keys rotate --kind <kind> [--environment e] [--wait] [--timeout 5m] [--yes]   # POST /api/v1/signing-keys/{kind}/rotations
+thoryn keys rotations [list] --kind <kind> [--limit n] [--cursor c]                   # GET  /api/v1/signing-keys/{kind}/rotations
+thoryn keys rotations get <id> --kind <kind>                                          # GET  /api/v1/signing-keys/{kind}/rotations/{id}
 ```
 
 > The supply-chain / verifiable-credential command tree was **removed** when the
@@ -243,6 +251,37 @@ thoryn domain remove --yes
   hub V181, which must be deployed before a CLI release that requests them.
 
 Full walkthrough: `docs/content/guides/custom-domain.mdx` in oathy (published at thoryn.org/docs).
+
+### On-demand signing-key rotation (SSO-3369)
+
+`thoryn keys …` asks for a new version of one of the selected environment's signing keys through
+product-api's `/api/v1/signing-keys/{kind}/rotations`. The API only records the request; the identity
+that already rotates the key on schedule carries it out.
+
+```bash
+thoryn keys rotate --kind sign-in --environment production --wait
+# Rotation requested: 5b0f…  (sign-in, production)
+# DONE — new version 3, kid tenant-ws.<workspace id>-v3. The previous version stays published, …
+thoryn keys rotate --kind security-events --wait          # PENDING → DONE within about two minutes
+thoryn keys rotations list --kind security-events         # the environment's requests, newest first
+thoryn keys rotations get <id> --kind security-events
+```
+
+- **What changes.** New tokens (`sign-in`) or security events (`security-events`) are signed with the new
+  version. The previous version stays published in the JWKS, so what it signed keeps validating;
+  relying parties that look keys up by `kid` and refetch the JWKS on an unknown `kid` need no change.
+- `rotate` asks for confirmation (it refuses without a terminal unless `--yes`). `--wait` follows the
+  request until it is `DONE` or `FAILED` (`--timeout`, default `5m`); it exits `4` on `FAILED` or when the
+  timeout passes while still `PENDING`.
+- One request per key at a time (`409 rotation_pending` names the pending request) and a one-hour
+  cooldown after a request (`429 rotation_cooldown` says when). `404 signing_key_not_found` means you
+  are not an admin of the workspace (or the environment is not one you can reach).
+- `--environment <slug>` targets an environment directly; otherwise the one `thoryn env use` selected.
+- Every subcommand accepts `--output json|yaml|table`; `--json` is shorthand for `--output json`.
+- The scopes are part of the default `thoryn login` set. They are granted to the `cli` client by oathy
+  hub V183, which must be deployed before a CLI release that requests them.
+
+Full walkthrough: `docs/content/guides/rotate-signing-keys.mdx` in oathy (published at thoryn.org/docs).
 
 ### Least-privilege access grants (SSO-3113, epic SSO-3108)
 

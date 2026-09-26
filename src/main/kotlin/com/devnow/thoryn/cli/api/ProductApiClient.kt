@@ -299,6 +299,30 @@ class ProductApiClient(
     fun deleteEmailProvider(confirmSlug: String? = null): Unit =
         deleteNoContent("/api/v1/email-provider", confirmSlug)
 
+    // ── Signing-key rotation (SSO-3369; product-api /api/v1/signing-keys/{kind}/rotations) ──
+    //
+    // On-demand rotation of one of the SELECTED environment's signing keys (the `X-Thoryn-Environment`
+    // header this client sends picks the environment). {kind}: `sign-in` (the environment's token
+    // signing key, rotated by the hub at once) or `security-events` (its SSF security-event key,
+    // rotated by the secevent-key-rotator within about two minutes). POST → tenant:keys.rotate
+    // (workspace admins only; others get 404); GETs → tenant:keys.read. Granted to the CLI's login
+    // clients by oathy hub V183. The request answers 202 with its id and state
+    // (PENDING → DONE | FAILED); poll GET …/{id} until it leaves PENDING.
+
+    fun requestSigningKeyRotation(kind: String): JsonNode =
+        post("/api/v1/signing-keys/${encode(kind)}/rotations", emptyBody())
+
+    fun listSigningKeyRotations(kind: String, limit: Int? = null, cursor: String? = null): JsonNode {
+        val query = buildList {
+            limit?.let { add("limit=$it") }
+            cursor?.takeIf { it.isNotBlank() }?.let { add("cursor=${encode(it)}") }
+        }.joinToString("&").let { if (it.isEmpty()) "" else "?$it" }
+        return get("/api/v1/signing-keys/${encode(kind)}/rotations$query")
+    }
+
+    fun getSigningKeyRotation(kind: String, id: String): JsonNode =
+        get("/api/v1/signing-keys/${encode(kind)}/rotations/${encode(id)}")
+
     // ── Custom domain (SSO-3303; product-api /api/v1/custom-domain) ─────────────────────
     //
     // The workspace's ONE custom domain (e.g. auth.acme.com): a singleton, workspace-level (the

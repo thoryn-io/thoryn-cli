@@ -1,0 +1,1 @@
+{"detail":"No such signing-key rotation request.","instance":"/api/v1/signing-keys/security-events/rotations/6e440d10-b0e5-4295-9739-1754b4a7b014","status":404,"title":"Not Found","type":"https://thoryn.io/problems/signing_key_rotation_not_found","errorCode":"signing_key_rotation_not_found"}

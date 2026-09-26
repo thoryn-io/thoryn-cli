@@ -1,0 +1,1 @@
+{"detail":"Unknown signing key kind. Supported: sign-in, security-events.","instance":"/api/v1/signing-keys/database/rotations","status":404,"title":"Not Found","type":"https://thoryn.io/problems/unknown_key_kind","errorCode":"unknown_key_kind"}

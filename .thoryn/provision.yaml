@@ -77,6 +77,10 @@ resources:
         # V181 before any CLI release requests it, so converging this file finds it already present.
         - tenant:domains.read
         - tenant:domains.write
+        # SSO-3369 — `thoryn keys …` (on-demand signing-key rotation). Granted to this client by oathy hub
+        # V183 before any CLI release requests it.
+        - tenant:keys.read
+        - tenant:keys.rotate
       requireAuthorizationConsent: false  # first-party: no consent screen for the platform's own CLI
 
   # SSO-3113 (epic SSO-3108) — the CI machine identity, named as the subject of the sandbox's `grants:`
