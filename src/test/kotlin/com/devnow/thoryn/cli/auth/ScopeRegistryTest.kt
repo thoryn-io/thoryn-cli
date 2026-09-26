@@ -34,6 +34,9 @@ class ScopeRegistryTest {
             // SSO-3303 — `domain` (the workspace's custom domain).
             .contains("tenant:domains.read")
             .contains("tenant:domains.write")
+            // SSO-3369 — `keys` (on-demand signing-key rotation).
+            .contains("tenant:keys.read")
+            .contains("tenant:keys.rotate")
     }
 
     @Test
@@ -52,6 +55,7 @@ class ScopeRegistryTest {
             "tenant:email.read", "tenant:email.write",
             "tenant:environments.read", "tenant:environments.write",
             "tenant:domains.read", "tenant:domains.write",
+            "tenant:keys.read", "tenant:keys.rotate",
         )
         assertThat(default).containsAll(ScopeRegistry.TENANT_CONFIG_SCOPES)
         assertThat(default).doesNotHaveDuplicates()

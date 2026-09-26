@@ -1,0 +1,1 @@
+{"detail":"A rotation of this key is already pending. Wait for it to finish.","instance":"/api/v1/signing-keys/security-events/rotations","status":409,"title":"Conflict","type":"https://thoryn.io/problems/rotation_pending","errorCode":"rotation_pending","pendingRequestId":"f0b7070e-c4ad-4d65-8ad7-4c5fc235e293"}

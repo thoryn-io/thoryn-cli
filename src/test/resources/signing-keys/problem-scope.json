@@ -1,0 +1,1 @@
+{"detail":"The token does not grant the scope required for this operation.","instance":"/api/v1/signing-keys/security-events/rotations","status":403,"title":"Forbidden","type":"https://thoryn.io/problems/access_denied","errorCode":"access_denied"}

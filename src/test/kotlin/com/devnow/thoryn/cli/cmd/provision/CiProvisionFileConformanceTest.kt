@@ -57,11 +57,14 @@ class CiProvisionFileConformanceTest {
         assertThat(granted - setOf("openid", "offline_access")).isEqualTo(requestable)
     }
 
-    /** Every `tenant:<area>.<read|write>` literal under src/main (sources + bundled resources). */
+    /**
+     * Every `tenant:<area>.<read|write>` literal under src/main (sources + bundled resources), plus the
+     * one action-verb scope `tenant:keys.rotate` (SSO-3369).
+     */
     private fun requestableTenantScopes(): Set<String> {
         val root = File(locate(PROVISION_PATH).parentFile.parentFile, "src/main").walkTopDown()
             .filter { it.isFile && (it.extension == "kt" || it.extension == "json" || it.extension == "yaml") }
-        val pattern = Regex("tenant:[a-z-]+\\.(read|write)")
+        val pattern = Regex("tenant:[a-z-]+\\.(read|write|rotate)")
         return root.flatMap { f -> pattern.findAll(f.readText()).map { it.value } }.toSet()
     }
 

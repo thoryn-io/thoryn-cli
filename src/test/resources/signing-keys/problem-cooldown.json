@@ -1,0 +1,1 @@
+{"detail":"This key was rotated on request recently. A new request is accepted after the cooldown.","instance":"/api/v1/signing-keys/security-events/rotations","status":429,"title":"Too Many Requests","type":"https://thoryn.io/problems/rotation_cooldown","errorCode":"rotation_cooldown","retryAt":"2026-09-26T06:22:07.045851Z"}

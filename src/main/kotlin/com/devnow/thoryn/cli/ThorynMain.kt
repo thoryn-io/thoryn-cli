@@ -10,6 +10,7 @@ import com.devnow.thoryn.cli.cmd.ClientsCommand
 import com.devnow.thoryn.cli.cmd.DevicesCommand
 import com.devnow.thoryn.cli.cmd.DiagCommand
 import com.devnow.thoryn.cli.cmd.DomainCommand
+import com.devnow.thoryn.cli.cmd.KeysCommand
 import com.devnow.thoryn.cli.cmd.EnvironmentCommand
 import com.devnow.thoryn.cli.cmd.FederationCommand
 import com.devnow.thoryn.cli.cmd.LoginCommand
@@ -55,6 +56,8 @@ import kotlin.system.exitProcess
         AccessCommand::class,
         // SSO-3303 — the workspace's custom domain (`thoryn domain add|status|verify|remove`).
         DomainCommand::class,
+        // SSO-3369 — on-demand signing-key rotation (`thoryn keys rotate | rotations`).
+        KeysCommand::class,
         BrandingCommand::class,
         LoginFlowCommand::class,
         LoginMethodsCommand::class,

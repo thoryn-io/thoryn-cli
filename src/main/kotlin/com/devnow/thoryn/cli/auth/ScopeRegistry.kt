@@ -73,6 +73,11 @@ object ScopeRegistry {
         // `domain add | verify | remove`.
         "tenant:domains.read",
         "tenant:domains.write",
+        // on-demand signing-key rotation (product-api /api/v1/signing-keys/{kind}/rotations — SSO-3369;
+        // granted to `cli` / `thoryn-cli` by oathy hub V183). read gates `keys rotations list|get` and
+        // `keys rotate --wait`'s polling; rotate gates `keys rotate`.
+        "tenant:keys.read",
+        "tenant:keys.rotate",
     )
 
     /**
