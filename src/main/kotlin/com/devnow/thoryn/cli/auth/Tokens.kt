@@ -42,6 +42,14 @@ data class Tokens(
     // the id is an opaque identifier and the name is the one the user chose.
     val deviceId: String? = null,
     val deviceName: String? = null,
+    // SSO-3379 — the platform BASE issuer this session's login resolved (`https://auth.<env>`), as
+    // opposed to [issuer], which after an interactive sign-in is the WORKSPACE issuer
+    // (`https://<slug>.auth.<env>`). Every other workspace's issuer is composed from THIS base
+    // (`https://<other>.auth.<env>`), never by prefixing a slug onto [issuer] — that produced the nested
+    // `https://<other>.<slug>.auth.<env>` the hub rejects `invalid_target` since SSO-3360. Nullable for
+    // token files written before SSO-3379: readers fall back to the base of [issuer]
+    // ([com.devnow.thoryn.cli.config.ThorynConfig.baseHubOf]). Not a secret.
+    val platformIssuer: String? = null,
 ) {
     companion object {
         /** SSO-2941 — [authMode] value marking a non-interactive API-key / client-credentials session. */

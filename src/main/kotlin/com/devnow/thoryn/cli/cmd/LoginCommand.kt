@@ -91,7 +91,7 @@ class LoginCommand : Callable<Int> {
 
     /**
      * SSO-3104 — the workspace an interactive sign-in (loopback / device-code) happens on: the issuer
-     * becomes `https://<slug>.hub.<env>` ([ThorynConfig.tenantIssuer]) and the session's `tnt` is that
+     * becomes `https://<slug>.<label>.<env>` ([ThorynConfig.tenantIssuer]) and the session's `tnt` is that
      * workspace. REQUIRED for those flows — the shared default tenant is not a sign-in target. Falls
      * back to the `THORYN_WORKSPACE` env var. The non-interactive modes bind their tenant elsewhere
      * (`--connection` from the contract's workspace; `--client-credentials` from the key's `tnt`).
@@ -306,6 +306,10 @@ class LoginCommand : Callable<Int> {
             workspace = signedInWorkspace,
             // The gateway derives from the hub BASE (`hub.<env>` → `api.<env>`), never from a tenant host.
             gateway = gateway?.takeIf { it.isNotBlank() } ?: ThorynConfig.gatewayForIssuer(baseIssuer),
+            // SSO-3379 — remember the platform BASE: [issuer] is the WORKSPACE issuer after an interactive
+            // sign-in, and every other workspace's issuer (`workspace switch`, examples) is composed from
+            // the base, never by prefixing a slug onto [issuer].
+            platformIssuer = baseIssuer.takeIf { it.isNotBlank() },
         )
 
     /** The hub base URL (before any workspace prefixing). */
@@ -320,7 +324,9 @@ class LoginCommand : Callable<Int> {
      * session is announced on stderr so the user sees which platform they are signing in to.
      */
     private fun resolveIssuer(): Boolean {
-        val previous = runCatching { tokenStore.read() }.getOrNull()?.issuer
+        // SSO-3379 — prefer the platform base the previous session recorded; an older token file has only
+        // the (workspace) issuer, which [ThorynConfig.resolveHubBase] normalises to its base.
+        val previous = runCatching { tokenStore.read() }.getOrNull()?.let { it.platformIssuer ?: it.issuer }
         val hub = ThorynConfig.resolveHubBase(issuerOption, previous)
         if (hub == null) {
             System.err.println(ThorynConfig.NO_HUB_GUIDANCE)
@@ -584,6 +590,7 @@ class LoginCommand : Callable<Int> {
                 tokens.copy(
                     issuer = derivedIssuer,
                     gateway = derivedGateway,
+                    platformIssuer = hubBase.trim().trimEnd('/'), // SSO-3379 — the base the workspace issuer was composed from
                     authMode = Tokens.AUTH_MODE_CLIENT_CREDENTIALS,
                     clientId = connection.clientId,
                 ),
