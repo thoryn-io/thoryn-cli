@@ -57,6 +57,8 @@ class LoginClientCredentialsTest : CommandTestBase() {
         assertThat(stored!!.accessToken).isEqualTo("AT-cc")
         // client_credentials yields no refresh token.
         assertThat(stored.refreshToken).isNull()
+        // SSO-3379 — the platform base is recorded so workspace issuers are composed from it.
+        assertThat(stored.platformIssuer).isEqualTo(baseUrl())
 
         val req = server.takeRequest()
         assertThat(req.path).isEqualTo("/oauth2/token")

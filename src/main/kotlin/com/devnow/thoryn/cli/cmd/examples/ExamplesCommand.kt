@@ -163,6 +163,7 @@ class ExamplesCommand : Callable<Int> {
             val tokens = CommandSupport.readTokens() ?: return CommandSupport.EXIT_NOT_SIGNED_IN
             val ctx = ExampleContext(
                 hub = CommandSupport.resolveHub(hub, tokens),
+                platformIssuer = CommandSupport.resolvePlatformIssuer(hub, tokens), // SSO-3379
                 gateway = CommandSupport.resolveGateway(gateway, tokens),
                 tokens = tokens,
                 state = ExampleStateStore(),
@@ -293,6 +294,7 @@ class ExamplesCommand : Callable<Int> {
             val tokens = CommandSupport.readTokens() ?: return CommandSupport.EXIT_NOT_SIGNED_IN
             val ctx = ExampleContext(
                 hub = CommandSupport.resolveHub(hub, tokens),
+                platformIssuer = CommandSupport.resolvePlatformIssuer(hub, tokens), // SSO-3379
                 gateway = CommandSupport.resolveGateway(gateway, tokens),
                 tokens = tokens,
                 state = ExampleStateStore(),
@@ -500,6 +502,7 @@ class ExamplesCommand : Callable<Int> {
             val tokens = CommandSupport.readTokens() ?: return CommandSupport.EXIT_NOT_SIGNED_IN
             val ctx = ExampleContext(
                 hub = CommandSupport.resolveHub(hub, tokens),
+                platformIssuer = CommandSupport.resolvePlatformIssuer(hub, tokens), // SSO-3379
                 gateway = CommandSupport.resolveGateway(gateway, tokens),
                 tokens = tokens,
                 state = ExampleStateStore(),

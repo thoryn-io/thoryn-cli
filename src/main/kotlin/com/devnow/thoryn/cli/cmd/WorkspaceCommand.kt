@@ -119,6 +119,7 @@ class WorkspaceCommand : Callable<Int> {
             val format = CommandSupport.parseFormat(outputRaw) ?: return CommandSupport.EXIT_USAGE
             val tokens = CommandSupport.readTokens() ?: return CommandSupport.EXIT_NOT_SIGNED_IN
             // SSO-2827 — default the hub + gateway to the ones recorded at login.
+            val hubOption = hub
             hub = CommandSupport.resolveHub(hub, tokens)
             gateway = CommandSupport.resolveGateway(gateway, tokens)
             val hubClient = CommandSupport.client(hub, tokens)
@@ -171,7 +172,8 @@ class WorkspaceCommand : Callable<Int> {
                 recordFields = { node -> workspaceRecordFields(node) + ("productApiRegistered" to registered) },
             )
             // Tell the user how to switch into the new workspace.
-            val tenantHub = WorkspaceTenantHost.tenantIssuer(hub, createdSlug)
+            // SSO-3379 — composed from the platform BASE, never from the (workspace) session issuer.
+            val tenantHub = WorkspaceTenantHost.tenantIssuer(CommandSupport.resolvePlatformIssuer(hubOption, tokens), createdSlug)
             if (tenantHub != null && format == OutputFormat.TABLE) {
                 System.err.println(
                     "To use this workspace, switch into it:  thoryn login --workspace $createdSlug",
@@ -221,6 +223,7 @@ class WorkspaceCommand : Callable<Int> {
         override fun call(): Int {
             val format = CommandSupport.parseFormat(outputRaw) ?: return CommandSupport.EXIT_USAGE
             val tokens = CommandSupport.readTokens() ?: return CommandSupport.EXIT_NOT_SIGNED_IN
+            val hubOption = hub
             hub = CommandSupport.resolveHub(hub, tokens) // SSO-2827 — the hub you signed into (also feeds the token exchange below)
             // SSO-3104 — exchange as the client this session was signed in with, never a fixed default.
             val clientId = clientIdOverride?.takeIf { it.isNotBlank() } ?: CommandSupport.sessionClientId(tokens)
@@ -242,9 +245,13 @@ class WorkspaceCommand : Callable<Int> {
             }
 
             val tenantId = match["tenantId"]?.asString() ?: ""
-            val tenantHub = WorkspaceTenantHost.tenantIssuer(hub, slug)
+            // SSO-3379 — the target workspace issuer is composed from the platform BASE (recorded at login,
+            // or the explicit --issuer), NOT from [hub]: after an interactive sign-in [hub] is the HOME
+            // workspace issuer, and prefixing it gave the nested host the hub rejects `invalid_target`.
+            val platformIssuer = CommandSupport.resolvePlatformIssuer(hubOption, tokens)
+            val tenantHub = WorkspaceTenantHost.tenantIssuer(platformIssuer, slug)
             if (tenantHub == null) {
-                System.err.println("Error: could not derive the tenant hub URL from '$hub'.")
+                System.err.println("Error: could not derive the workspace issuer from '$platformIssuer'.")
                 return CommandSupport.EXIT_IO_ERROR
             }
 
@@ -486,23 +493,57 @@ class WorkspaceCommand : Callable<Int> {
 }
 
 /**
- * Derives a tenant's hub issuer URL (`{slug}.{hubHost}`) from the base hub URL,
- * matching the BFF's `TenantAwareClientRegistrationRepository.withTenantHost`
- * rewrite (scheme/port/path preserved, host prefixed with the slug). Used to
- * print the `thoryn login --workspace …` line for a workspace switch.
+ * Composes a WORKSPACE issuer (the RFC 8693 `resource` of a `workspace switch`, and the issuer a
+ * switched session mints tokens for) from the platform BASE issuer.
+ *
+ * SSO-3379 — the hub resolves that `resource` through the platform issuer rule since SSO-3360: a
+ * workspace issuer is exactly `https://{slug}.<label>.<env>` (optionally `/{env}` for a sandbox) or an
+ * ACTIVE custom domain; anything else is `invalid_target`. The slug is therefore always composed onto
+ * the platform BASE host (`auth.stg.thoryn.org` → `acme.auth.stg.thoryn.org`), never onto the host of
+ * the session issuer — after an interactive sign-in that is already a workspace host, and prefixing it
+ * produced the nested `acme.thoryn.auth.stg.thoryn.org`. (The pre-SSO-3360 hub took only the first host
+ * label, which is why the nested shape used to work; this object's old KDoc described it as mirroring
+ * the console BFF's `withTenantHost` rewrite, which no longer applies.)
  */
 internal object WorkspaceTenantHost {
 
-    fun tenantIssuer(hubBaseUrl: String, slug: String): String? {
+    /**
+     * The issuer of workspace [slug] on the platform named by [platformIssuer]. [platformIssuer] may be
+     * the base (`https://auth.stg.thoryn.org`) or any workspace issuer on it
+     * (`https://thoryn.auth.stg.thoryn.org`, a sandbox `…/{env}` form) — it is normalised to the base
+     * first ([ThorynConfig.baseHubOf]) and the slug is composed with the base's own label
+     * ([ThorynConfig.tenantIssuer]). A host with no recognised platform label (local dev
+     * `http://localhost:54702`) keeps the plain `{slug}.{host}` prefix. Null when unparseable.
+     */
+    fun tenantIssuer(platformIssuer: String, slug: String): String? {
         return try {
-            val parsed = URI(hubBaseUrl.trimEnd('/'))
+            val base = ThorynConfig.baseHubOf(platformIssuer)
+            val parsed = URI(base)
             val host = parsed.host ?: return null
-            val tenantHost = "$slug.$host"
-            URI(parsed.scheme, parsed.userInfo, tenantHost, parsed.port, parsed.path, parsed.query, parsed.fragment)
+            if (ThorynConfig.labelIndex(host) == 0) return ThorynConfig.tenantIssuer(base, slug)
+            URI(parsed.scheme, parsed.userInfo, "$slug.$host", parsed.port, parsed.path, parsed.query, parsed.fragment)
                 .toString()
                 .trimEnd('/')
         } catch (_: Exception) {
             null
         }
+    }
+
+    /**
+     * The token-exchange target for a persisted [selection]. A selection written before SSO-3379 while
+     * signed in at a workspace issuer holds the nested `https://<slug>.<home>.<label>.<env>` — its host
+     * starts with the selected slug and carries a recognised platform label deeper than the workspace
+     * position. Such a value is re-derived from [platformIssuer]; every other stored issuer (a clean
+     * workspace issuer, a local-dev host, an explicit override recorded at switch time) is returned as-is.
+     */
+    fun healedSelection(selection: SelectedWorkspace, platformIssuer: String): String {
+        val stored = selection.tenantHubIssuer
+        val nested = runCatching {
+            val labels = ThorynConfig.tenantHostLabels()
+            val parts = URI(stored.trim()).host?.lowercase()?.split('.') ?: return@runCatching false
+            parts.firstOrNull() == selection.slug.lowercase() && parts.indexOfFirst { it in labels } >= 2
+        }.getOrDefault(false)
+        if (!nested) return stored
+        return tenantIssuer(platformIssuer, selection.slug) ?: stored
     }
 }

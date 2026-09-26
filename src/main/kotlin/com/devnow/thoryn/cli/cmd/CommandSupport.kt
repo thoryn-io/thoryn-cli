@@ -143,6 +143,12 @@ internal object CommandSupport {
             ?: return client(gateway, baseTokens, overrideSlug)
         val environmentSlug = if (environmentOverride != null) overrideSlug else selected.environmentSlug?.takeIf { applyEnvironment }
 
+        // SSO-3379 — a selection written by a CLI before SSO-3379 while signed in at a WORKSPACE issuer
+        // stored the nested `https://<slug>.<home>.auth.<env>`, which the hub rejects `invalid_target`
+        // since SSO-3360. Re-derive such a value from the session's platform base; any other stored
+        // issuer (including an explicit `--issuer` override at switch time) is used verbatim.
+        val targetIssuer = WorkspaceTenantHost.healedSelection(selected, resolvePlatformIssuer(ThorynConfig.DEFAULT_HUB, baseTokens))
+
         fun mint(): Tokens? {
             val base = ensureFresh(baseTokens, err)
             val issuer = base.issuer?.takeIf { it.isNotBlank() } ?: return null
@@ -152,7 +158,7 @@ internal object CommandSupport {
                     clientId = sessionClientId(base),
                     clientSecret = ThorynConfig.resolveClientSecret(),
                     subjectToken = base.accessToken,
-                    targetResource = selected.tenantHubIssuer,
+                    targetResource = targetIssuer,
                     sender = realHttpSender(),
                     // SSO-2965 (reverted) — request NO scope on the switch exchange. The hub's
                     // cross-tenant exchange already mints the FULL entitled set the caller holds in
@@ -291,6 +297,7 @@ internal object CommandSupport {
                 .copy(
                     issuer = current.issuer,
                     gateway = current.gateway,
+                    platformIssuer = current.platformIssuer, // SSO-3379
                     clientId = current.clientId,
                     workspace = current.workspace,
                 )
@@ -348,6 +355,7 @@ internal object CommandSupport {
                 .copy(
                     issuer = current.issuer,
                     gateway = current.gateway,
+                    platformIssuer = current.platformIssuer, // SSO-3379
                     authMode = Tokens.AUTH_MODE_CLIENT_CREDENTIALS,
                     clientId = clientId,
                     workspace = current.workspace,
@@ -385,6 +393,22 @@ internal object CommandSupport {
     fun resolveHub(explicit: String, tokens: Tokens?): String =
         if (explicit != ThorynConfig.DEFAULT_HUB) explicit
         else tokens?.issuer?.takeIf { it.isNotBlank() } ?: explicit
+
+    /**
+     * SSO-3379 — resolve the platform BASE issuer (`https://auth.<env>`) every workspace issuer is
+     * composed from ([WorkspaceTenantHost.tenantIssuer]), with the same precedence as [resolveHub]:
+     *   1. an explicit, non-default `--issuer`/`--hub` — documented as the platform base issuer; a
+     *      workspace issuer passed there is normalised to its base ([ThorynConfig.baseHubOf]);
+     *   2. the base recorded at login ([Tokens.platformIssuer]);
+     *   3. for a token file written before SSO-3379, the base of the recorded [Tokens.issuer] — which
+     *      after an interactive sign-in is a WORKSPACE issuer, so it must never be used as-is;
+     *   4. the local-dev sentinel, as [resolveHub].
+     */
+    fun resolvePlatformIssuer(explicit: String, tokens: Tokens?): String =
+        if (explicit != ThorynConfig.DEFAULT_HUB) ThorynConfig.baseHubOf(explicit)
+        else tokens?.platformIssuer?.takeIf { it.isNotBlank() }?.trim()?.trimEnd('/')
+            ?: tokens?.issuer?.takeIf { it.isNotBlank() }?.let(ThorynConfig::baseHubOf)
+            ?: explicit
 
     /** SSO-2827 — as [resolveHub], for the gateway base URL ([Tokens.gateway]). */
     fun resolveGateway(explicit: String, tokens: Tokens?): String =

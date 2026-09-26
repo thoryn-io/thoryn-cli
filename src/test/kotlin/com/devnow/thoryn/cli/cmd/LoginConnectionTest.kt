@@ -83,6 +83,8 @@ class LoginConnectionTest : CommandTestBase() {
         assertThat(stored.refreshToken).isNull()
         // The session was stamped with the derived issuer + gateway (local hub base => no-op derive).
         assertThat(stored.issuer).isEqualTo(baseUrl())
+        // SSO-3379 — and the platform base the workspace issuer was composed from.
+        assertThat(stored.platformIssuer).isEqualTo(baseUrl())
 
         val req = server.takeRequest()
         assertThat(req.path).isEqualTo("/oauth2/token")

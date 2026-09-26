@@ -715,7 +715,7 @@ internal class RecipeInterpreter(
         val w = workspace ?: throw RecipeException("this step requires a prior hub.createWorkspace step")
         return w.provisioningToken?.let { ctx.provisioningGatewayClient(it, slug) }
             ?: ctx.tenantGatewayClient(
-                ThorynConfig.tenantIssuer(ctx.hub, w.slug)
+                ThorynConfig.tenantIssuer(ctx.platformIssuer, w.slug) // SSO-3379 — from the platform base
                     ?: throw RecipeException("could not derive the tenant issuer for workspace '${w.slug}'"),
                 slug,
             )
@@ -779,8 +779,8 @@ internal class RecipeInterpreter(
             tenantId = w?.tenantId,
             clientId = createdClientId,
             redirectUri = createdRedirectUri,
-            tenantIssuer = slug?.let { ThorynConfig.tenantIssuer(ctx.hub, it) },
-            identityHost = slug?.let { ThorynConfig.tenantIdentityHost(ctx.hub, it) },
+            tenantIssuer = slug?.let { ThorynConfig.tenantIssuer(ctx.platformIssuer, it) },
+            identityHost = slug?.let { ThorynConfig.tenantIdentityHost(ctx.platformIssuer, it) },
             // SSO-2961 — the ephemeral sandbox this recipe created, so teardown can hard-delete it.
             environmentId = createdEnvironmentId,
             environmentSlug = createdEnvironmentSlug,

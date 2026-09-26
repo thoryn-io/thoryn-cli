@@ -52,6 +52,13 @@ internal class ExampleContext(
     val state: ExampleStateStore,
     val out: PrintStream = System.out,
     val err: PrintStream = System.err,
+    /**
+     * SSO-3379 — the platform BASE issuer (`https://auth.<env>`) a created workspace's issuer and
+     * directory host are composed from. [hub] is the session issuer — after an interactive sign-in a
+     * WORKSPACE issuer — so composing from it named the caller's home workspace (and a localhost
+     * directory host) instead of the created one. Defaults to the base of [hub].
+     */
+    val platformIssuer: String = ThorynConfig.baseHubOf(hub),
 ) {
     /** Client for the hub `/account/[**]` surface (workspaces). */
     fun hubClient(): ProductApiClient = CommandSupport.client(hub, tokens)
@@ -105,7 +112,7 @@ internal class ExampleContext(
 
     /**
      * SSO-2831 — a gateway client scoped to the target workspace named by [tenantIssuer]
-     * (`https://{slug}.hub.<domain>`). Silently exchanges the session token for a token in that
+     * (`https://{slug}.<label>.<domain>`, composed from [platformIssuer]). Silently exchanges the session token for a token in that
      * tenant (RFC 8693, the same mechanism as `thoryn workspace switch`), so resources are created
      * UNDER the workspace — not the caller's login tenant. Without this the RP client would be
      * registered in the login tenant while sign-in runs against the workspace's issuer, and the
