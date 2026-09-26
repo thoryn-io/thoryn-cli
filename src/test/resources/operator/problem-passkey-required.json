@@ -1,0 +1,8 @@
+{
+  "type": "https://thoryn.org/problems/operator_passkey_required",
+  "title": "Passkey authentication required",
+  "status": 403,
+  "detail": "Operator actions require a passkey sign-in. Sign in again with your passkey and retry.",
+  "instance": "/admin/tenants/acme/custom-domain/entitlement",
+  "errorCode": "operator_passkey_required"
+}

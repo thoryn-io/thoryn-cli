@@ -1,0 +1,8 @@
+{
+  "type": "about:blank",
+  "title": "Not Found",
+  "status": 404,
+  "detail": "The requested resource was not found.",
+  "instance": "/admin/tenants/acme/custom-domain/entitlement",
+  "errorCode": "not_found"
+}

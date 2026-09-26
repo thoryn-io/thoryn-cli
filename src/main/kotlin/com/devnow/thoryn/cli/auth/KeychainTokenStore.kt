@@ -87,6 +87,12 @@ class KeychainTokenStore(
         const val ACCOUNT: String = "tokens"
 
         /**
+         * SSO-3356 — keychain "account" of the isolated OPERATOR session (`thoryn operator login`),
+         * a separate entry under the same [SERVICE] so it never replaces the customer session.
+         */
+        const val OPERATOR_ACCOUNT: String = "operator-tokens"
+
+        /**
          * Open the OS-default keychain backend. Throws
          * [BackendNotSupportedException] if no backend is available on this
          * platform (e.g. a Linux container without a Secret Service daemon).

@@ -131,6 +131,44 @@ class TokenStoreFactoryTest {
             .isInstanceOf(TokenStoreUnavailableException::class.java)
     }
 
+    @Test
+    fun `operator session lives in its own keychain entry and never replaces the customer session`() {
+        TokenStoreFactory.environment = envOf()
+        val entries = mutableMapOf<Pair<String, String>, String>()
+        val memory = object : KeychainAccess {
+            override fun getPassword(service: String, account: String): String? = entries[service to account]
+            override fun setPassword(service: String, account: String, password: String) {
+                entries[service to account] = password
+            }
+            override fun deletePassword(service: String, account: String) {
+                entries.remove(service to account)
+            }
+        }
+        TokenStoreFactory.keychainProvider = { memory }
+
+        TokenStoreFactory.default().write(Tokens(accessToken = "customer"))
+        TokenStoreFactory.operator().write(Tokens(accessToken = "operator"))
+
+        assertThat(entries.keys).containsExactlyInAnyOrder(
+            KeychainTokenStore.SERVICE to KeychainTokenStore.ACCOUNT,
+            KeychainTokenStore.SERVICE to KeychainTokenStore.OPERATOR_ACCOUNT,
+        )
+        assertThat(TokenStoreFactory.default().read()?.accessToken).isEqualTo("customer")
+        assertThat(TokenStoreFactory.operator().read()?.accessToken).isEqualTo("operator")
+
+        TokenStoreFactory.operator().delete()
+        assertThat(TokenStoreFactory.default().read()?.accessToken).isEqualTo("customer")
+    }
+
+    @Test
+    fun `plaintext opt-in puts the operator session in a sibling file`() {
+        TokenStoreFactory.environment = envOf(TokenStoreFactory.PLAINTEXT_OPT_IN_ENV_VAR to "1")
+
+        assertThat(FileTokenStore.operatorPath().fileName.toString()).isEqualTo("operator-tokens.json")
+        assertThat(FileTokenStore.operatorPath().parent).isEqualTo(FileTokenStore.defaultPath().parent)
+        assertThat(TokenStoreFactory.operator()).isInstanceOf(FileTokenStore::class.java)
+    }
+
     // ── Helpers ────────────────────────────────────────────────────────────────
 
     private fun envOf(vararg pairs: Pair<String, String>): (String) -> String? {
