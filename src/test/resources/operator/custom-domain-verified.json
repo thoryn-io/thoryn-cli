@@ -1,0 +1,16 @@
+{
+  "domain": "auth.acme.com",
+  "state": "VERIFIED",
+  "entitled": true,
+  "dnsRecords": [
+    { "type": "TXT", "name": "_thoryn-verify.auth.acme.com", "value": "thoryn-verify=Zk3pQm1vT2x5c0dvb2RUb2tlbg" },
+    { "type": "CNAME", "name": "auth.acme.com", "value": "acme.auth.stg.thoryn.org" }
+  ],
+  "claimedAt": "2026-09-25T10:00:00Z",
+  "claimExpiresAt": "2026-10-02T10:00:00Z",
+  "verifiedAt": "2026-09-25T10:15:00Z",
+  "lastCheckedAt": "2026-09-26T03:00:00Z",
+  "suspendedAt": null,
+  "failureReason": null,
+  "reissueAccepted": false
+}

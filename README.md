@@ -186,6 +186,15 @@ thoryn domain remove [--yes]                     # DELETE /api/v1/custom-domain 
 thoryn keys rotate --kind <kind> [--environment e] [--wait] [--timeout 5m] [--yes]   # POST /api/v1/signing-keys/{kind}/rotations
 thoryn keys rotations [list] --kind <kind> [--limit n] [--cursor c]                   # GET  /api/v1/signing-keys/{kind}/rotations
 thoryn keys rotations get <id> --kind <kind>                                          # GET  /api/v1/signing-keys/{kind}/rotations/{id}
+
+# Operator plane (SSO-3356) — Thoryn staff / self-managed platform operators only. Passkey sign-in on the
+# `thoryn` home with client thoryn-operator, stored APART from `thoryn login`; calls go to the hub's /admin
+# surface over a kubectl port-forward (never a public host). See "Operator commands" below.
+thoryn operator login [--issuer <base>] [--status]            # passkey sign-in → admin:custom-domains.manage/.read
+thoryn operator logout                                         # forget the operator session only
+thoryn operator custom-domain entitle <workspace> [--hub-url u] # PUT /admin/tenants/{slug}/custom-domain/entitlement {"entitled":true}
+thoryn operator custom-domain revoke  <workspace> [--hub-url u] # … {"entitled":false} (an existing domain stays)
+thoryn operator custom-domain status  <workspace> [--hub-url u] # GET /admin/tenants/{slug}/custom-domain
 ```
 
 > The supply-chain / verifiable-credential command tree was **removed** when the
@@ -1007,6 +1016,68 @@ thoryn provision apply --file .thoryn/provision.yaml --secret-file ci.secret
 No standing test user and no standing sandbox are needed any more: the provisioning file
 creates (or adopts) the sandbox and the client per run.
 
+## Operator commands
+
+`thoryn operator …` is the **operator plane** (oathy ADR
+`2026-09-18-operator-workspace-ownership-transfer.md`, amended 2026-09-26 for custom domains;
+docs `operate/operator-plane/`). It is not part of the customer product: an operator is an identity in
+the platform home workspace `thoryn` that holds the explicit `platform:thoryn#operator` grant, appointed
+only by the deployment value `productApi.operatorPlatformSubjects`.
+
+Three things differ from every other command:
+
+* **A separate session.** `thoryn operator login` signs in on the `thoryn` home with the public native
+  client `thoryn-operator` (hub V174; loopback `http://127.0.0.1/callback`, any port) and stores the
+  result in its own slot — keychain account `operator-tokens` (or `operator-tokens.json` next to
+  `tokens.json` under `THORYN_CI_PLAINTEXT_TOKENS=1`). Your `thoryn login` session is never replaced,
+  and no customer-plane command ever uses the operator token.
+* **A passkey is required.** The hub mints `admin:*` scopes only to a passkey sign-in (`amr`
+  `swk` / `hwk` / `webauthn`) of an identity with standing, and re-checks both on every call. The login
+  sends `prompt=login` so an existing (possibly password) browser session is not reused — choose your
+  passkey on the sign-in page. The token lasts 15 minutes and has no refresh token; sign in again when
+  it expires.
+* **No public address.** `/admin` is refused on every public host (edge deny Ingress +
+  `AdminSurfaceExposureFilter`). The commands call the hub through a port-forward, default
+  `--hub-url http://localhost:18080`, and refuse any URL that is not loopback, a single-label Service
+  name or a `*.svc` name — an operator token is never sent to a public host.
+
+```bash
+# 1. Sign in as an operator (browser; choose your PASSKEY). Default scopes:
+#    openid admin:custom-domains.manage admin:custom-domains.read
+thoryn operator login --issuer https://auth.stg.thoryn.org
+thoryn operator login --status          # validity, subject, scopes, "Passkey: yes"
+
+# 2. In another terminal (needs cluster access):
+kubectl -n thoryn port-forward svc/thoryn-hub 18080:8080
+
+# 3. Turn custom domains on for a workspace, and check it:
+thoryn operator custom-domain entitle acme
+# Custom domains ENABLED for workspace 'acme' (entitled: true). Its admins can now run `thoryn domain add <host>`.
+thoryn operator custom-domain status acme
+# Workspace 'acme' has no custom domain.   (until its admins claim one; then state, DNS records, last check)
+
+thoryn operator custom-domain revoke acme   # off again; an existing domain is NOT removed
+thoryn operator logout
+```
+
+Every `custom-domain` subcommand takes `--output json|yaml|table` / `--json`.
+
+| Symptom | Meaning | Fix |
+|---|---|---|
+| `the hub is not reachable at http://localhost:18080` | No port-forward | Start `kubectl -n thoryn port-forward svc/thoryn-hub 18080:8080` |
+| `Refusing to send an operator token to '<host>'` | `--hub-url` is a public host | Use the port-forward address |
+| `404 not_found` | The workspace does not exist, **or** your identity holds no operator standing here (the hub answers both with 404) | Check the slug; confirm your platform subject is in `productApi.operatorPlatformSubjects` |
+| `403 operator_passkey_required` | The operator session was not a passkey sign-in | `thoryn operator login`, choose the passkey |
+| `403 insufficient_scope` | The token lacks `admin:custom-domains.manage` (or `.read` for `status`) — e.g. minted before hub V185 | `thoryn operator login` again |
+| login fails with `invalid_scope` | No operator standing, or not a passkey sign-in (the hub does not say which) | Confirm standing; sign in with the passkey |
+| `Your operator session has expired` | 15-minute token, no refresh | `thoryn operator login` |
+
+DPoP: the operator login uses the same DPoP path as `thoryn login`, but the hub binds only for clients
+that participate, and `thoryn-operator` does not (not `dpop_required` / `dpop_allowed`, not in the
+cutover list) — so its tokens are Bearer tokens today. Should the client ever be bound, the commands
+present the token under `DPoP` with a proof whose `htu` is the port-forward URL, which is what the hub
+(strict `htu`, reconstructed from the `Host` it receives) compares against.
+
 ## Build
 
 Requires a JDK 21+ on `PATH`. The Maven wrapper (`./mvnw`) pins Maven, so no
@@ -1048,7 +1119,8 @@ thoryn-cli/
     │   │   ├── Tokens.kt
     │   │   └── ScopeRegistry.kt                             # SSO-959 scope wildcards
     │   ├── api/
-    │   │   └── ProductApiClient.kt                          # SSO-959 typed HTTP client
+    │   │   ├── ProductApiClient.kt                          # SSO-959 typed HTTP client
+    │   │   └── OperatorHubClient.kt                         # SSO-3356 hub /admin operator surface (port-forward)
     │   ├── cmd/
     │   │   ├── LoginCommand.kt + LogoutCommand.kt
     │   │   ├── CommandSupport.kt                            # SSO-1552 shared token/output/error helpers
@@ -1060,7 +1132,8 @@ thoryn-cli/
     │   │   ├── TenantCommand.kt                             # SSO-1553 tenant seed (non-interactive provisioner)
     │   │   ├── SelectedWorkspaceStore.kt                    # SSO-1552 records the switched-into workspace
     │   │   ├── AuditCommand.kt                              # SSO-1552 audit query (config + auth events)
-    │   │   └── AuditReplayCommand.kt                        # SSO-940b
+    │   │   ├── AuditReplayCommand.kt                        # SSO-940b
+    │   │   └── operator/                                    # SSO-3356 `operator login|logout|custom-domain` (operator plane)
     │   ├── config/
     │   │   └── ThorynConfig.kt                              # per-env defaults
     │   └── output/

@@ -1,0 +1,7 @@
+{
+  "type": "about:blank",
+  "title": "Not Found",
+  "status": 404,
+  "detail": "Tenant not found: nosuch",
+  "instance": "/admin/tenants/nosuch/custom-domain/entitlement"
+}

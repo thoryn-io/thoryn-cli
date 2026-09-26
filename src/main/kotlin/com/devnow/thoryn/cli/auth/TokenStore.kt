@@ -94,6 +94,18 @@ class FileTokenStore(
     companion object {
         const val OVERRIDE_ENV_VAR: String = "THORYN_TOKEN_FILE"
 
+        /**
+         * SSO-3356 — the file that holds the isolated OPERATOR session (`thoryn operator login`): a
+         * sibling of the customer-session file ([defaultPath]), so an operator sign-in never
+         * overwrites — or is overwritten by — the ordinary `thoryn login` session.
+         */
+        const val OPERATOR_FILE_NAME: String = "operator-tokens.json"
+
+        fun operatorPath(): Path {
+            val customer = defaultPath()
+            return customer.parent?.resolve(OPERATOR_FILE_NAME) ?: Path(OPERATOR_FILE_NAME)
+        }
+
         fun defaultPath(): Path {
             System.getenv(OVERRIDE_ENV_VAR)?.takeIf { it.isNotBlank() }?.let { return Path(it) }
             val home = System.getProperty("user.home") ?: error("user.home is not set")
@@ -165,6 +177,32 @@ object TokenStoreFactory {
             KeychainTokenStore(keychainProvider())
         } catch (e: BackendNotSupportedException) {
             handleBackendUnavailable(e)
+        }
+    }
+
+    /**
+     * SSO-3356 — the isolated OPERATOR session slot (`thoryn operator login` / `thoryn operator …`).
+     *
+     * Same backend decision as [default] — the OS keychain, or the plaintext file only on the same
+     * explicit opt-ins — but a DIFFERENT entry: keychain account [KeychainTokenStore.OPERATOR_ACCOUNT],
+     * or [FileTokenStore.operatorPath]. An operator token carries `admin:*` scopes and is minted only to
+     * a passkey sign-in on the platform home; keeping it apart means signing in as an operator never
+     * replaces the customer session every other command uses, and no customer-plane command can ever
+     * pick the operator token up by accident.
+     */
+    fun operator(): TokenStore {
+        if (isPlaintextOptIn()) {
+            log.warning(
+                "Using plaintext file token store for the operator session. This violates ADR 2026-04-25 §4. " +
+                    "Only safe in CI; set THORYN_CI_PLAINTEXT_TOKENS=1 to acknowledge.",
+            )
+            return FileTokenStore(FileTokenStore.operatorPath())
+        }
+        return try {
+            KeychainTokenStore(keychainProvider(), account = KeychainTokenStore.OPERATOR_ACCOUNT)
+        } catch (e: BackendNotSupportedException) {
+            handleBackendUnavailable(e)
+            FileTokenStore(FileTokenStore.operatorPath())
         }
     }
 

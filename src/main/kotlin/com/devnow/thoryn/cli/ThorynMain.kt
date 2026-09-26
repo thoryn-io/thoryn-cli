@@ -22,6 +22,7 @@ import com.devnow.thoryn.cli.cmd.WhoamiCommand
 import com.devnow.thoryn.cli.cmd.WorkspaceCommand
 import com.devnow.thoryn.cli.cmd.examples.ExamplesCommand
 import com.devnow.thoryn.cli.cmd.provision.ProvisionCommand
+import com.devnow.thoryn.cli.cmd.operator.OperatorCommand
 import picocli.CommandLine
 import picocli.CommandLine.Command
 import kotlin.system.exitProcess
@@ -67,6 +68,8 @@ import kotlin.system.exitProcess
         AuditReplayCommand::class,
         ExamplesCommand::class,
         ProvisionCommand::class,
+        // SSO-3356 — the operator plane (passkey session on the `thoryn` home; `/admin` over a port-forward).
+        OperatorCommand::class,
         // SSO-2956 — hidden internal diagnostics (native-image token round-trip check).
         DiagCommand::class,
     ],
