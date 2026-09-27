@@ -323,6 +323,33 @@ class ProductApiClient(
     fun getSigningKeyRotation(kind: String, id: String): JsonNode =
         get("/api/v1/signing-keys/${encode(kind)}/rotations/${encode(id)}")
 
+    // ── Signing-key retirement (SSO-3396; product-api /api/v1/signing-keys/{kind}/retirements) ──
+    //
+    // Retire a LEAKED key: every version up to `throughVersion` (default: the signing version) stops
+    // verifying at once. retire → tenant:keys.retire + a passkey sign-in ≤ 5 min (RFC 9470 step-up) +
+    // `acknowledgeConsequences: true`; reading → tenant:keys.read. sign-in answers 201 DONE (200 when the
+    // range was already retired); security-events answers 202 PENDING (the rotator acts within ~2 min).
+
+    fun retireSigningKey(kind: String, throughVersion: Int?): JsonNode =
+        post(
+            "/api/v1/signing-keys/${encode(kind)}/retirements",
+            mapper.createObjectNode().apply {
+                put("acknowledgeConsequences", true)
+                throughVersion?.let { put("throughVersion", it) }
+            },
+        )
+
+    fun listSigningKeyRetirements(kind: String, limit: Int? = null, cursor: String? = null): JsonNode {
+        val query = buildList {
+            limit?.let { add("limit=$it") }
+            cursor?.takeIf { it.isNotBlank() }?.let { add("cursor=${encode(it)}") }
+        }.joinToString("&").let { if (it.isEmpty()) "" else "?$it" }
+        return get("/api/v1/signing-keys/${encode(kind)}/retirements$query")
+    }
+
+    fun getSigningKeyRetirement(kind: String, id: String): JsonNode =
+        get("/api/v1/signing-keys/${encode(kind)}/retirements/${encode(id)}")
+
     // ── Custom domain (SSO-3303; product-api /api/v1/custom-domain) ─────────────────────
     //
     // The workspace's ONE custom domain (e.g. auth.acme.com): a singleton, workspace-level (the
@@ -915,7 +942,10 @@ class ProductApiClient(
         val response = sendAuthed(HttpResponse.BodyHandlers.ofString(), build)
         val body = response.body() ?: ""
         if (response.statusCode() !in 200..299) {
-            throw ProductApiException.fromResponse(response.statusCode(), body, mapper)
+            throw ProductApiException.fromResponse(
+                response.statusCode(), body, mapper,
+                wwwAuthenticate = response.headers().firstValue("WWW-Authenticate").orElse(null),
+            )
         }
         if (body.isBlank()) return mapper.nullNode()
         return mapper.readTree(body)
@@ -1031,11 +1061,29 @@ class ProductApiException(
     val errorDescription: String?,
     /** Raw body for `--output json` structured-error reporting. */
     val rawBody: String,
+    /** SSO-3396 — the `WWW-Authenticate` challenge, when the API sent one (an RFC 9470 step-up has no body). */
+    val wwwAuthenticate: String? = null,
 ) : RuntimeException("HTTP $httpStatus: ${errorCode ?: "no_error_code"}${errorDescription?.let { " — $it" } ?: ""}") {
 
     /** True if this is a "you don't have the right scope" failure. */
     val isInsufficientScope: Boolean
-        get() = httpStatus == 403 || errorCode == "insufficient_scope"
+        get() = (httpStatus == 403 && !isStepUpRequired) || errorCode == "insufficient_scope"
+
+    /**
+     * SSO-3396 — RFC 9470: the operation needs a stronger or fresher sign-in. The `403` carries the
+     * challenge in `WWW-Authenticate` (`error="insufficient_user_authentication"`, `acr_values`,
+     * `max_age`) and no body.
+     */
+    val isStepUpRequired: Boolean
+        get() = httpStatus == 403 && wwwAuthenticate?.contains("insufficient_user_authentication") == true
+
+    /** The `acr_values` the step-up challenge asks for, when it names them. */
+    val stepUpAcrValues: String?
+        get() = wwwAuthenticate?.let { Regex("acr_values=\"([^\"]*)\"").find(it)?.groupValues?.get(1) }
+
+    /** The `max_age` (seconds) the step-up challenge asks for, when it names one. */
+    val stepUpMaxAge: Long?
+        get() = wwwAuthenticate?.let { Regex("max_age=\"?(\\d+)\"?").find(it)?.groupValues?.get(1)?.toLongOrNull() }
 
     /**
      * SSO-2413 — the destructive action targets a **production** workspace and no
@@ -1062,9 +1110,9 @@ class ProductApiException(
         /** RFC 9457 `errorCode` emitted with 422 when the confirm header does not match the workspace slug. */
         const val ERROR_CODE_CONFIRMATION_MISMATCH: String = "production_confirmation_mismatch"
 
-        fun fromResponse(status: Int, body: String, mapper: ObjectMapper): ProductApiException {
+        fun fromResponse(status: Int, body: String, mapper: ObjectMapper, wwwAuthenticate: String? = null): ProductApiException {
             val (code, description) = parseOAuthError(body, mapper)
-            return ProductApiException(status, code, description, body)
+            return ProductApiException(status, code, description, body, wwwAuthenticate)
         }
 
         private fun parseOAuthError(body: String, mapper: ObjectMapper): Pair<String?, String?> {

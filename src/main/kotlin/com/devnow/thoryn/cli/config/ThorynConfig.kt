@@ -400,7 +400,9 @@ object ThorynConfig {
      * grant to the hub — hub V161; the `cli` client carries it from `.thoryn/provision.yaml`), SSO-3303
      * (`domains.*` for `thoryn domain …`; granted to `cli` / `thoryn-cli` by oathy hub V181, which must be
      * deployed before a release carrying this default — the SSO-2278 ordering rule), SSO-3369
-     * (`keys.*` for `thoryn keys …`; granted to `cli` / `thoryn-cli` by oathy hub V183 — same rule).
+     * (`keys.*` for `thoryn keys …`; granted to `cli` / `thoryn-cli` by oathy hub V183 — same rule), SSO-3396
+     * (`keys.retire` for `thoryn keys retire`; granted by oathy hub V189, which must be deployed before a
+     * release carrying this default — same rule).
      */
     const val DEFAULT_SCOPE =
         "openid offline_access " +
@@ -414,7 +416,7 @@ object ThorynConfig {
             "tenant:idp.read tenant:idp.write " +
             "tenant:access.read tenant:access.write " +
             "tenant:domains.read tenant:domains.write " +
-            "tenant:keys.read tenant:keys.rotate"
+            "tenant:keys.read tenant:keys.rotate tenant:keys.retire"
 
     /**
      * The `--hub` / `--gateway` "not given" sentinel of the post-login commands (SSO-2827): they use the

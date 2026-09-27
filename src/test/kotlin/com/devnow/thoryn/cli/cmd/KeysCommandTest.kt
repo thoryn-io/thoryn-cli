@@ -131,7 +131,7 @@ class KeysCommandTest : CommandTestBase() {
         server.enqueue(problem(404, "problem-not-admin"))
         val (notAdmin, _, notAdminErr) = runCli("keys", "rotate", "--kind", "security-events", "--yes", "--gateway", baseUrl())
         assertThat(notAdmin).isEqualTo(CommandSupport.EXIT_HTTP_ERROR)
-        assertThat(notAdminErr).contains("signing_key_not_found").contains("Only workspace admins can rotate keys")
+        assertThat(notAdminErr).contains("signing_key_not_found").contains("Only workspace admins can rotate or retire keys")
 
         server.enqueue(problem(403, "problem-scope"))
         val (scope, _, scopeErr) = runCli("keys", "rotate", "--kind", "security-events", "--yes", "--gateway", baseUrl())
