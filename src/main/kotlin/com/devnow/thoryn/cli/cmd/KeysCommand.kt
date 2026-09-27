@@ -34,25 +34,36 @@ import java.util.concurrent.Callable
  *  - `rotations [list] --kind <kind> [--limit n] [--cursor c]` — GET  /api/v1/signing-keys/{kind}/rotations
  *  - `rotations get <id> --kind <kind>`                         — GET  /api/v1/signing-keys/{kind}/rotations/{id}
  *
+ *  - `retire --kind <kind> [--through-version n] [--wait] [--yes]` — POST /api/v1/signing-keys/{kind}/retirements
+ *  - `retirements [list] --kind <kind>` / `retirements get <id> --kind <kind>`                    — GET …/retirements
+ *
+ * **Retire (SSO-3396)** is for a LEAKED key: every version up to the one named (default: the version
+ * signing now) stops verifying at once — for the sign-in key every session and refresh token those
+ * versions signed ends. It cannot be undone. It needs `tenant:keys.retire`, a passkey sign-in from the
+ * last five minutes (`thoryn login --acr-values urn:thoryn:acr:phishing_resistant --max-age 300`; the
+ * API answers an RFC 9470 step-up challenge otherwise), and the explicit confirmation the command asks for.
+ *
  * Every subcommand takes `--environment <slug>` (else the environment `env use` selected), `--output
- * json|yaml|table` and `--json`. Scopes: `rotate` → `tenant:keys.rotate` (workspace admins only — for
- * anyone else the API answers 404); reading → `tenant:keys.read` (both granted by oathy hub V183 and
- * part of the default `thoryn login` set).
+ * json|yaml|table` and `--json`. Scopes: `rotate` → `tenant:keys.rotate`, `retire` → `tenant:keys.retire`
+ * (workspace admins only — for anyone else the API answers 404); reading → `tenant:keys.read` (granted by
+ * oathy hub V183 / V189 and part of the default `thoryn login` set).
  */
 @Command(
     name = "keys",
-    description = ["Rotate your environment's signing keys on demand (sign-in tokens, security events)."],
+    description = ["Rotate your environment's signing keys on demand, or retire a leaked one (sign-in tokens, security events)."],
     mixinStandardHelpOptions = true,
     subcommands = [
         KeysCommand.RotateSubcommand::class,
         KeysCommand.RotationsCommand::class,
+        KeysCommand.RetireSubcommand::class,
+        KeysCommand.RetirementsCommand::class,
     ],
 )
 class KeysCommand : Callable<Int> {
 
     override fun call(): Int {
         System.err.println("Usage: thoryn keys <subcommand>")
-        System.err.println("Subcommands: rotate | rotations [list | get <id>]")
+        System.err.println("Subcommands: rotate | rotations [list | get <id>] | retire | retirements [list | get <id>]")
         return CommandSupport.EXIT_USAGE
     }
 
@@ -263,9 +274,213 @@ class KeysCommand : Callable<Int> {
         }
     }
 
+    /** `thoryn keys retire --kind <kind> [--through-version n] [--wait] [--timeout <d>] [--yes]` (SSO-3396) */
+    @Command(
+        name = "retire",
+        description = [
+            "Retire a LEAKED signing key (workspace admins, passkey sign-in within 5 minutes): every version up",
+            "to --through-version (default: the one signing now) stops verifying at once. Cannot be undone.",
+        ],
+        mixinStandardHelpOptions = true,
+    )
+    class RetireSubcommand : Base() {
+
+        @Option(
+            names = ["--through-version"],
+            description = ["Retire every version up to and including this one (default: the version signing now, and every older one)."],
+        )
+        var throughVersion: Int? = null
+
+        @Option(names = ["--wait"], description = ["security-events: wait until the key's rotator has retired it (or the request fails)."])
+        var wait: Boolean = false
+
+        @Option(names = ["--timeout"], description = ["With --wait: give up after this long, e.g. 90s, 5m (default: 5m)."])
+        var timeoutRaw: String = "5m"
+
+        @Option(names = ["--poll-interval"], hidden = true, description = ["With --wait: time between checks (default: 3s)."])
+        var pollRaw: String = "3s"
+
+        @Option(names = ["--yes", "-y"], description = ["Skip the confirmation prompt (non-interactive use). You still accept the consequences."])
+        var yes: Boolean = false
+
+        override val requiredScope: String = SCOPE_RETIRE
+
+        private lateinit var timeout: Duration
+        private lateinit var poll: Duration
+
+        override fun precheck(): Int? {
+            timeout = parseDuration(timeoutRaw) ?: return usage("--timeout", timeoutRaw)
+            poll = parseDuration(pollRaw) ?: return usage("--poll-interval", pollRaw)
+            throughVersion?.let {
+                if (it < 1) {
+                    System.err.println("Error: --through-version must be 1 or above (was $it).")
+                    return CommandSupport.EXIT_USAGE
+                }
+            }
+            if (yes) return null
+            val where = environment?.let { "environment '$it'" } ?: "the selected environment"
+            val range = throughVersion?.let { "version $it and every older version" } ?: "the version signing now and every older version"
+            val confirmed = Prompt.confirm(retireWarning(kind, where, range))
+            if (confirmed) return null
+            System.err.println(
+                if (Prompt.interactive()) "Aborted. Nothing was retired." else "Refusing to retire without confirmation; re-run with --yes.",
+            )
+            return CommandSupport.EXIT_USAGE
+        }
+
+        override fun run(client: ProductApiClient, format: OutputFormat): Int {
+            var body = client.retireSigningKey(kind, throughVersion)
+            val id = text(body, "id") ?: return renderRetirement(format, body, kind, CommandSupport.EXIT_OK)
+            if (wait && state(body) == STATE_PENDING) {
+                if (format == OutputFormat.TABLE) System.out.println("Retirement requested: $id. Waiting for the key's rotator…")
+                val deadline = System.nanoTime() + timeout.toNanos()
+                while (state(body) == STATE_PENDING && System.nanoTime() < deadline) {
+                    Thread.sleep(poll.toMillis())
+                    body = client.getSigningKeyRetirement(kind, id)
+                }
+                if (state(body) == STATE_PENDING) {
+                    if (format == OutputFormat.TABLE) {
+                        System.err.println("Still PENDING after $timeoutRaw. Follow it with: thoryn keys retirements get $id --kind $kind")
+                    } else {
+                        CommandSupport.emitRecord(format, body, ::retirementFields)
+                    }
+                    return CommandSupport.EXIT_CHECK_FAILED
+                }
+            }
+            val exit = if (state(body) == STATE_FAILED) CommandSupport.EXIT_CHECK_FAILED else CommandSupport.EXIT_OK
+            return renderRetirement(format, body, kind, exit)
+        }
+
+        private fun usage(option: String, raw: String): Int {
+            System.err.println("Error: $option must be a duration such as 90s or 5m (was '$raw').")
+            return CommandSupport.EXIT_USAGE
+        }
+    }
+
+    /** `thoryn keys retirements [list] --kind <kind>` — the environment's retirements, newest first. */
+    @Command(
+        name = "retirements",
+        description = ["List the environment's retirements of a key (or `get <id>`)."],
+        mixinStandardHelpOptions = true,
+        subcommands = [RetirementsListSubcommand::class, RetirementsGetSubcommand::class],
+    )
+    class RetirementsCommand : Base() {
+        @Option(names = ["--limit"], description = ["Maximum retirements to return (default: 50)."])
+        var limit: Int? = null
+
+        @Option(names = ["--cursor"], description = ["Continue a previous listing (the `pagination.cursor` it returned)."])
+        var cursor: String? = null
+
+        override val requiredScope: String = SCOPE_READ
+
+        override fun run(client: ProductApiClient, format: OutputFormat): Int = listRetirements(client, format, kind, limit, cursor)
+    }
+
+    /** `thoryn keys retirements list --kind <kind>` */
+    @Command(name = "list", description = ["List the environment's retirements of a key."], mixinStandardHelpOptions = true)
+    class RetirementsListSubcommand : Base() {
+        @Option(names = ["--limit"], description = ["Maximum retirements to return (default: 50)."])
+        var limit: Int? = null
+
+        @Option(names = ["--cursor"], description = ["Continue a previous listing (the `pagination.cursor` it returned)."])
+        var cursor: String? = null
+
+        override val requiredScope: String = SCOPE_READ
+
+        override fun run(client: ProductApiClient, format: OutputFormat): Int = listRetirements(client, format, kind, limit, cursor)
+    }
+
+    /** `thoryn keys retirements get <id> --kind <kind>` */
+    @Command(name = "get", description = ["Show one retirement."], mixinStandardHelpOptions = true)
+    class RetirementsGetSubcommand : Base() {
+        @Parameters(index = "0", paramLabel = "<id>", description = ["The retirement id (from `keys retire`)."])
+        lateinit var id: String
+
+        override val requiredScope: String = SCOPE_READ
+
+        override fun run(client: ProductApiClient, format: OutputFormat): Int {
+            val body = client.getSigningKeyRetirement(kind, id.trim())
+            return renderRetirement(format, body, kind, CommandSupport.EXIT_OK)
+        }
+    }
+
     companion object {
         const val SCOPE_READ: String = "tenant:keys.read"
         const val SCOPE_ROTATE: String = "tenant:keys.rotate"
+        const val SCOPE_RETIRE: String = "tenant:keys.retire"
+
+        /** The re-login that satisfies the retire endpoint's RFC 9470 challenge. */
+        const val PASSKEY_ACR: String = "urn:thoryn:acr:phishing_resistant"
+        const val STEP_UP_LOGIN: String = "thoryn login --acr-values $PASSKEY_ACR --max-age 300"
+
+        private val RETIREMENT_HEADERS = listOf("ID", "STATE", "ENVIRONMENT", "REQUESTED", "RETIRED THROUGH", "SIGNING KID / REASON")
+
+        internal fun listRetirements(client: ProductApiClient, format: OutputFormat, kind: String, limit: Int?, cursor: String?): Int {
+            val body = client.listSigningKeyRetirements(kind, limit, cursor)
+            CommandSupport.emitList(format, body, RETIREMENT_HEADERS, rowMapper = { row: JsonNode ->
+                listOf(
+                    text(row, "id"),
+                    text(row, "state"),
+                    text(row, "environment"),
+                    text(row, "requestedAt"),
+                    row["retiredThroughVersion"]?.takeUnless { it.isNull }?.asInt(),
+                    text(row, "signingKid") ?: text(row, "failureReason"),
+                )
+            })
+            if (format == OutputFormat.TABLE) {
+                body["pagination"]?.get("cursor")?.takeUnless { it.isNull }?.asString()?.let {
+                    System.out.println("More: thoryn keys retirements list --kind $kind --cursor $it")
+                }
+            }
+            return CommandSupport.EXIT_OK
+        }
+
+        internal fun renderRetirement(format: OutputFormat, body: JsonNode, kind: String, exit: Int): Int {
+            when (format) {
+                OutputFormat.TABLE -> {
+                    Printers.record(retirementFields(body), System.out)
+                    System.out.println()
+                    System.out.println(retirementSummary(body, kind))
+                }
+                else -> CommandSupport.emitRecord(format, body, ::retirementFields)
+            }
+            return exit
+        }
+
+        fun retirementFields(body: JsonNode): List<Pair<String, Any?>> = listOf(
+            "id" to text(body, "id"),
+            "kind" to text(body, "kind"),
+            "environment" to text(body, "environment"),
+            "state" to text(body, "state"),
+            "requestedAt" to text(body, "requestedAt"),
+            "completedAt" to text(body, "completedAt"),
+            "retiredThroughVersion" to body["retiredThroughVersion"]?.takeUnless { it.isNull }?.asInt(),
+            "retiredKids" to body["retiredKids"]?.takeIf { it.isArray && !it.isEmpty }?.joinToString(", ") { it.asString() },
+            "signingKid" to text(body, "signingKid"),
+            "rotated" to body["rotated"]?.takeUnless { it.isNull }?.asBoolean(),
+            "failureReason" to text(body, "failureReason"),
+        ).filter { it.second != null }
+
+        /** One plain sentence for a retirement's state. */
+        fun retirementSummary(body: JsonNode, kind: String): String = when (state(body)) {
+            STATE_DONE -> "DONE — every version up to ${body["retiredThroughVersion"]?.asInt()} is retired and no longer verifies; " +
+                "${text(body, "signingKid")} signs from now on. Ask your relying parties to fetch the key set again" +
+                (if (kind == KIND_SIGN_IN) " and to sign their users in again." else ".")
+            STATE_FAILED -> "FAILED — ${failureText(text(body, "failureReason"))}"
+            STATE_PENDING -> "PENDING — the key's rotator retires it within about two minutes. " +
+                "Follow it with: thoryn keys retirements get ${text(body, "id")} --kind $kind"
+            else -> "State: ${state(body)}"
+        }
+
+        /** What the confirmation prompt says before anything is retired. */
+        internal fun retireWarning(kind: String, where: String, range: String): String =
+            "Retire the ${describe(kind)} of $where — $range? This cannot be undone. " +
+                if (kind == KIND_SIGN_IN) {
+                    "Every ID token, access token, session and refresh token those versions signed stops working at once; " +
+                        "your relying parties must sign their users in again."
+                } else {
+                    "Relying parties can no longer verify security events those versions signed."
+                }
         const val KIND_SIGN_IN: String = "sign-in"
         const val KIND_SECURITY_EVENTS: String = "security-events"
         val KINDS: List<String> = listOf(KIND_SIGN_IN, KIND_SECURITY_EVENTS)
@@ -330,6 +545,7 @@ class KeysCommand : Callable<Int> {
             "key_not_provisioned" ->
                 "this environment has not signed anything with that key yet, so there is nothing to rotate (its first key is created on first use)."
             "timed_out" -> "the request was not completed within 30 minutes. Ask again; if it repeats, contact support."
+            "version_not_found" -> "that version is above the key's latest version; nothing was retired."
             null -> "no reason reported."
             else -> "$reason."
         }
@@ -362,9 +578,25 @@ class KeysCommand : Callable<Int> {
          */
         fun renderKeysError(format: OutputFormat, ex: ProductApiException, requiredScope: String, kind: String): Int {
             val extra = runCatching { JsonMapper.builder().build().readTree(ex.rawBody) }.getOrNull()
+            if (ex.isStepUpRequired) {
+                val exit = CommandSupport.renderError(format, ex, requiredScope = requiredScope)
+                if (format == OutputFormat.TABLE) {
+                    val acr = ex.stepUpAcrValues ?: PASSKEY_ACR
+                    val maxAge = ex.stepUpMaxAge ?: 300
+                    System.err.println("This needs a passkey sign-in from the last ${maxAge / 60} minutes. Sign in again, then retry:")
+                    System.err.println("  thoryn login --acr-values $acr --max-age $maxAge")
+                }
+                return exit
+            }
             val hint = when (ex.errorCode) {
                 "signing_key_not_found" ->
-                    "Only workspace admins can rotate keys, and only in an environment they can reach. Check --environment."
+                    "Only workspace admins can rotate or retire keys, and only in an environment they can reach. Check --environment."
+                "signing_key_retirement_not_found" -> "No such retirement in this workspace for that --kind."
+                "key_not_provisioned" -> "This environment has not signed anything with that key yet, so there is nothing to retire."
+                "invalid_key_version" -> extra?.get("latestVersion")?.asInt()?.let {
+                    "The key's latest version is $it; --through-version must be between 1 and $it."
+                }
+                "acknowledgement_required" -> "The request did not acknowledge the consequences; nothing was retired."
                 "signing_key_rotation_not_found" -> "No such request in this workspace for that --kind."
                 "unknown_key_kind" -> "Use --kind ${KINDS.joinToString(" or ")}."
                 "rotation_pending" -> extra?.get("pendingRequestId")?.asString()?.let {

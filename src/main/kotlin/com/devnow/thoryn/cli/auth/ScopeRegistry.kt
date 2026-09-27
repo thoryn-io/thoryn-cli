@@ -78,6 +78,9 @@ object ScopeRegistry {
         // `keys rotate --wait`'s polling; rotate gates `keys rotate`.
         "tenant:keys.read",
         "tenant:keys.rotate",
+        // retiring a LEAKED signing key (product-api /api/v1/signing-keys/{kind}/retirements — SSO-3396;
+        // granted to `cli` / `thoryn-cli` by oathy hub V189). Gates `keys retire`.
+        "tenant:keys.retire",
     )
 
     /**

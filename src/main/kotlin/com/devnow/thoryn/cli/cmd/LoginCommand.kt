@@ -130,6 +130,24 @@ class LoginCommand : Callable<Int> {
     )
     var scope: String = ThorynConfig.DEFAULT_SCOPE
 
+    /**
+     * SSO-3396 — OIDC `acr_values` / RFC 9470: ask the hub for a sign-in at this assurance, e.g.
+     * `urn:thoryn:acr:phishing_resistant` (a passkey), as an operation's step-up challenge demands
+     * (`thoryn keys retire`). Interactive (loopback) sign-in only.
+     */
+    @Option(
+        names = ["--acr-values"],
+        description = ["Ask for a sign-in at this assurance level, e.g. urn:thoryn:acr:phishing_resistant (a passkey). Interactive sign-in only."],
+    )
+    var acrValues: String? = null
+
+    /** SSO-3396 — OIDC `max_age`: re-authenticate unless the last sign-in is at most this many seconds old. */
+    @Option(
+        names = ["--max-age"],
+        description = ["Re-authenticate unless the last sign-in is at most this many seconds old (OIDC max_age). Interactive sign-in only."],
+    )
+    var maxAge: Long? = null
+
     @Option(
         names = ["--device-code"],
         description = ["Use the device-code flow (RFC 8628) instead of loopback redirect. Useful on headless machines."],
@@ -391,6 +409,15 @@ class LoginCommand : Callable<Int> {
         val exclusiveModes = listOf(useClientCredentials, useDeviceCode, useWorkloadIdentity).count { it }
         if (exclusiveModes > 1) {
             System.err.println("Error: --client-credentials, --device-code and --workload-identity are mutually exclusive.")
+            return EXIT_USAGE
+        }
+        // SSO-3396 — a step-up (acr_values / max_age) is a browser sign-in; the other flows cannot carry it.
+        if ((acrValues != null || maxAge != null) && exclusiveModes > 0) {
+            System.err.println("Error: --acr-values and --max-age apply to the interactive sign-in only (not with --client-credentials, --device-code or --workload-identity).")
+            return EXIT_USAGE
+        }
+        if (maxAge != null && maxAge!! < 0) {
+            System.err.println("Error: --max-age must be 0 or more seconds.")
             return EXIT_USAGE
         }
         if (useWorkloadIdentity) {
@@ -799,6 +826,8 @@ class LoginCommand : Callable<Int> {
                 codeChallenge = challenge,
                 state = state,
                 dpopJkt = dpopJkt(),
+                acrValues = acrValues,
+                maxAge = maxAge,
             )
             // SSO-3234 — push the parameters back-channel when the hub advertises PAR (RFC 9126),
             // so the browser carries only `client_id` + an opaque request_uri.
@@ -1101,6 +1130,8 @@ class LoginCommand : Callable<Int> {
             codeChallenge: String,
             state: String,
             dpopJkt: String?,
+            acrValues: String? = null,
+            maxAge: Long? = null,
         ): List<Pair<String, String>> = buildList {
             add("response_type" to "code")
             add("client_id" to clientId)
@@ -1112,6 +1143,9 @@ class LoginCommand : Callable<Int> {
             // Null omits it entirely rather than sending an empty one: "no key named" and "a key
             // named badly" are very different requests to the hub.
             dpopJkt?.takeIf { it.isNotBlank() }?.let { add("dpop_jkt" to it) }
+            // SSO-3396 — OIDC Core §3.1.2.1 / RFC 9470 step-up; omitted unless asked for.
+            acrValues?.takeIf { it.isNotBlank() }?.let { add("acr_values" to it.trim()) }
+            maxAge?.let { add("max_age" to it.toString()) }
         }
 
         /** The front-channel carrier: every parameter on the URL the browser opens. */

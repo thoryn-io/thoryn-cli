@@ -59,12 +59,12 @@ class CiProvisionFileConformanceTest {
 
     /**
      * Every `tenant:<area>.<read|write>` literal under src/main (sources + bundled resources), plus the
-     * one action-verb scope `tenant:keys.rotate` (SSO-3369).
+     * the action-verb scopes `tenant:keys.rotate` (SSO-3369) and `tenant:keys.retire` (SSO-3396).
      */
     private fun requestableTenantScopes(): Set<String> {
         val root = File(locate(PROVISION_PATH).parentFile.parentFile, "src/main").walkTopDown()
             .filter { it.isFile && (it.extension == "kt" || it.extension == "json" || it.extension == "yaml") }
-        val pattern = Regex("tenant:[a-z-]+\\.(read|write|rotate)")
+        val pattern = Regex("tenant:[a-z-]+\\.(read|write|rotate|retire)")
         return root.flatMap { f -> pattern.findAll(f.readText()).map { it.value } }.toSet()
     }
 

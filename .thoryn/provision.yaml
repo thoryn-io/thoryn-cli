@@ -81,6 +81,9 @@ resources:
         # V183 before any CLI release requests it.
         - tenant:keys.read
         - tenant:keys.rotate
+        # SSO-3396 — `thoryn keys retire` (retire a leaked signing key). Granted to this client by oathy hub
+        # V189 before any CLI release requests it.
+        - tenant:keys.retire
       requireAuthorizationConsent: false  # first-party: no consent screen for the platform's own CLI
 
   # SSO-3113 (epic SSO-3108) — the CI machine identity, named as the subject of the sandbox's `grants:`

@@ -186,6 +186,12 @@ thoryn domain remove [--yes]                     # DELETE /api/v1/custom-domain 
 thoryn keys rotate --kind <kind> [--environment e] [--wait] [--timeout 5m] [--yes]   # POST /api/v1/signing-keys/{kind}/rotations
 thoryn keys rotations [list] --kind <kind> [--limit n] [--cursor c]                   # GET  /api/v1/signing-keys/{kind}/rotations
 thoryn keys rotations get <id> --kind <kind>                                          # GET  /api/v1/signing-keys/{kind}/rotations/{id}
+# Retire a LEAKED key (SSO-3396): every version up to --through-version (default: the signing version)
+# stops verifying at once; cannot be undone. Needs tenant:keys.retire and a passkey sign-in ≤ 5 minutes:
+#   thoryn login --acr-values urn:thoryn:acr:phishing_resistant --max-age 300
+thoryn keys retire --kind <kind> [--environment e] [--through-version n] [--wait] [--yes]  # POST /api/v1/signing-keys/{kind}/retirements
+thoryn keys retirements [list] --kind <kind> [--limit n] [--cursor c]                      # GET  /api/v1/signing-keys/{kind}/retirements
+thoryn keys retirements get <id> --kind <kind>                                             # GET  /api/v1/signing-keys/{kind}/retirements/{id}
 
 # Operator plane (SSO-3356) — Thoryn staff / self-managed platform operators only. Passkey sign-in on the
 # `thoryn` home with client thoryn-operator, stored APART from `thoryn login`; calls go to the hub's /admin
@@ -289,6 +295,29 @@ thoryn keys rotations get <id> --kind security-events
 - Every subcommand accepts `--output json|yaml|table`; `--json` is shorthand for `--output json`.
 - The scopes are part of the default `thoryn login` set. They are granted to the `cli` client by oathy
   hub V183, which must be deployed before a CLI release that requests them.
+
+#### Retiring a leaked key (SSO-3396)
+
+Rotating keeps the previous version published, so a token forged with a **leaked** version would still
+verify. `thoryn keys retire` retires it instead: every version up to `--through-version` (default: the
+version signing now, and every older one) stops verifying at once; the signing version is rotated first
+when needed, so signing continues. It cannot be undone.
+
+```bash
+thoryn login --acr-values urn:thoryn:acr:phishing_resistant --max-age 300   # passkey step-up (RFC 9470)
+thoryn keys retire --kind sign-in --environment production                  # asks you to confirm the consequences
+thoryn keys retire --kind security-events --through-version 2 --wait        # PENDING → DONE within about two minutes
+thoryn keys retirements list --kind sign-in
+```
+
+- **Consequences.** `sign-in`: every ID token, access token, session and refresh token the retired versions
+  signed stops working; relying parties must sign their users in again. `security-events`: receivers can no
+  longer verify security events those versions signed. Ask your relying parties to fetch the JWKS again.
+- Without a recent passkey sign-in the API answers an RFC 9470 step-up challenge; the CLI prints the exact
+  `thoryn login --acr-values … --max-age …` line to run. `--acr-values` / `--max-age` apply to the
+  interactive sign-in only.
+- `tenant:keys.retire` is part of the default `thoryn login` set. It is granted to the `cli` client by oathy
+  hub V189, which must be deployed before a CLI release that requests it.
 
 Full walkthrough: `docs/content/guides/rotate-signing-keys.mdx` in oathy (published at thoryn.org/docs).
 

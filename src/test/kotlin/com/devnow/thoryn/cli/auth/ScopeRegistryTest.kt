@@ -37,6 +37,8 @@ class ScopeRegistryTest {
             // SSO-3369 — `keys` (on-demand signing-key rotation).
             .contains("tenant:keys.read")
             .contains("tenant:keys.rotate")
+            // SSO-3396 — `keys retire`.
+            .contains("tenant:keys.retire")
     }
 
     @Test
@@ -55,7 +57,7 @@ class ScopeRegistryTest {
             "tenant:email.read", "tenant:email.write",
             "tenant:environments.read", "tenant:environments.write",
             "tenant:domains.read", "tenant:domains.write",
-            "tenant:keys.read", "tenant:keys.rotate",
+            "tenant:keys.read", "tenant:keys.rotate", "tenant:keys.retire",
         )
         assertThat(default).containsAll(ScopeRegistry.TENANT_CONFIG_SCOPES)
         assertThat(default).doesNotHaveDuplicates()
