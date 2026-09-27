@@ -166,6 +166,7 @@ object WorkloadIdentityDiagnostics {
                     },
                 )
             }
+            appendLine()
             append(
                 "Compare the job above with the trust (`thoryn workload-identity trusts get <id>`): its client id, audience, " +
                     "repository ids, GitHub environment, ref and runner pin must all match, and it must live in the " +

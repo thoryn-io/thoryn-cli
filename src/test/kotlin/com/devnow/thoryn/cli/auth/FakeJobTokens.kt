@@ -25,7 +25,12 @@ object FakeJobTokens {
     ): Map<String, Any?> = buildMap {
         put("iss", WorkloadIdentityFlow.GITHUB_ACTIONS_ISSUER)
         put("aud", audience)
-        put("sub", "repo:$repository:" + (environment?.let { "environment:$it" } ?: "ref:$ref"))
+        // GitHub's default `sub`: environment wins, then pull_request, then the ref.
+        put("sub", "repo:$repository:" + when {
+            environment != null -> "environment:$environment"
+            eventName == "pull_request" -> "pull_request"
+            else -> "ref:$ref"
+        })
         put("jti", UUID.randomUUID().toString())
         put("repository", repository)
         put("repository_id", repositoryId)

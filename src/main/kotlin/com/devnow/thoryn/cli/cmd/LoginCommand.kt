@@ -56,12 +56,19 @@ import java.util.concurrent.Callable
  *    (SSO-1553 secret-safety rule). A client-credentials token carries no refresh
  *    token, so on expiry the CLI RE-MINTS from the stored client id + the
  *    env-supplied secret (SSO-2941, see [CommandSupport.forceRefresh]).
+ *  - **Workload identity** via `--workload-identity --client-id <wi_…> --audience <aud>` (SSO-3308) —
+ *    a GitHub Actions job exchanges its own OIDC token under a workload identity trust
+ *    (`thoryn workload-identity trusts create`). No secret at all; the job needs `permissions: id-token:
+ *    write`. No refresh token either: on expiry the CLI runs the exchange again with a FRESH job token.
+ *  - **A connection contract** via `--connection <file>` (SSO-2948) — the API-key or workload identity
+ *    binding committed as data.
  */
 @Command(
     name = "login",
     description = [
         "Sign in to Thoryn. Default: Authorization Code + PKCE (loopback). " +
-            "--device-code on headless-but-human machines; --client-credentials for CI/automation.",
+            "--device-code on headless-but-human machines; --client-credentials for CI/automation; " +
+            "--workload-identity for a GitHub Actions job with no secret.",
     ],
     mixinStandardHelpOptions = true,
 )
@@ -239,7 +246,7 @@ class LoginCommand : Callable<Int> {
      */
     @Option(
         names = ["--connection"],
-        description = ["Sign in from a connection contract (connection.schema.json). Derives issuer/gateway from workspace.slug; reads the client secret from the env var named by auth.secretEnv; requests exactly auth.scopes. Mutually exclusive with --issuer/--gateway/--scope/--client-credentials."],
+        description = ["Sign in from a connection contract (connection.schema.json). Derives issuer/gateway from workspace.slug; auth.method client_credentials reads the client secret from the env var named by auth.secretEnv, workload_identity exchanges the GitHub Actions job's OIDC token (no secret); requests exactly auth.scopes. Mutually exclusive with --issuer/--gateway/--scope/--client-id and the other modes."],
     )
     var connectionFile: File? = null
 
