@@ -9,6 +9,7 @@ import com.devnow.thoryn.cli.auth.JwtClaims
 import com.devnow.thoryn.cli.auth.LoopbackRedirectServer
 import com.devnow.thoryn.cli.auth.LoopbackTimeoutException
 import com.devnow.thoryn.cli.auth.PkceUtil
+import com.devnow.thoryn.cli.auth.RetiredIssuer
 import com.devnow.thoryn.cli.auth.TokenStoreFactory
 import com.devnow.thoryn.cli.auth.Tokens
 import com.devnow.thoryn.cli.cmd.BrowserLauncher
@@ -108,7 +109,8 @@ class OperatorLoginCommand : Callable<Int> {
         val base = ThorynConfig.resolveHubBase(
             explicit = issuerOption,
             previousSessionIssuer = runCatching { store.read() }.getOrNull()?.issuer
-                ?: runCatching { TokenStoreFactory.default().read() }.getOrNull()?.issuer,
+                // SSO-3379 — the `thoryn login` session's recorded platform base, else its (workspace) issuer.
+                ?: runCatching { TokenStoreFactory.default().read() }.getOrNull()?.let { it.platformIssuer ?: it.issuer },
         )
         if (base == null) {
             err.println(
@@ -126,6 +128,26 @@ class OperatorLoginCommand : Callable<Int> {
             )
         }
         val issuer = ThorynConfig.tenantIssuer(base.url, slug)
+        // SSO-3377 — a retired issuer (410 issuer_retired, the SSO-3297 auth-host cutover) can only refuse
+        // the sign-in; say so before a browser opens, and leave the remembered issuer untouched.
+        when (val status = RetiredIssuer.check(issuer)) {
+            is RetiredIssuer.Status.Retired -> {
+                err.println(
+                    RetiredIssuer.loginGuidance(
+                        retired = status,
+                        base = base.url,
+                        workspace = slug,
+                        remembered = base.source == ThorynConfig.HubSource.PREVIOUS_SESSION,
+                    ) { RetiredIssuer.defaultFix(it, "thoryn operator login", includeWorkspace = slug != OperatorSession.HOME_WORKSPACE) },
+                )
+                return EXIT_USAGE
+            }
+            is RetiredIssuer.Status.Gone -> {
+                err.println(RetiredIssuer.goneGuidance(status))
+                return EXIT_USAGE
+            }
+            RetiredIssuer.Status.Live -> Unit
+        }
         return runLoopback(issuer, slug)
     }
 

@@ -18,8 +18,9 @@ package com.devnow.thoryn.cli.config
  *
  * Known platforms:
  *
- *  - Staging:    `https://hub.stg.thoryn.org` ([STAGING_ISSUER]) / `https://api.stg.thoryn.org`
- *                — becomes `https://auth.stg.thoryn.org` at the SSO-3297 cutover
+ *  - Staging:    `https://auth.stg.thoryn.org` ([STAGING_ISSUER]) / `https://api.stg.thoryn.org`
+ *                — `https://hub.stg.thoryn.org` before the SSO-3297 cutover; that host now answers
+ *                `410 issuer_retired` ([com.devnow.thoryn.cli.auth.RetiredIssuer])
  *  - Local dev:  `http://localhost:54702` ([LOCAL_DEV_HUB]) / `http://localhost:8991` — pass
  *    `--issuer http://localhost:54702` (or export THORYN_ISSUER) explicitly
  *  - Production: not live yet ([PLATFORM_HUB] is `null`; it will be `https://auth.thoryn.io`)
@@ -273,12 +274,14 @@ object ThorynConfig {
      * help text, the no-platform guidance and the connection error message; it is never a silent
      * default, so changing it cannot re-point an existing session.
      *
-     * **SSO-3297 CUTOVER — this is the CLI's one-line flip.** Staging serves `hub.stg.thoryn.org`
-     * until the big-bang deploy flips `OAUTHY_TENANCY_PLATFORM_DOMAIN`; on that day this becomes
-     * `https://auth.stg.thoryn.org` and nothing else in the CLI changes, because every composed host
-     * derives its label from the base issuer at runtime ([DEFAULT_TENANT_HOST_LABELS]).
+     * **SSO-3297 CUTOVER — flipped (SSO-3377).** Staging moved to `auth.stg.thoryn.org`; the old
+     * `hub.stg.thoryn.org` hosts now answer `410 issuer_retired`, so help text and guidance naming them
+     * sent people to a host that can only refuse them. Nothing else in the CLI changed with the flip,
+     * because every composed host derives its label from the base issuer at runtime
+     * ([DEFAULT_TENANT_HOST_LABELS]); a session remembered from before the cutover is caught by
+     * [com.devnow.thoryn.cli.auth.RetiredIssuer].
      */
-    const val STAGING_ISSUER = "https://hub.stg.thoryn.org"
+    const val STAGING_ISSUER = "https://auth.stg.thoryn.org"
 
     /** The staging gateway (customer-plane ingress) matching [STAGING_ISSUER]. */
     const val STAGING_GATEWAY = "https://api.stg.thoryn.org"

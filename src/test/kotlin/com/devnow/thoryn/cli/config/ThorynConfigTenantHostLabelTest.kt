@@ -176,12 +176,12 @@ class ThorynConfigTenantHostLabelTest {
     }
 
     /**
-     * SSO-3297 hand-off: the ONE line the cutover moves in this repo. Until it flips, the released CLI
-     * and every help string still name today's staging host, so nothing scheduled against staging breaks.
+     * SSO-3297 hand-off: the ONE line the cutover moves in this repo — flipped under SSO-3377 once staging's
+     * `hub.` hosts started answering `410 issuer_retired`, so help text no longer names a retired host.
      */
     @Test
-    fun `the staging convenience constant still names the pre-cutover host`() {
-        assertThat(ThorynConfig.STAGING_ISSUER).isEqualTo("https://hub.stg.thoryn.org")
+    fun `the staging convenience constant names the post-cutover auth host`() {
+        assertThat(ThorynConfig.STAGING_ISSUER).isEqualTo("https://auth.stg.thoryn.org")
         assertThat(ThorynConfig.gatewayForIssuer(ThorynConfig.STAGING_ISSUER)).isEqualTo(ThorynConfig.STAGING_GATEWAY)
     }
 }

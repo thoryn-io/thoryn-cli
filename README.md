@@ -47,7 +47,7 @@ the stable asset name the `thoryn-examples` conformance CI consumes.
 ## Command tree
 
 ```
-thoryn login --workspace <slug> [--issuer https://hub.<env>]  # Auth code + PKCE (loopback) or --device-code — ON your workspace (SSO-3104)
+thoryn login --workspace <slug> [--issuer https://auth.<env>]  # Auth code + PKCE (loopback) or --device-code — ON your workspace (SSO-3104)
 thoryn login --client-credentials [--client-id <id>] # SSO-1553/2941 — non-interactive API key (CI); THORYN_API_KEY=<id>:<secret>, auto re-mints on expiry
 thoryn login --status
 thoryn logout [--rotate-key]                 # SSO-3199 — --rotate-key also discards this machine's DPoP key
@@ -414,8 +414,8 @@ platform BASE ISSUER (`https://<label>.<env>`) in this order:
 With none of them the command exits 65 and tells you how to name one — it does not dial anything.
 
 ```bash
-thoryn login --workspace thoryn --issuer https://hub.stg.thoryn.org   # Thoryn staging
-export THORYN_ISSUER=https://hub.stg.thoryn.org && thoryn login --workspace thoryn
+thoryn login --workspace thoryn --issuer https://auth.stg.thoryn.org   # Thoryn staging
+export THORYN_ISSUER=https://auth.stg.thoryn.org && thoryn login --workspace thoryn
 thoryn login --workspace dev --issuer http://localhost:54702          # a platform on your own machine
 ```
 
@@ -442,8 +442,38 @@ re-release. Sandbox environments keep their **path** form either way:
 For a deployment whose base host uses neither word, name the label once with
 `THORYN_TENANT_HOST_LABEL=<label>`; `auth` and `hub` stay recognised alongside it.
 
-> **Staging today still serves `hub.stg.thoryn.org`.** The samples in this README use it deliberately.
-> They become `auth.stg.thoryn.org` when SSO-3297 flips `OAUTHY_TENANCY_PLATFORM_DOMAIN`.
+> **Staging moved to `auth.stg.thoryn.org` (SSO-3297).** The old `hub.stg.thoryn.org` hosts are
+> retired: they answer every request with `410 issuer_retired`. See the next section if you signed in
+> before the move.
+
+### A retired issuer (SSO-3377)
+
+`thoryn login` remembers the platform of your previous sign-in. If that platform has since moved its
+sign-in host — staging's `hub.stg.thoryn.org` became `auth.stg.thoryn.org` — the remembered issuer can
+only refuse you. Before it opens a browser, requests a device code or posts a grant, **every login mode**
+(`--device-code`, `--client-credentials`, `--workload-identity`, `--connection`, and `thoryn operator
+login`) asks the issuer's discovery document whether it is still served. A `410 issuer_retired` stops
+the sign-in (exit 65) with the retired issuer named and, where the platform can be inferred
+(`hub.<env>` → `auth.<env>`, `<slug>.hub.<env>` → `auth.<env>` with `--workspace <slug>`), the line
+to run instead:
+
+```text
+Using hub https://hub.stg.thoryn.org (from your previous sign-in; pass --issuer to choose another).
+Error: the issuer https://thoryn.hub.stg.thoryn.org has been retired (HTTP 410 issuer_retired) — This host has been retired. Use the issuer advertised in the current discovery document.
+https://hub.stg.thoryn.org was remembered from your previous sign-in on this machine; the CLI does not change a saved issuer for you.
+Sign in with the platform's current issuer:
+    thoryn login --issuer https://auth.stg.thoryn.org --workspace thoryn
+```
+
+The CLI never rewrites a saved issuer on its own — which platform receives your credentials is your
+call, made with `--issuer`. After that sign-in, later ones reuse the new issuer. A `--connection`
+contract is told which env var to change instead (`Set THORYN_ISSUER=… and run … again`), since it
+refuses `--issuer`. A `410` that does not say `issuer_retired` is reported as a plain "answered HTTP 410
+Gone" with no suggestion.
+
+Commands that run on a session remembered from a retired issuer (a refresh, an API-key re-mint, a
+`workspace switch` exchange, a hub call) print the same guidance instead of a bare `HTTP 401` or
+`Hub returned 410: issuer_retired`.
 
 ```bash
 # Default scopes (SSO-3182): EXACTLY the `cli` login client's registered set — openid,
@@ -456,7 +486,7 @@ For a deployment whose base host uses neither word, name the label once with
 # SSO-3104 — sign-in is always ON A WORKSPACE (`https://<slug>.<label>.<env>`, client `cli`,
 # provisioned in the `thoryn` workspace by this repo's .thoryn/provision.yaml); the shared
 # default tenant is not a sign-in target. `--workspace` or `export THORYN_WORKSPACE=<slug>`.
-thoryn login --workspace thoryn --issuer https://hub.stg.thoryn.org
+thoryn login --workspace thoryn --issuer https://auth.stg.thoryn.org
 
 # Grab the whole tenant-config scope set explicitly.
 thoryn login --workspace thoryn --scope all-tenant-config
@@ -484,13 +514,13 @@ second device:
 # SSO-2941 — single-knob API key: one secret carries id + secret as "<id>:<secret>".
 export THORYN_API_KEY="ci-bot:$CI_SERVICE_ACCOUNT_SECRET"
 thoryn login --client-credentials \
-  --issuer https://acme.hub.stg.thoryn.org \
+  --issuer https://acme.auth.stg.thoryn.org \
   --scope "tenant:applications.write tenant:federation.write"
 
 # Or split form — --client-id + THORYN_CLIENT_SECRET (or --client-secret-file <path>):
 export THORYN_CLIENT_SECRET="$CI_SERVICE_ACCOUNT_SECRET"
 thoryn login --client-credentials --client-id ci-bot \
-  --issuer https://acme.hub.stg.thoryn.org \
+  --issuer https://acme.auth.stg.thoryn.org \
   --scope "tenant:applications.write tenant:federation.write"
 
 # One-shot tenant seed: sample OAuth clients + identity-service federation member.
@@ -603,7 +633,7 @@ off every sign-in and put the parameters back in the browser.
 thoryn status --output json
 # …
 # pushesAuthorizationRequest          true
-# pushedAuthorizationRequestEndpoint  https://acme.hub.stg.thoryn.org/oauth2/par
+# pushedAuthorizationRequestEndpoint  https://acme.auth.stg.thoryn.org/oauth2/par
 ```
 
 ## Sender-constrained tokens (DPoP, SSO-3199)
@@ -850,7 +880,7 @@ gateway alongside the token, so the other commands default to them — you do
 **not** need to repeat `--issuer` / `--gateway` on every call after signing in:
 
 ```bash
-thoryn login --workspace acme --issuer https://hub.stg.thoryn.org  # records issuer + gateway for the session
+thoryn login --workspace acme --issuer https://auth.stg.thoryn.org  # records issuer + gateway for the session
 thoryn workspace list                                              # uses the session issuer, no --issuer needed
 thoryn clients list                                                # uses the session gateway, no --gateway needed
 ```
@@ -1031,7 +1061,7 @@ Everything the run needs is either committed or minted once by a founder:
 # 0) Sign in interactively as an admin of the `thoryn` workspace (authorization-code + PKCE). The
 #    default scope set already covers every scope the provisioning file grants (SSO-3182); the hub
 #    only lets you grant what you hold.
-thoryn login --workspace thoryn --issuer https://hub.stg.thoryn.org
+thoryn login --workspace thoryn --issuer https://auth.stg.thoryn.org
 
 # 1) Apply. The declared confidential client is created and its secret delivered ONCE, via SecretIo.
 #    (SSO-3113 retired the imperative `provision ci-identity` bootstrap: the identity is a resource.)
@@ -1124,7 +1154,7 @@ java -jar target/thoryn.jar login --status
 # Requires GRAALVM_HOME (or JAVA_HOME) to point at a GraalVM distribution
 # with `native-image` installed.
 ./mvnw -Pnative -DskipTests package
-./target/thoryn workspace list --issuer https://hub.stg.thoryn.org
+./target/thoryn workspace list --issuer https://auth.stg.thoryn.org
 ```
 
 ## Module layout

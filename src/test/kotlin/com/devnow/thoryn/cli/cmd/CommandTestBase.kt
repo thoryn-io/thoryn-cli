@@ -3,6 +3,7 @@ package com.devnow.thoryn.cli.cmd
 import com.devnow.thoryn.cli.ThorynMain
 import com.devnow.thoryn.cli.auth.DpopCapability
 import com.devnow.thoryn.cli.auth.FileTokenStore
+import com.devnow.thoryn.cli.auth.RetiredIssuer
 import com.devnow.thoryn.cli.auth.TokenStoreFactory
 import com.devnow.thoryn.cli.auth.Tokens
 import okhttp3.mockwebserver.MockResponse
@@ -52,6 +53,11 @@ abstract class CommandTestBase {
         // mock, where it would be answered by whichever response the test enqueued for its own call.
         // The gate itself is covered by `DpopCapabilityGateTest`.
         DpopCapability.probe = { false }
+        // SSO-3377 — every login first asks the issuer's discovery document whether the host is retired.
+        // Same reasoning: no discovery document here, so "no answer" (= not retired) is what the real
+        // probe would conclude, without a GET eating a response queued for the test's own call. The
+        // probe itself is covered by `LoginRetiredIssuerTest`.
+        RetiredIssuer.fetcher = { null }
     }
 
     @AfterEach
@@ -60,6 +66,7 @@ abstract class CommandTestBase {
         System.setProperty("user.home", originalUserHome ?: "")
         TokenStoreFactory.environment = originalEnvSeam
         DpopCapability.resetForTest()
+        RetiredIssuer.resetForTest()
     }
 
     protected fun clearTokens() {
