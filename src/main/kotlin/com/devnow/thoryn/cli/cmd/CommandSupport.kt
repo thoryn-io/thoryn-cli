@@ -16,6 +16,8 @@ import com.devnow.thoryn.cli.auth.TokenExchangeFlow
 import com.devnow.thoryn.cli.auth.TokenStoreFactory
 import com.devnow.thoryn.cli.auth.JwtClaims
 import com.devnow.thoryn.cli.auth.Tokens
+import com.devnow.thoryn.cli.auth.WorkloadIdentityException
+import com.devnow.thoryn.cli.auth.WorkloadIdentityFlow
 import com.devnow.thoryn.cli.config.ThorynConfig
 import com.devnow.thoryn.cli.output.OutputFormat
 import com.devnow.thoryn.cli.output.Printers
@@ -264,6 +266,11 @@ internal object CommandSupport {
         if (current.authMode == Tokens.AUTH_MODE_CLIENT_CREDENTIALS) {
             return reMintClientCredentials(current, err)
         }
+        // SSO-3308 — a workload identity session has no refresh token and no secret: renew it by running the
+        // exchange again with a FRESH GitHub Actions job token (a job token works once).
+        if (current.authMode == Tokens.AUTH_MODE_WORKLOAD_IDENTITY) {
+            return reMintWorkloadIdentity(current, err)
+        }
         // SSO-3182 — an interactive session with NO refresh token: nothing to renew with. Before this,
         // the CLI failed silently here and the command surfaced a bare `Error: HTTP 401`, with no hint
         // that the fix was a fresh sign-in. Say so once per process, with the exact command.
@@ -303,13 +310,18 @@ internal object CommandSupport {
     internal fun retiredSessionGuidance(session: Tokens): String {
         retiredSessionReported = true
         val clientCredentials = session.authMode == Tokens.AUTH_MODE_CLIENT_CREDENTIALS
+        val workload = session.authMode == Tokens.AUTH_MODE_WORKLOAD_IDENTITY
         return RetiredIssuer.sessionGuidance(
             sessionIssuer = session.issuer,
             platformIssuer = session.platformIssuer?.takeIf { it.isNotBlank() }
                 ?: session.issuer?.takeIf { it.isNotBlank() }?.let(ThorynConfig::baseHubOf),
             workspace = session.workspace?.takeIf { it.isNotBlank() } ?: ThorynConfig.workspaceOfIssuer(session.issuer),
-            command = if (clientCredentials) "thoryn login --client-credentials" else "thoryn login",
-            includeWorkspace = !clientCredentials,
+            command = when {
+                workload -> "thoryn login --workload-identity"
+                clientCredentials -> "thoryn login --client-credentials"
+                else -> "thoryn login"
+            },
+            includeWorkspace = !clientCredentials && !workload,
         )
     }
 
@@ -409,6 +421,49 @@ internal object CommandSupport {
                 "Could not re-mint the API-key session (${e.oauthError}); check the credentials, " +
                     "or run `thoryn login --client-credentials`.",
             )
+            null
+        }
+    }
+
+    /**
+     * SSO-3308 — renew an expired workload identity session: the same trust binding the login stored
+     * ([Tokens.clientId], the audience in [Tokens.issuer], [Tokens.tokenEndpoint], the granted
+     * [Tokens.scope]) exchanged again with a FRESH job token from the runner. Works for as long as the job
+     * runs; outside it (no runner variables) it says so once and returns null, so the command surfaces its
+     * 401. The renewed bundle keeps the session fields and is written back to the store.
+     */
+    private fun reMintWorkloadIdentity(current: Tokens, err: PrintStream): Tokens? {
+        val audience = current.issuer?.takeIf { it.isNotBlank() } ?: return null
+        val clientId = current.clientId?.takeIf { it.isNotBlank() } ?: return null
+        val tokenEndpoint = current.tokenEndpoint?.takeIf { it.isNotBlank() } ?: "${audience.trimEnd('/')}/oauth2/token"
+        return try {
+            val minted = WorkloadIdentityFlow(
+                clientId = clientId,
+                audience = audience,
+                tokenEndpoint = tokenEndpoint,
+                tokenSender = realHttpSender(),
+            ).run(current.scope)
+                .copy(
+                    issuer = current.issuer,
+                    gateway = current.gateway,
+                    platformIssuer = current.platformIssuer,
+                    authMode = Tokens.AUTH_MODE_WORKLOAD_IDENTITY,
+                    clientId = clientId,
+                    workspace = current.workspace,
+                    tokenEndpoint = tokenEndpoint,
+                )
+            runCatching { TokenStoreFactory.default().write(minted) }
+            minted
+        } catch (e: WorkloadIdentityException) {
+            if (RetiredIssuer.isRetiredError(e.oauthError)) {
+                warnOnce(err) { retiredSessionGuidance(current) }
+                return null
+            }
+            warnOnce(err) {
+                "Could not renew the workload identity session for '$clientId' (${e.oauthError}): ${e.message}. " +
+                    "A workload identity session renews only inside the GitHub Actions job that signed in; " +
+                    "run `${LoginCommand.reLoginCommand(current)}` there."
+            }
             null
         }
     }

@@ -50,9 +50,21 @@ data class Tokens(
     // token files written before SSO-3379: readers fall back to the base of [issuer]
     // ([com.devnow.thoryn.cli.config.ThorynConfig.baseHubOf]). Not a secret.
     val platformIssuer: String? = null,
+    // SSO-3308 — the token endpoint a WORKLOAD IDENTITY session exchanges its GitHub Actions job token at
+    // (`{audience}/oauth2/token` unless the sign-in named another on the same origin). The session's
+    // [issuer] is the trust's audience. Kept so a renewal can run the same exchange again with a FRESH job
+    // token (a job token works once). Null for every other session. Not a secret.
+    val tokenEndpoint: String? = null,
 ) {
     companion object {
         /** SSO-2941 — [authMode] value marking a non-interactive API-key / client-credentials session. */
         const val AUTH_MODE_CLIENT_CREDENTIALS: String = "client_credentials"
+
+        /**
+         * SSO-3308 — [authMode] value marking a secret-less WORKLOAD IDENTITY session: a GitHub Actions job
+         * token exchanged for a short-lived (≤ 15 min) workspace token under a workload identity trust. No
+         * refresh token; on expiry the CLI runs the exchange again with a fresh job token from the runner.
+         */
+        const val AUTH_MODE_WORKLOAD_IDENTITY: String = "workload_identity"
     }
 }

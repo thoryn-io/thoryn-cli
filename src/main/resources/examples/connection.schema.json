@@ -2,10 +2,14 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://thoryn.io/examples/connection.schema.json",
   "title": "Thoryn CLI connection contract",
-  "description": "SSO-2948 (epic SSO-2947) — a schema-backed, declarative sign-in configuration for the `thoryn` CLI: HOW a caller (a person for their own use cases, or a CI pipeline dogfooding the same feature) signs the CLI into a given workspace/identity. It is DATA, not code — a sibling of the recipe schema — passed to `thoryn login --connection <file>`. The workspace slug derives the per-tenant issuer (`https://<slug>.hub.<env>`) and gateway; the client authenticates by the client-credentials grant. The SECRET is NEVER in this file — only the NAME of the environment variable that carries it (`auth.secretEnv`); a client id is public and MAY appear.",
+  "description": "SSO-2948 (epic SSO-2947) — a schema-backed, declarative sign-in configuration for the `thoryn` CLI: HOW a caller (a person for their own use cases, or a CI pipeline dogfooding the same feature) signs the CLI into a given workspace/identity. It is DATA, not code — a sibling of the recipe schema — passed to `thoryn login --connection <file>`. The workspace slug derives the per-tenant issuer (`https://<slug>.<label>.<env>`) and gateway. Two auth methods, one per client: `client_credentials` (an API key — the SECRET is NEVER in this file, only the NAME of the environment variable that carries it, `auth.secretEnv`) and, since SSO-3308, `workload_identity` (a GitHub Actions workload identity trust — no secret at all: the job's own OIDC token is exchanged, so the file names no env var). A client id is public and MAY appear.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["apiVersion", "workspace", "auth"],
+  "required": [
+    "apiVersion",
+    "workspace",
+    "auth"
+  ],
   "properties": {
     "apiVersion": {
       "description": "Connection schema version.",
@@ -15,7 +19,9 @@
       "description": "The workspace this CLI binds to. Its slug derives the per-tenant hub issuer and gateway.",
       "type": "object",
       "additionalProperties": false,
-      "required": ["slug"],
+      "required": [
+        "slug"
+      ],
       "properties": {
         "slug": {
           "description": "Workspace slug (same grammar as a recipe workspace slug). Derives https://<slug>.hub.<env>.",
@@ -31,27 +37,34 @@
       }
     },
     "auth": {
-      "description": "How the CLI authenticates into the workspace.",
+      "description": "How the CLI authenticates into the workspace. `client_credentials` needs `secretEnv`; `workload_identity` must not carry one.",
       "type": "object",
       "additionalProperties": false,
-      "required": ["method", "clientId", "secretEnv", "scopes"],
+      "required": [
+        "method",
+        "clientId",
+        "scopes"
+      ],
       "properties": {
         "method": {
-          "description": "Authentication method. Only the non-interactive client-credentials grant is a connection method today.",
-          "const": "client_credentials"
+          "description": "Authentication method: `client_credentials` (an API key, secret named by `secretEnv`) or `workload_identity` (SSO-3308 — a GitHub Actions job exchanges its OIDC token under a workload identity trust; runs only inside a job with `permissions: id-token: write`).",
+          "enum": [
+            "client_credentials",
+            "workload_identity"
+          ]
         },
         "clientId": {
-          "description": "OAuth client id of the machine client. PUBLIC — a client id is not a secret and MAY be committed.",
+          "description": "OAuth client id of the machine client — for `workload_identity` the trust's `clientId` (`wi_…`). PUBLIC — a client id is not a secret and MAY be committed.",
           "type": "string",
           "minLength": 1
         },
         "secretEnv": {
-          "description": "NAME of the environment variable holding the client secret (a GitHub secret in CI; a locally-exported var for a developer). NEVER the secret value itself.",
+          "description": "`client_credentials` only (required there): NAME of the environment variable holding the client secret (a GitHub secret in CI; a locally-exported var for a developer). NEVER the secret value itself.",
           "type": "string",
           "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
         },
         "scopes": {
-          "description": "The EXACT scope set requested — the ceiling AND the floor (the hub grants only what is requested). Non-empty, unique, each a tenant:<resource>.<verb> scope.",
+          "description": "The EXACT scope set requested — the ceiling AND the floor (the platform grants only what is requested). Non-empty, unique, each a tenant:<resource>.<verb> scope. For `workload_identity`, a subset of the trust's scopes.",
           "type": "array",
           "minItems": 1,
           "uniqueItems": true,
@@ -59,8 +72,129 @@
             "type": "string",
             "pattern": "^tenant:[a-z-]+\\.[a-z-]+$"
           }
+        },
+        "provider": {
+          "description": "`workload_identity` only: the workload identity provider. `github_actions` is the only provider (the default).",
+          "const": "github_actions"
+        },
+        "audience": {
+          "description": "`workload_identity` only: the trust's `audience` EXACTLY (as `thoryn workload-identity trusts create|get` prints it) — the audience the job requests its OIDC token for. When omitted it is derived: the workspace issuer, plus `/<environment>` for a sandbox. Required when the workspace has an active custom domain.",
+          "type": "string",
+          "pattern": "^https?://[^\\s/?#]+(/[^\\s?#]*)?$"
+        },
+        "environment": {
+          "description": "`workload_identity` only, and only when `audience` is omitted: the slug of the sandbox environment the trust lives in; the derived audience becomes <workspace issuer>/<environment>. Omit for a production-plane trust.",
+          "type": "string",
+          "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"
+        },
+        "tokenEndpoint": {
+          "description": "`workload_identity` only: the trust's `tokenEndpoint`. Default `<audience>/oauth2/token`. Must be on the audience's own origin — the CLI refuses to send a job token anywhere else.",
+          "type": "string",
+          "pattern": "^https?://[^\\s/?#]+(/[^\\s?#]*)?$"
+        },
+        "github": {
+          "description": "`workload_identity` only, optional: the trust's GitHub pins (same names as the trust API's `github`). Used ONLY to explain a refused sign-in — the platform refuses every mismatch with the same `invalid_client`, so the CLI compares the job's claims with these and names the field that differs. They grant nothing; the trust on the platform decides.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "owner": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Repository owner (user or organization) name."
+            },
+            "repository": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Repository name (without the owner)."
+            },
+            "ownerId": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "GitHub's immutable owner id (`repository_owner_id`)."
+            },
+            "repositoryId": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "GitHub's immutable repository id (`repository_id`)."
+            },
+            "environment": {
+              "type": "string",
+              "minLength": 1,
+              "description": "The GitHub environment the job must run in (exact)."
+            },
+            "ref": {
+              "type": "string",
+              "minLength": 1,
+              "description": "The exact `ref` the job must run on."
+            },
+            "githubHostedRunnersOnly": {
+              "type": "boolean",
+              "description": "The trust accepts only GitHub-hosted runners."
+            }
+          }
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "method": {
+                "const": "client_credentials"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "secretEnv"
+            ],
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "provider"
+                  ]
+                },
+                {
+                  "required": [
+                    "audience"
+                  ]
+                },
+                {
+                  "required": [
+                    "environment"
+                  ]
+                },
+                {
+                  "required": [
+                    "tokenEndpoint"
+                  ]
+                },
+                {
+                  "required": [
+                    "github"
+                  ]
+                }
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "method": {
+                "const": "workload_identity"
+              }
+            }
+          },
+          "then": {
+            "not": {
+              "required": [
+                "secretEnv"
+              ]
+            }
+          }
+        }
+      ]
     }
   }
 }

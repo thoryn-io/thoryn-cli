@@ -8,7 +8,6 @@ import com.devnow.thoryn.cli.auth.DeviceCodeException
 import com.devnow.thoryn.cli.auth.DeviceCodeFlow
 import com.devnow.thoryn.cli.auth.Dpop
 import com.devnow.thoryn.cli.auth.DpopCapability
-import com.devnow.thoryn.cli.auth.EcPrivateKeyJwtSigner
 import com.devnow.thoryn.cli.auth.HttpSender
 import com.devnow.thoryn.cli.auth.IssuerUrlValidationException
 import com.devnow.thoryn.cli.auth.IssuerUrlValidator
@@ -24,6 +23,9 @@ import com.devnow.thoryn.cli.auth.ScopeRegistry
 import com.devnow.thoryn.cli.auth.TokenStore
 import com.devnow.thoryn.cli.auth.TokenStoreFactory
 import com.devnow.thoryn.cli.auth.Tokens
+import com.devnow.thoryn.cli.auth.TrustPins
+import com.devnow.thoryn.cli.auth.WorkloadIdentityBinding
+import com.devnow.thoryn.cli.auth.WorkloadIdentityDiagnostics
 import com.devnow.thoryn.cli.auth.WorkloadIdentityException
 import com.devnow.thoryn.cli.auth.WorkloadIdentityFlow
 import com.devnow.thoryn.cli.cmd.connection.Connection
@@ -183,67 +185,40 @@ class LoginCommand : Callable<Int> {
     var clientSecretFile: File? = null
 
     /**
-     * SSO-2879 — secret-less sign-in for the thoryn-examples recipe-conformance CI: exchange the
-     * GitHub Actions OIDC token for a hub access token via Workload Identity Federation, with the
-     * exchange client authenticating by `private_key_jwt` (no shared secret). See [runWorkloadIdentityFlow].
+     * SSO-3308 (retargets SSO-2879) — secret-less sign-in for a GitHub Actions job under a workload
+     * identity trust (`thoryn workload-identity trusts create`): the job's own OIDC token, requested for
+     * the trust's audience, is exchanged at the trust's token endpoint for a short-lived workspace token.
+     * Needs `--client-id` (the trust's `wi_…` client) and `--audience` (the trust's audience, exactly).
+     * See [runWorkloadIdentityFlow].
      */
     @Option(
         names = ["--workload-identity", "--github-oidc"],
-        description = ["Sign in via GitHub Actions OIDC -> hub Workload Identity Federation (RFC 8693). Non-interactive, secret-less; for CI. Requires the CI signing key (THORYN_CI_WIF_SIGNING_KEY / --wif-signing-key-file)."],
+        description = [
+            "Sign in from a GitHub Actions job under a workload identity trust — no secret. The job needs " +
+                "`permissions: id-token: write`. Requires --client-id <the trust's wi_… client id> and " +
+                "--audience <the trust's audience>; --scope optional (a subset of the trust's scopes). " +
+                "See `thoryn workload-identity trusts create`.",
+        ],
     )
     var useWorkloadIdentity: Boolean = false
 
-    @Option(
-        names = ["--tenant"],
-        description = ["Workspace slug whose tenant the WIF token targets (default: \${DEFAULT-VALUE})."],
-        defaultValue = ThorynConfig.DEFAULT_WIF_TENANT_SLUG,
-    )
-    var wifTenantSlug: String = ThorynConfig.DEFAULT_WIF_TENANT_SLUG
-
-    @Option(
-        names = ["--wif-client-id"],
-        description = ["OAuth client id of the private_key_jwt exchange client (default: \${DEFAULT-VALUE})."],
-        defaultValue = ThorynConfig.DEFAULT_WIF_CLIENT_ID,
-    )
-    var wifClientId: String = ThorynConfig.DEFAULT_WIF_CLIENT_ID
-
-    @Option(
-        names = ["--wif-key-id"],
-        description = ["kid of the CI signing key, matching the hub-registered public JWKS (default: \${DEFAULT-VALUE})."],
-        defaultValue = ThorynConfig.DEFAULT_WIF_KEY_ID,
-    )
-    var wifKeyId: String = ThorynConfig.DEFAULT_WIF_KEY_ID
-
     /**
-     * SSO-2879 — the PKCS#8 PEM private key for the client assertion, read from a file. Falls back to
-     * the `THORYN_CI_WIF_SIGNING_KEY` env var (the canonical CI knob). Never a flag value — a key in
-     * argv lands in shell history and `ps aux`.
-     */
-    @Option(
-        names = ["--wif-signing-key-file"],
-        description = ["Read the WIF private_key_jwt signing key (PKCS#8 PEM) from this file. Falls back to THORYN_CI_WIF_SIGNING_KEY. Never pass the key as an argument."],
-    )
-    var wifSigningKeyFile: File? = null
-
-    /**
-     * SSO-2879 — the OIDC token `audience` requested from GitHub (== the hub's registered
-     * `allowed_audience`). Defaults to `--issuer`. Also the base for the client-assertion `aud`.
+     * SSO-3308 — the trust's `audience`, EXACTLY as `trusts create|get` prints it: the audience the job
+     * requests its OIDC token for, and the issuer the minted token carries (the workspace issuer, plus
+     * `/{environment}` for a sandbox, or the custom domain when one is active).
      */
     @Option(
         names = ["--audience"],
-        description = ["Audience requested for the GitHub OIDC token (WIF). Default: the --issuer value."],
+        description = ["With --workload-identity: the trust's audience, exactly as `thoryn workload-identity trusts get` prints it."],
     )
     var wifAudience: String? = null
 
-    /**
-     * SSO-2879 — supply the subject token explicitly instead of fetching it from the GitHub Actions
-     * runner (local testing off-runner). Falls back to the `THORYN_CI_WIF_SUBJECT_TOKEN` env var.
-     */
+    /** SSO-3308 — the trust's token endpoint when it is not `{audience}/oauth2/token`; same origin only. */
     @Option(
-        names = ["--subject-token"],
-        description = ["Use this GitHub OIDC token as the WIF subject_token instead of fetching it from the runner (testing). Falls back to THORYN_CI_WIF_SUBJECT_TOKEN."],
+        names = ["--token-endpoint"],
+        description = ["With --workload-identity: the trust's token endpoint (default: <audience>/oauth2/token). Must be on the audience's origin."],
     )
-    var wifSubjectToken: String? = null
+    var wifTokenEndpoint: String? = null
 
     @Option(
         names = ["--status"],
@@ -443,6 +418,24 @@ class LoginCommand : Callable<Int> {
         if (connectionFile != null) {
             return runConnectionFlow(connectionFile!!)
         }
+        val exclusiveModes = listOf(useClientCredentials, useDeviceCode, useWorkloadIdentity).count { it }
+        if (exclusiveModes > 1) {
+            System.err.println("Error: --client-credentials, --device-code and --workload-identity are mutually exclusive.")
+            return EXIT_USAGE
+        }
+        // SSO-3308 — a workload identity sign-in is bound to the trust's audience, not to a platform issuer:
+        // it needs none resolved (and must not fail for want of one), so it branches before the issuer.
+        if (useWorkloadIdentity) {
+            if (acrValues != null || maxAge != null) {
+                System.err.println("Error: --acr-values and --max-age apply to the interactive sign-in only (not with --client-credentials, --device-code or --workload-identity).")
+                return EXIT_USAGE
+            }
+            return runWorkloadIdentityFlow()
+        }
+        if (wifAudience != null || wifTokenEndpoint != null) {
+            System.err.println("Error: --audience and --token-endpoint apply to --workload-identity only.")
+            return EXIT_USAGE
+        }
         // SSO-3182 — no localhost default: resolve the platform's hub or fail fast with guidance.
         if (!resolveIssuer()) return EXIT_USAGE
         // SSO-1145: validate the issuer URL before any network activity begins.
@@ -450,11 +443,6 @@ class LoginCommand : Callable<Int> {
             IssuerUrlValidator.validate(issuer, devMode)
         } catch (e: IssuerUrlValidationException) {
             System.err.println("Error: ${e.message}")
-            return EXIT_USAGE
-        }
-        val exclusiveModes = listOf(useClientCredentials, useDeviceCode, useWorkloadIdentity).count { it }
-        if (exclusiveModes > 1) {
-            System.err.println("Error: --client-credentials, --device-code and --workload-identity are mutually exclusive.")
             return EXIT_USAGE
         }
         // SSO-3396 — a step-up (acr_values / max_age) is a browser sign-in; the other flows cannot carry it.
@@ -465,9 +453,6 @@ class LoginCommand : Callable<Int> {
         if (maxAge != null && maxAge!! < 0) {
             System.err.println("Error: --max-age must be 0 or more seconds.")
             return EXIT_USAGE
-        }
-        if (useWorkloadIdentity) {
-            return runWorkloadIdentityFlow()
         }
         if (useClientCredentials) {
             baseIssuer = issuer
@@ -598,6 +583,8 @@ class LoginCommand : Callable<Int> {
             if (useClientCredentials) add("--client-credentials")
             if (useDeviceCode) add("--device-code")
             if (useWorkloadIdentity) add("--workload-identity")
+            if (wifAudience != null) add("--audience")
+            if (wifTokenEndpoint != null) add("--token-endpoint")
         }
         if (conflicting.isNotEmpty()) {
             System.err.println(
@@ -613,6 +600,9 @@ class LoginCommand : Callable<Int> {
             System.err.println("Error: ${e.message}")
             return EXIT_USAGE
         }
+
+        // SSO-3308 — a workload identity contract: no secret, the GitHub Actions job token is exchanged.
+        if (connection.isWorkloadIdentity) return runConnectionWorkloadIdentity(file, connection)
 
         // Resolve the hub base from the env var the contract names (-D property first, then env, so
         // tests and `java -jar -D…` work), falling back to the CLI's baked-in platform hub. SSO-3182 — no
@@ -717,67 +707,166 @@ class LoginCommand : Callable<Int> {
             ?: System.getenv(name)?.takeIf { it.isNotBlank() }
 
     /**
-     * SSO-2879 — the secret-less WIF sign-in. Resolves the CI signing key (env / file), signs a
-     * `private_key_jwt` client assertion, and exchanges the GitHub Actions OIDC token for a hub
-     * access token via [WorkloadIdentityFlow].
-     *
-     * Two hub URLs (see [WorkloadIdentityFlow]): the request is POSTed to the TENANT-SUBDOMAIN token
-     * endpoint (`{slug}.hub…/oauth2/token`, so the hub resolves the ci-conformance tenant) while the
-     * assertion `aud` is the DEFAULT-issuer token endpoint (`--issuer`/oauth2/token). The requested
-     * scope defaults to the client's exact registered set ([ThorynConfig.DEFAULT_WIF_SCOPE]) unless
-     * the caller overrode `--scope`.
+     * SSO-3308 — `thoryn login --workload-identity --client-id <wi_…> --audience <aud> [--scope …]`: the
+     * flag form of the workload identity sign-in. The binding is exactly what the trust printed; nothing is
+     * derived from a platform issuer, so none has to be resolved. The gateway is `--gateway`, else derived
+     * from the audience's platform host (`<slug>.auth.<env>` → `api.<env>`).
      */
     private fun runWorkloadIdentityFlow(): Int {
-        val signingKeyPem = ThorynConfig.readWifSigningKey(wifSigningKeyFile)
-        if (signingKeyPem == null) {
+        val workloadClient = clientId.takeIf { it != ThorynConfig.DEFAULT_CLIENT_ID }?.trim()?.takeIf { it.isNotEmpty() }
+        val audience = wifAudience?.trim()?.trimEnd('/')?.takeIf { it.isNotEmpty() }
+        if (workloadClient == null || audience == null) {
             System.err.println(
-                "No WIF signing key available. Set ${ThorynConfig.WIF_SIGNING_KEY_ENV} (PKCS#8 PEM) " +
-                    "or pass --wif-signing-key-file <path>.",
+                "Error: --workload-identity needs the trust's client id and audience: " +
+                    "--client-id <wi_…> --audience <audience>. `thoryn workload-identity trusts get <id>` prints both.",
             )
             return EXIT_USAGE
         }
-        val signer = try {
-            EcPrivateKeyJwtSigner(privateKeyPem = signingKeyPem, keyId = wifKeyId)
+        // An explicit --scope narrows the request; the interactive default set is not a workload scope set.
+        val requested = scope.takeIf { it != ThorynConfig.DEFAULT_SCOPE }?.let(ScopeRegistry::expand)?.takeIf { it.isNotBlank() }
+        return signInWithWorkloadIdentity(
+            clientIdValue = workloadClient,
+            audience = audience,
+            explicitTokenEndpoint = wifTokenEndpoint,
+            requestedScope = requested,
+            platformBase = issuerOption?.trim()?.trimEnd('/')?.takeIf { it.isNotEmpty() }?.let(ThorynConfig::baseHubOf),
+            workspaceSlug = workspace?.trim()?.takeIf { it.isNotEmpty() },
+            pins = null,
+            reLogin = "thoryn login --workload-identity --client-id $workloadClient --audience <the trust's audience>",
+        )
+    }
+
+    /**
+     * SSO-3308 — `thoryn login --connection <file>` for a `workload_identity` contract. The audience is the
+     * contract's `auth.audience`, else derived from the workspace slug and the platform base issuer (the env
+     * var `workspace.hubBaseUrlEnv` names) plus `/{auth.environment}` for a sandbox trust. Requests EXACTLY
+     * the contract's scopes, like the API-key form.
+     */
+    private fun runConnectionWorkloadIdentity(file: File, connection: Connection): Int {
+        val hubBase = resolveConnectionIssuerBase(connection.hubBaseUrlEnv) ?: ThorynConfig.PLATFORM_HUB
+        val audience = connection.audience ?: hubBase?.let { base ->
+            ThorynConfig.tenantIssuer(base, connection.slug) + (connection.environment?.let { "/$it" } ?: "")
+        } ?: run {
+            System.err.println(
+                "Error: the connection names no auth.audience and the platform base issuer env var " +
+                    "'${connection.hubBaseUrlEnv}' (named by workspace.hubBaseUrlEnv) is unset or empty, so the " +
+                    "audience cannot be derived. Set auth.audience to the trust's audience, or export " +
+                    "${ThorynConfig.ISSUER_ENV}=${ThorynConfig.STAGING_ISSUER}.",
+            )
+            return EXIT_USAGE
+        }
+        // The contract names ONE workspace; an audience on another workspace's host is a contradiction, not a choice.
+        ThorynConfig.workspaceOfIssuer(audience)?.let { audienceWorkspace ->
+            if (audienceWorkspace != connection.slug) {
+                System.err.println(
+                    "Error: auth.audience '$audience' is on workspace '$audienceWorkspace' but the connection's " +
+                        "workspace.slug is '${connection.slug}'. Use the audience the trust in '${connection.slug}' prints.",
+                )
+                return EXIT_USAGE
+            }
+        }
+        return signInWithWorkloadIdentity(
+            clientIdValue = connection.clientId,
+            audience = audience,
+            explicitTokenEndpoint = connection.tokenEndpoint,
+            requestedScope = connection.scopes.joinToString(" "),
+            platformBase = hubBase?.trim()?.trimEnd('/'),
+            workspaceSlug = connection.slug,
+            pins = connection.github,
+            reLogin = "thoryn login --connection ${file.path}",
+        )
+    }
+
+    /**
+     * SSO-3308 — the workload identity sign-in both forms share: validate the audience, refuse a token
+     * endpoint off the audience's origin and a retired host, request a fresh GitHub Actions job token for
+     * the audience, exchange it, and store a `workload_identity` session that renews itself by a fresh
+     * exchange ([CommandSupport.forceRefresh]). A refusal prints [WorkloadIdentityDiagnostics.render].
+     *
+     * @param platformBase the platform base issuer when known (flag `--issuer`, connection env var); else
+     *   the audience's own platform host, which gives the gateway.
+     */
+    private fun signInWithWorkloadIdentity(
+        clientIdValue: String,
+        audience: String,
+        explicitTokenEndpoint: String?,
+        requestedScope: String?,
+        platformBase: String?,
+        workspaceSlug: String?,
+        pins: TrustPins?,
+        reLogin: String,
+    ): Int {
+        try {
+            IssuerUrlValidator.validate(audience, devMode)
+        } catch (e: IssuerUrlValidationException) {
+            System.err.println("Error: audience '$audience' is invalid — ${e.message}")
+            return EXIT_USAGE
+        }
+        val tokenEndpoint = try {
+            WorkloadIdentityFlow.tokenEndpointFor(audience, explicitTokenEndpoint)
         } catch (e: IllegalArgumentException) {
-            System.err.println("Sign-in failed: invalid WIF signing key — ${e.message}")
-            return EXIT_WORKLOAD_IDENTITY_FAILED
+            System.err.println("Error: ${e.message}.")
+            return EXIT_USAGE
+        }
+        val audienceOrigin = WorkloadIdentityFlow.origin(java.net.URI(audience))
+        val base = platformBase ?: ThorynConfig.baseHubOf(audienceOrigin)
+        val sessionGateway = gateway?.trim()?.takeIf { it.isNotEmpty() } ?: ThorynConfig.gatewayForIssuer(base)
+        if (sessionGateway == ThorynConfig.DEFAULT_GATEWAY && !isLoopback(audience)) {
+            System.err.println(
+                "Error: cannot derive the customer-plane gateway from the audience '$audience' (a custom domain?). " +
+                    "Pass --gateway <url>, e.g. ${ThorynConfig.STAGING_GATEWAY}.",
+            )
+            return EXIT_USAGE
         }
 
-        val base = issuer.trimEnd('/')
-        val oidcAudience = wifAudience?.takeIf { it.isNotBlank() } ?: base
-        val subjectToken = wifSubjectToken?.takeIf { it.isNotBlank() }
-            ?: ThorynConfig.readWifSubjectTokenOverride()
-        // Request the client's exact registered scope set by default; honour an explicit --scope.
-        val requestedScope = if (scope == ThorynConfig.DEFAULT_SCOPE) ThorynConfig.DEFAULT_WIF_SCOPE else expandedScope()
-
-        // SSO-3377 — the assertion audience is the base issuer and the request goes to the tenant host;
-        // either being retired makes the exchange impossible.
-        refuseRetiredIssuer(listOf(base, ThorynConfig.tenantIssuer(base, wifTenantSlug)), workspaceForSuggestion = null) {
-            RetiredIssuer.defaultFix(it, "thoryn login --workload-identity", includeWorkspace = false)
+        // SSO-3377 — a retired host can only refuse; stop before asking GitHub for a job token.
+        baseIssuer = base
+        refuseRetiredIssuer(listOf(audience), workspaceForSuggestion = null) { suggestion ->
+            "The trust's audience moved with the platform" +
+                (suggestion?.let { " (now ${it.issuer})" } ?: "") +
+                ": read the current one with `thoryn workload-identity trusts get <id>` and sign in with it."
         }?.let { return it }
 
+        val binding = WorkloadIdentityBinding(clientIdValue, audience, tokenEndpoint, requestedScope, pins)
         val flow = WorkloadIdentityFlow(
-            tokenEndpoint = "${ThorynConfig.tenantIssuer(base, wifTenantSlug)}/oauth2/token",
-            assertionAudience = "$base/oauth2/token",
-            clientId = wifClientId,
-            signer = signer,
-            oidcAudience = oidcAudience,
-            sender = realHttpSender(),
-            explicitSubjectToken = subjectToken,
+            clientId = clientIdValue,
+            audience = audience,
+            tokenEndpoint = tokenEndpoint,
+            tokenSender = realHttpSender(),
         )
-
         return try {
             val tokens = flow.run(requestedScope)
-            persistSession(withSession(tokens))
+            persistSession(
+                tokens.copy(
+                    issuer = audience,
+                    gateway = sessionGateway,
+                    platformIssuer = base,
+                    authMode = Tokens.AUTH_MODE_WORKLOAD_IDENTITY,
+                    clientId = clientIdValue,
+                    workspace = workspaceSlug ?: ThorynConfig.workspaceOfIssuer(audience),
+                    tokenEndpoint = tokenEndpoint,
+                ),
+            )
+            // SSO-2863 — a fresh login resets the base tenant; drop any stale workspace selection.
             SelectedWorkspaceStore().clear()
-            println("Signed in (workload-identity / '$wifClientId' in tenant '$wifTenantSlug').")
+            val who = com.devnow.thoryn.cli.auth.JwtClaims.of(tokens.accessToken)["sub"]?.asString() ?: clientIdValue
+            println("Signed in (workload identity / client '$clientIdValue' at $audience, as $who).")
             tokens.scope?.let { println("Scopes: $it") }
+            val minutes = tokens.expiresAtEpochSecond?.let { (it - System.currentTimeMillis() / 1000) / 60 }
+            println(
+                "The token lasts ${minutes?.let { "about ${it}m" } ?: "a few minutes"}; later commands in this job renew it " +
+                    "with a fresh job token (re-run `$reLogin` outside the job's lifetime).",
+            )
             EXIT_OK
         } catch (e: WorkloadIdentityException) {
-            System.err.println("Sign-in failed: ${e.message}")
-            e.bodySnippet?.takeIf { e.oauthError == "unknown" }?.let { System.err.println("  hub response: $it") }
+            System.err.println(WorkloadIdentityDiagnostics.render(e, binding))
             EXIT_WORKLOAD_IDENTITY_FAILED
         }
+    }
+
+    private fun isLoopback(url: String): Boolean {
+        val host = runCatching { java.net.URI(url).host }.getOrNull()?.lowercase() ?: return false
+        return host == "localhost" || host == "127.0.0.1" || host == "[::1]" || host == "::1"
     }
 
     private fun runDeviceCodeFlow(): Int {
@@ -1137,6 +1226,10 @@ class LoginCommand : Callable<Int> {
          * session recorded (or its tenant issuer names) a workspace, else plain `thoryn login`.
          */
         internal fun reLoginCommand(tokens: Tokens?): String {
+            // SSO-3308 — a workload identity session re-signs-in with the same trust binding, inside a job.
+            if (tokens?.authMode == Tokens.AUTH_MODE_WORKLOAD_IDENTITY) {
+                return "thoryn login --workload-identity --client-id ${tokens.clientId ?: "<wi_…>"} --audience ${tokens.issuer ?: "<audience>"}"
+            }
             val slug = tokens?.workspace?.takeIf { it.isNotBlank() } ?: ThorynConfig.workspaceOfIssuer(tokens?.issuer)
             return if (slug != null) "thoryn login --workspace $slug" else "thoryn login"
         }
@@ -1256,7 +1349,7 @@ class LoginCommand : Callable<Int> {
         /** SSO-2820 — the interactive loopback flow failed (timeout, state mismatch, error redirect, bad code). */
         const val EXIT_LOOPBACK_FAILED = 72
 
-        /** SSO-2879 — the workload-identity (GitHub OIDC -> WIF) sign-in failed. */
+        /** SSO-2879 / SSO-3308 — the workload identity (GitHub Actions job token) sign-in failed. */
         const val EXIT_WORKLOAD_IDENTITY_FAILED = 73
 
         /** SSO-2820 — how long to wait for the browser sign-in redirect on the loopback listener. */
