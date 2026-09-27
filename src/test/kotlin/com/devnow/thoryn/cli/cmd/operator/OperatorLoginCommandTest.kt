@@ -3,6 +3,9 @@ package com.devnow.thoryn.cli.cmd.operator
 import com.devnow.thoryn.cli.auth.FileTokenStore
 import com.devnow.thoryn.cli.auth.HttpSender
 import com.devnow.thoryn.cli.auth.ParCapability
+import com.devnow.thoryn.cli.auth.RetiredIssuer
+import com.devnow.thoryn.cli.auth.Tokens
+import com.devnow.thoryn.cli.cmd.LoginRetiredIssuerTest
 import com.devnow.thoryn.cli.cmd.CommandTestBase
 import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.api.AfterEach
@@ -127,6 +130,27 @@ class OperatorLoginCommandTest : CommandTestBase() {
 
         assertThat(result.exit).isEqualTo(0)
         assertThat(result.err).contains("did not use a passkey").contains("operator_passkey_required")
+    }
+
+    @Test
+    fun `operator login from a remembered retired issuer stops before opening a browser and suggests the auth host`() {
+        // SSO-3377 — the customer session was signed in before the auth-host cutover.
+        seedTokens(Tokens(accessToken = "AT-test", issuer = "https://thoryn.hub.stg.thoryn.org", platformIssuer = "https://hub.stg.thoryn.org"))
+        val probed = mutableListOf<String>()
+        RetiredIssuer.fetcher = { url -> probed += url; RetiredIssuer.Answer(410, LoginRetiredIssuerTest.RETIRED_BODY) }
+        OperatorLoginCommand.browser = { openedUrl = it }
+
+        val result = runCli("operator", "login")
+
+        assertThat(result.exit).isEqualTo(OperatorLoginCommand.EXIT_USAGE)
+        assertThat(result.err)
+            .contains("the issuer https://thoryn.hub.stg.thoryn.org has been retired (HTTP 410 issuer_retired)")
+            .contains("remembered from your previous sign-in")
+            .contains("thoryn operator login --issuer https://auth.stg.thoryn.org")
+            .doesNotContain("--workspace")
+        assertThat(probed).containsExactly("https://thoryn.hub.stg.thoryn.org/.well-known/openid-configuration")
+        assertThat(openedUrl).isNull()
+        assertThat(FileTokenStore(FileTokenStore.operatorPath()).read()).isNull()
     }
 
     @Test

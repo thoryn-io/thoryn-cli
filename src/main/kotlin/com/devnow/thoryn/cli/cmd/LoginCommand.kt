@@ -18,6 +18,7 @@ import com.devnow.thoryn.cli.auth.ParCapability
 import com.devnow.thoryn.cli.auth.ParPushResult
 import com.devnow.thoryn.cli.auth.PkceUtil
 import com.devnow.thoryn.cli.auth.PushedAuthorizationRequestFlow
+import com.devnow.thoryn.cli.auth.RetiredIssuer
 import com.devnow.thoryn.cli.auth.RevokedDevice
 import com.devnow.thoryn.cli.auth.ScopeRegistry
 import com.devnow.thoryn.cli.auth.TokenStore
@@ -358,7 +359,52 @@ class LoginCommand : Callable<Int> {
         }
         issuer = hub.url
         baseIssuer = hub.url
+        hubSource = hub.source
         return true
+    }
+
+    /** SSO-3377 — where the platform base came from; a remembered one is named as such when it is retired. */
+    private var hubSource: ThorynConfig.HubSource? = null
+
+    /**
+     * SSO-3377 — ask each of [candidates]' discovery documents whether the platform still serves it,
+     * BEFORE the sign-in opens a browser or posts anything. A retired issuer (`410 issuer_retired`, the
+     * SSO-3297 auth-host cutover) can only ever refuse the sign-in, so stop here with guidance naming the
+     * retired issuer and, where the platform can be inferred, the successor to pass with `--issuer`.
+     *
+     * The saved issuer is left exactly as it is: the successor is a suggestion the user acts on, not a
+     * host the CLI starts trusting on its own.
+     *
+     * Returns the exit code to stop with ([EXIT_USAGE] — a configuration error, the same as an invalid or
+     * missing issuer), or null to proceed.
+     */
+    private fun refuseRetiredIssuer(
+        candidates: List<String>,
+        workspaceForSuggestion: String?,
+        fix: (RetiredIssuer.Suggestion?) -> String,
+    ): Int? {
+        for (candidate in candidates.map { it.trim().trimEnd('/') }.distinct()) {
+            when (val status = RetiredIssuer.check(candidate)) {
+                is RetiredIssuer.Status.Retired -> {
+                    System.err.println(
+                        RetiredIssuer.loginGuidance(
+                            retired = status,
+                            base = baseIssuer.ifBlank { candidate },
+                            workspace = workspaceForSuggestion,
+                            remembered = hubSource == ThorynConfig.HubSource.PREVIOUS_SESSION,
+                            fix = fix,
+                        ),
+                    )
+                    return EXIT_USAGE
+                }
+                is RetiredIssuer.Status.Gone -> {
+                    System.err.println(RetiredIssuer.goneGuidance(status))
+                    return EXIT_USAGE
+                }
+                RetiredIssuer.Status.Live -> Unit
+            }
+        }
+        return null
     }
 
     /**
@@ -425,10 +471,17 @@ class LoginCommand : Callable<Int> {
         }
         if (useClientCredentials) {
             baseIssuer = issuer
+            refuseRetiredIssuer(listOf(issuer), workspaceForSuggestion = null) {
+                RetiredIssuer.defaultFix(it, "thoryn login --client-credentials", includeWorkspace = false)
+            }?.let { return it }
             return runClientCredentialsFlow()
         }
         // SSO-3104 — the interactive flows sign in ON A WORKSPACE, never on the shared default tenant.
         if (!selectWorkspaceIssuer()) return EXIT_USAGE
+        // SSO-3377 — before a browser opens (or a device code is requested) at a host that can only answer 410.
+        refuseRetiredIssuer(listOf(issuer), workspaceForSuggestion = signedInWorkspace) {
+            RetiredIssuer.defaultFix(it, if (useDeviceCode) "thoryn login --device-code" else "thoryn login")
+        }?.let { return it }
         if (useDeviceCode) {
             return runDeviceCodeFlow()
         }
@@ -601,6 +654,15 @@ class LoginCommand : Callable<Int> {
             return EXIT_CLIENT_CREDENTIALS_FAILED
         }
 
+        // SSO-3377 — the contract's issuer comes from an env var, so the fix is that env var, not
+        // `--issuer` (which `--connection` refuses).
+        baseIssuer = hubBase.trim().trimEnd('/')
+        val issuerEnv = if (connection.hubBaseUrlEnv == Connection.DEFAULT_HUB_BASE_URL_ENV) ThorynConfig.ISSUER_ENV else connection.hubBaseUrlEnv
+        refuseRetiredIssuer(listOf(derivedIssuer), workspaceForSuggestion = connection.slug) { suggestion ->
+            val value = suggestion?.issuer ?: "<the platform's current issuer>"
+            "Set $issuerEnv=$value and run `thoryn login --connection ${file.path}` again."
+        }?.let { return it }
+
         val flow = ClientCredentialsFlow(
             issuer = derivedIssuer,
             clientId = connection.clientId,
@@ -687,6 +749,12 @@ class LoginCommand : Callable<Int> {
             ?: ThorynConfig.readWifSubjectTokenOverride()
         // Request the client's exact registered scope set by default; honour an explicit --scope.
         val requestedScope = if (scope == ThorynConfig.DEFAULT_SCOPE) ThorynConfig.DEFAULT_WIF_SCOPE else expandedScope()
+
+        // SSO-3377 — the assertion audience is the base issuer and the request goes to the tenant host;
+        // either being retired makes the exchange impossible.
+        refuseRetiredIssuer(listOf(base, ThorynConfig.tenantIssuer(base, wifTenantSlug)), workspaceForSuggestion = null) {
+            RetiredIssuer.defaultFix(it, "thoryn login --workload-identity", includeWorkspace = false)
+        }?.let { return it }
 
         val flow = WorkloadIdentityFlow(
             tokenEndpoint = "${ThorynConfig.tenantIssuer(base, wifTenantSlug)}/oauth2/token",

@@ -8,6 +8,8 @@ import com.devnow.thoryn.cli.auth.Dpop
 import com.devnow.thoryn.cli.auth.HttpSender
 import com.devnow.thoryn.cli.auth.RefreshTokenException
 import com.devnow.thoryn.cli.auth.RefreshTokenFlow
+import com.devnow.thoryn.cli.auth.RetiredIssuer
+import com.devnow.thoryn.cli.auth.TokenExchangeException
 import com.devnow.thoryn.cli.auth.RevokedDevice
 import com.devnow.thoryn.cli.auth.ScopeRegistry
 import com.devnow.thoryn.cli.auth.TokenExchangeFlow
@@ -149,6 +151,7 @@ internal object CommandSupport {
         // issuer (including an explicit `--issuer` override at switch time) is used verbatim.
         val targetIssuer = WorkspaceTenantHost.healedSelection(selected, resolvePlatformIssuer(ThorynConfig.DEFAULT_HUB, baseTokens))
 
+        var retired = false
         fun mint(): Tokens? {
             val base = ensureFresh(baseTokens, err)
             val issuer = base.issuer?.takeIf { it.isNotBlank() } ?: return null
@@ -169,11 +172,18 @@ internal object CommandSupport {
                     // clients.write and anything not requested at login — which broke `clients update`
                     // / `env` management in a switched workspace. No-scope is the correct behaviour.
                 ).run()
+            }.onFailure { e ->
+                // SSO-3377 — the hub refused the exchange because the session's issuer is retired: a
+                // re-login on the SAME issuer cannot help, so name the retired issuer and the fix.
+                if (e is TokenExchangeException && RetiredIssuer.isRetiredError(e.oauthError)) {
+                    retired = true
+                    warnOnce(err) { retiredSessionGuidance(base) }
+                }
             }.getOrNull()
         }
 
         val initial = mint()
-        if (initial == null) {
+        if (initial == null && !retired && !retiredSessionReported) {
             // SSO-3182 — name the HOME session that could not be renewed and the exact re-login line
             // (the old text said only "Run `thoryn login`", which on a thoryn-homed session re-ran the
             // same workspace-less login the user had already done).
@@ -268,6 +278,10 @@ internal object CommandSupport {
     @Volatile
     private var sessionHintPrinted: Boolean = false
 
+    /** SSO-3377 — set once this process has told the user the session's issuer is retired. */
+    @Volatile
+    private var retiredSessionReported: Boolean = false
+
     private fun warnOnce(err: PrintStream, message: () -> String) {
         if (sessionHintPrinted) return
         sessionHintPrinted = true
@@ -277,6 +291,26 @@ internal object CommandSupport {
     /** Test seam — reset the once-per-process hint latch. */
     internal fun resetSessionHintForTest() {
         sessionHintPrinted = false
+        retiredSessionReported = false
+    }
+
+    /**
+     * SSO-3377 — the guidance for a REMEMBERED session whose issuer the hub has retired (`410
+     * issuer_retired`, the SSO-3297 auth-host cutover). Names the session's issuer and — where the
+     * platform can be inferred — the `thoryn login --issuer <successor>` line. The stored session is
+     * not touched: re-pointing it is the user's call.
+     */
+    internal fun retiredSessionGuidance(session: Tokens): String {
+        retiredSessionReported = true
+        val clientCredentials = session.authMode == Tokens.AUTH_MODE_CLIENT_CREDENTIALS
+        return RetiredIssuer.sessionGuidance(
+            sessionIssuer = session.issuer,
+            platformIssuer = session.platformIssuer?.takeIf { it.isNotBlank() }
+                ?: session.issuer?.takeIf { it.isNotBlank() }?.let(ThorynConfig::baseHubOf),
+            workspace = session.workspace?.takeIf { it.isNotBlank() } ?: ThorynConfig.workspaceOfIssuer(session.issuer),
+            command = if (clientCredentials) "thoryn login --client-credentials" else "thoryn login",
+            includeWorkspace = !clientCredentials,
+        )
     }
 
     /** SSO-2834 — redeem the stored refresh token (RFC 6749 §6). Null when there is no issuer or the redemption fails. */
@@ -311,6 +345,9 @@ internal object CommandSupport {
                 // again. Name the one command that changes anything.
                 if (e is RefreshTokenException && RevokedDevice.refused(e.oauthErrorDescription)) {
                     RevokedDevice.RENEWAL_GUIDANCE
+                } else if (e is RefreshTokenException && RetiredIssuer.isRetiredError(e.oauthError)) {
+                    // SSO-3377 — `thoryn login` alone would reuse the retired issuer; name the successor.
+                    retiredSessionGuidance(current)
                 } else {
                     "Could not renew your sign-in session (${e.message}). " +
                         "Run `${LoginCommand.reLoginCommand(current)}` to sign in again."
@@ -363,6 +400,11 @@ internal object CommandSupport {
             runCatching { TokenStoreFactory.default().write(minted) }
             minted
         } catch (e: ClientCredentialsException) {
+            if (RetiredIssuer.isRetiredError(e.oauthError)) {
+                // SSO-3377 — the credentials are fine; the issuer the session was minted at is retired.
+                warnOnce(err) { retiredSessionGuidance(current) }
+                return null
+            }
             err.println(
                 "Could not re-mint the API-key session (${e.oauthError}); check the credentials, " +
                     "or run `thoryn login --client-credentials`.",
@@ -538,6 +580,8 @@ internal object CommandSupport {
         // generic HTTP-error rendering.
         if (ex.isProductionConfirmationRequired) return renderConfirmation(format, ex, CONFIRM_REQUIRED_HINT, out, err)
         if (ex.isProductionConfirmationMismatch) return renderConfirmation(format, ex, CONFIRM_MISMATCH_HINT, out, err)
+        // SSO-3377 — a hub call on a remembered session whose issuer is retired (410 issuer_retired).
+        if (RetiredIssuer.isRetiredError(ex.errorCode)) return renderRetiredIssuer(format, ex, out, err)
 
         val structured = linkedMapOf<String, Any?>(
             "error" to (ex.errorCode ?: "unknown"),
@@ -579,6 +623,27 @@ internal object CommandSupport {
             OutputFormat.JSON -> Printers.json(confirmationStructured(ex, hint), out)
             OutputFormat.YAML -> Printers.yaml(confirmationStructured(ex, hint), out)
             OutputFormat.TABLE -> err.println(hint)
+        }
+        return EXIT_HTTP_ERROR
+    }
+
+    /**
+     * SSO-3377 — render a `410 issuer_retired` from the hub. When the refresh path already said so in
+     * this process, the guidance is not repeated. TABLE prints it to stderr; JSON/YAML carry it as
+     * `hint` next to the stable `errorCode`. Returns [EXIT_HTTP_ERROR].
+     */
+    private fun renderRetiredIssuer(format: OutputFormat, ex: ProductApiException, out: PrintStream, err: PrintStream): Int {
+        val alreadyReported = retiredSessionReported
+        val session = runCatching { TokenStoreFactory.default().read() }.getOrNull()
+        val hint = if (session != null) {
+            retiredSessionGuidance(session)
+        } else {
+            RetiredIssuer.sessionGuidance(null, null, null)
+        }
+        when (format) {
+            OutputFormat.JSON -> Printers.json(confirmationStructured(ex, hint), out)
+            OutputFormat.YAML -> Printers.yaml(confirmationStructured(ex, hint), out)
+            OutputFormat.TABLE -> if (!alreadyReported) err.println(hint)
         }
         return EXIT_HTTP_ERROR
     }

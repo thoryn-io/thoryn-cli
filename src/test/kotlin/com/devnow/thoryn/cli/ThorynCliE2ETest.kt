@@ -1,6 +1,7 @@
 package com.devnow.thoryn.cli
 
 import com.devnow.thoryn.cli.auth.DpopCapability
+import com.devnow.thoryn.cli.auth.RetiredIssuer
 import com.devnow.thoryn.cli.auth.TokenStoreFactory
 import okhttp3.mockwebserver.Dispatcher
 import okhttp3.mockwebserver.MockResponse
@@ -132,6 +133,8 @@ class ThorynCliE2ETest {
         // give it; stubbing it states that explicitly rather than firing an HTTP GET into a
         // queue-based mock. The gate itself is covered by `DpopCapabilityGateTest`.
         DpopCapability.probe = { false }
+        // SSO-3377 — likewise the retired-issuer probe: no discovery document, so "not retired".
+        RetiredIssuer.fetcher = { null }
     }
 
     @AfterEach
@@ -139,6 +142,7 @@ class ThorynCliE2ETest {
         hub.shutdown()
         gateway.shutdown()
         DpopCapability.resetForTest()
+        RetiredIssuer.resetForTest()
         System.setProperty("user.home", originalUserHome ?: "")
         TokenStoreFactory.environment = originalEnvSeam
         if (originalClientSecretProp == null) {
