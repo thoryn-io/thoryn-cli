@@ -197,19 +197,20 @@ class LoginRetiredIssuerTest : CommandTestBase() {
     }
 
     @Test
-    fun `workload identity at a retired issuer stops before the exchange`() {
+    fun `workload identity at a retired audience stops before asking GitHub for a job token`() {
         clearTokens()
         routeToServer()
         server.enqueue(retired())
 
         val (exit, _, err) = runCli(
-            "login", "--workload-identity", "--issuer", "https://hub.stg.thoryn.org",
-            "--wif-signing-key-file", writeTestSigningKey(), "--subject-token", "gh-oidc-token",
+            "login", "--workload-identity", "--client-id", "wi_0123456789abcdef01234567",
+            "--audience", "https://thoryn.hub.stg.thoryn.org/cli-ci",
         )
 
         assertThat(exit).isEqualTo(LoginCommand.EXIT_USAGE)
-        assertThat(err).contains("thoryn login --workload-identity --issuer https://auth.stg.thoryn.org")
-        assertThat(server.requestCount).isEqualTo(1)
+        assertThat(err).contains("has been retired").contains("thoryn workload-identity trusts get")
+        assertThat(probed).containsExactly("https://thoryn.hub.stg.thoryn.org/cli-ci/.well-known/openid-configuration")
+        assertThat(server.requestCount).isEqualTo(1) // no job-token request, no exchange
     }
 
     @Test
@@ -242,14 +243,6 @@ class LoginRetiredIssuerTest : CommandTestBase() {
     }
 
     /** A throwaway P-256 key: the WIF path parses it before it probes. */
-    private fun writeTestSigningKey(): String {
-        val generator = java.security.KeyPairGenerator.getInstance("EC").apply { initialize(256) }
-        val pkcs8 = java.util.Base64.getMimeEncoder(64, "\n".toByteArray()).encodeToString(generator.generateKeyPair().private.encoded)
-        val file = tempHome.resolve("wif-key.pem")
-        Files.writeString(file, "-----BEGIN PRIVATE KEY-----\n$pkcs8\n-----END PRIVATE KEY-----\n")
-        return file.toString()
-    }
-
     companion object {
         /** The body staging's retired hosts answer with (captured 2026-09-27). */
         const val RETIRED_BODY: String =

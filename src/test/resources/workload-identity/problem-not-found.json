@@ -1,0 +1,1 @@
+{"type":"about:blank","title":"Not Found","status":404,"detail":"No such workload identity trust.","instance":"/api/v1/workload-identity/trusts/5b0f6c1e-8c2a-4f5e-9f3d-2a1b0c9d8e7f","errorCode":"workload_identity_trust_not_found"}
