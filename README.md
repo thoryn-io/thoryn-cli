@@ -175,7 +175,7 @@ thoryn access mine   [--type <objectType>] [--relation <relation>]   # GET /api/
 # feature enabled for the workspace by Thoryn (else 403 entitlement_required).
 # Scopes: tenant:domains.read (status) / tenant:domains.write (add, verify, remove).
 thoryn domain add <host> [--accept-re-sign-in]   # PUT    /api/v1/custom-domain — prints the TXT + CNAME records to create
-thoryn domain status                             # GET    /api/v1/custom-domain — state, records, issuer, certificate, last check
+thoryn domain status                             # GET    /api/v1/custom-domain — state, records, issuer, certificate, last check, release countdown when SUSPENDED
 thoryn domain verify                             # POST   /api/v1/custom-domain/verify — exit 4 while the DNS does not prove it yet
 thoryn domain remove [--yes]                     # DELETE /api/v1/custom-domain — asks for confirmation unless --yes
 
@@ -261,6 +261,12 @@ thoryn domain remove --yes
 - `verify` exits `4` (not `2`) while the DNS does not prove the claim yet (`verification_failed`,
   with `reason` `txt_record_missing` / `cname_missing` / `cname_mismatch`), so a script can poll it.
 - An unverified claim expires after 7 days (`claim_expired`); claim again for a new TXT value.
+- A `SUSPENDED` domain keeps its certificate for 30 days (product-api `suspension.releaseAt`, oathy
+  SSO-3371); verifying again before then brings it straight back. `status` shows the release time and a
+  countdown (SSO-3399):
+  `Released: 2026-10-26 03:00 UTC (in 28 days) — verify again before then to keep it; after that the domain goes back to PENDING and must be verified again with a new TXT record.`
+  Once that time has passed it says `release pending`; a server that predates SSO-3371 sends no
+  `releaseAt` and the line is omitted. `--output json|yaml` carries `suspension.releaseAt` as-is.
 - Every subcommand accepts `--output json|yaml|table`; `--json` is shorthand for `--output json`.
 - The scopes are part of the default `thoryn login` set. They are granted to the `cli` client by oathy
   hub V181, which must be deployed before a CLI release that requests them.
