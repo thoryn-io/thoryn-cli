@@ -2,7 +2,10 @@ package com.devnow.thoryn.cli.cmd
 
 import okhttp3.mockwebserver.MockResponse
 import org.assertj.core.api.Assertions.assertThat
+import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Test
+import java.time.Duration
+import java.time.Instant
 
 /**
  * SSO-3303 — `thoryn domain add | status | verify | remove` against a MockWebServer standing in for the
@@ -13,6 +16,11 @@ import org.junit.jupiter.api.Test
  * SSO-3082 lesson: a fixture fabricated in the wrong shape lets a parsing bug pass its own test.
  */
 class DomainCommandTest : CommandTestBase() {
+
+    @AfterEach
+    fun resetClock() {
+        DomainCommand.resetForTest()
+    }
 
     private fun fixture(name: String): String =
         requireNotNull(javaClass.getResource("/custom-domain/$name.json")) { "missing fixture $name" }.readText()
@@ -140,6 +148,95 @@ class DomainCommandTest : CommandTestBase() {
             .contains("https://cd-ws.auth.thoryn.io")
             .contains("_thoryn-verify.auth.acme.com")
             .contains("CNAME points somewhere other than the workspace's platform host")
+    }
+
+    // ── status: release countdown of a suspended domain (SSO-3399, product-api SSO-3371) ──────────
+    //
+    // `status-suspended-release.json` is `status-suspended.json` plus `suspension.releaseAt`, with the
+    // values product-api's `CustomDomainControllerTest` (SSO-3371) pins for a SUSPENDED domain:
+    // suspendedAt 2026-09-26T03:00:00Z → releaseAt 2026-10-26T03:00:00Z (30 days).
+
+    @Test
+    fun `status of a suspended domain shows when it is released and the countdown`() {
+        DomainCommand.clock = { Instant.parse("2026-09-27T09:00:00Z") }
+        server.enqueue(jsonResponse(200, fixture("status-suspended-release")))
+
+        val (exit, out, _) = runCli("domain", "status", "--gateway", baseUrl())
+
+        assertThat(exit).isEqualTo(0)
+        assertThat(out).contains(
+            "Released: 2026-10-26 03:00 UTC (in 28 days) — verify again before then to keep it; after that " +
+                "the domain goes back to PENDING and must be verified again with a new TXT record.",
+        )
+    }
+
+    @Test
+    fun `status of a suspended domain whose release time has passed says the release is pending`() {
+        DomainCommand.clock = { Instant.parse("2026-10-26T04:00:00Z") }
+        server.enqueue(jsonResponse(200, fixture("status-suspended-release")))
+
+        val (exit, out, _) = runCli("domain", "status", "--gateway", baseUrl())
+
+        assertThat(exit).isEqualTo(0)
+        assertThat(out)
+            .contains("Released: release pending (due 2026-10-26 03:00 UTC)")
+            .contains("goes back to PENDING")
+            .doesNotContain("(in ")
+    }
+
+    @Test
+    fun `status of a domain that is not suspended prints no release line`() {
+        DomainCommand.clock = { Instant.parse("2026-09-27T09:00:00Z") }
+        server.enqueue(jsonResponse(200, fixture("verify-verified")))
+
+        val (exit, out, _) = runCli("domain", "status", "--gateway", baseUrl())
+
+        assertThat(exit).isEqualTo(0)
+        assertThat(out).contains("VERIFIED").doesNotContain("Released")
+    }
+
+    @Test
+    fun `status against a server without releaseAt still shows the suspension and no release line`() {
+        server.enqueue(jsonResponse(200, fixture("status-suspended")))
+
+        val (exit, out, _) = runCli("domain", "status", "--gateway", baseUrl())
+
+        assertThat(exit).isEqualTo(0)
+        assertThat(out).contains("SUSPENDED").contains("cname_mismatch").doesNotContain("Released")
+    }
+
+    @Test
+    fun `status --json passes releaseAt through unchanged`() {
+        server.enqueue(jsonResponse(200, fixture("status-suspended-release")))
+
+        val (exit, out, _) = runCli("domain", "status", "--json", "--gateway", baseUrl())
+
+        assertThat(exit).isEqualTo(0)
+        @Suppress("UNCHECKED_CAST")
+        val suspension = parseJson(out)["suspension"] as Map<String, Any?>
+        assertThat(suspension)
+            .containsEntry("releaseAt", "2026-10-26T03:00:00Z")
+            .containsEntry("suspendedAt", "2026-09-26T03:00:00Z")
+            .containsEntry("reason", "cname_mismatch")
+    }
+
+    @Test
+    fun `status --output yaml passes releaseAt through`() {
+        server.enqueue(jsonResponse(200, fixture("status-suspended-release")))
+
+        val (exit, out, _) = runCli("domain", "status", "--output", "yaml", "--gateway", baseUrl())
+
+        assertThat(exit).isEqualTo(0)
+        assertThat(out).containsPattern("releaseAt: \"?2026-10-26T03:00:00Z").doesNotContain("Released")
+    }
+
+    @Test
+    fun `the countdown is coarse and singular-aware`() {
+        assertThat(DomainCommand.countdown(Duration.ofDays(29).plusHours(3))).isEqualTo("in 29 days")
+        assertThat(DomainCommand.countdown(Duration.ofHours(47))).isEqualTo("in 47 hours")
+        assertThat(DomainCommand.countdown(Duration.ofHours(1))).isEqualTo("in 1 hour")
+        assertThat(DomainCommand.countdown(Duration.ofMinutes(1))).isEqualTo("in 1 minute")
+        assertThat(DomainCommand.countdown(Duration.ofSeconds(30))).isEqualTo("in less than a minute")
     }
 
     @Test

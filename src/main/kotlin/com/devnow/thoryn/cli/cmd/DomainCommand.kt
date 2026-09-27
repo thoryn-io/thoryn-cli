@@ -11,6 +11,10 @@ import picocli.CommandLine.Option
 import picocli.CommandLine.Parameters
 import tools.jackson.databind.JsonNode
 import java.io.PrintStream
+import java.time.Duration
+import java.time.Instant
+import java.time.ZoneOffset
+import java.time.format.DateTimeFormatter
 import java.util.concurrent.Callable
 
 /**
@@ -26,7 +30,8 @@ import java.util.concurrent.Callable
  *
  * Subcommands:
  *  - `add <host> [--accept-re-sign-in]` — PUT    /api/v1/custom-domain
- *  - `status`                           — GET    /api/v1/custom-domain
+ *  - `status`                           — GET    /api/v1/custom-domain (a SUSPENDED domain also shows its
+ *                                         release countdown, `suspension.releaseAt` — SSO-3399)
  *  - `verify`                           — POST   /api/v1/custom-domain/verify
  *  - `remove [--yes]`                   — DELETE /api/v1/custom-domain (confirmation prompt)
  *
@@ -138,7 +143,10 @@ class DomainCommand : Callable<Int> {
     }
 
     /** `thoryn domain status` */
-    @Command(name = "status", description = ["Show the workspace's custom domain, its DNS records and verification state."], mixinStandardHelpOptions = true)
+    @Command(name = "status", description = [
+        "Show the workspace's custom domain, its DNS records and verification state.",
+        "A SUSPENDED domain also shows when it is released (back to PENDING) unless it verifies again first.",
+    ], mixinStandardHelpOptions = true)
     class StatusSubcommand : Base() {
         override val requiredScope: String = SCOPE_READ
 
@@ -161,6 +169,7 @@ class DomainCommand : Callable<Int> {
                     printRecords(body, out)
                     out.println()
                     out.println(explain(body))
+                    releaseLine(body, clock())?.let(out::println)
                 }
                 else -> CommandSupport.emitRecord(format, body, ::domainRecordFields)
             }
@@ -219,6 +228,17 @@ class DomainCommand : Callable<Int> {
         const val SCOPE_READ: String = "tenant:domains.read"
         const val SCOPE_WRITE: String = "tenant:domains.write"
         const val STATE_NONE: String = "NONE"
+
+        /** Test seam (SSO-3399) — the clock the release countdown of a suspended domain is measured against. */
+        internal var clock: () -> Instant = { Instant.now() }
+
+        /** Test seam — restore the system clock. */
+        internal fun resetForTest() {
+            clock = { Instant.now() }
+        }
+
+        private val RELEASE_TIME: DateTimeFormatter =
+            DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm 'UTC'").withZone(ZoneOffset.UTC)
 
         private const val NOT_ENTITLED_HINT: String =
             "Custom domains are not enabled for this workspace. Contact Thoryn to enable them."
@@ -283,6 +303,42 @@ class DomainCommand : Callable<Int> {
                 "SUSPENDED" -> "Suspended — a daily re-check failed: ${reasonText(reason)} Restore the record; " +
                     "the domain returns to VERIFIED when it verifies again (thoryn domain verify)."
                 else -> "State: ${text(body, "state")}"
+            }
+        }
+
+        /**
+         * SSO-3399 — the release countdown of a SUSPENDED domain (product-api `suspension.releaseAt`,
+         * oathy SSO-3371). Until then the domain keeps its certificate and verifying again brings it
+         * straight back; at `releaseAt` its certificate and routes are deleted and it returns to
+         * PENDING with a NEW TXT ownership value. Null (no line) when the domain is not suspended or
+         * the server does not send `releaseAt` (a product-api from before SSO-3371).
+         */
+        fun releaseLine(body: JsonNode, now: Instant): String? {
+            if (text(body, "state") != "SUSPENDED") return null
+            val suspension = body["suspension"]?.takeUnless { it.isNull } ?: return null
+            val raw = text(suspension, "releaseAt") ?: return null
+            val releaseAt = runCatching { Instant.parse(raw) }.getOrNull()
+                ?: return "Released: $raw — $RELEASE_CONSEQUENCE"
+            val at = RELEASE_TIME.format(releaseAt)
+            return if (releaseAt.isAfter(now)) {
+                "Released: $at (${countdown(Duration.between(now, releaseAt))}) — verify again before then to keep it; " +
+                    "after that $RELEASE_CONSEQUENCE"
+            } else {
+                "Released: release pending (due $at) — $RELEASE_CONSEQUENCE"
+            }
+        }
+
+        private const val RELEASE_CONSEQUENCE: String =
+            "the domain goes back to PENDING and must be verified again with a new TXT record."
+
+        /** A coarse human countdown: "in 28 days", "in 5 hours", "in 12 minutes". */
+        fun countdown(remaining: Duration): String {
+            fun plural(n: Long, unit: String) = "in $n $unit" + if (n == 1L) "" else "s"
+            return when {
+                remaining.toDays() >= 2 -> plural(remaining.toDays(), "day")
+                remaining.toHours() >= 1 -> plural(remaining.toHours(), "hour")
+                remaining.toMinutes() >= 1 -> plural(remaining.toMinutes(), "minute")
+                else -> "in less than a minute"
             }
         }
 
