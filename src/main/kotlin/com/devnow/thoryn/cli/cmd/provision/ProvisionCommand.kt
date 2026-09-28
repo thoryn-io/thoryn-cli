@@ -2,7 +2,12 @@ package com.devnow.thoryn.cli.cmd.provision
 
 import com.devnow.thoryn.cli.VersionProvider
 import com.devnow.thoryn.cli.api.ProductApiException
+import com.devnow.thoryn.cli.auth.JwtClaims
+import com.devnow.thoryn.cli.auth.Tokens
 import com.devnow.thoryn.cli.cmd.CommandSupport
+import com.devnow.thoryn.cli.cmd.CustomDomainView
+import com.devnow.thoryn.cli.cmd.DomainCommand
+import com.devnow.thoryn.cli.cmd.DomainWaiter
 import com.devnow.thoryn.cli.cmd.SecretIo
 import com.devnow.thoryn.cli.cmd.SelectedWorkspaceStore
 import com.devnow.thoryn.cli.cmd.examples.Prompt
@@ -11,6 +16,8 @@ import com.devnow.thoryn.cli.output.OutputFormat
 import picocli.CommandLine.Command
 import picocli.CommandLine.Option
 import java.io.File
+import java.time.Duration
+import java.time.Instant
 import java.util.concurrent.Callable
 
 /**
@@ -108,6 +115,8 @@ class ProvisionCommand : Callable<Int> {
             clients = { slug -> CommandSupport.gatewayClient(gateway, tokens, applyEnvironment = false, environmentOverride = slug ?: "") },
             cliVersion = runCatching { VersionProvider.readVersion() }.getOrNull(),
             secretSink = secretSink,
+            // SSO-3413 — the workspace id (`tnt`) names the workspace-level custom domain's access object.
+            workspaceId = runCatching { JwtClaims.of(tokens.accessToken)["tnt"]?.asString() }.getOrNull()?.takeIf { it.isNotBlank() },
         )
 
         fun workspaceSlug(): String? = runCatching { SelectedWorkspaceStore().read()?.slug }.getOrNull()
@@ -127,6 +136,16 @@ class ProvisionCommand : Callable<Int> {
             plan.changes.filter { it.hasGrantChanges }.forEach { c ->
                 c.grantAdds.forEach { println("      ${c.kind} ${c.name}: grant + $it") }
                 c.grantRemoves.forEach { println("      ${c.kind} ${c.name}: grant - $it") }
+            }
+            // SSO-3413 / SSO-3414 — a customDomain's state, the issuer in use and the DNS records to publish.
+            plan.changes.forEach { c ->
+                val d = c.customDomain ?: return@forEach
+                println("      ${c.kind} ${c.name}: ${d["desiredHost"]} — state ${d["state"]}, entitled ${d["entitled"]}, issuer ${d["issuer"] ?: "(unknown)"}")
+                @Suppress("UNCHECKED_CAST")
+                val records = (d["records"] as? List<Map<String, Any?>>).orEmpty()
+                if (records.isNotEmpty()) println("      DNS records to publish (machine-readable: --output json → changes[].customDomain.records):")
+                records.forEach { r -> println("        ${r["type"]}  ${r["name"]}  ${r["value"]}  ttl=${r["ttl"]}") }
+                if (d["state"] == CustomDomainView.NONE) println("        (the TXT ownership record is issued when apply claims the domain)")
             }
             println(
                 "  ${plan.creates.size} to create, ${plan.updates.size} to update, ${plan.adopts.size} to adopt, " +
@@ -196,17 +215,39 @@ class ProvisionCommand : Callable<Int> {
         @Option(names = ["--force-stdout"], description = ["Allow printing a minted client secret to a non-interactive stdout (pipe/redirect). Off by default."])
         var forceStdout: Boolean = false
 
+        @Option(names = ["--wait"], description = ["SSO-3414 — after applying, block until the file's customDomain is --wait-until (default ACTIVE), verifying it each round; bounded by --wait-timeout."])
+        var wait: Boolean = false
+
+        @Option(names = ["--wait-until"], description = ["With --wait: ACTIVE (default) or VERIFIED."])
+        var waitUntil: String = CustomDomainView.ACTIVE
+
+        @Option(names = ["--wait-timeout"], description = ["With --wait: give up after this long, e.g. 15m (default 15m)."])
+        var waitTimeout: String? = null
+
+        @Option(names = ["--wait-interval"], description = ["With --wait: time between checks, e.g. 20s (default 20s)."])
+        var waitInterval: String? = null
+
+        /** Test seams (SSO-3414) — the wait's clock and sleep. */
+        internal var waitClock: () -> Instant = { Instant.now() }
+        internal var waitSleeper: (Duration) -> Unit = { Thread.sleep(it.toMillis()) }
+
         override fun call(): Int {
             val format = CommandSupport.parseFormat(outputRaw) ?: return CommandSupport.EXIT_USAGE
             val s = try { open() ?: return CommandSupport.EXIT_USAGE } catch (ex: ProvisionException) {
                 System.err.println("Error: ${ex.message}"); return CommandSupport.EXIT_USAGE
             }
+            waitUsageError(s.file)?.let { System.err.println("Error: $it"); return CommandSupport.EXIT_USAGE }
             val tokens = CommandSupport.readTokens() ?: return CommandSupport.EXIT_NOT_SIGNED_IN
             gateway = CommandSupport.resolveGateway(gateway, tokens)
             val engine = engine(gateway, tokens, ProvisionEngine.SecretSink.toSecretIo(secretFile, forceStdout))
-            val plan = engine.plan(s.file, s.receipt, prune)
+            val plan = try {
+                engine.plan(s.file, s.receipt, prune)
+            } catch (ex: Exception) {
+                return fail(ex, gateway, format)
+            }
             if (format == OutputFormat.TABLE) printPlan(plan, s.file)
             if (!plan.hasChanges) {
+                if (wait) return awaitDomain(gateway, tokens, format, plan.toStructured())
                 if (format == OutputFormat.TABLE) println("No changes.") else CommandSupport.emitValue(format, plan.toStructured(), "")
                 return CommandSupport.EXIT_OK
             }
@@ -222,7 +263,7 @@ class ProvisionCommand : Callable<Int> {
                 val result = engine.apply(s.file, s.receipt, plan, workspaceSlug(), confirm) { s.store.write(s.receiptPath, it) }
                 if (format == OutputFormat.TABLE) {
                     println("Applied. ${result.resources.size} resource(s) owned. Receipt: ${s.receiptPath.path}")
-                } else {
+                } else if (!wait) {
                     CommandSupport.emitValue(format, result, "")
                 }
                 // SSO-3113 — the resources exist and are owned, but a minted client secret was not surfaced.
@@ -235,11 +276,56 @@ class ProvisionCommand : Callable<Int> {
                     )
                     return SecretIo.EXIT_NO_SECRET
                 }
-                CommandSupport.EXIT_OK
+                if (wait) awaitDomain(gateway, tokens, format, result) else CommandSupport.EXIT_OK
             } catch (ex: Exception) {
                 System.err.println("Apply stopped; the receipt at ${s.receiptPath.path} records what succeeded — fix the cause and re-run.")
                 fail(ex, gateway, format)
             }
+        }
+
+        /** `--wait*` validation: the flags go together, and there must be a customDomain to wait for. */
+        private fun waitUsageError(file: ProvisionFile): String? {
+            if (!wait) {
+                return if (waitTimeout != null || waitInterval != null || waitUntil != CustomDomainView.ACTIVE) {
+                    "--wait-until, --wait-timeout and --wait-interval apply to --wait only."
+                } else {
+                    null
+                }
+            }
+            if (file.resources.none { it.kind == ProvisionFile.KIND_CUSTOM_DOMAIN }) {
+                return "--wait waits for the file's customDomain, and ${file.source} declares none."
+            }
+            waitUntil = waitUntil.trim().uppercase()
+            if (waitUntil !in DomainWaiter.TARGETS) return "--wait-until must be ACTIVE or VERIFIED (was '$waitUntil')."
+            if (waitTimeout != null && DomainWaiter.parseDuration(waitTimeout) == null) return "--wait-timeout must be a positive duration such as 15m (was '$waitTimeout')."
+            if (waitInterval != null && DomainWaiter.parseDuration(waitInterval) == null) return "--wait-interval must be a positive duration such as 20s (was '$waitInterval')."
+            return null
+        }
+
+        /**
+         * SSO-3414 — block until the workspace's custom domain reaches [waitUntil], verifying it every round.
+         * With `--output json|yaml` the ONE document printed is `{ "apply": <receipt or plan>, "customDomain": <status> }`.
+         */
+        private fun awaitDomain(gateway: String, tokens: Tokens, format: OutputFormat, applied: Any?): Int {
+            val timeout = DomainWaiter.parseDuration(waitTimeout) ?: DomainWaiter.DEFAULT_TIMEOUT
+            val outcome = DomainWaiter(
+                client = CommandSupport.gatewayClient(gateway, tokens, applyEnvironment = false, environmentOverride = ""),
+                until = waitUntil,
+                timeout = timeout,
+                interval = DomainWaiter.parseDuration(waitInterval) ?: DomainWaiter.DEFAULT_INTERVAL,
+                drive = true,
+                clock = waitClock,
+                sleeper = waitSleeper,
+            ).await()
+            if (format != OutputFormat.TABLE) {
+                CommandSupport.emitValue(
+                    format,
+                    mapOf("apply" to applied, "customDomain" to outcome.body?.let { CustomDomainView.normalized(it) }),
+                    "",
+                )
+                return DomainCommand.renderWaitOutcome(outcome, format, waitUntil, timeout, emitBody = false)
+            }
+            return DomainCommand.renderWaitOutcome(outcome, format, waitUntil, timeout)
         }
     }
 

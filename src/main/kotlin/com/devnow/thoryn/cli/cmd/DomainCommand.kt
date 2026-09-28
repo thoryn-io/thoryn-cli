@@ -77,6 +77,10 @@ class DomainCommand : Callable<Int> {
         /** The scope the subcommand needs, for the `thoryn login --scope …` hint on a 403. */
         abstract val requiredScope: String
 
+        /** Test seams (SSO-3414) — the wait's clock and sleep. */
+        internal var waitClock: () -> Instant = { Instant.now() }
+        internal var waitSleeper: (Duration) -> Unit = { Thread.sleep(it.toMillis()) }
+
         override fun call(): Int {
             if (json && outputRaw != null && !outputRaw.equals("json", ignoreCase = true)) {
                 System.err.println("Error: --json cannot be combined with --output $outputRaw.")
@@ -101,6 +105,69 @@ class DomainCommand : Callable<Int> {
         open fun precheck(): Int? = null
 
         abstract fun run(client: ProductApiClient, format: OutputFormat): Int
+    }
+
+    /**
+     * SSO-3414 — `--wait [--until ACTIVE|VERIFIED] [--timeout 15m] [--interval 20s]`: block until the domain
+     * reaches the target state, bounded by the timeout, and fail with the status API's last-check reason
+     * ([DomainWaiter]). Exit 0 when reached; [CommandSupport.EXIT_CHECK_FAILED] on a timeout or a wait that
+     * can never succeed (no domain, an expired claim, not entitled, no access).
+     */
+    abstract class WaitingBase : Base() {
+        @Option(names = ["--wait"], description = ["Block until the domain reaches --until (default ACTIVE), bounded by --timeout."])
+        var wait: Boolean = false
+
+        @Option(names = ["--until"], description = ["With --wait: ACTIVE (default) or VERIFIED (VERIFIED also accepts ACTIVE)."])
+        var until: String = CustomDomainView.ACTIVE
+
+        @Option(names = ["--timeout"], description = ["With --wait: give up after this long, e.g. 90s, 15m, 1h (default 15m)."])
+        var timeoutRaw: String? = null
+
+        @Option(names = ["--interval"], description = ["With --wait: time between checks, e.g. 20s (default 20s)."])
+        var intervalRaw: String? = null
+
+        /** Whether the wait VERIFIES a pending domain each round (needs tenant:domains.write) or only reads. */
+        abstract val drivesVerification: Boolean
+
+        override fun precheck(): Int? {
+            if (!wait) {
+                if (timeoutRaw != null || intervalRaw != null || until != CustomDomainView.ACTIVE) {
+                    System.err.println("Error: --until, --timeout and --interval apply to --wait only.")
+                    return CommandSupport.EXIT_USAGE
+                }
+                return null
+            }
+            until = until.trim().uppercase()
+            if (until !in DomainWaiter.TARGETS) {
+                System.err.println("Error: --until must be ACTIVE or VERIFIED (was '$until').")
+                return CommandSupport.EXIT_USAGE
+            }
+            if (timeoutRaw != null && DomainWaiter.parseDuration(timeoutRaw) == null) {
+                System.err.println("Error: --timeout must be a positive duration such as 90s, 15m or 1h (was '$timeoutRaw').")
+                return CommandSupport.EXIT_USAGE
+            }
+            if (intervalRaw != null && DomainWaiter.parseDuration(intervalRaw) == null) {
+                System.err.println("Error: --interval must be a positive duration such as 20s (was '$intervalRaw').")
+                return CommandSupport.EXIT_USAGE
+            }
+            return null
+        }
+
+        /** Run the wait and render its outcome; the exit code of the subcommand. */
+        fun runWait(client: ProductApiClient, format: OutputFormat): Int {
+            val timeout = DomainWaiter.parseDuration(timeoutRaw) ?: DomainWaiter.DEFAULT_TIMEOUT
+            val interval = DomainWaiter.parseDuration(intervalRaw) ?: DomainWaiter.DEFAULT_INTERVAL
+            val outcome = DomainWaiter(
+                client = client,
+                until = until,
+                timeout = timeout,
+                interval = interval,
+                drive = drivesVerification,
+                clock = waitClock,
+                sleeper = waitSleeper,
+            ).await()
+            return renderWaitOutcome(outcome, format, until, timeout)
+        }
     }
 
     /** `thoryn domain add <host> [--accept-re-sign-in]` */
@@ -146,11 +213,16 @@ class DomainCommand : Callable<Int> {
     @Command(name = "status", description = [
         "Show the workspace's custom domain, its DNS records and verification state.",
         "A SUSPENDED domain also shows when it is released (back to PENDING) unless it verifies again first.",
+        "--json prints the records as {type, name, value, ttl} for DNS tooling; --wait blocks until ACTIVE / VERIFIED.",
     ], mixinStandardHelpOptions = true)
-    class StatusSubcommand : Base() {
+    class StatusSubcommand : WaitingBase() {
         override val requiredScope: String = SCOPE_READ
 
+        /** `status --wait` only reads — the platform re-checks a pending claim every 15 minutes on its own. */
+        override val drivesVerification: Boolean = false
+
         override fun run(client: ProductApiClient, format: OutputFormat): Int {
+            if (wait) return runWait(client, format)
             val body = client.getCustomDomain()
             when (format) {
                 OutputFormat.TABLE -> {
@@ -171,25 +243,33 @@ class DomainCommand : Callable<Int> {
                     out.println(explain(body))
                     releaseLine(body, clock())?.let(out::println)
                 }
-                else -> CommandSupport.emitRecord(format, body, ::domainRecordFields)
+                // SSO-3414 — the records in their stable machine-readable shape ({type, name, value, ttl}).
+                else -> CommandSupport.emitRecord(format, CustomDomainView.normalized(body), ::domainRecordFields)
             }
             return CommandSupport.EXIT_OK
         }
     }
 
     /** `thoryn domain verify` — exit 0 when verified, [CommandSupport.EXIT_CHECK_FAILED] when the DNS does not prove it yet. */
-    @Command(name = "verify", description = ["Check the domain's DNS records now."], mixinStandardHelpOptions = true)
-    class VerifySubcommand : Base() {
+    @Command(name = "verify", description = [
+        "Check the domain's DNS records now.",
+        "--wait keeps verifying until the domain is ACTIVE (or --until VERIFIED), bounded by --timeout.",
+    ], mixinStandardHelpOptions = true)
+    class VerifySubcommand : WaitingBase() {
         override val requiredScope: String = SCOPE_WRITE
 
+        /** `verify --wait` drives verification every round rather than waiting for the scheduled re-check. */
+        override val drivesVerification: Boolean = true
+
         override fun run(client: ProductApiClient, format: OutputFormat): Int {
+            if (wait) return runWait(client, format)
             val body = client.verifyCustomDomain()
             when (format) {
                 OutputFormat.TABLE -> {
                     System.out.println("Verified: ${text(body, "domain")} is ${text(body, "state")}.")
                     System.out.println(explain(body))
                 }
-                else -> CommandSupport.emitRecord(format, body, ::domainRecordFields)
+                else -> CommandSupport.emitRecord(format, CustomDomainView.normalized(body), ::domainRecordFields)
             }
             return CommandSupport.EXIT_OK
         }
@@ -273,8 +353,8 @@ class DomainCommand : Callable<Int> {
             if (records.isEmpty()) return
             out.println("DNS records to create at your DNS provider:")
             Printers.table(
-                listOf("TYPE", "NAME", "VALUE"),
-                records.map { listOf(text(it, "type"), text(it, "name"), text(it, "value")) },
+                listOf("TYPE", "NAME", "VALUE", "TTL"),
+                records.mapNotNull { DnsRecord.of(it) }.map { listOf(it.type, it.name, it.value, it.ttl.toString()) },
                 out,
             )
         }
@@ -342,6 +422,49 @@ class DomainCommand : Callable<Int> {
             }
         }
 
+        /**
+         * SSO-3414 — render a [DomainWaiter] outcome. JSON/YAML print the last status (records normalised) on
+         * stdout in every case, so a pipeline can still read the records and the issuer after a timeout; the
+         * failure itself goes to stderr.
+         */
+        internal fun renderWaitOutcome(
+            outcome: DomainWaiter.Outcome,
+            format: OutputFormat,
+            until: String,
+            timeout: Duration,
+            emitBody: Boolean = true,
+        ): Int {
+            val body = outcome.body
+            if (emitBody && format != OutputFormat.TABLE && body != null) {
+                CommandSupport.emitRecord(format, CustomDomainView.normalized(body), ::domainRecordFields)
+            }
+            return when (outcome) {
+                is DomainWaiter.Outcome.Reached -> {
+                    if (format == OutputFormat.TABLE) {
+                        val view = CustomDomainView.of(outcome.body)
+                        println("${view.domain} is ${view.state}.")
+                        println(explain(outcome.body))
+                    }
+                    CommandSupport.EXIT_OK
+                }
+                is DomainWaiter.Outcome.TimedOut -> {
+                    System.err.println(
+                        "Error: timed out after ${DomainWaiter.human(timeout)} waiting for the custom domain to be $until — " +
+                            "it is ${outcome.state ?: "unknown"}" +
+                            (outcome.reason?.let { ": ${reasonText(it)}" } ?: "."),
+                    )
+                    if (format == OutputFormat.TABLE && body != null) {
+                        printRecords(body, System.err)
+                    }
+                    CommandSupport.EXIT_CHECK_FAILED
+                }
+                is DomainWaiter.Outcome.Stopped -> {
+                    System.err.println("Error: ${outcome.message.replaceFirstChar { it.uppercase() }}")
+                    CommandSupport.EXIT_CHECK_FAILED
+                }
+            }
+        }
+
         fun reasonText(reason: String?): String = when (reason) {
             "txt_record_missing" -> "the TXT ownership record is missing or carries another value."
             "cname_missing" -> "the domain has no CNAME record."
@@ -366,7 +489,8 @@ class DomainCommand : Callable<Int> {
                 "claim_expired" -> "Claim the domain again (thoryn domain add <host>) and publish the new TXT value."
                 "custom_domain_exists" -> "Remove the current domain first: thoryn domain remove"
                 "custom_domain_not_found" ->
-                    "The workspace has no custom domain, or your account is not an admin of this workspace."
+                    "The workspace has no custom domain, or this identity cannot manage it: only workspace admins, and " +
+                        "identities a workspace admin granted (`thoryn access grant client:<id> manager custom_domain:<workspace-id>`), can."
                 "dns_unavailable" -> "Nothing changed; try again in a moment."
                 else -> null
             }
