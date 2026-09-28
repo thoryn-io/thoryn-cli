@@ -16,8 +16,6 @@ import com.devnow.thoryn.cli.output.OutputFormat
 import picocli.CommandLine.Command
 import picocli.CommandLine.Option
 import java.io.File
-import java.time.Duration
-import java.time.Instant
 import java.util.concurrent.Callable
 
 /**
@@ -111,8 +109,11 @@ class ProvisionCommand : Callable<Int> {
             gateway: String,
             tokens: com.devnow.thoryn.cli.auth.Tokens,
             secretSink: ProvisionEngine.SecretSink = ProvisionEngine.SecretSink.undeliverable(),
+            format: OutputFormat = OutputFormat.TABLE,
         ): ProvisionEngine = ProvisionEngine(
             clients = { slug -> CommandSupport.gatewayClient(gateway, tokens, applyEnvironment = false, environmentOverride = slug ?: "") },
+            // SSO-3414 — with --output json|yaml stdout carries ONE document; the per-resource progress goes to stderr.
+            out = if (format == OutputFormat.TABLE) System.out else System.err,
             cliVersion = runCatching { VersionProvider.readVersion() }.getOrNull(),
             secretSink = secretSink,
             // SSO-3413 — the workspace id (`tnt`) names the workspace-level custom domain's access object.
@@ -227,10 +228,6 @@ class ProvisionCommand : Callable<Int> {
         @Option(names = ["--wait-interval"], description = ["With --wait: time between checks, e.g. 20s (default 20s)."])
         var waitInterval: String? = null
 
-        /** Test seams (SSO-3414) — the wait's clock and sleep. */
-        internal var waitClock: () -> Instant = { Instant.now() }
-        internal var waitSleeper: (Duration) -> Unit = { Thread.sleep(it.toMillis()) }
-
         override fun call(): Int {
             val format = CommandSupport.parseFormat(outputRaw) ?: return CommandSupport.EXIT_USAGE
             val s = try { open() ?: return CommandSupport.EXIT_USAGE } catch (ex: ProvisionException) {
@@ -239,7 +236,7 @@ class ProvisionCommand : Callable<Int> {
             waitUsageError(s.file)?.let { System.err.println("Error: $it"); return CommandSupport.EXIT_USAGE }
             val tokens = CommandSupport.readTokens() ?: return CommandSupport.EXIT_NOT_SIGNED_IN
             gateway = CommandSupport.resolveGateway(gateway, tokens)
-            val engine = engine(gateway, tokens, ProvisionEngine.SecretSink.toSecretIo(secretFile, forceStdout))
+            val engine = engine(gateway, tokens, ProvisionEngine.SecretSink.toSecretIo(secretFile, forceStdout), format)
             val plan = try {
                 engine.plan(s.file, s.receipt, prune)
             } catch (ex: Exception) {
@@ -314,8 +311,8 @@ class ProvisionCommand : Callable<Int> {
                 timeout = timeout,
                 interval = DomainWaiter.parseDuration(waitInterval) ?: DomainWaiter.DEFAULT_INTERVAL,
                 drive = true,
-                clock = waitClock,
-                sleeper = waitSleeper,
+                clock = DomainCommand.waitClock,
+                sleeper = DomainCommand.waitSleeper,
             ).await()
             if (format != OutputFormat.TABLE) {
                 CommandSupport.emitValue(

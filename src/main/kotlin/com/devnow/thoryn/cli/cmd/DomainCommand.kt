@@ -77,10 +77,6 @@ class DomainCommand : Callable<Int> {
         /** The scope the subcommand needs, for the `thoryn login --scope …` hint on a 403. */
         abstract val requiredScope: String
 
-        /** Test seams (SSO-3414) — the wait's clock and sleep. */
-        internal var waitClock: () -> Instant = { Instant.now() }
-        internal var waitSleeper: (Duration) -> Unit = { Thread.sleep(it.toMillis()) }
-
         override fun call(): Int {
             if (json && outputRaw != null && !outputRaw.equals("json", ignoreCase = true)) {
                 System.err.println("Error: --json cannot be combined with --output $outputRaw.")
@@ -312,9 +308,15 @@ class DomainCommand : Callable<Int> {
         /** Test seam (SSO-3399) — the clock the release countdown of a suspended domain is measured against. */
         internal var clock: () -> Instant = { Instant.now() }
 
-        /** Test seam — restore the system clock. */
+        /** Test seams (SSO-3414) — the clock and the sleep every `--wait` loop uses. */
+        internal var waitClock: () -> Instant = { Instant.now() }
+        internal var waitSleeper: (Duration) -> Unit = { Thread.sleep(it.toMillis()) }
+
+        /** Test seam — restore the system clock (and the wait's clock and sleep). */
         internal fun resetForTest() {
             clock = { Instant.now() }
+            waitClock = { Instant.now() }
+            waitSleeper = { Thread.sleep(it.toMillis()) }
         }
 
         private val RELEASE_TIME: DateTimeFormatter =

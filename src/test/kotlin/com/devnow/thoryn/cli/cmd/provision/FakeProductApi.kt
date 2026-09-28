@@ -36,6 +36,90 @@ internal class FakeProductApi : Dispatcher() {
     var denyGrantReads = false
     /** SSO-3113 — the one-shot client secrets the fake minted for confidential applications, by clientId (test-side ledger only). */
     val mintedSecrets = mutableMapOf<String, String>()
+    // ── SSO-3413 / SSO-3414 — the workspace's ONE custom domain (product-api /api/v1/custom-domain) ──
+    /** Custom domains enabled for the workspace (the operator entitlement). */
+    var domainEntitled = true
+    /** False ⇒ the caller has no reach: every custom-domain call is the opaque 404 (no grant). */
+    var domainReachable = true
+    var domainHost: String? = null
+    var domainState = "NONE"
+    /** Whether the DNS records are published: a verify then passes (→ VERIFIED). */
+    var dnsPublished = false
+    /** The failing proof a verify reports while [dnsPublished] is false. */
+    var dnsFailureReason = "txt_record_missing"
+    /** The workspace has production users (a claim then needs acceptReSignIn). */
+    var productionUsers = false
+    /** SUSPENDED only — when the domain is released. */
+    var domainReleaseAt: String? = null
+    /** The `ttl` product-api sends on each record; null models a product-api from before SSO-3414. */
+    var domainTtl: Int? = 300
+    /** VERIFIED → ACTIVE after this many further status reads (models the certificate stage); null ⇒ never. */
+    var activeAfterReads: Int? = null
+    private var readsSinceVerified = 0
+    private var lastCheckReason: String? = null
+
+    fun customDomainStatus(): Map<String, Any?> {
+        val host = domainHost
+        val records = if (host == null) emptyList() else listOf(
+            linkedMapOf<String, Any?>("type" to "TXT", "name" to "_thoryn-verify.$host", "value" to "thoryn-verify=tok-$host"),
+            linkedMapOf<String, Any?>("type" to "CNAME", "name" to host, "value" to "acme.auth.thoryn.io"),
+        ).onEach { r -> domainTtl?.let { r["ttl"] = it } }
+        val active = domainState == "ACTIVE"
+        return linkedMapOf(
+            "domain" to host,
+            "state" to domainState,
+            "entitled" to domainEntitled,
+            "cnameTarget" to "acme.auth.thoryn.io",
+            "dnsRecords" to records,
+            "issuer" to if (active && host != null) "https://$host" else "https://acme.auth.thoryn.io",
+            "customIssuer" to host?.let { "https://$it" },
+            "certificateState" to when (domainState) { "VERIFIED" -> "PENDING"; "ACTIVE" -> "ACTIVE"; else -> "NONE" },
+            "lastVerification" to lastCheckReason?.let { mapOf("checkedAt" to "2026-09-28T12:00:00Z", "result" to "failed", "reason" to it) },
+            "suspension" to if (domainState == "SUSPENDED") mapOf("suspendedAt" to "2026-09-27T03:00:00Z", "reason" to (lastCheckReason ?: "cname_mismatch"), "releaseAt" to domainReleaseAt) else null,
+            "reSignInAccepted" to false,
+        )
+    }
+
+    private fun customDomain(method: String, route: String, b: Map<String, Any?>): MockResponse {
+        if (!domainReachable) return problem(404, "custom_domain_not_found")
+        return when {
+            route == "/api/v1/custom-domain" && method == "GET" -> {
+                if (domainState == "VERIFIED" && activeAfterReads != null && ++readsSinceVerified > activeAfterReads!!) domainState = "ACTIVE"
+                json(200, customDomainStatus())
+            }
+            route == "/api/v1/custom-domain" && method == "PUT" -> {
+                val host = b["domain"].toString()
+                when {
+                    !domainEntitled -> problem(403, "entitlement_required")
+                    domainHost != null && domainHost != host -> problem(409, "custom_domain_exists")
+                    productionUsers && b["acceptReSignIn"] != true -> problem(409, "production_users_present")
+                    else -> {
+                        if (domainHost == null) { domainHost = host; domainState = "PENDING" }
+                        json(200, customDomainStatus())
+                    }
+                }
+            }
+            route == "/api/v1/custom-domain/verify" && method == "POST" -> when {
+                domainHost == null -> problem(404, "custom_domain_not_found")
+                !domainEntitled -> problem(403, "entitlement_required")
+                dnsPublished -> {
+                    if (domainState == "PENDING" || domainState == "SUSPENDED") { domainState = "VERIFIED"; readsSinceVerified = 0 }
+                    lastCheckReason = null
+                    json(200, customDomainStatus())
+                }
+                else -> {
+                    lastCheckReason = dnsFailureReason
+                    json(422, mapOf("type" to "about:blank", "status" to 422, "errorCode" to "verification_failed", "detail" to "DNS does not prove it", "reason" to dnsFailureReason))
+                }
+            }
+            route == "/api/v1/custom-domain" && method == "DELETE" -> {
+                domainHost = null; domainState = "NONE"; lastCheckReason = null
+                MockResponse().setResponseCode(204)
+            }
+            else -> problem(404, "no_route:$method $route")
+        }
+    }
+
     private val supportedLoginMethods = listOf("password", "magic_link", "magic_code", "passkey", "totp", "sms")
     private var seq = 0
     private val mapper = JsonMapper.builder().addModule(kotlinModule()).build()
@@ -253,6 +337,8 @@ internal class FakeProductApi : Dispatcher() {
                 val q = query(path)
                 json(200, mapOf("data" to mine.filter { q["type"] == null || it.startsWith(q["type"] + ":") }))
             }
+            // ── custom domain (SSO-3413 / SSO-3414) ──
+            route.startsWith("/api/v1/custom-domain") -> customDomain(method, route, b)
             // ── receipt attestation (SSO-2878; the recipe interpreter's best-effort signed layer) ──
             route == "/api/v1/attestations" && method == "POST" ->
                 json(200, mapOf("kid" to "receipt-attestation-fake-v1", "signature" to "sig", "canonicalPayload" to "e30", "attestedAt" to "2026-01-01T00:00:00Z"))
