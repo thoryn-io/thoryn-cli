@@ -1,0 +1,1 @@
+{"type":"about:blank","title":"Forbidden","status":403,"detail":"Caller does not hold these scopes and therefore cannot grant them: tenant:users.write","instance":"/api/v1/workload-identity/trusts","errorCode":"scope_not_grantable"}

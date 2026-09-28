@@ -18,6 +18,7 @@ import com.devnow.thoryn.cli.cmd.LogoutCommand
 import com.devnow.thoryn.cli.cmd.StatusCommand
 import com.devnow.thoryn.cli.cmd.TenantCommand
 import com.devnow.thoryn.cli.cmd.UsersCommand
+import com.devnow.thoryn.cli.cmd.WorkloadIdentityCommand
 import com.devnow.thoryn.cli.cmd.WhoamiCommand
 import com.devnow.thoryn.cli.cmd.WorkspaceCommand
 import com.devnow.thoryn.cli.cmd.examples.ExamplesCommand
@@ -59,6 +60,7 @@ import kotlin.system.exitProcess
         DomainCommand::class,
         // SSO-3369 — on-demand signing-key rotation (`thoryn keys rotate | rotations`).
         KeysCommand::class,
+        WorkloadIdentityCommand::class,
         BrandingCommand::class,
         LoginFlowCommand::class,
         LoginMethodsCommand::class,

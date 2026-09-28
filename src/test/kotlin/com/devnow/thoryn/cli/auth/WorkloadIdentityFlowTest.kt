@@ -1,198 +1,201 @@
 package com.devnow.thoryn.cli.auth
 
+import okhttp3.mockwebserver.Dispatcher
+import okhttp3.mockwebserver.MockResponse
+import okhttp3.mockwebserver.MockWebServer
+import okhttp3.mockwebserver.RecordedRequest
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.assertThatThrownBy
+import org.junit.jupiter.api.AfterEach
+import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
-import java.io.IOException
-import java.net.URI
+import java.net.URLDecoder
 import java.net.http.HttpClient
-import java.net.http.HttpHeaders
-import java.net.http.HttpRequest
-import java.net.http.HttpResponse
-import java.nio.ByteBuffer
-import java.security.KeyPairGenerator
-import java.security.spec.ECGenParameterSpec
-import java.util.Base64
-import java.util.Optional
-import java.util.concurrent.Flow
-import javax.net.ssl.SSLSession
+import java.util.concurrent.CopyOnWriteArrayList
 
 /**
- * SSO-2879 — unit tests for [WorkloadIdentityFlow]: building the GitHub OIDC token request,
- * assembling the RFC 8693 + RFC 7523 token-exchange form, and driving the two-leg flow
- * (GitHub OIDC fetch -> token exchange) with a stubbed [HttpSender].
+ * SSO-3308 — [WorkloadIdentityFlow] against two MockWebServers: one standing in for the GitHub Actions
+ * runner's job-token endpoint (`$ACTIONS_ID_TOKEN_REQUEST_URL`), one for the platform token endpoint.
+ * Pins the wire contract of oathy #3787: the audience + bearer on the job-token request; exactly
+ * `grant_type=client_credentials`, the workload `client_id`, the jwt-bearer assertion type and the job
+ * token as `client_assertion` on the exchange, with NO client secret; and a FRESH job token for every
+ * exchange (a job token works once).
  */
 class WorkloadIdentityFlowTest {
 
-    private val signer = EcPrivateKeyJwtSigner(privateKeyPem = testPem(), keyId = "kid-1")
+    private lateinit var github: MockWebServer
+    private lateinit var platform: MockWebServer
+    private val issuedJobTokens = CopyOnWriteArrayList<String>()
 
-    private val tokenResponse = """
-        {"access_token":"AT-wif","token_type":"Bearer","expires_in":300,
-         "scope":"tenant:applications.write tenant:federation.write"}
-    """.trimIndent()
+    private val runnerRequestToken = "runner-request-token-not-a-real-one"
 
-    // ── request/form shaping ─────────────────────────────────────────────────────────────────────
+    private fun audience() = platform.url("/cli-ci").toString().trimEnd('/')
 
-    @Test
-    fun `buildOidcTokenRequest appends the audience and sends the ephemeral token as a bearer`() {
-        val req = WorkloadIdentityFlow.buildOidcTokenRequest(
-            requestUrl = "https://pipelines.actions.example/token?api-version=1.0",
-            requestToken = "runner-token-xyz",
-            audience = "https://hub.stg.thoryn.org",
-        )
-        assertThat(req.method()).isEqualTo("GET")
-        // Existing query string keeps its `?`, so audience is appended with `&` and URL-encoded.
-        assertThat(req.uri().toString())
-            .contains("api-version=1.0")
-            .contains("&audience=https%3A%2F%2Fhub.stg.thoryn.org")
-        assertThat(req.headers().firstValue("Authorization")).hasValue("Bearer runner-token-xyz")
+    @BeforeEach
+    fun start() {
+        github = MockWebServer().apply {
+            dispatcher = object : Dispatcher() {
+                override fun dispatch(request: RecordedRequest): MockResponse {
+                    val aud = request.requestUrl?.queryParameter("audience") ?: return MockResponse().setResponseCode(400)
+                    val token = FakeJobTokens.token(aud).also { issuedJobTokens += it }
+                    return json(200, """{"count":1,"value":"$token"}""")
+                }
+            }
+            start()
+        }
+        platform = MockWebServer().also { it.start() }
     }
 
-    @Test
-    fun `buildForm carries the token-exchange grant, id_token subject type, the assertion and client_id`() {
-        val flow = flow(sender = CapturingSender())
-        val body = flow.buildForm("SUBJECT-JWT", "ASSERTION-JWT", "openid tenant:applications.write")
-
-        assertThat(body).contains("grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Atoken-exchange")
-        assertThat(body).contains("subject_token=SUBJECT-JWT")
-        assertThat(body).contains("subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aid_token")
-        assertThat(body).contains("client_assertion_type=urn%3Aietf%3Aparams%3Aoauth%3Aclient-assertion-type%3Ajwt-bearer")
-        assertThat(body).contains("client_assertion=ASSERTION-JWT")
-        assertThat(body).contains("client_id=conformance-ci-github-wif")
-        assertThat(body).contains("scope=openid+tenant%3Aapplications.write")
+    @AfterEach
+    fun stop() {
+        github.shutdown()
+        platform.shutdown()
     }
 
-    @Test
-    fun `buildForm omits client_id when asked (reproducing the SSO-1608 bug)`() {
-        val body = flow(sender = CapturingSender()).buildForm("S", "A", null, includeClientId = false)
-        assertThat(body).doesNotContain("client_id=")
+    private fun json(status: Int, body: String) =
+        MockResponse().setResponseCode(status).setHeader("Content-Type", "application/json").setBody(body)
+
+    private val runnerEnv: (String) -> String? = { name ->
+        when (name) {
+            WorkloadIdentityFlow.REQUEST_URL_ENV -> github.url("/_apis/actions/token?api-version=2.0").toString()
+            WorkloadIdentityFlow.REQUEST_TOKEN_ENV -> runnerRequestToken
+            else -> null
+        }
     }
 
-    // ── happy path with an explicit subject token (no GitHub call) ────────────────────────────────
-
-    @Test
-    fun `run exchanges an explicit subject token and returns the minted token`() {
-        val sender = CapturingSender(stub(200, tokenResponse))
-        val flow = flow(sender = sender, explicitSubjectToken = "GH-OIDC-JWT")
-
-        val tokens = flow.run("openid tenant:applications.write")
-
-        assertThat(tokens.accessToken).isEqualTo("AT-wif")
-        assertThat(tokens.refreshToken).isNull()
-        assertThat(tokens.scope).isEqualTo("tenant:applications.write tenant:federation.write")
-
-        val req = sender.requests.single()
-        assertThat(req.uri().toString()).isEqualTo("https://ci-conformance.hub.stg.thoryn.org/oauth2/token")
-        val body = sender.bodies.single()!!
-        assertThat(body).contains("subject_token=GH-OIDC-JWT")
-        assertThat(body).contains("client_assertion=")
-        assertThat(body).contains("client_id=conformance-ci-github-wif")
+    private fun sender(): HttpSender {
+        val client = HttpClient.newHttpClient()
+        return HttpSender { r, h -> client.send(r, h) }
     }
 
-    // ── two-leg path: fetch GitHub OIDC token, then exchange ──────────────────────────────────────
-
-    @Test
-    fun `run fetches the GitHub OIDC token from the runner env then exchanges it`() {
-        val sender = CapturingSender(
-            stub(200, """{"value":"GH-OIDC-FROM-RUNNER"}"""), // leg 1: GitHub OIDC
-            stub(200, tokenResponse),                          // leg 2: token exchange
-        )
-        val flow = flow(
-            sender = sender,
-            env = mapOf(
-                "ACTIONS_ID_TOKEN_REQUEST_URL" to "https://runner/token",
-                "ACTIONS_ID_TOKEN_REQUEST_TOKEN" to "ephemeral-xyz",
-            )::get,
-        )
-
-        val tokens = flow.run("openid")
-
-        assertThat(tokens.accessToken).isEqualTo("AT-wif")
-        // Leg 1 hit the runner OIDC endpoint with the audience; leg 2 exchanged the fetched value.
-        assertThat(sender.requests[0].uri().toString()).contains("https://runner/token").contains("audience=")
-        assertThat(sender.bodies[1]!!).contains("subject_token=GH-OIDC-FROM-RUNNER")
-    }
-
-    @Test
-    fun `run fails clearly when no subject token and not on a runner`() {
-        val flow = flow(sender = CapturingSender(), env = { null })
-        assertThatThrownBy { flow.run("openid") }
-            .isInstanceOf(WorkloadIdentityException::class.java)
-            .extracting { (it as WorkloadIdentityException).oauthError }
-            .isEqualTo("missing_subject_token")
-    }
-
-    @Test
-    fun `a hub invalid_client is surfaced as the oauth error`() {
-        val sender = CapturingSender(stub(401, """{"error":"invalid_client"}"""))
-        val flow = flow(sender = sender, explicitSubjectToken = "GH-OIDC-JWT")
-        assertThatThrownBy { flow.run("openid") }
-            .isInstanceOf(WorkloadIdentityException::class.java)
-            .extracting { (it as WorkloadIdentityException).oauthError }
-            .isEqualTo("invalid_client")
-    }
-
-    // ── helpers ──────────────────────────────────────────────────────────────────────────────────
-
-    private fun flow(
-        sender: HttpSender,
-        explicitSubjectToken: String? = null,
-        env: (String) -> String? = { null },
-    ) = WorkloadIdentityFlow(
-        tokenEndpoint = "https://ci-conformance.hub.stg.thoryn.org/oauth2/token",
-        assertionAudience = "https://hub.stg.thoryn.org/oauth2/token",
-        clientId = "conformance-ci-github-wif",
-        signer = signer,
-        oidcAudience = "https://hub.stg.thoryn.org",
-        sender = sender,
-        explicitSubjectToken = explicitSubjectToken,
+    private fun flow(env: (String) -> String? = runnerEnv) = WorkloadIdentityFlow(
+        clientId = "wi_0123456789abcdef01234567",
+        audience = audience(),
+        tokenEndpoint = "${audience()}/oauth2/token",
+        tokenSender = sender(),
+        oidcSender = sender(),
         env = env,
     )
 
-    private fun stub(status: Int, body: String): HttpResponse<String> = StubResponse(status, body)
-
-    private fun testPem(): String {
-        val kp = KeyPairGenerator.getInstance("EC")
-            .apply { initialize(ECGenParameterSpec("secp256r1")) }
-            .generateKeyPair()
-        val b64 = Base64.getMimeEncoder(64, "\n".toByteArray()).encodeToString(kp.private.encoded)
-        return "-----BEGIN PRIVATE KEY-----\n$b64\n-----END PRIVATE KEY-----\n"
-    }
-
-    /** Captures each request the flow sends and replies from a queued list of responses (in order). */
-    private class CapturingSender(vararg responses: HttpResponse<String>) : HttpSender {
-        private val queue = ArrayDeque(responses.toList())
-        val requests = mutableListOf<HttpRequest>()
-        val bodies = mutableListOf<String?>()
-
-        override fun send(request: HttpRequest, bodyHandler: HttpResponse.BodyHandler<String>): HttpResponse<String> {
-            requests += request
-            bodies += request.bodyPublisher().map { readBody(it) }.orElse(null)
-            return queue.removeFirstOrNull() ?: throw IOException("no stubbed response left")
+    private fun form(body: String): Map<String, String> =
+        body.split("&").associate { pair ->
+            val (k, v) = pair.split("=", limit = 2)
+            URLDecoder.decode(k, Charsets.UTF_8) to URLDecoder.decode(v, Charsets.UTF_8)
         }
 
-        private fun readBody(publisher: HttpRequest.BodyPublisher): String {
-            val sb = StringBuilder()
-            publisher.subscribe(object : Flow.Subscriber<ByteBuffer> {
-                override fun onSubscribe(subscription: Flow.Subscription) = subscription.request(Long.MAX_VALUE)
-                override fun onNext(item: ByteBuffer) {
-                    val bytes = ByteArray(item.remaining()); item.get(bytes); sb.append(String(bytes, Charsets.UTF_8))
-                }
-                override fun onError(throwable: Throwable) = Unit
-                override fun onComplete() = Unit
-            })
-            return sb.toString()
-        }
+    @Test
+    fun `the job token is requested for the trust's audience with the runner's bearer, then exchanged with exactly the contract's fields`() {
+        platform.enqueue(json(200, """{"access_token":"AT-wif","token_type":"Bearer","expires_in":900,"scope":"tenant:environments.read"}"""))
+
+        val tokens = flow().run("tenant:environments.read")
+
+        assertThat(tokens.accessToken).isEqualTo("AT-wif")
+        assertThat(tokens.refreshToken).isNull()
+        assertThat(tokens.scope).isEqualTo("tenant:environments.read")
+        assertThat(tokens.expiresAtEpochSecond!! - System.currentTimeMillis() / 1000).isBetween(890L, 900L)
+
+        val jobTokenRequest = github.takeRequest()
+        assertThat(jobTokenRequest.method).isEqualTo("GET")
+        assertThat(jobTokenRequest.requestUrl!!.queryParameter("api-version")).isEqualTo("2.0")
+        assertThat(jobTokenRequest.requestUrl!!.queryParameter("audience")).isEqualTo(audience())
+        assertThat(jobTokenRequest.getHeader("Authorization")).isEqualTo("Bearer $runnerRequestToken")
+
+        val exchange = platform.takeRequest()
+        assertThat(exchange.method).isEqualTo("POST")
+        assertThat(exchange.path).isEqualTo("/cli-ci/oauth2/token")
+        assertThat(exchange.getHeader("Content-Type")).startsWith("application/x-www-form-urlencoded")
+        // No client secret in any shape: no Basic header, no client_secret field.
+        assertThat(exchange.getHeader("Authorization")).isNull()
+        val fields = form(exchange.body.readUtf8())
+        assertThat(fields).containsExactlyInAnyOrderEntriesOf(
+            mapOf(
+                "grant_type" to "client_credentials",
+                "client_id" to "wi_0123456789abcdef01234567",
+                "client_assertion_type" to "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+                "client_assertion" to issuedJobTokens.single(),
+                "scope" to "tenant:environments.read",
+            ),
+        )
     }
 
-    private class StubResponse(private val status: Int, private val body: String) : HttpResponse<String> {
-        override fun statusCode(): Int = status
-        override fun request(): HttpRequest = throw UnsupportedOperationException()
-        override fun previousResponse(): Optional<HttpResponse<String>> = Optional.empty()
-        override fun headers(): HttpHeaders = HttpHeaders.of(emptyMap()) { _, _ -> true }
-        override fun body(): String = body
-        override fun sslSession(): Optional<SSLSession> = Optional.empty()
-        override fun uri(): URI = URI.create("http://test")
-        override fun version(): HttpClient.Version = HttpClient.Version.HTTP_1_1
+    @Test
+    fun `no scope requested sends no scope field (the trust's full set)`() {
+        platform.enqueue(json(200, """{"access_token":"AT","token_type":"Bearer","expires_in":900,"scope":"tenant:a.read tenant:b.read"}"""))
+
+        val tokens = flow().run(null)
+
+        assertThat(form(platform.takeRequest().body.readUtf8())).doesNotContainKey("scope")
+        assertThat(tokens.scope).isEqualTo("tenant:a.read tenant:b.read")
+    }
+
+    @Test
+    fun `every exchange uses a fresh job token — a second run asks the runner again`() {
+        platform.enqueue(json(200, """{"access_token":"AT-1","token_type":"Bearer","expires_in":900}"""))
+        platform.enqueue(json(200, """{"access_token":"AT-2","token_type":"Bearer","expires_in":900}"""))
+
+        assertThat(flow().run("tenant:environments.read").accessToken).isEqualTo("AT-1")
+        assertThat(flow().run("tenant:environments.read").accessToken).isEqualTo("AT-2")
+
+        assertThat(github.requestCount).isEqualTo(2)
+        assertThat(issuedJobTokens).hasSize(2).doesNotHaveDuplicates()
+        val first = form(platform.takeRequest().body.readUtf8())["client_assertion"]
+        val second = form(platform.takeRequest().body.readUtf8())["client_assertion"]
+        assertThat(listOf(first, second)).containsExactlyElementsOf(issuedJobTokens)
+    }
+
+    @Test
+    fun `a refused exchange carries the job's public identity and the platform's code, never the job token`() {
+        platform.enqueue(json(401, """{"error":"invalid_client"}"""))
+
+        val thrown = runCatching { flow().run("tenant:environments.read") }.exceptionOrNull()
+
+        assertThat(thrown).isInstanceOf(WorkloadIdentityException::class.java)
+        val e = thrown as WorkloadIdentityException
+        assertThat(e.oauthError).isEqualTo("invalid_client")
+        assertThat(e.status).isEqualTo(401)
+        assertThat(e.jobIdentity!!.repository).isEqualTo("thoryn-io/thoryn-cli")
+        assertThat(e.jobIdentity!!.audience).containsExactly(audience())
+        assertThat(e.message).doesNotContain(issuedJobTokens.single())
+        assertThat(e.jobIdentity.toString()).doesNotContain(issuedJobTokens.single())
+    }
+
+    @Test
+    fun `outside GitHub Actions the missing runner variables are named, and nothing is sent`() {
+        assertThatThrownBy { flow(env = { null }).run("tenant:environments.read") }
+            .isInstanceOf(WorkloadIdentityException::class.java)
+            .hasMessageContaining(WorkloadIdentityFlow.REQUEST_URL_ENV)
+            .hasMessageContaining(WorkloadIdentityFlow.REQUEST_TOKEN_ENV)
+            .hasMessageContaining("id-token: write")
+            .extracting { (it as WorkloadIdentityException).oauthError }
+            .isEqualTo(WorkloadIdentityFlow.ERROR_NOT_ON_GITHUB_ACTIONS)
+        assertThat(github.requestCount).isZero()
+        assertThat(platform.requestCount).isZero()
+    }
+
+    @Test
+    fun `GitHub refusing the job-token request stops before the exchange`() {
+        github.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest) = json(403, """{"message":"forbidden"}""")
+        }
+
+        assertThatThrownBy { flow().run(null) }
+            .isInstanceOf(WorkloadIdentityException::class.java)
+            .hasMessageContaining("HTTP 403")
+            .extracting { (it as WorkloadIdentityException).oauthError }
+            .isEqualTo(WorkloadIdentityFlow.ERROR_JOB_TOKEN_REQUEST_FAILED)
+        assertThat(platform.requestCount).isZero()
+    }
+
+    @Test
+    fun `the token endpoint defaults to the audience's and must stay on its origin`() {
+        val aud = "https://acme.auth.thoryn.io/staging"
+        assertThat(WorkloadIdentityFlow.tokenEndpointFor(aud, null)).isEqualTo("https://acme.auth.thoryn.io/staging/oauth2/token")
+        assertThat(WorkloadIdentityFlow.tokenEndpointFor(aud, "https://acme.auth.thoryn.io/staging/oauth2/token"))
+            .isEqualTo("https://acme.auth.thoryn.io/staging/oauth2/token")
+        assertThatThrownBy { WorkloadIdentityFlow.tokenEndpointFor(aud, "https://evil.example/oauth2/token") }
+            .isInstanceOf(IllegalArgumentException::class.java)
+            .hasMessageContaining("not on the audience's origin")
+        assertThatThrownBy { WorkloadIdentityFlow.tokenEndpointFor(aud, "http://acme.auth.thoryn.io/staging/oauth2/token") }
+            .isInstanceOf(IllegalArgumentException::class.java)
     }
 }

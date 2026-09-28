@@ -81,6 +81,11 @@ object ScopeRegistry {
         // retiring a LEAKED signing key (product-api /api/v1/signing-keys/{kind}/retirements — SSO-3396;
         // granted to `cli` / `thoryn-cli` by oathy hub V189). Gates `keys retire`.
         "tenant:keys.retire",
+        // workload identity trusts — secret-less GitHub Actions sign-in (product-api
+        // /api/v1/workload-identity/trusts — SSO-3308; granted to `cli` / `thoryn-cli` by oathy hub V192).
+        // read gates `workload-identity trusts list|get`; write gates `trusts create|delete`.
+        "tenant:workload-identity.read",
+        "tenant:workload-identity.write",
     )
 
     /**

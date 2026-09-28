@@ -1,0 +1,1 @@
+{"type":"about:blank","title":"Bad Request","status":400,"detail":"Creating a trust in production requires confirmProduction: true.","instance":"/api/v1/workload-identity/trusts","errorCode":"production_confirmation_required"}

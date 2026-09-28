@@ -117,3 +117,32 @@ re-bootstrap.
 > A leaked `cli-ci` sandbox (a run that failed before `destroy`) is adopted — not duplicated — by the
 > next `apply`, and adopted resources are never auto-deleted: remove it by hand with
 > `thoryn env delete <id> --confirm cli-ci` if it should go.
+
+## Workload identity — the staging sign-in check with no secret (SSO-3308)
+
+`ci.yml`'s `workload identity sign-in (staging)` job signs in to shared staging **without any secret**:
+it exchanges the job's own GitHub Actions OIDC token under a workload identity trust (`thoryn login
+--workload-identity`) and runs a harmless read (`thoryn env list`), then signs in a second time to prove a
+fresh job token is requested for every exchange. The trust is a real product resource, created once
+through the product — never seeded — and the job skips with a notice until it exists.
+
+One-time setup (a `thoryn` workspace admin, once oathy #3787 / hub V192 is deployed to staging and a CLI
+carrying SSO-3308 is installed):
+
+```bash
+thoryn login --workspace thoryn --issuer https://auth.stg.thoryn.org
+thoryn env create cli-wif --name "thoryn-cli workload identity check"   # a sandbox only this check uses
+thoryn workload-identity trusts create --environment cli-wif --name thoryn-cli-staging-check \
+  --repository thoryn-io/thoryn-cli --github-environment thoryn-staging-wif \
+  --github-hosted-runners-only --scope tenant:environments.read
+# then store the printed clientId and audience as repository VARIABLES (public identifiers, not secrets):
+gh variable set THORYN_WIF_CLIENT_ID -R thoryn-io/thoryn-cli --body '<clientId from the output>'
+gh variable set THORYN_WIF_AUDIENCE  -R thoryn-io/thoryn-cli --body '<audience from the output>'
+```
+
+- The trust lives in its own sandbox (`cli-wif`), not in `cli-ci`: the provisioning run may hard-delete
+  `cli-ci`, and a deleted environment takes its trusts with it.
+- It pins the GitHub environment `thoryn-staging-wif`, which the job declares, so a pull request and a
+  push to `main` present the same `sub`. It carries only `tenant:environments.read`.
+- To stop the check, delete the trust (`thoryn workload-identity trusts delete <id> --environment cli-wif`)
+  or unset either variable.

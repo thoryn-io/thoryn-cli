@@ -236,40 +236,6 @@ object ThorynConfig {
     const val DEFAULT_GATEWAY = "http://localhost:8991"
 
     /**
-     * SSO-2879 (epic SSO-2871) — defaults for `thoryn login --workload-identity`, the secret-less
-     * sign-in the thoryn-examples recipe-conformance CI uses (GitHub Actions OIDC -> hub WIF
-     * token-exchange, replacing the static `THORYN_CI_CLIENT_SECRET`). The values match hub
-     * migration V143's seeded `ci-conformance` tenant + `conformance-ci-github-wif` exchange client.
-     */
-    const val DEFAULT_WIF_CLIENT_ID = "conformance-ci-github-wif"
-
-    /** The workspace slug whose tenant-subdomain token endpoint the WIF request is POSTed to (V143). */
-    const val DEFAULT_WIF_TENANT_SLUG = "ci-conformance"
-
-    /** The `kid` of the CI signing key — matches the inline public JWKS seeded in hub V143. */
-    const val DEFAULT_WIF_KEY_ID = "ci-conformance-wif-v1"
-
-    /** Env var holding the PKCS#8 PEM of the CI private_key_jwt signing key (the GitHub secret). */
-    const val WIF_SIGNING_KEY_ENV = "THORYN_CI_WIF_SIGNING_KEY"
-
-    /** Optional env override for the GitHub OIDC subject token (local testing without a runner). */
-    const val WIF_SUBJECT_TOKEN_ENV = "THORYN_CI_WIF_SUBJECT_TOKEN"
-
-    /**
-     * The scope set requested by `--workload-identity` — EXACTLY the `conformance-ci-github-wif`
-     * client's registered scopes (V143, + `tenant:users.*` from V146/SSO-2907). It must be a subset
-     * of the client's registered set: the WIF exchange bounds the minted token to
-     * `requested ∩ client-registered` and rejects `invalid_scope` when the request exceeds it (a WIF
-     * subject token carries no scope of its own). ORDERING (project_console_scope_grant_ordering): the
-     * hub grant (V146) MUST deploy before a CLI requesting the added scope runs, else this request is
-     * an `invalid_scope` — the migration ships in the same PR and deploys ahead of any CLI re-release.
-     */
-    const val DEFAULT_WIF_SCOPE =
-        "openid tenant:applications.read tenant:applications.write " +
-            "tenant:federation.read tenant:federation.write " +
-            "tenant:users.read tenant:users.write"
-
-    /**
      * Convenience constant — pass to `--issuer` to point the CLI at the staging platform. Used ONLY in
      * help text, the no-platform guidance and the connection error message; it is never a silent
      * default, so changing it cannot re-point an existing session.
@@ -405,7 +371,9 @@ object ThorynConfig {
      * deployed before a release carrying this default — the SSO-2278 ordering rule), SSO-3369
      * (`keys.*` for `thoryn keys …`; granted to `cli` / `thoryn-cli` by oathy hub V183 — same rule), SSO-3396
      * (`keys.retire` for `thoryn keys retire`; granted by oathy hub V189, which must be deployed before a
-     * release carrying this default — same rule).
+     * release carrying this default — same rule), SSO-3308 (`workload-identity.*` for `thoryn workload-identity
+     * trusts …`; granted to `cli` / `thoryn-cli` by oathy hub V192 (oathy #3787), which must be deployed before
+     * a release carrying this default — same rule).
      */
     const val DEFAULT_SCOPE =
         "openid offline_access " +
@@ -419,7 +387,8 @@ object ThorynConfig {
             "tenant:idp.read tenant:idp.write " +
             "tenant:access.read tenant:access.write " +
             "tenant:domains.read tenant:domains.write " +
-            "tenant:keys.read tenant:keys.rotate tenant:keys.retire"
+            "tenant:keys.read tenant:keys.rotate tenant:keys.retire " +
+            "tenant:workload-identity.read tenant:workload-identity.write"
 
     /**
      * The `--hub` / `--gateway` "not given" sentinel of the post-login commands (SSO-2827): they use the
@@ -492,23 +461,4 @@ object ThorynConfig {
      */
     fun resolveApiKeySecret(): String? =
         resolveApiKey()?.clientSecret ?: resolveClientSecret()
-
-    /**
-     * SSO-2879 — resolve the WIF private_key_jwt signing key (PKCS#8 PEM) for `login --workload-identity`.
-     *
-     * Resolution order (first non-blank wins), keeping the key out of argv:
-     *   1. `--wif-signing-key-file <path>` — a file (typical when a CI step writes the secret to disk).
-     *   2. `THORYN_CI_WIF_SIGNING_KEY` system property — used by tests / `-D` invocations.
-     *   3. `THORYN_CI_WIF_SIGNING_KEY` environment variable — the canonical GitHub-secret knob.
-     */
-    fun readWifSigningKey(file: java.io.File?): String? {
-        file?.takeIf { it.isFile }?.readText()?.takeIf { it.isNotBlank() }?.let { return it }
-        return System.getProperty(WIF_SIGNING_KEY_ENV)?.takeIf { it.isNotBlank() }
-            ?: System.getenv(WIF_SIGNING_KEY_ENV)?.takeIf { it.isNotBlank() }
-    }
-
-    /** SSO-2879 — optional off-runner subject-token override (system property then env). */
-    fun readWifSubjectTokenOverride(): String? =
-        System.getProperty(WIF_SUBJECT_TOKEN_ENV)?.takeIf { it.isNotBlank() }
-            ?: System.getenv(WIF_SUBJECT_TOKEN_ENV)?.takeIf { it.isNotBlank() }
 }

@@ -41,6 +41,11 @@
 #       file: recipes/my-scenario/e2e/provision.yaml          # any provisioning file in your checkout
 #   The connection/file paths are resolved in the CALLER's workspace. The env var name the contract's
 #   `auth.secretEnv` declares must match `secret-env` (default THORYN_CLI_CI_CLIENT_SECRET).
+#
+#   SSO-3308 — with a `workload_identity` contract there is no secret at all: omit `client-secret` and
+#   grant the calling job `permissions: id-token: write`; the CLI exchanges the job's own OIDC token
+#   under the workspace's workload identity trust (`thoryn workload-identity trusts create`). Needs a
+#   `cli-v*` release carrying SSO-3308.
 
 name: "Provision Thoryn (as a real customer)"
 description: >-
@@ -56,7 +61,10 @@ inputs:
       Pass it from a repository secret. NEVER a literal — this repo is public. Supplied to the CLI as
       the env var named by `secret-env`; never echoed, never an argv flag. See `.thoryn/README.md`
       for the one-time bootstrap that mints it (`thoryn provision apply --secret-file`, SSO-3113).
-    required: true
+      Required for a `client_credentials` contract; leave it empty for a `workload_identity` contract
+      (SSO-3308), which uses no secret — the calling job must then grant `permissions: id-token: write`.
+    required: false
+    default: ""
   secret-env:
     description: "NAME of the env var the connection contract's `auth.secretEnv` declares for the secret."
     required: false
@@ -175,22 +183,31 @@ runs:
         THORYN_CI_PLAINTEXT_TOKENS: "1"
       run: |
         set -euo pipefail
-        if [ -z "${SECRET_VALUE:-}" ]; then
-          echo "::error::client-secret is empty — pass the repository secret the connection contract's auth.secretEnv names." >&2
-          exit 1
-        fi
         if [ ! -f "$CONNECTION" ]; then
           echo "::error::connection contract '$CONNECTION' not found — commit .thoryn/connection.json or pass the connection input." >&2
           exit 1
         fi
-        declared="$(jq -r '.auth.secretEnv // ""' "$CONNECTION")"
-        if [ "$declared" != "$SECRET_ENV" ]; then
-          echo "::error::connection contract names secret env var '$declared' but the Action's secret-env input is '$SECRET_ENV' — make them match." >&2
-          exit 1
+        method="$(jq -r '.auth.method // ""' "$CONNECTION")"
+        if [ "$method" = "workload_identity" ]; then
+          # SSO-3308 — no secret: the CLI exchanges this job's own OIDC token under the workspace's trust.
+          if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
+            echo "::error::the connection contract uses workload_identity, but this job cannot request an OIDC token — grant the job 'permissions: id-token: write'." >&2
+            exit 1
+          fi
+        else
+          if [ -z "${SECRET_VALUE:-}" ]; then
+            echo "::error::client-secret is empty — pass the repository secret the connection contract's auth.secretEnv names." >&2
+            exit 1
+          fi
+          declared="$(jq -r '.auth.secretEnv // ""' "$CONNECTION")"
+          if [ "$declared" != "$SECRET_ENV" ]; then
+            echo "::error::connection contract names secret env var '$declared' but the Action's secret-env input is '$SECRET_ENV' — make them match." >&2
+            exit 1
+          fi
+          # Export the secret under the NAME the contract declares (never on argv, never echoed).
+          export "$SECRET_ENV"="$SECRET_VALUE"
         fi
-        # Export the secret under the NAME the contract declares (never on argv, never echoed).
-        export "$SECRET_ENV"="$SECRET_VALUE"
-        echo "Signing in from connection contract $CONNECTION (base issuer $THORYN_ISSUER)."
+        echo "Signing in from connection contract $CONNECTION (method ${method:-client_credentials}, base issuer $THORYN_ISSUER)."
         java -jar thoryn.jar login --connection "$CONNECTION"
         java -jar thoryn.jar login --status
 

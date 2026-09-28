@@ -110,9 +110,74 @@ class ConnectionSchemaConformanceTest {
     }
 
     @Test
-    fun `a connection with a non-client_credentials method is rejected`() {
+    fun `a connection with an unknown method is rejected`() {
         val bad = node(validConnection.replace("client_credentials", "authorization_code"))
-        assertThat(Connection.validate(bad)).anyMatch { it.contains("auth.method must be") }
+        assertThat(Connection.validate(bad)).anyMatch { it.contains("auth.method must be one of client_credentials | workload_identity") }
+    }
+
+    // --- SSO-3308: the workload_identity method ---
+
+    private val workloadConnection = """
+        {
+          "apiVersion": "thoryn.io/connection/v1",
+          "workspace": { "slug": "thoryn" },
+          "auth": {
+            "method": "workload_identity",
+            "provider": "github_actions",
+            "clientId": "wi_3f0c9a1b2d4e5f6a7b8c9d0e",
+            "audience": "https://thoryn.auth.stg.thoryn.org/cli-wif",
+            "scopes": ["tenant:environments.read"],
+            "github": { "owner": "thoryn-io", "repository": "thoryn-cli", "repositoryId": 1044556677, "environment": "thoryn-staging-wif" }
+          }
+        }
+    """.trimIndent()
+
+    @Test
+    fun `a workload_identity connection conforms and parses its binding and pins — no secret env`() {
+        assertThat(Connection.validate(node(workloadConnection))).isEmpty()
+        val parsed = Connection.parse(workloadConnection.toByteArray())
+        assertThat(parsed.isWorkloadIdentity).isTrue()
+        assertThat(parsed.secretEnvOrNull).isNull()
+        assertThat(parsed.audience).isEqualTo("https://thoryn.auth.stg.thoryn.org/cli-wif")
+        assertThat(parsed.github!!.repositoryId).isEqualTo(1044556677L)
+        assertThat(parsed.github!!.environment).isEqualTo("thoryn-staging-wif")
+    }
+
+    @Test
+    fun `a workload_identity connection may derive its audience from an environment instead`() {
+        val derived = workloadConnection.replace(
+            "\"audience\": \"https://thoryn.auth.stg.thoryn.org/cli-wif\"", "\"environment\": \"cli-wif\"",
+        )
+        assertThat(Connection.validate(node(derived))).isEmpty()
+        assertThat(Connection.parse(derived.toByteArray()).environment).isEqualTo("cli-wif")
+    }
+
+    @Test
+    fun `a workload_identity connection must not name a secret env var`() {
+        val bad = node(workloadConnection.replace("\"clientId\":", "\"secretEnv\": \"SOME_SECRET\", \"clientId\":"))
+        assertThat(Connection.validate(bad)).anyMatch { it.contains("auth.secretEnv must not be set for 'workload_identity'") }
+    }
+
+    @Test
+    fun `workload-only members are refused on a client_credentials connection`() {
+        val bad = node(validConnection.replace("\"method\":", "\"audience\": \"https://a.example\", \"method\":"))
+        assertThat(Connection.validate(bad)).anyMatch { it.contains("auth.audience applies to the 'workload_identity' method only") }
+    }
+
+    @Test
+    fun `malformed workload members are rejected with the field named`() {
+        val bad = node(
+            workloadConnection
+                .replace("\"github_actions\"", "\"gitlab\"")
+                .replace("https://thoryn.auth.stg.thoryn.org/cli-wif", "not a url")
+                .replace("1044556677", "-4")
+                .replace("\"environment\": \"thoryn-staging-wif\"", "\"environment\": \"x\", \"rogue\": 1"),
+        )
+        val violations = Connection.validate(bad)
+        assertThat(violations).anyMatch { it.contains("auth.provider must be 'github_actions'") }
+        assertThat(violations).anyMatch { it.contains("auth.audience 'not a url' must be an absolute http(s) URL") }
+        assertThat(violations).anyMatch { it.contains("auth.github.repositoryId must be a positive integer") }
+        assertThat(violations).anyMatch { it.contains("auth.github has unknown property 'rogue'") }
     }
 
     @Test
@@ -146,9 +211,9 @@ class ConnectionSchemaConformanceTest {
     }
 
     @Test
-    fun `the bundled schema pins the auth method const and the hubBaseUrlEnv default the loader uses`() {
-        assertThat(schema["properties"]["auth"]["properties"]["method"]["const"].asString())
-            .isEqualTo(Connection.AUTH_METHOD_CLIENT_CREDENTIALS)
+    fun `the bundled schema pins the auth methods and the hubBaseUrlEnv default the loader uses`() {
+        assertThat(schema["properties"]["auth"]["properties"]["method"]["enum"].toList().map { it.asString() })
+            .isEqualTo(Connection.AUTH_METHODS)
         assertThat(schema["properties"]["workspace"]["properties"]["hubBaseUrlEnv"]["default"].asString())
             .isEqualTo(Connection.DEFAULT_HUB_BASE_URL_ENV)
     }

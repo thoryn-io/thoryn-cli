@@ -1,0 +1,1 @@
+{"type":"about:blank","title":"Conflict","status":409,"detail":"A workload identity trust with this name already exists in this environment.","instance":"/api/v1/workload-identity/trusts","errorCode":"workload_identity_trust_name_taken"}

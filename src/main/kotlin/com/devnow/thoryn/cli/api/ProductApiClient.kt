@@ -374,6 +374,39 @@ class ProductApiClient(
     fun deleteCustomDomain(): Unit =
         deleteNoContent("/api/v1/custom-domain")
 
+    // ── Workload identity trusts (SSO-3308; product-api /api/v1/workload-identity/trusts, oathy SSO-3307) ──
+    //
+    // A trust lets a GitHub Actions workflow authenticate WITHOUT a stored secret: the job's OIDC token is
+    // exchanged at the environment's token endpoint for a short-lived token carrying the trust's scopes.
+    // Environment-scoped (the X-Thoryn-Environment header this client sends picks the environment).
+    // create/delete → tenant:workload-identity.write; list/get → tenant:workload-identity.read (granted to the
+    // CLI's login clients by oathy hub V192). Environment managers write, viewers read; others get 404.
+    // Create answers 201 with the trust's clientId, audience and tokenEndpoint — what a workflow needs.
+
+    fun createWorkloadIdentityTrust(body: Map<String, Any?>): JsonNode =
+        post("/api/v1/workload-identity/trusts", mapper.valueToTree<JsonNode>(body.withoutNulls()))
+
+    fun listWorkloadIdentityTrusts(limit: Int? = null, cursor: String? = null): JsonNode {
+        val query = buildList {
+            limit?.let { add("limit=$it") }
+            cursor?.takeIf { it.isNotBlank() }?.let { add("cursor=${encode(it)}") }
+        }.joinToString("&").let { if (it.isEmpty()) "" else "?$it" }
+        return get("/api/v1/workload-identity/trusts$query")
+    }
+
+    fun getWorkloadIdentityTrust(id: String): JsonNode =
+        get("/api/v1/workload-identity/trusts/${encode(id)}")
+
+    fun deleteWorkloadIdentityTrust(id: String, confirmSlug: String? = null): Unit =
+        deleteNoContent("/api/v1/workload-identity/trusts/${encode(id)}", confirmSlug)
+
+    /** Drop null members (recursively through nested maps) so an omitted option is absent, not `null`. */
+    private fun Map<String, Any?>.withoutNulls(): Map<String, Any?> =
+        filterValues { it != null }.mapValues { (_, v) ->
+            @Suppress("UNCHECKED_CAST")
+            if (v is Map<*, *>) (v as Map<String, Any?>).withoutNulls() else v
+        }
+
     // ── Hosted-login branding (SSO-3037; product-api /api/v1/login-experience/branding) ─
     //
     // The per-(tenant, environment) branding of the hosted sign-in / register screens:

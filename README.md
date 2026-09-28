@@ -49,6 +49,7 @@ the stable asset name the `thoryn-examples` conformance CI consumes.
 ```
 thoryn login --workspace <slug> [--issuer https://auth.<env>]  # Auth code + PKCE (loopback) or --device-code — ON your workspace (SSO-3104)
 thoryn login --client-credentials [--client-id <id>] # SSO-1553/2941 — non-interactive API key (CI); THORYN_API_KEY=<id>:<secret>, auto re-mints on expiry
+thoryn login --workload-identity --client-id <wi_…> --audience <aud> [--scope s]  # SSO-3308 — GitHub Actions job, NO secret (id-token: write); renews with a fresh job token
 thoryn login --status
 thoryn logout [--rotate-key]                 # SSO-3199 — --rotate-key also discards this machine's DPoP key
 thoryn whoami [--check]                      # SSO-2860/3199/3228 — identity, scopes, expiry, DPoP key + device (--check: this device's server-side state)
@@ -193,6 +194,15 @@ thoryn keys retire --kind <kind> [--environment e] [--through-version n] [--wait
 thoryn keys retirements [list] --kind <kind> [--limit n] [--cursor c]                      # GET  /api/v1/signing-keys/{kind}/retirements
 thoryn keys retirements get <id> --kind <kind>                                             # GET  /api/v1/signing-keys/{kind}/retirements/{id}
 
+# Workload identity trusts (SSO-3308, epic SSO-3304) — let ONE GitHub repository's Actions jobs sign in
+# to an environment with NO stored secret (`thoryn login --workload-identity`). Environment managers only
+# (others get 404). Scopes: tenant:workload-identity.read (list, get) / tenant:workload-identity.write (create, delete).
+thoryn workload-identity trusts create --name <n> --repository <owner/repo> --scope <tenant:…> [--environment e]
+    [--owner-id n --repository-id n] [--github-environment <gh-env>] [--ref <ref>] [--github-hosted-runners-only] [--confirm-production]
+thoryn workload-identity trusts list [--limit n] [--cursor c]         # GET    /api/v1/workload-identity/trusts
+thoryn workload-identity trusts get <id>                              # GET    /api/v1/workload-identity/trusts/{id} (+ the sign-in line)
+thoryn workload-identity trusts delete <id> [--yes] [--confirm <slug>] # DELETE /api/v1/workload-identity/trusts/{id}
+
 # Operator plane (SSO-3356) — Thoryn staff / self-managed platform operators only. Passkey sign-in on the
 # `thoryn` home with client thoryn-operator, stored APART from `thoryn login`; calls go to the hub's /admin
 # surface over a kubectl port-forward (never a public host). See "Operator commands" below.
@@ -326,6 +336,107 @@ thoryn keys retirements list --kind sign-in
   hub V189, which must be deployed before a CLI release that requests it.
 
 Full walkthrough: `docs/content/guides/rotate-signing-keys.mdx` in oathy (published at thoryn.org/docs).
+
+### Workload identity — CI sign-in with no secret (SSO-3308, epic SSO-3304)
+
+A **workload identity trust** lets one GitHub repository's Actions jobs sign in to an environment
+without any stored secret. The job asks GitHub for its own short-lived OIDC token, for the trust's
+audience, and the CLI exchanges it for a workspace token (at most 15 minutes, no refresh token) carrying
+the trust's scopes. The trust pins the repository by its immutable GitHub ids (a repository deleted and
+re-created under the same name does not match), and optionally a GitHub environment, an exact ref, and
+GitHub-hosted runners only.
+
+```bash
+# An environment manager creates the trust (once). The ids are looked up for a public repository;
+# pass --owner-id and --repository-id for a private one.
+thoryn workload-identity trusts create --environment staging --name billing-ci \
+  --repository acme/billing --github-environment staging --scope tenant:applications.write
+# → prints the clientId (wi_…), audience and token endpoint, a job snippet and a connection.json.
+```
+
+In the workflow — the job needs `permissions: id-token: write` and nothing else:
+
+```yaml
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: staging          # when the trust pins it
+    permissions:
+      contents: read
+      id-token: write             # lets the job request its OIDC token
+    steps:
+      - run: thoryn login --workload-identity --client-id wi_3f0c9a1b2d4e5f6a7b8c9d0e --audience https://acme.auth.thoryn.io/staging --scope tenant:applications.write
+      - run: thoryn provision apply --file .thoryn/provision.yaml --yes
+```
+
+Or commit the binding as a connection contract and run `thoryn login --connection .thoryn/connection.json`
+(the provisioning Action does this; leave its `client-secret` input empty):
+
+```json
+{
+  "apiVersion": "thoryn.io/connection/v1",
+  "workspace": { "slug": "acme" },
+  "auth": {
+    "method": "workload_identity",
+    "clientId": "wi_3f0c9a1b2d4e5f6a7b8c9d0e",
+    "audience": "https://acme.auth.thoryn.io/staging",
+    "scopes": ["tenant:applications.write"],
+    "github": { "owner": "acme", "repository": "billing", "environment": "staging" }
+  }
+}
+```
+
+- `audience` is the trust's audience **exactly** (the workspace issuer, plus `/<environment>` for a
+  sandbox, or the custom domain when one is active). Omit it and give `"environment": "<slug>"` to have the
+  CLI derive it from `workspace.slug` and `THORYN_ISSUER`. `tokenEndpoint` (default `<audience>/oauth2/token`)
+  must be on the audience's origin — the CLI never sends a job token anywhere else.
+- `github` is optional and grants nothing: it only lets the CLI name the field that differs when a
+  sign-in is refused.
+- **A job token works once.** Every exchange — including the automatic renewal when a later command finds
+  the 15-minute token expired — requests a fresh one from the runner. A workload session renews only inside
+  the job that signed in.
+- **Refusals.** The platform answers every mismatch with the same `401 invalid_client` and records the
+  reason only in the workspace audit log. The CLI prints what it sent, the job's own identity (the public
+  claims of its token — never the token) and any difference it can see:
+
+```text
+Sign-in failed: the platform refused the workload identity exchange (HTTP 401: invalid_client).
+The platform does not say which check failed. The exact reason is in the workspace audit log
+(event workload_identity.exchange_failed, field errorReason); a workspace admin can read it with:
+    thoryn audit query --event-type workload_identity.exchange_failed
+
+Sent:
+  client id            wi_3f0c9a1b2d4e5f6a7b8c9d0e
+  audience             https://thoryn.auth.stg.thoryn.org/cli-wif
+  token endpoint       https://thoryn.auth.stg.thoryn.org/cli-wif/oauth2/token
+  scope                tenant:environments.read
+
+This job (claims of its GitHub OIDC token; the token itself is not shown):
+  sub                  repo:thoryn-io/thoryn-cli:pull_request
+  repository           thoryn-io/thoryn-cli
+  repository_id        1044556677
+  repository_owner_id  187654321
+  ref                  refs/pull/97/merge
+  environment          (none)
+  event_name           pull_request
+  runner_environment   github-hosted
+
+Differences found locally:
+  - environment: the trust pins GitHub environment 'thoryn-staging-wif'; this job declares no `environment:` (add `environment: thoryn-staging-wif` to the job).
+
+Compare the job above with the trust (`thoryn workload-identity trusts get <id>`): its client id, audience, repository ids, GitHub environment, ref and runner pin must all match, and it must live in the environment the audience names.
+```
+
+- A trust can carry only `tenant:` scopes your own session holds (`403 scope_not_grantable` otherwise). A
+  production trust needs `--github-environment` and `--confirm-production`; `pull_request` and
+  `pull_request_target` jobs are refused there.
+- A trust with `tenant:workload-identity.write` lets its workflow create further trusts — grant it only
+  deliberately.
+- The `tenant:workload-identity.*` scopes are part of the default `thoryn login` set. They are granted to
+  the `cli` client by oathy hub V192, which must be deployed before a CLI release that requests them.
+
+This retargets SSO-2879's `--workload-identity` (an operator-registered token exchange signed with a CI
+key; its `--tenant`, `--wif-*` and `--subject-token` flags are gone).
 
 ### Least-privilege access grants (SSO-3113, epic SSO-3108)
 
@@ -484,7 +595,7 @@ Commands that run on a session remembered from a retired issuer (a refresh, an A
 ```bash
 # Default scopes (SSO-3182): EXACTLY the `cli` login client's registered set — openid,
 # offline_access and the whole tenant-config surface (applications, clients, users,
-# federation, audit, environments, email, idp, access, domains). A bare login therefore authorizes
+# federation, audit, environments, email, idp, access, domains, keys, workload-identity). A bare login therefore authorizes
 # `clients`, `federation`, `audit`, `env`, `workspace email-provider`, `branding`, `access`,
 # `domain` and `provision apply` (including a file's `grants:` block) with no --scope list.
 # `workspace` rides on SCOPE_openid (the hub /account surface). The hub mints only the
