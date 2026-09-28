@@ -228,8 +228,8 @@ internal class DomainWaiter(
         /** The custom-domain surface answers 404 to an identity with no reach (never 403). */
         const val NO_ACCESS: String =
             "this identity cannot reach the workspace's custom domain. A workspace admin must grant it explicitly: " +
-                "`thoryn access grant client:<client-id> manager custom_domain:<workspace-id>` (the workspace id is the " +
-                "`tnt` claim `thoryn whoami` prints). The `tenant:domains.*` scopes alone are not enough."
+                "`thoryn access grant client:<client-id> manager custom_domain:<workspace-id>` (`thoryn whoami --output json` prints the workspace id as " +
+                "`tenant`). The `tenant:domains.*` scopes alone are not enough."
 
         /** The `reason` extension of a `422 verification_failed` problem, when present. */
         fun problemReason(ex: ProductApiException): String? = try {
