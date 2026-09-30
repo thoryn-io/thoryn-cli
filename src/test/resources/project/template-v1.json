@@ -1,0 +1,6 @@
+{
+  "apiVersion": "thoryn.io/starter-template/v1",
+  "kind": "application",
+  "description": "The 09-28 template: rendered placeholders and a connection.json, before the v2 variable contract.",
+  "placeholders": { "THORYN_WORKSPACE": "{{workspace}}" }
+}
