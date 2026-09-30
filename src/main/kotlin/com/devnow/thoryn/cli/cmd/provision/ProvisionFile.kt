@@ -138,7 +138,7 @@ internal class ProvisionFile private constructor(
             DEFAULT_FILES.map { File(dir, "$DEFAULT_DIR/$it") }.firstOrNull { it.isFile }
 
         /** Read, parse and validate a provisioning file; throws [ProvisionException] on any problem. */
-        fun load(file: File): ProvisionFile {
+        fun load(file: File, env: (String) -> String? = { System.getenv(it) }): ProvisionFile {
             if (!file.isFile) throw ProvisionException("provisioning file not found: ${file.path}")
             val bytes = try {
                 file.readBytes()
@@ -146,11 +146,25 @@ internal class ProvisionFile private constructor(
                 throw ProvisionException("could not read provisioning file '${file.path}': ${e.message}")
             }
             val yaml = !file.name.endsWith(".json", ignoreCase = true)
-            return parse(bytes, file.path, yaml)
+            return parse(bytes, file.path, yaml, env)
         }
 
-        /** Parse and validate [bytes] (YAML unless [yaml] is false); [source] is used only in messages. */
-        fun parse(bytes: ByteArray, source: String = "<provision>", yaml: Boolean = true): ProvisionFile {
+        /**
+         * Parse and validate [bytes] (YAML unless [yaml] is false); [source] is used only in messages.
+         *
+         * SSO-3430 — a resource's `environment` may carry `{{env.NAME}}` placeholders (the grammar `spec`
+         * already uses), resolved here from [env]: a repository that is not rendered names its sandbox
+         * through a CI variable (`environment: "{{env.THORYN_ENVIRONMENT}}"`). The field is ADDRESSING,
+         * not a write-only secret, so an unset or empty variable fails closed for plan and apply alike —
+         * never a silent fallback to the production plane. [env] `null` leaves `environment` as written (a
+         * bundled recipe resolves its own params later); `thoryn provision` ([load]) reads the process env.
+         */
+        fun parse(
+            bytes: ByteArray,
+            source: String = "<provision>",
+            yaml: Boolean = true,
+            env: ((String) -> String?)? = null,
+        ): ProvisionFile {
             val root = try {
                 if (yaml) yamlMapper.readTree(bytes) else jsonMapper.readTree(bytes)
             } catch (e: Exception) {
@@ -160,21 +174,50 @@ internal class ProvisionFile private constructor(
             if (violations.isNotEmpty()) {
                 throw ProvisionException("invalid provisioning file '$source':\n  - " + violations.joinToString("\n  - "))
             }
-            val resources = root["resources"].toList().map { r ->
+            val unresolved = mutableListOf<String>()
+            val resources = root["resources"].toList().mapIndexed { i, r ->
                 val kind = r["kind"].asString()
                 @Suppress("UNCHECKED_CAST")
                 val spec = jsonMapper.convertValue(r["spec"], Map::class.java) as Map<String, Any?>
                 ProvisionResource(
                     kind = kind,
                     name = r["name"]?.takeIf { !it.isNull }?.asString()?.takeIf { it.isNotBlank() } ?: kind,
-                    environment = r["environment"]?.takeIf { !it.isNull }?.asString()?.takeIf { it.isNotBlank() },
+                    environment = r["environment"]?.takeIf { !it.isNull }?.asString()?.takeIf { it.isNotBlank() }
+                        ?.let { raw -> env?.let { resolveEnvironment(raw, "resources[$i]", it, unresolved) } ?: raw },
                     spec = spec,
                     grants = r["grants"]?.takeIf { it.isArray() }?.toList()?.map { g ->
                         ProvisionGrant(subject = g["subject"].asString().trim(), relation = g["relation"].asString().trim())
                     },
                 )
             }
+            if (unresolved.isNotEmpty()) {
+                throw ProvisionException("invalid provisioning file '$source':\n  - " + unresolved.joinToString("\n  - "))
+            }
             return ProvisionFile(source = source, digest = sha256(bytes), resources = resources)
+        }
+
+        /**
+         * SSO-3430 — substitute `{{env.NAME}}` in a resource's `environment`. A value without a placeholder
+         * is returned unchanged; an unset / empty variable, or a result that is not an environment name or
+         * slug, is recorded in [problems] (and the raw value returned so parsing can report every problem).
+         */
+        private fun resolveEnvironment(raw: String, where: String, env: (String) -> String?, problems: MutableList<String>): String {
+            if (!ProvisionEngine.ENV_PLACEHOLDER.containsMatchIn(raw)) return raw
+            var missing = false
+            val resolved = ProvisionEngine.ENV_PLACEHOLDER.replace(raw) { m ->
+                val name = m.groupValues[1]
+                env(name)?.trim()?.takeIf { it.isNotEmpty() } ?: run {
+                    problems += "$where environment '$raw' references env var '$name', which is not set"
+                    missing = true
+                    m.value
+                }
+            }
+            if (missing) return raw
+            if (!NAME_PATTERN.matches(resolved)) {
+                problems += "$where environment '$raw' resolves to '$resolved', which is not an environment slug (${NAME_PATTERN.pattern})"
+                return raw
+            }
+            return resolved
         }
 
         /**

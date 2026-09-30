@@ -30,7 +30,7 @@
           "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"
         },
         "environment": {
-          "description": "The environment this resource lives in: the `name` of an `environment` resource in this file, or the slug of an environment that already exists. Omitted ⇒ the workspace's production plane. Not allowed on an `environment` resource.",
+          "description": "The environment this resource lives in: the `name` of an `environment` resource in this file, or the slug of an environment that already exists. May be a `{{env.NAME}}` placeholder, resolved from the environment when the file is read (an unset variable is an error). Omitted ⇒ the workspace's production plane. Not allowed on an `environment` resource.",
           "type": "string",
           "minLength": 1
         },
