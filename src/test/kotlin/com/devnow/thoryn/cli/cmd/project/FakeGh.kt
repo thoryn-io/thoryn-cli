@@ -33,6 +33,10 @@ internal class FakeGh : GhRunner {
     /** fullName → ruleset id → ruleset body. */
     val rulesets = mutableMapOf<String, MutableMap<Long, Map<String, Any?>>>()
     private var nextRulesetId = 4200L
+    /** "fullName@branch" → the files of a non-default branch (branches thoryn creates through git/refs). */
+    val branches = mutableMapOf<String, MutableMap<String, String>>()
+    /** Open pull requests: fullName → (head branch → html_url). */
+    val pulls = mutableMapOf<String, MutableMap<String, String>>()
     /** template fullName → its declaration (null ⇒ the template repository is empty). */
     val declarations = mutableMapOf<String, String?>()
     val tarballs = mutableMapOf<String, ByteArray>()
@@ -93,11 +97,41 @@ internal class FakeGh : GhRunner {
         val path = rest.first()
         val fields = rest.drop(1).chunked(2).filter { it.size == 2 && (it[0] == "-f" || it[0] == "-F") }
             .associate { it[1].substringBefore('=') to it[1].substringAfter('=') }
-        val seg = path.split('/')
+        val seg = path.substringBefore('?').split('/')
         return when {
             method == "GET" && seg[0] == "users" && seg.size == 2 -> users[seg[1]]?.let { okJson(mapOf("id" to it, "login" to seg[1])) } ?: notFound()
             method == "GET" && seg[0] == "repos" && seg.size == 3 -> repos["${seg[1]}/${seg[2]}"]?.let { okJson(it) } ?: notFound()
+            method == "GET" && seg[0] == "repos" && seg.size >= 4 && seg[3] == "contents" && path.contains("?ref=") -> {
+                val file = seg.drop(4).joinToString("/").substringBefore('?')
+                val content = branches["${seg[1]}/${seg[2]}@${path.substringAfter("?ref=")}"]?.get(file) ?: return notFound()
+                okJson(mapOf("type" to "file", "sha" to "sha-${content.hashCode()}", "content" to Base64.getMimeEncoder().encodeToString(content.toByteArray())))
+            }
             method == "GET" && seg[0] == "repos" && seg.size >= 4 && seg[3] == "contents" -> contents("${seg[1]}/${seg[2]}", seg.drop(4).joinToString("/"))
+            method == "GET" && seg[0] == "repos" && seg.size >= 6 && seg[3] == "git" && seg[4] == "ref" -> {
+                val full = "${seg[1]}/${seg[2]}"
+                val branch = seg.drop(6).joinToString("/")
+                if (full !in repos) return notFound()
+                val known = branch == repos.getValue(full)["default_branch"] || "$full@$branch" in branches
+                if (known) okJson(mapOf("ref" to "refs/heads/$branch", "object" to mapOf("sha" to "commit-$branch"))) else notFound()
+            }
+            method == "POST" && seg[0] == "repos" && seg.size == 5 && seg[3] == "git" && seg[4] == "refs" -> {
+                val full = "${seg[1]}/${seg[2]}"
+                val branch = fields.getValue("ref").removePrefix("refs/heads/")
+                branches["$full@$branch"] = files[full].orEmpty().toMutableMap()
+                okJson(mapOf("ref" to fields["ref"]))
+            }
+            seg[0] == "repos" && seg.size == 4 && seg[3] == "pulls" -> {
+                val full = "${seg[1]}/${seg[2]}"
+                val open = pulls.getOrPut(full) { linkedMapOf() }
+                if (method == "GET") {
+                    val head = path.substringAfter("head=").substringBefore('&').substringAfter(':')
+                    okJson(open.filterKeys { it == head }.values.map { mapOf("html_url" to it) })
+                } else {
+                    val url = "https://github.com/$full/pull/${open.size + 1}"
+                    open[fields.getValue("head")] = url
+                    okJson(mapOf("html_url" to url, "number" to open.size))
+                }
+            }
             method == "PUT" && seg[0] == "repos" && seg.size >= 4 && seg[3] == "contents" -> putContents("${seg[1]}/${seg[2]}", seg.drop(4).joinToString("/"), stdin)
             method == "GET" && seg[0] == "repos" && seg.size == 5 && seg[3] == "branches" -> if ("${seg[1]}/${seg[2]}" in repos) okJson(mapOf("name" to seg[4])) else notFound()
             seg[0] == "repos" && seg.size >= 4 && seg[3] == "rulesets" -> ruleset("${seg[1]}/${seg[2]}", seg.getOrNull(4)?.toLong(), method, stdin)
@@ -135,11 +169,19 @@ internal class FakeGh : GhRunner {
 
     private fun putContents(fullName: String, path: String, stdin: ByteArray?): GhResult {
         if (fullName !in repos) return notFound()
+        @Suppress("UNCHECKED_CAST")
+        val body = json.readValue(stdin, Map::class.java) as Map<String, Any?>
+        val branch = body["branch"] as String? ?: repos.getValue(fullName)["default_branch"] as String
+        if (branch != repos.getValue(fullName)["default_branch"]) {
+            val files = branches["$fullName@$branch"] ?: return notFound()
+            val existing = files[path]
+            if (existing != null && body["sha"] != "sha-${existing.hashCode()}") return GhResult(1, ByteArray(0), "gh: sha wasn't supplied (HTTP 422)")
+            files[path] = String(Base64.getDecoder().decode(body["content"] as String))
+            return okJson(mapOf("content" to mapOf("path" to path)))
+        }
         if (rulesets[fullName].orEmpty().values.any { it["enforcement"] == "active" }) {
             return GhResult(1, ByteArray(0), "gh: Repository rule violations found (HTTP 409)")
         }
-        @Suppress("UNCHECKED_CAST")
-        val body = json.readValue(stdin, Map::class.java) as Map<String, Any?>
         val existing = files[fullName]?.get(path)
         if (existing != null && body["sha"] != "sha-${existing.hashCode()}") return GhResult(1, ByteArray(0), "gh: sha wasn't supplied (HTTP 422)")
         files.getOrPut(fullName) { mutableMapOf() }[path] = String(Base64.getDecoder().decode(body["content"] as String))

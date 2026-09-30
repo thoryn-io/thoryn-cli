@@ -225,9 +225,9 @@ class GitHubCli(
     /** A file on the default branch: its text and blob sha. */
     data class RepoFile(val content: String, val sha: String)
 
-    /** [path] on the default branch, or null when it does not exist. */
-    fun readFile(repository: GhRepository, path: String, step: String): RepoFile? {
-        val r = gh.run(listOf("api", "repos/${repository.fullName}/contents/$path"))
+    /** [path] on the default branch (or on [ref]), or null when it does not exist. */
+    fun readFile(repository: GhRepository, path: String, step: String, ref: String? = null): RepoFile? {
+        val r = gh.run(listOf("api", "repos/${repository.fullName}/contents/$path" + (ref?.let { "?ref=$it" } ?: "")))
         if (!r.ok) {
             if (r.httpStatus() == 404) return null
             throw GhCommandException(step, r)
@@ -240,12 +240,20 @@ class GitHubCli(
         return RepoFile(content, n.path("sha").asString(""))
     }
 
-    /** Create or replace [path] on the default branch with one commit (`sha` = the blob it replaces). */
-    fun writeFile(repository: GhRepository, path: String, content: String, sha: String?, message: String, step: String) {
+    /** Create or replace [path] on [branch] with one commit (`sha` = the blob it replaces). */
+    fun writeFile(
+        repository: GhRepository,
+        path: String,
+        content: String,
+        sha: String?,
+        message: String,
+        step: String,
+        branch: String = repository.defaultBranch,
+    ) {
         val body = linkedMapOf<String, Any?>(
             "message" to message,
             "content" to Base64.getEncoder().encodeToString(content.toByteArray()),
-            "branch" to repository.defaultBranch,
+            "branch" to branch,
         )
         if (sha != null) body["sha"] = sha
         val r = gh.run(listOf("api", "--method", "PUT", "repos/${repository.fullName}/contents/$path", "--input", "-"), stdin = json.writeValueAsBytes(body))
@@ -266,6 +274,39 @@ class GitHubCli(
             if (attempt < BRANCH_ATTEMPTS - 1) sleeper(BRANCH_WAIT_MILLIS)
         }
         throw GhCommandException(step, last!!, "GitHub had not finished creating the repository's ${repository.defaultBranch} branch; re-run in a minute.")
+    }
+
+    /**
+     * Propose [content] for [path] through a pull request instead of a direct commit: the deterministic [branch] is
+     * created from the default branch when absent (reused when present), the file is committed there when it
+     * differs, and the open pull request from it is reused or opened. Returns the pull request's URL. The default
+     * branch is never written.
+     */
+    fun proposeFile(repository: GhRepository, path: String, content: String, branch: String, title: String, body: String, step: String): String {
+        val full = repository.fullName
+        val ref = gh.run(listOf("api", "repos/$full/git/ref/heads/$branch"))
+        if (!ref.ok) {
+            if (ref.httpStatus() != 404) throw GhCommandException(step, ref)
+            val base = gh.run(listOf("api", "repos/$full/git/ref/heads/${repository.defaultBranch}"))
+            if (!base.ok) throw GhCommandException(step, base)
+            val sha = node(base, step).path("object").path("sha").asString("")
+            val created = gh.run(listOf("api", "--method", "POST", "repos/$full/git/refs", "-f", "ref=refs/heads/$branch", "-f", "sha=$sha"))
+            if (!created.ok) throw GhCommandException(step, created)
+        }
+        val onBranch = readFile(repository, path, step, ref = branch)
+        if (onBranch?.content != content) writeFile(repository, path, content, onBranch?.sha, title, step, branch = branch)
+        val open = gh.run(listOf("api", "repos/$full/pulls?head=${repository.ownerLogin}:$branch&state=open"))
+        if (!open.ok) throw GhCommandException(step, open)
+        val list = node(open, step)
+        if (list.size() > 0) return list.get(0).path("html_url").asString("")
+        val pr = gh.run(
+            listOf(
+                "api", "--method", "POST", "repos/$full/pulls",
+                "-f", "title=$title", "-f", "head=$branch", "-f", "base=${repository.defaultBranch}", "-f", "body=$body",
+            ),
+        )
+        if (!pr.ok) throw GhCommandException(step, pr)
+        return node(pr, step).path("html_url").asString("")
     }
 
     /** The id of the repository's ruleset named [name], or null. */
@@ -354,6 +395,8 @@ class GitHubCli(
         const val RULESET_NAME: String = "thoryn-production-approval"
         const val ENFORCEMENT_ACTIVE: String = "active"
         const val ENFORCEMENT_DISABLED: String = "disabled"
+        /** The deterministic branch a CODEOWNERS change is proposed on once the ruleset protects the default branch. */
+        const val CODEOWNERS_BRANCH: String = "thoryn/codeowners"
         private const val BRANCH_ATTEMPTS = 10
         private const val BRANCH_WAIT_MILLIS = 1500L
     }

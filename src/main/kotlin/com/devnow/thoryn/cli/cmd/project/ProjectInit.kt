@@ -538,10 +538,16 @@ internal class ProjectInit(
     }
 
     /**
-     * The default-branch approval: the `thoryn-production-approval` ruleset (adopted and updated when it exists) and,
-     * with --repo, the reviewers' CODEOWNERS committed through the contents API. A commit to the default branch is
-     * made while the ruleset is not yet (or briefly not) enforced — the ruleset itself forbids direct pushes — and the
-     * ruleset is active when this returns. In an existing clone CODEOWNERS is written to the working tree instead.
+     * The default-branch approval: the `thoryn-production-approval` ruleset and, with --repo, the reviewers' CODEOWNERS.
+     *
+     * An ACTIVE ruleset is never disabled or weakened — not to commit CODEOWNERS, not with --force: that would put an
+     * unreviewed change on the default branch.
+     *  - **The ruleset does not exist yet** (this run creates it; nothing was protected before): it is created
+     *    disabled, CODEOWNERS is committed, then it is enforced — or created active when there is nothing to commit.
+     *  - **The ruleset exists** (active, evaluating, or disabled by someone): it is brought back to the required
+     *    shape and enforced FIRST (that only tightens); a CODEOWNERS change then goes through a pull request from the
+     *    deterministic branch `thoryn/codeowners` (reused on a re-run), and waits for review.
+     * In an existing clone, CODEOWNERS is written to the working tree and reaches GitHub with the user's pull request.
      * Throws [GhPlanLimitException] when GitHub has no rulesets for this private repository (GitHub Free).
      */
     private fun approvalRuleset(repo: GhRepository, codeowners: String, remote: GitHubCli.RepoFile?): Long {
@@ -551,30 +557,47 @@ internal class ProjectInit(
             github.awaitDefaultBranch(repo, STEP_APPROVAL)
             existing = github.readFile(repo, CODEOWNERS_PATH, STEP_APPROVAL)
         }
-        val commit = request.repo != null && existing?.content != codeowners
-        var id = github.rulesetId(repo, GitHubCli.RULESET_NAME, STEP_APPROVAL)
-        val created = id == null
-        if (id == null) {
-            id = github.createRuleset(repo, if (commit) GitHubCli.ENFORCEMENT_DISABLED else GitHubCli.ENFORCEMENT_ACTIVE, STEP_APPROVAL)
-        } else if (commit) {
-            github.updateRuleset(repo, id, GitHubCli.ENFORCEMENT_DISABLED, STEP_APPROVAL)
+        val change = request.repo != null && existing?.content != codeowners
+        val found = github.rulesetId(repo, GitHubCli.RULESET_NAME, STEP_APPROVAL)
+        var pullRequest: String? = null
+        val id: Long
+        if (found == null) {
+            if (change) {
+                id = github.createRuleset(repo, GitHubCli.ENFORCEMENT_DISABLED, STEP_APPROVAL)
+                github.writeFile(repo, CODEOWNERS_PATH, codeowners, existing?.sha, CODEOWNERS_MESSAGE, STEP_APPROVAL)
+                github.updateRuleset(repo, id, GitHubCli.ENFORCEMENT_ACTIVE, STEP_APPROVAL)
+            } else {
+                id = github.createRuleset(repo, GitHubCli.ENFORCEMENT_ACTIVE, STEP_APPROVAL)
+            }
+        } else {
+            id = found
+            github.updateRuleset(repo, id, GitHubCli.ENFORCEMENT_ACTIVE, STEP_APPROVAL)
+            if (change) {
+                pullRequest = github.proposeFile(
+                    repo, CODEOWNERS_PATH, codeowners, GitHubCli.CODEOWNERS_BRANCH, CODEOWNERS_MESSAGE,
+                    "Proposed by `thoryn project init config`: the production approval needs these code owners. " +
+                        "The default branch is protected by ${GitHubCli.RULESET_NAME}, so this change needs a review like any other.",
+                    STEP_APPROVAL,
+                )
+            }
         }
-        if (commit) {
-            github.writeFile(repo, CODEOWNERS_PATH, codeowners, existing?.sha, "Thoryn config project: reviewers own production and the workflows", STEP_APPROVAL)
-        }
-        if (commit || !created) github.updateRuleset(repo, id, GitHubCli.ENFORCEMENT_ACTIVE, STEP_APPROVAL)
+        report["codeownersPullRequest"] = pullRequest
         step(
             STEP_CODEOWNERS,
             when {
                 request.repo == null -> "pending"
-                commit -> "committed"
+                pullRequest != null -> "pending review"
+                change -> "committed"
                 else -> "unchanged"
             },
-            "$CODEOWNERS_PATH: ${request.reviewers.joinToString(" ") { "@$it" }} own ${CODEOWNED_PATHS.joinToString(" and ")}" +
-                if (request.repo == null) " (written with the template's files; it lands with your pull request)" else "",
+            when {
+                pullRequest != null -> "CODEOWNERS update pending review: $pullRequest"
+                else -> "$CODEOWNERS_PATH: ${request.reviewers.joinToString(" ") { "@$it" }} own ${CODEOWNED_PATHS.joinToString(" and ")}" +
+                    if (request.repo == null) " (written with the template's files; it lands with your pull request)" else ""
+            },
         )
         step(
-            STEP_RULESET, if (created) "created" else "updated",
+            STEP_RULESET, if (found == null) "created" else "enforced",
             "${GitHubCli.RULESET_NAME} on ${repo.defaultBranch}: pull request with 1 approval + code-owner review, stale approvals dismissed, " +
                 "no force-push or deletion, no bypass",
         )
@@ -711,6 +734,9 @@ internal class ProjectInit(
             )
             else -> add("Push a commit (or re-run the workflow) to start a run with the variables set.")
         }
+        (report["codeownersPullRequest"] as? String)?.let {
+            add("CODEOWNERS update pending review: $it — the ruleset already requires an approved pull request; merge this one to make the reviewers the code owners.")
+        }
         if (config) {
             val reviewers = request.reviewers.joinToString(", ")
             @Suppress("UNCHECKED_CAST")
@@ -833,6 +859,7 @@ internal class ProjectInit(
         const val STEP_CODEOWNERS: String = "codeowners"
         const val STEP_RULESET: String = "ruleset"
         const val CODEOWNERS_PATH: String = ".github/CODEOWNERS"
+        private const val CODEOWNERS_MESSAGE = "Thoryn config project: reviewers own production and the workflows"
         val CODEOWNED_PATHS: List<String> = listOf("/.thoryn/environments/production/", "/.github/workflows/")
 
         /** The config project's CODEOWNERS: the --reviewer logins own production's configuration and the workflows. */

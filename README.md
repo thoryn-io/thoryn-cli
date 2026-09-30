@@ -542,10 +542,18 @@ immutable ids, the GitHub environment `thoryn-production` and the default branch
    one approving review, requires a code-owner review, dismisses stale approvals on a new push, blocks
    force-pushes and deletion, and has **no bypass actors**.
 2. **CODEOWNERS.** `.github/CODEOWNERS` makes the `--reviewer` logins the owners of
-   `/.thoryn/environments/production/` and `/.github/workflows/`. With `--repo` it is committed through the
-   GitHub API. The ruleset is enforced right after that commit, because the ruleset itself forbids direct
-   commits. In an existing clone it is written to the working tree and reaches GitHub with your pull
-   request. An existing, different CODEOWNERS is a conflict: the command stops unless you pass `--force`.
+   `/.thoryn/environments/production/` and `/.github/workflows/`. An existing, different CODEOWNERS is a
+   conflict: the command stops unless you pass `--force`.
+   - **With `--repo`, when this run creates the ruleset:** nothing was protected before, so CODEOWNERS is
+     committed through the GitHub API first and the ruleset is enforced right after.
+   - **With `--repo`, when the ruleset already exists:** an active ruleset is **never** disabled or weakened,
+     not even with `--force`. That would put an unreviewed change on the default branch. The ruleset is
+     brought back to the required shape and enforced first, which only tightens it; a disabled one is
+     re-enforced. A CODEOWNERS change then goes through a pull request from the branch `thoryn/codeowners`
+     (reused on a re-run), and the output says `CODEOWNERS update pending review: <PR url>`. The run
+     continues, because the ruleset already requires an approved pull request.
+   - **In an existing clone:** it is written to the working tree and reaches GitHub with your pull
+     request.
 3. **The production GitHub environment** accepts deployments from the default branch only.
 4. **Environment reviewers**, when your plan offers them. GitHub offers required reviewers for a private
    repository only on GitHub Enterprise. On another plan it refuses them, and the environment is set up
@@ -592,7 +600,7 @@ cd web && thoryn project init app --stack express --environment dev
 | `--repo <owner/name>` | both | The GitHub repository. It is created from the template when it does not exist, and used as it is when it does. Leave it out to work on the clone. |
 | `--public` | both | Create the repository public. The default is private. Only with `--repo`. |
 | `--dir <path>` | both | The clone's root. Only without `--repo`. |
-| `--force` | both | Overwrite files that differ: the template's files in a clone, or (config, `--repo`) an existing `.github/CODEOWNERS`. |
+| `--force` | both | Overwrite files that differ: the template's files in a clone, or (config, `--repo`) propose replacing an existing `.github/CODEOWNERS`. `--force` never weakens the approval ruleset: under an existing ruleset the replacement is a pull request. |
 | `--template <owner/repo>` | both | Start from another template repository, such as a mirror. The default is `thoryn-io/starter-<stack>`; for config, `thoryn-io/starter-config`. |
 | `--sandbox <slug>` | config | The sandbox to configure. It is created when it does not exist. |
 | `--reviewer <login>` | config | A GitHub user who approves every production run. Repeatable, 1–6, required. |
@@ -613,7 +621,8 @@ gh api repos/<owner>/<name> ; gh api users/<login>                 # the reposit
 gh repo view --json nameWithOwner ; gh api repos/<template>/tarball # (clone only) the repository; the template's files
 gh api --method POST repos/<template>/generate -f owner=… -f name=… -F private=… -f description=…
 gh api repos/<o>/<r>/branches/<default>                              # (config, new repo) wait until GitHub has generated it
-gh api repos/<o>/<r>/contents/.github/CODEOWNERS ; gh api --method PUT … --input -   # (config, --repo) the reviewers' CODEOWNERS
+gh api repos/<o>/<r>/contents/.github/CODEOWNERS ; gh api --method PUT … --input -   # (config, --repo) the reviewers' CODEOWNERS (direct only when this run creates the ruleset)
+gh api repos/<o>/<r>/git/ref/heads/thoryn/codeowners ; gh api --method POST repos/<o>/<r>/git/refs … ; gh api [--method POST] repos/<o>/<r>/pulls …   # CODEOWNERS change under an existing ruleset
 gh api repos/<o>/<r>/rulesets ; gh api --method POST|PUT repos/<o>/<r>/rulesets[/<id>] --input -  # (config) thoryn-production-approval
 gh api --method PUT repos/<o>/<r>/environments/thoryn-production --input -      # (config) reviewers + branch policy; again without reviewers on a billing-plan 422
 gh api [--method POST|DELETE] repos/<o>/<r>/environments/thoryn-production/deployment-branch-policies[/<id>]
@@ -657,7 +666,8 @@ the same command again:
 | `You do not manage sandbox …` / `needs you to manage the workspace` (exit 4) | Managers delegate. Ask a workspace admin for `thoryn access grant member:<you> manager environment:<id>` (or `workspace:<id>`). |
 | `Production approval needs a reviewed pull request on the default branch, which GitHub Free does not support for private repositories.` (config; exit 4, or 3 when this run created the repository) | GitHub Free has no rulesets for a private repository, and a config project's production changes must go through a reviewed pull request. It is refused: there is no fallback. Use GitHub Pro, Team or Enterprise, or a public repository. This happens before anything is written in Thoryn, so nothing exists there. If `--repo` created the repository in this run, it is kept and the message names it. Delete it yourself (`gh repo delete <owner>/<name>`) if you do not want it. |
 | `required reviewers not offered by this GitHub plan` (config, success) | Not an error. GitHub offers environment reviewers for a private repository only on GitHub Enterprise. The reviewed pull request (ruleset + CODEOWNERS) carries the approval. |
-| `already has a different .github/CODEOWNERS` (config, exit 4) | Merge the two ownership lines into your CODEOWNERS and re-run, or re-run with `--force` to replace it. |
+| `already has a different .github/CODEOWNERS` (config, exit 4) | Merge the two ownership lines into your CODEOWNERS and re-run, or re-run with `--force` to replace it. Once the approval ruleset exists, that replacement is a pull request. |
+| `CODEOWNERS update pending review: <url>` (config, success) | The default branch is already protected, so the CLI does not commit to it: it opened (or reused) a pull request from `thoryn/codeowners`. Have a reviewer approve and merge it. |
 | `the protection step failed — gh: …` (exit 3) | GitHub refused the environment for another reason. Most often you lack admin rights on the repository. The message is GitHub's own. |
 | `cannot yet grant a machine client workspace-wide management` (exit 2, config) | The platform does not yet support `manager` on `workspace:<id>` for a client. Everything before it is kept and no variable is set. Re-run once it does. |
 | `Trust 'starter-…' … exists but pins another …` (exit 4) | A trust with the deterministic name exists with other pins or scopes. Delete it (`thoryn workload-identity trusts delete <id> --environment <env>`) and re-run. |

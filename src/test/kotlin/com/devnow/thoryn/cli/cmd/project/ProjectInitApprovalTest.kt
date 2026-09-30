@@ -103,28 +103,73 @@ class ProjectInitApprovalTest : ProjectTestBase() {
             .containsEntry("require_code_owner_review", true).containsEntry("dismiss_stale_reviews_on_push", true)
     }
 
+    /** Every ruleset body thoryn sent: none may ever be anything but active once the ruleset exists. */
+    private fun rulesetBodies(): List<Map<String, Any?>> =
+        gh.calls.filter { c -> c.args.any { it.contains("/rulesets") } && c.stdin != null }.map { parseJson(it.stdin!!) }
+
     @Test
-    fun `an existing repository's different CODEOWNERS stops before any change, and --force replaces it past the ruleset`() {
+    fun `an existing repository's different CODEOWNERS stops before any change without --force`() {
         gh.seedRepo("acme/platform")
         gh.files["acme/platform"] = mutableMapOf(".github/CODEOWNERS" to "* @someone-else\n")
 
         val (exit, _, err) = runCli(*base, "--repo", "acme/platform")
+
         assertThat(exit).isEqualTo(ProjectInit.EXIT_CHECK)
         assertThat(err).contains("already has a different .github/CODEOWNERS. Nothing was changed").contains("--force")
         assertThat(gh.mutations).isEmpty()
         assertThat(api.writes).isEmpty()
+    }
 
-        // With an active ruleset from an earlier run, --force disables it for the one commit, then enforces it again.
+    @Test
+    fun `a CODEOWNERS change under an ACTIVE ruleset goes through a pull request — never a disabled ruleset, not even with --force`() {
+        gh.seedRepo("acme/platform")
+        gh.files["acme/platform"] = mutableMapOf(".github/CODEOWNERS" to "* @someone-else\n")
         gh.rulesets["acme/platform"] = linkedMapOf(4100L to mapOf("name" to "thoryn-production-approval", "enforcement" to "active"))
-        val forced = runCli(*base, "--repo", "acme/platform", "--force")
-        assertThat(forced.exit).describedAs(forced.err).isEqualTo(0)
-        assertThat(gh.files.getValue("acme/platform")[".github/CODEOWNERS"]).contains("/.thoryn/environments/production/ @alice @bob")
-        assertThat(gh.mutations.filter { it.contains("rulesets") || it.contains("contents") }).containsExactly(
-            "gh api --method PUT repos/acme/platform/rulesets/4100 --input -",
+
+        val (exit, out, err) = runCli(*base, "--repo", "acme/platform", "--force")
+
+        assertThat(exit).describedAs(err).isEqualTo(0)
+        assertThat(rulesetBodies()).isNotEmpty().allMatch { it["enforcement"] == "active" }
+        assertThat(gh.files.getValue("acme/platform")[".github/CODEOWNERS"]).isEqualTo("* @someone-else\n") // main untouched
+        assertThat(gh.branches.getValue("acme/platform@thoryn/codeowners")[".github/CODEOWNERS"])
+            .isEqualTo(ProjectInit.codeownersFor(listOf("alice", "bob")))
+        assertThat(gh.mutations.filter { it.contains("rulesets") || it.contains("contents") || it.contains("git/refs") || it.contains("pulls") }).containsExactly(
+            "gh api --method PUT repos/acme/platform/rulesets/4100 --input -", // enforced first: only tightens
+            "gh api --method POST repos/acme/platform/git/refs -f ref=refs/heads/thoryn/codeowners -f sha=commit-main",
             "gh api --method PUT repos/acme/platform/contents/.github/CODEOWNERS --input -",
-            "gh api --method PUT repos/acme/platform/rulesets/4100 --input -",
+            "gh api --method POST repos/acme/platform/pulls -f title=Thoryn config project: reviewers own production and the workflows " +
+                "-f head=thoryn/codeowners -f base=main -f body=Proposed by `thoryn project init config`: the production approval needs these code owners. " +
+                "The default branch is protected by thoryn-production-approval, so this change needs a review like any other.",
         )
+        assertThat(parseJson(gh.calls.first { it.args.contains("repos/acme/platform/contents/.github/CODEOWNERS") && it.stdin != null }.stdin!!))
+            .containsEntry("branch", "thoryn/codeowners")
+        assertThat(out).contains("CODEOWNERS update pending review: https://github.com/acme/platform/pull/1")
+        assertThat(api.trusts).hasSize(2) // the run continues: the existing ruleset already enforces approval
+
+        // A re-run reuses the branch and the open pull request.
+        val again = runCli(*base, "--repo", "acme/platform", "--force", "--json")
+        assertThat(again.exit).describedAs(again.err).isEqualTo(0)
+        assertThat(parseJson(again.out)).containsEntry("codeownersPullRequest", "https://github.com/acme/platform/pull/1")
+        assertThat(gh.pulls.getValue("acme/platform")).hasSize(1)
+        assertThat(gh.invocations.count { it.contains("--method POST repos/acme/platform/git/refs") }).isEqualTo(1)
+        assertThat(rulesetBodies()).allMatch { it["enforcement"] == "active" }
+    }
+
+    @Test
+    fun `a ruleset someone disabled is re-enforced before anything else, and CODEOWNERS then goes through a pull request`() {
+        gh.seedRepo("acme/platform")
+        gh.rulesets["acme/platform"] = linkedMapOf(4100L to mapOf("name" to "thoryn-production-approval", "enforcement" to "disabled"))
+
+        val (exit, out, err) = runCli(*base, "--repo", "acme/platform")
+
+        assertThat(exit).describedAs(err).isEqualTo(0)
+        val mutations = gh.mutations
+        assertThat(mutations.first { it.contains("rulesets") || it.contains("contents") || it.contains("git/refs") })
+            .isEqualTo("gh api --method PUT repos/acme/platform/rulesets/4100 --input -")
+        assertThat(rulesetBodies()).allMatch { it["enforcement"] == "active" }
         assertThat(gh.rulesets.getValue("acme/platform").getValue(4100L)["enforcement"]).isEqualTo("active")
+        assertThat(gh.files["acme/platform"].orEmpty()).doesNotContainKey(".github/CODEOWNERS") // no direct commit
+        assertThat(out).contains("CODEOWNERS update pending review: https://github.com/acme/platform/pull/1")
     }
 
     @Test

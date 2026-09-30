@@ -336,7 +336,7 @@ class ProjectCommand : Callable<Int> {
             }
         }
 
-        private val CHANGED = setOf("created", "set", "granted", "written")
+        private val CHANGED = setOf("created", "set", "granted", "written", "committed", "pending review")
 
         private fun printSteps(steps: List<ProjectInit.Step>, out: PrintStream) {
             val nameWidth = steps.maxOfOrNull { it.name.length } ?: 0
