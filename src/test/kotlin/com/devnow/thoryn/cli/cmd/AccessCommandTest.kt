@@ -30,6 +30,19 @@ class AccessCommandTest : CommandTestBase() {
     }
 
     @Test
+    fun `grant accepts the workspace's custom_domain object and sends it unchanged`() {
+        val tnt = "22222222-2222-2222-2222-222222222222"
+        server.enqueue(jsonResponse(201, """{"subject":"client:wi_abc","relation":"manager","object":"custom_domain:$tnt","createdAt":"2026-09-30T10:00:00Z"}"""))
+
+        val (exit, out, _) = runCli("access", "grant", "client:wi_abc", "manager", "custom_domain:$tnt", "--gateway", baseUrl())
+
+        assertThat(exit).isEqualTo(0)
+        assertThat(out).contains("custom_domain:$tnt")
+        val req = server.takeRequest()
+        assertThat(parseJson(req.body.readUtf8())).isEqualTo(mapOf("subject" to "client:wi_abc", "relation" to "manager", "object" to "custom_domain:$tnt"))
+    }
+
+    @Test
     fun `grant is idempotent — a 200 for an existing grant still succeeds`() {
         server.enqueue(jsonResponse(200, """{"subject":"member:alice","relation":"viewer","object":"application:app-1","createdAt":"2026-09-15T10:00:00Z"}"""))
 
