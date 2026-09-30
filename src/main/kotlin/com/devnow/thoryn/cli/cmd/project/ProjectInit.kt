@@ -222,7 +222,7 @@ internal class ProjectInit(
                     throw Stop(
                         EXIT_CHECK, "file_conflicts",
                         "${repository.fullName} already has a different $CODEOWNERS_PATH. Nothing was changed.",
-                        "The config project's reviewers must own /.thoryn/environments/production/ and /.github/workflows/. " +
+                        "The config project's reviewers must own /.thoryn/environments/production/, /.github/workflows/ and /.github/CODEOWNERS. " +
                             "Merge those two lines into it yourself and re-run, or re-run with --force to replace it.",
                         mapOf("conflicts" to listOf(CODEOWNERS_PATH)),
                     )
@@ -496,7 +496,7 @@ internal class ProjectInit(
             throw Stop(EXIT_CHECK, "starter_template_invalid", "The template's files could not be read: ${ex.message}.")
         }
         val root = request.dir.toAbsolutePath().normalize()
-        // A config project's CODEOWNERS (the reviewers own production and the workflows) replaces the template's.
+        // A config project's CODEOWNERS (the reviewers own production, the workflows and CODEOWNERS) replaces the template's.
         val all = if (codeowners == null) entries else entries.filter { it.path != CODEOWNERS_PATH } + TemplateArchive.Entry(CODEOWNERS_PATH, codeowners.toByteArray(), false)
         val planned = all.map { e ->
             val target = root.resolve(e.path).normalize()
@@ -592,7 +592,7 @@ internal class ProjectInit(
             },
             when {
                 pullRequest != null -> "CODEOWNERS update pending review: $pullRequest"
-                else -> "$CODEOWNERS_PATH: ${request.reviewers.joinToString(" ") { "@$it" }} own ${CODEOWNED_PATHS.joinToString(" and ")}" +
+                else -> "$CODEOWNERS_PATH: ${request.reviewers.joinToString(" ") { "@$it" }} own ${CODEOWNED_PATHS.joinToString(", ")}" +
                     if (request.repo == null) " (written with the template's files; it lands with your pull request)" else ""
             },
         )
@@ -761,7 +761,7 @@ internal class ProjectInit(
             add("gh api repos/$repo --jq '{id: .id, ownerId: .owner.id, defaultBranch: .default_branch}'   # the ids the trusts pin")
             if (request.kind == Kind.CONFIG) {
                 request.reviewers.forEach { add("gh api users/$it --jq .id   # reviewer id") }
-                add("# .github/CODEOWNERS: ${CODEOWNED_PATHS.joinToString("; ") { "$it ${request.reviewers.joinToString(" ") { r -> "@$r" }}" }} — commit it to the default branch")
+                add("# .github/CODEOWNERS, one line each: ${CODEOWNED_PATHS.joinToString("; ") { "$it ${request.reviewers.joinToString(" ") { r -> "@$r" }}" }} — commit it to the default branch")
                 add("gh api --method POST repos/$repo/rulesets --input ruleset.json   # name ${GitHubCli.RULESET_NAME}, target ~DEFAULT_BRANCH: pull_request (1 approval, require_code_owner_review, dismiss_stale_reviews_on_push), non_fast_forward, deletion; bypass_actors []")
                 add("gh api --method PUT repos/$repo/environments/$prodEnv --input protection.json   # reviewers need GitHub Enterprise on a private repository; omit them otherwise — {\"reviewers\":[{\"type\":\"User\",\"id\":<reviewer id>}],\"deployment_branch_policy\":{\"protected_branches\":false,\"custom_branch_policies\":true}}")
                 add("gh api --method POST repos/$repo/environments/$prodEnv/deployment-branch-policies -f name=<default branch> -f type=branch")
@@ -859,16 +859,19 @@ internal class ProjectInit(
         const val STEP_CODEOWNERS: String = "codeowners"
         const val STEP_RULESET: String = "ruleset"
         const val CODEOWNERS_PATH: String = ".github/CODEOWNERS"
-        private const val CODEOWNERS_MESSAGE = "Thoryn config project: reviewers own production and the workflows"
-        val CODEOWNED_PATHS: List<String> = listOf("/.thoryn/environments/production/", "/.github/workflows/")
+        private const val CODEOWNERS_MESSAGE = "Thoryn config project: reviewers own production, the workflows and CODEOWNERS"
+        /** What the reviewers own, in this order — the same file the orchestrator (#3817) writes. */
+        val CODEOWNED_PATHS: List<String> = listOf("/.thoryn/environments/production/", "/.github/workflows/", "/.github/CODEOWNERS")
 
-        /** The config project's CODEOWNERS: the --reviewer logins own production's configuration and the workflows. */
-        fun codeownersFor(reviewers: List<String>): String = buildString {
-            append("# Thoryn config project (thoryn project init): changes to production's configuration and to the\n")
-            append("# workflows need a review by one of these code owners (ruleset ${GitHubCli.RULESET_NAME}).\n")
+        /**
+         * The config project's CODEOWNERS: the --reviewer logins own production's configuration, the workflows and the
+         * CODEOWNERS file itself (product-owner decision 2026-09-30) — exactly one line per path, nothing else.
+         */
+        fun codeownersFor(reviewers: List<String>): String {
             val owners = reviewers.joinToString(" ") { "@$it" }
-            CODEOWNED_PATHS.forEach { append("$it $owners\n") }
+            return CODEOWNED_PATHS.joinToString("") { "$it $owners\n" }
         }
+
         private const val MAX_TRUST_PAGES = 20
 
         /**

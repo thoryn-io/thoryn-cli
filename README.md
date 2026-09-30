@@ -514,7 +514,7 @@ thoryn project init config --repo acme/thoryn-config \
 Set up the config project acme/thoryn-config for workspace acme.
 
   repository      created  acme/thoryn-config (private) from thoryn-io/starter-config
-  codeowners      committed  .github/CODEOWNERS: @alice @bob own /.thoryn/environments/production/ and /.github/workflows/
+  codeowners      committed  .github/CODEOWNERS: @alice @bob own /.thoryn/environments/production/, /.github/workflows/, /.github/CODEOWNERS
   ruleset         created  thoryn-production-approval on main: pull request with 1 approval + code-owner review, stale approvals dismissed, no force-push or deletion, no bypass
   protection      set      GitHub environment thoryn-production: deploys from main only; required reviewers not offered by this GitHub plan (the ruleset carries the approval)
   environments    created  sandbox sandbox
@@ -541,9 +541,17 @@ immutable ids, the GitHub environment `thoryn-production` and the default branch
    `thoryn-production-approval` (adopted and updated on a re-run) requires a pull request with at least
    one approving review, requires a code-owner review, dismisses stale approvals on a new push, blocks
    force-pushes and deletion, and has **no bypass actors**.
-2. **CODEOWNERS.** `.github/CODEOWNERS` makes the `--reviewer` logins the owners of
-   `/.thoryn/environments/production/` and `/.github/workflows/`. An existing, different CODEOWNERS is a
-   conflict: the command stops unless you pass `--force`.
+2. **CODEOWNERS.** `.github/CODEOWNERS` makes the `--reviewer` logins the owners of production's
+   configuration, the workflows, and the CODEOWNERS file itself, so no one can drop the approval by editing
+   it without a reviewer. The file is exactly:
+
+   ```text
+   /.thoryn/environments/production/ @alice @bob
+   /.github/workflows/ @alice @bob
+   /.github/CODEOWNERS @alice @bob
+   ```
+
+   An existing, different CODEOWNERS is a conflict: the command stops unless you pass `--force`.
    - **With `--repo`, when this run creates the ruleset:** nothing was protected before, so CODEOWNERS is
      committed through the GitHub API first and the ruleset is enforced right after.
    - **With `--repo`, when the ruleset already exists:** an active ruleset is **never** disabled or weakened,
@@ -666,7 +674,7 @@ the same command again:
 | `You do not manage sandbox …` / `needs you to manage the workspace` (exit 4) | Managers delegate. Ask a workspace admin for `thoryn access grant member:<you> manager environment:<id>` (or `workspace:<id>`). |
 | `Production approval needs a reviewed pull request on the default branch, which GitHub Free does not support for private repositories.` (config; exit 4, or 3 when this run created the repository) | GitHub Free has no rulesets for a private repository, and a config project's production changes must go through a reviewed pull request. It is refused: there is no fallback. Use GitHub Pro, Team or Enterprise, or a public repository. This happens before anything is written in Thoryn, so nothing exists there. If `--repo` created the repository in this run, it is kept and the message names it. Delete it yourself (`gh repo delete <owner>/<name>`) if you do not want it. |
 | `required reviewers not offered by this GitHub plan` (config, success) | Not an error. GitHub offers environment reviewers for a private repository only on GitHub Enterprise. The reviewed pull request (ruleset + CODEOWNERS) carries the approval. |
-| `already has a different .github/CODEOWNERS` (config, exit 4) | Merge the two ownership lines into your CODEOWNERS and re-run, or re-run with `--force` to replace it. Once the approval ruleset exists, that replacement is a pull request. |
+| `already has a different .github/CODEOWNERS` (config, exit 4) | Merge the three ownership lines into your CODEOWNERS and re-run, or re-run with `--force` to replace it. Once the approval ruleset exists, that replacement is a pull request. |
 | `CODEOWNERS update pending review: <url>` (config, success) | The default branch is already protected, so the CLI does not commit to it: it opened (or reused) a pull request from `thoryn/codeowners`. Have a reviewer approve and merge it. |
 | `the protection step failed — gh: …` (exit 3) | GitHub refused the environment for another reason. Most often you lack admin rights on the repository. The message is GitHub's own. |
 | `cannot yet grant a machine client workspace-wide management` (exit 2, config) | The platform does not yet support `manager` on `workspace:<id>` for a client. Everything before it is kept and no variable is set. Re-run once it does. |

@@ -89,6 +89,13 @@ class ProjectBuildingBlocksTest {
     }
 
     @Test
+    fun `the config project's CODEOWNERS is exactly the three owned paths, in order, and the reviewers own CODEOWNERS itself`() {
+        assertThat(ProjectInit.codeownersFor(listOf("r1", "r2"))).isEqualTo(
+            "/.thoryn/environments/production/ @r1 @r2\n/.github/workflows/ @r1 @r2\n/.github/CODEOWNERS @r1 @r2\n",
+        )
+    }
+
+    @Test
     fun `trust names are deterministic per connection and repository`() {
         assertThat(ProjectInit.trustName("sandbox", 1044556677L)).isEqualTo("starter-sandbox-1044556677")
         assertThat(ProjectInit.trustName("production", 1044556677L)).isEqualTo("starter-production-1044556677")

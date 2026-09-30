@@ -76,8 +76,11 @@ class ProjectInitConfigTest : ProjectTestBase() {
             .contains("GitHub environment thoryn-production: deploys from main only; required reviewers alice, bob")
             .contains("thoryn-production-approval on main: pull request with 1 approval + code-owner review")
             .contains("each production run also waits for approval by: alice, bob")
-        assertThat(gh.files.getValue("acme/platform")[".github/CODEOWNERS"])
-            .contains("/.thoryn/environments/production/ @alice @bob").contains("/.github/workflows/ @alice @bob")
+        assertThat(gh.files.getValue("acme/platform")[".github/CODEOWNERS"]).isEqualTo(
+            "/.thoryn/environments/production/ @alice @bob\n" +
+                "/.github/workflows/ @alice @bob\n" +
+                "/.github/CODEOWNERS @alice @bob\n",
+        )
         assertThat(gh.rulesets.getValue("acme/platform").values.single()["enforcement"]).isEqualTo("active")
     }
 

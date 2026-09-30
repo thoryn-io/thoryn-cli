@@ -137,7 +137,7 @@ class ProjectInitApprovalTest : ProjectTestBase() {
             "gh api --method PUT repos/acme/platform/rulesets/4100 --input -", // enforced first: only tightens
             "gh api --method POST repos/acme/platform/git/refs -f ref=refs/heads/thoryn/codeowners -f sha=commit-main",
             "gh api --method PUT repos/acme/platform/contents/.github/CODEOWNERS --input -",
-            "gh api --method POST repos/acme/platform/pulls -f title=Thoryn config project: reviewers own production and the workflows " +
+            "gh api --method POST repos/acme/platform/pulls -f title=Thoryn config project: reviewers own production, the workflows and CODEOWNERS " +
                 "-f head=thoryn/codeowners -f base=main -f body=Proposed by `thoryn project init config`: the production approval needs these code owners. " +
                 "The default branch is protected by thoryn-production-approval, so this change needs a review like any other.",
         )
