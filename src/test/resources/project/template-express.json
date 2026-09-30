@@ -1,0 +1,40 @@
+{
+  "apiVersion": "thoryn.io/starter-template/v2",
+  "kind": "application",
+  "description": "An APPLICATION project: one web app, its OAuth application client and its own sandbox test user. It declares no environment and no workspace configuration (that is the workspace's CONFIG project). Nothing in the repository is rendered: the pipeline reads its wiring from the GitHub Actions variables below at run time. This file stays in the repository as the declaration of what the creation flow must set up.",
+  "variables": {
+    "THORYN_ISSUER": {
+      "level": "repository",
+      "description": "Platform base issuer the thoryn CLI signs in to, e.g. https://auth.stg.thoryn.org. Not the application's issuer: that one is resolved at run time (.thoryn/app-env.mjs)."
+    },
+    "THORYN_WORKSPACE": {
+      "level": "repository",
+      "description": "Slug of the Thoryn workspace the application belongs to."
+    },
+    "THORYN_ENVIRONMENT": {
+      "level": "repository",
+      "description": "Slug of the SANDBOX environment the application's client and test user live in, and that the workload identity trust is bound to."
+    },
+    "THORYN_WIF_CLIENT_ID": {
+      "level": "repository",
+      "description": "clientId (wi_...) of the workload identity trust created for this repository in that sandbox."
+    }
+  },
+  "connections": {
+    "sandbox": {
+      "description": "Who CI is: the workload identity trust in the sandbox. It provisions the app's client and a per-run test user, and reads the sandbox's test inbox.",
+      "production": false,
+      "clientIdVariable": "THORYN_WIF_CLIENT_ID",
+      "environmentVariable": "THORYN_ENVIRONMENT",
+      "provisionFile": ".thoryn/provision.yaml",
+      "scopes": [
+        "tenant:applications.read",
+        "tenant:applications.write",
+        "tenant:users.read",
+        "tenant:users.write",
+        "tenant:environments.read"
+      ],
+      "grant": { "relation": "manager", "on": "environment" }
+    }
+  }
+}

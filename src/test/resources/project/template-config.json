@@ -1,0 +1,59 @@
+{
+  "apiVersion": "thoryn.io/starter-template/v2",
+  "kind": "config",
+  "description": "The workspace's CONFIG project: configuration only, no app code. It owns the workspace-wide configuration (environments, sign-in methods, branding, email, identity providers, custom domain), one section per connection under .thoryn/environments/<connection>/. Nothing in the repository is rendered: the pipeline reads its wiring from the GitHub Actions variables below at run time. This file stays in the repository as the declaration of what the creation flow must set up.",
+  "github": {
+    "productionEnvironment": "thoryn-production"
+  },
+  "variables": {
+    "THORYN_ISSUER": {
+      "level": "repository",
+      "description": "Platform base issuer the thoryn CLI signs in to, e.g. https://auth.stg.thoryn.org."
+    },
+    "THORYN_WORKSPACE": {
+      "level": "repository",
+      "description": "Slug of the Thoryn workspace this project configures."
+    },
+    "THORYN_SANDBOX_ENVIRONMENT": {
+      "level": "repository",
+      "description": "Slug of the first sandbox environment. The production section declares it; the sandbox section configures it."
+    },
+    "THORYN_SANDBOX_WIF_CLIENT_ID": {
+      "level": "repository",
+      "description": "clientId (wi_...) of the workload identity trust for this repository in the sandbox environment."
+    },
+    "THORYN_PRODUCTION_WIF_CLIENT_ID": {
+      "level": "environment",
+      "environment": "thoryn-production",
+      "description": "clientId (wi_...) of the PRODUCTION workload identity trust for this repository. The trust pins the GitHub environment, and the variable lives in that environment, so only the production job can read it."
+    }
+  },
+  "connections": {
+    "production": {
+      "description": "The production workload identity trust. It pins the GitHub environment github.productionEnvironment (only jobs in it, never a pull request), declares the environments and converges production's own configuration.",
+      "production": true,
+      "clientIdVariable": "THORYN_PRODUCTION_WIF_CLIENT_ID",
+      "provisionFile": ".thoryn/environments/production/provision.yaml",
+      "scopes": [
+        "tenant:environments.read",
+        "tenant:environments.write",
+        "tenant:idp.read",
+        "tenant:idp.write"
+      ],
+      "grant": { "relation": "manager", "on": "workspace" }
+    },
+    "sandbox": {
+      "description": "The sandbox's workload identity trust. It converges that sandbox's configuration.",
+      "production": false,
+      "clientIdVariable": "THORYN_SANDBOX_WIF_CLIENT_ID",
+      "environmentVariable": "THORYN_SANDBOX_ENVIRONMENT",
+      "provisionFile": ".thoryn/environments/sandbox/provision.yaml",
+      "scopes": [
+        "tenant:environments.read",
+        "tenant:idp.read",
+        "tenant:idp.write"
+      ],
+      "grant": { "relation": "manager", "on": "environment" }
+    }
+  }
+}

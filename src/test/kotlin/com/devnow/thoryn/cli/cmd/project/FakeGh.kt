@@ -1,0 +1,184 @@
+package com.devnow.thoryn.cli.cmd.project
+
+import tools.jackson.databind.json.JsonMapper
+import tools.jackson.module.kotlin.kotlinModule
+import java.nio.file.Path
+import java.util.Base64
+
+/**
+ * SSO-3435 — a fake `gh`: an in-memory GitHub reached only through the invocations `thoryn project init` makes.
+ * It RECORDS every invocation (arguments, stdin, directory) so a test can assert the exact `gh` calls, and it
+ * answers anything it does not model with a failure, so an unexpected call fails the test. Never calls GitHub.
+ */
+internal class FakeGh : GhRunner {
+
+    data class Call(val args: List<String>, val stdin: String?, val dir: Path?) {
+        override fun toString(): String = "gh " + args.joinToString(" ")
+    }
+
+    class Env(var reviewers: List<Long> = emptyList(), var custom: Boolean = false, val policies: MutableList<Pair<Long, String>> = mutableListOf())
+
+    private val json = JsonMapper.builder().addModule(kotlinModule()).build()
+
+    val calls = mutableListOf<Call>()
+    var installed = true
+    var signedIn = true
+    val users = mutableMapOf("alice" to 501L, "bob" to 502L, "acme" to 900L)
+    /** fullName → repository record. */
+    val repos = linkedMapOf<String, MutableMap<String, Any?>>()
+    /** fullName → paths present on the default branch (for the contents API). */
+    val files = mutableMapOf<String, MutableSet<String>>()
+    /** template fullName → its declaration (null ⇒ the template repository is empty). */
+    val declarations = mutableMapOf<String, String?>()
+    val tarballs = mutableMapOf<String, ByteArray>()
+    /** clone directory → fullName (what `gh repo view` answers there). */
+    val clones = mutableMapOf<Path, String>()
+    /** "fullName/envName" → environment state. */
+    val environments = linkedMapOf<String, Env>()
+    /** "fullName[@env]:NAME" → value. */
+    val variables = linkedMapOf<String, String>()
+    var failProtectionWith: String? = null
+    /** When set, `gh variable set` fails with this stderr (e.g. one carrying a token-like string). */
+    var failVariablesWith: String? = null
+    private var nextRepoId = 1044556600L
+    private var nextPolicyId = 70L
+
+    fun seedRepo(fullName: String, defaultBranch: String = "main", private: Boolean = true): MutableMap<String, Any?> {
+        val (owner, name) = fullName.split('/')
+        val repo = linkedMapOf<String, Any?>(
+            "id" to nextRepoId++, "name" to name, "owner" to mapOf("login" to owner, "id" to (users[owner] ?: 900L)),
+            "default_branch" to defaultBranch, "html_url" to "https://github.com/$fullName", "private" to private,
+        )
+        repos[fullName] = repo
+        return repo
+    }
+
+    fun repoId(fullName: String): Long = repos.getValue(fullName)["id"] as Long
+
+    val invocations: List<String> get() = calls.map { it.toString() }
+
+    /** Calls that change GitHub (everything that is not a read). */
+    val mutations: List<String>
+        get() = calls.filter { c ->
+            c.args.firstOrNull() == "variable" || (c.args.firstOrNull() == "api" && c.args.getOrNull(1) == "--method")
+        }.map { it.toString() }
+
+    override fun run(args: List<String>, stdin: ByteArray?, dir: Path?): GhResult {
+        calls += Call(args, stdin?.toString(Charsets.UTF_8), dir)
+        if (!installed) throw GhNotInstalledException("the GitHub CLI (gh) is not installed or not on PATH")
+        return when {
+            args == listOf("--version") -> ok("gh version 2.100.0 (fake)")
+            args == listOf("auth", "status") -> if (signedIn) {
+                ok("github.com\n  ✓ Logged in to github.com account alice\n  - Token: gho_************************************")
+            } else {
+                GhResult(1, ByteArray(0), "You are not logged into any GitHub hosts. To log in, run: gh auth login")
+            }
+            args == listOf("repo", "view", "--json", "nameWithOwner") ->
+                clones[dir?.toAbsolutePath()?.normalize()]?.let { okJson(mapOf("nameWithOwner" to it)) }
+                    ?: GhResult(1, ByteArray(0), "no git remotes found")
+            args.firstOrNull() == "variable" -> variable(args)
+            args.firstOrNull() == "api" -> api(args.drop(1), stdin)
+            else -> unexpected(args)
+        }
+    }
+
+    private fun api(a: List<String>, stdin: ByteArray?): GhResult {
+        val method = if (a.firstOrNull() == "--method") a[1] else "GET"
+        val rest = if (a.firstOrNull() == "--method") a.drop(2) else a
+        val path = rest.first()
+        val fields = rest.drop(1).chunked(2).filter { it.size == 2 && (it[0] == "-f" || it[0] == "-F") }
+            .associate { it[1].substringBefore('=') to it[1].substringAfter('=') }
+        val seg = path.split('/')
+        return when {
+            method == "GET" && seg[0] == "users" && seg.size == 2 -> users[seg[1]]?.let { okJson(mapOf("id" to it, "login" to seg[1])) } ?: notFound()
+            method == "GET" && seg[0] == "repos" && seg.size == 3 -> repos["${seg[1]}/${seg[2]}"]?.let { okJson(it) } ?: notFound()
+            method == "GET" && seg[0] == "repos" && seg.size >= 4 && seg[3] == "contents" -> contents("${seg[1]}/${seg[2]}", seg.drop(4).joinToString("/"))
+            method == "GET" && seg[0] == "repos" && seg.size == 4 && seg[3] == "tarball" -> tarballs["${seg[1]}/${seg[2]}"]?.let { GhResult(0, it, "") } ?: notFound()
+            method == "POST" && seg[0] == "repos" && seg.size == 4 && seg[3] == "generate" -> generate("${seg[1]}/${seg[2]}", fields)
+            seg[0] == "repos" && seg.size >= 5 && seg[3] == "environments" -> environment("${seg[1]}/${seg[2]}", seg[4], seg.drop(5), method, fields, stdin)
+            else -> unexpected(listOf("api") + a)
+        }
+    }
+
+    private fun contents(fullName: String, path: String): GhResult {
+        if (fullName in declarations) {
+            val raw = declarations[fullName] ?: return GhResult(1, "{\"message\":\"This repository is empty.\"}".toByteArray(), "gh: This repository is empty. (HTTP 404)")
+            return if (path == StarterTemplateManifest.PATH) {
+                okJson(mapOf("type" to "file", "content" to Base64.getMimeEncoder().encodeToString(raw.toByteArray())))
+            } else {
+                notFound()
+            }
+        }
+        return if (files[fullName]?.contains(path) == true) okJson(mapOf("type" to "file", "content" to "")) else notFound()
+    }
+
+    private fun generate(template: String, fields: Map<String, String>): GhResult {
+        if (template !in tarballs && declarations[template] == null) return notFound()
+        val fullName = "${fields["owner"]}/${fields["name"]}"
+        if (fullName in repos) return GhResult(1, ByteArray(0), "gh: Name already exists on this account (HTTP 422)")
+        val repo = seedRepo(fullName, private = fields["private"] == "true")
+        repo["template_repository"] = mapOf("full_name" to template)
+        files[fullName] = mutableSetOf(StarterTemplateManifest.PATH)
+        return okJson(repo)
+    }
+
+    private fun environment(fullName: String, name: String, tail: List<String>, method: String, fields: Map<String, String>, stdin: ByteArray?): GhResult {
+        if (fullName !in repos) return notFound()
+        val key = "$fullName/$name"
+        return when {
+            tail.isEmpty() && method == "PUT" -> {
+                failProtectionWith?.let { return GhResult(1, ByteArray(0), it) }
+                @Suppress("UNCHECKED_CAST")
+                val body = json.readValue(stdin, Map::class.java) as Map<String, Any?>
+                val env = environments.getOrPut(key) { Env() }
+                @Suppress("UNCHECKED_CAST")
+                env.reviewers = (body["reviewers"] as List<Map<String, Any?>>).map { (it["id"] as Number).toLong() }
+                @Suppress("UNCHECKED_CAST")
+                env.custom = (body["deployment_branch_policy"] as Map<String, Any?>)["custom_branch_policies"] == true
+                okJson(mapOf("name" to name))
+            }
+            tail.isEmpty() && method == "GET" -> {
+                val env = environments[key] ?: return notFound()
+                val rules = if (env.reviewers.isEmpty()) {
+                    emptyList()
+                } else {
+                    listOf(mapOf("type" to "required_reviewers", "reviewers" to env.reviewers.map { mapOf("type" to "User", "reviewer" to mapOf("id" to it)) }))
+                }
+                okJson(mapOf("name" to name, "protection_rules" to rules, "deployment_branch_policy" to mapOf("protected_branches" to false, "custom_branch_policies" to env.custom)))
+            }
+            tail == listOf("deployment-branch-policies") && method == "GET" -> {
+                val env = environments[key] ?: return notFound()
+                okJson(mapOf("total_count" to env.policies.size, "branch_policies" to env.policies.map { mapOf("id" to it.first, "name" to it.second, "type" to "branch") }))
+            }
+            tail == listOf("deployment-branch-policies") && method == "POST" -> {
+                val env = environments[key] ?: return notFound()
+                env.policies += nextPolicyId++ to fields.getValue("name")
+                okJson(mapOf("name" to fields["name"]))
+            }
+            tail.size == 2 && tail[0] == "deployment-branch-policies" && method == "DELETE" -> {
+                val env = environments[key] ?: return notFound()
+                env.policies.removeIf { it.first == tail[1].toLong() }
+                GhResult(0, ByteArray(0), "")
+            }
+            else -> unexpected(listOf(method, fullName, name) + tail)
+        }
+    }
+
+    private fun variable(args: List<String>): GhResult {
+        // variable set NAME --body VALUE --repo O/N [--env E]
+        failVariablesWith?.let { return GhResult(1, ByteArray(0), it) }
+        if (args.getOrNull(1) != "set") return unexpected(args)
+        val name = args[2]
+        val opts = args.drop(3).chunked(2).associate { it[0] to it.getOrNull(1) }
+        val repo = opts["--repo"] ?: return unexpected(args)
+        if (repo !in repos) return notFound()
+        val env = opts["--env"]
+        variables[if (env == null) "$repo:$name" else "$repo@$env:$name"] = opts.getValue("--body")!!
+        return GhResult(0, ByteArray(0), "")
+    }
+
+    private fun ok(text: String) = GhResult(0, text.toByteArray(), "")
+    private fun okJson(value: Any?) = GhResult(0, json.writeValueAsBytes(value), "")
+    private fun notFound() = GhResult(1, "{\"message\":\"Not Found\"}".toByteArray(), "gh: Not Found (HTTP 404)")
+    private fun unexpected(args: List<String>) = GhResult(99, ByteArray(0), "FakeGh: unexpected invocation ${args.joinToString(" ")}")
+}

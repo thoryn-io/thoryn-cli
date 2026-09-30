@@ -79,6 +79,24 @@ class ProductApiClient(
     /** Current bearer material; swapped in place by the reactive refresh-on-401 retry. */
     private var tokens: Tokens = tokens
 
+    /**
+     * SSO-3435 — the scopes the token this client presents carries: the access token's `scope` (or `scp`)
+     * claim, else the scope the token response reported; null when neither is known (an opaque token). Used
+     * for a pre-flight scope-ceiling check so a request that product-api would refuse part-way is refused
+     * before anything is created; product-api still enforces the same rule on every call.
+     */
+    fun sessionScopes(): Set<String>? {
+        val claims = com.devnow.thoryn.cli.auth.JwtClaims.of(tokens.accessToken)
+        val claim = claims["scope"] ?: claims["scp"]
+        val fromClaim = when {
+            claim == null || claim.isNull -> null
+            claim.isArray -> claim.toList().mapNotNull { it.asString() }
+            else -> claim.asString().split(' ', ',')
+        }
+        val raw = fromClaim ?: tokens.scope?.split(' ', ',') ?: return null
+        return raw.map { it.trim() }.filter { it.isNotEmpty() }.toSet().takeIf { it.isNotEmpty() }
+    }
+
     // ── OAuth applications / clients (SSO-1552; product-api SSO-1027/SSO-1028) ─
     //
     // The CLI targets the `/api/v1/applications` surface (NOT the thinner

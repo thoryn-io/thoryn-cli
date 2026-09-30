@@ -215,6 +215,12 @@ thoryn workload-identity trusts list [--limit n] [--cursor c]         # GET    /
 thoryn workload-identity trusts get <id>                              # GET    /api/v1/workload-identity/trusts/{id} (+ the sign-in line)
 thoryn workload-identity trusts delete <id> [--yes] [--confirm <slug>] # DELETE /api/v1/workload-identity/trusts/{id}
 
+# Project repositories (SSO-3435, epic SSO-3304) — set up a GitHub repository that manages your workspace
+# (config) or connects one application (app), with your OWN gh CLI and no GitHub App. See "Project repositories".
+thoryn project init config [--repo owner/name] [--sandbox <slug>] --reviewer <login>… --confirm-production
+thoryn project init app --stack express|spring-boot|aspnet-core --environment <sandbox> [--repo owner/name]
+    # without --repo: works on the clone in the current directory (or --dir); [--force] [--public] [--template owner/repo]
+
 # Operator plane (SSO-3356) — Thoryn staff / self-managed platform operators only. Passkey sign-in on the
 # `thoryn` home with client thoryn-operator, stored APART from `thoryn login`; calls go to the hub's /admin
 # surface over a kubectl port-forward (never a public host). See "Operator commands" below.
@@ -473,6 +479,155 @@ Compare the job above with the trust (`thoryn workload-identity trusts get <id>`
 
 This retargets SSO-2879's `--workload-identity` (an operator-registered token exchange signed with a CI
 key; its `--tenant`, `--wif-*` and `--subject-token` flags are gone).
+
+### Project repositories — `thoryn project init` (SSO-3435, epic SSO-3304)
+
+`thoryn project init` sets up a GitHub repository for Thoryn from the command line, with **your own
+GitHub CLI (`gh`) and no GitHub App**. There are two kinds:
+
+- **config** — the repository that manages your workspace's configuration. It gets two secret-less
+  workload identity connections: **production** (manager of the workspace; its runs wait for a
+  reviewer's approval) and one **sandbox** (manager of that sandbox).
+- **app** — a repository that connects one application to an existing **sandbox**. It gets one
+  connection to that sandbox. It never gets a production trust.
+
+What each connection gets comes from the template's `.thoryn/template.json`
+(`thoryn.io/starter-template/v2`, published by thoryn-io/thoryn-starters): its exact scopes, its access
+grant, and the GitHub Actions variables to set. This is the same contract the console's GitHub App
+flow uses, so both set up a repository the same way.
+
+**Before you start.** Sign in (`thoryn login`, and `thoryn workspace switch <slug>` when you have more
+than one workspace). Install `gh` and run `gh auth login` as a GitHub user who can create repositories
+for the owner, and who is an admin of an existing repository. Thoryn never sees your GitHub token: it
+runs `gh` and `gh` authenticates on its own.
+
+#### A config project
+
+```bash
+# A new private repository, created from thoryn-io/starter-config:
+thoryn project init config --repo acme/thoryn-config \
+  --reviewer alice --reviewer bob --confirm-production
+# Optional: --sandbox <slug> picks (or creates) the sandbox. Default: the only sandbox, else a new `sandbox`.
+```
+
+```text
+Set up the config project acme/thoryn-config for workspace acme.
+
+  repository      created  acme/thoryn-config (private) from thoryn-io/starter-config
+  protection      set      GitHub environment thoryn-production: reviewers alice, bob; deploys from main only
+  environments    created  sandbox sandbox
+  workload-trust  created  sandbox: starter-sandbox-1044556677 → wi_… (in sandbox)
+  workload-trust  created  production: starter-production-1044556677 → wi_… (in production, GitHub environment thoryn-production)
+  access          granted  client:wi_… manager environment:<id>
+  access          granted  client:wi_… manager workspace:<id>
+  variables       set      THORYN_ISSUER, THORYN_WORKSPACE, THORYN_SANDBOX_ENVIRONMENT, THORYN_SANDBOX_WIF_CLIENT_ID (repository); THORYN_PRODUCTION_WIF_CLIENT_ID (environment thoryn-production)
+
+Next steps:
+  1. Clone it: gh repo clone acme/thoryn-config
+  2. GitHub's initial commit started a first workflow run before the variables existed, so its Thoryn jobs skipped. Re-run it …
+  3. Production runs wait in the GitHub environment thoryn-production for approval by: alice, bob.
+```
+
+The rules match the console's flow. There is one production connection. `--reviewer` (1–6 GitHub
+logins) and `--confirm-production` are required. You must be a manager of the workspace, and you must
+be signed in as yourself: a person, not a machine identity. The production trust pins the repository's
+immutable ids, the GitHub environment `thoryn-production` and the default branch. The GitHub environment
+is protected, with the required reviewers and a deployment-branch policy for the default branch only,
+**before** the production client id is set in it. The CLI reads the protection back before it sets
+`THORYN_PRODUCTION_WIF_CLIENT_ID`.
+
+#### An app project
+
+```bash
+# The sandbox must exist and you must manage it (thoryn env list):
+thoryn project init app --stack express --environment dev --repo acme/web
+# stacks: express | spring-boot | aspnet-core
+```
+
+#### In an existing clone
+
+Leave out `--repo` and run the command at the root of a clone of your GitHub repository, or pass
+`--dir <path>`. `gh repo view` names the repository. The template's files are added to the working
+tree:
+
+- An existing file with the same content is skipped.
+- An existing file with **different** content is never overwritten. The command lists the conflicts and
+  stops **before any change**. `--force` overwrites them.
+- Nothing is committed. The output ends with the `git add … && git commit … && git push` to run.
+
+```bash
+cd web && thoryn project init app --stack express --environment dev
+```
+
+#### Flags
+
+| Flag | Kind | Meaning |
+|---|---|---|
+| `--repo <owner/name>` | both | The GitHub repository. It is created from the template when it does not exist, and used as it is when it does. Leave it out to work on the clone. |
+| `--public` | both | Create the repository public. The default is private. Only with `--repo`. |
+| `--dir <path>` / `--force` | both | The clone's root / overwrite files that differ. Only without `--repo`. |
+| `--template <owner/repo>` | both | Start from another template repository, such as a mirror. The default is `thoryn-io/starter-<stack>`; for config, `thoryn-io/starter-config`. |
+| `--sandbox <slug>` | config | The sandbox to configure. It is created when it does not exist. |
+| `--reviewer <login>` | config | A GitHub user who approves every production run. Repeatable, 1–6, required. |
+| `--confirm-production` | config | Required. The project gets a production workload identity that manages the workspace. |
+| `--stack <stack>` | app | `express`, `spring-boot` or `aspnet-core`. |
+| `--environment <sandbox>` | app | The existing sandbox the application connects to. `production` is refused. |
+| `--output json\|yaml\|table`, `--json` | both | The report (steps, trusts, grants, variables, files, next steps) as JSON/YAML. |
+
+Exit codes: `0` done · `1` not signed in to Thoryn · `2` product-api refused a call · `3` a `gh` step
+failed · `4` a pre-flight check refused (nothing was changed) · `64` invalid flags.
+
+#### What it runs on GitHub (your `gh`)
+
+```text
+gh --version ; gh auth status                                     # installed, signed in (output never shown)
+gh api repos/<template>/contents/.thoryn/template.json             # the template's declaration (must be v2)
+gh api repos/<owner>/<name> ; gh api users/<login>                 # the repository's ids; the owner / each reviewer
+gh repo view --json nameWithOwner ; gh api repos/<template>/tarball # (clone only) the repository; the template's files
+gh api --method POST repos/<template>/generate -f owner=… -f name=… -F private=… -f description=…
+gh api --method PUT repos/<o>/<r>/environments/thoryn-production --input -      # (config) reviewers + custom branch policy
+gh api [--method POST|DELETE] repos/<o>/<r>/environments/thoryn-production/deployment-branch-policies[/<id>]
+gh api repos/<o>/<r>/environments/thoryn-production                 # (config) protection read back before its variable
+gh variable set <NAME> --body <value> --repo <o>/<r> [--env thoryn-production]
+```
+
+On Thoryn it uses your own session and the public customer-plane API: `GET /api/v1/environments`,
+`GET /api/v1/access/mine`, `POST /api/v1/environments` (config, only when the sandbox is missing),
+`GET`/`POST /api/v1/workload-identity/trusts` and `POST /api/v1/access/grants`.
+
+#### Nothing half-done, and safe to re-run
+
+Every check runs **before the first change**, on both sides. The checks are: the flags; your Thoryn
+session and your reach (you manage the sandbox, or the workspace for config); `gh` installed and signed
+in; the template (v2 and valid); the scope ceiling (a trust carries exactly the template's scopes, and
+you can grant only scopes you hold); the repository (it resolves, or its owner exists); the reviewers
+exist; file conflicts in a clone; and a conflicting trust.
+
+A later step can still fail on something no check can see, such as GitHub refusing the environment
+protection. The CLI then lists the steps it completed and stops. Every step can be repeated, so run
+the same command again:
+
+- The repository is re-used.
+- The protection is brought back to the required shape (other reviewers and extra branch policies are
+  replaced).
+- Trusts are adopted. A trust is found by its deterministic name, `starter-<connection>-<repository id>`.
+  A trust the console's GitHub App flow created is found by its pins: the same repository id,
+  GitHub environment, ref and scopes.
+- Grants and variables are upserts.
+- Identical files are skipped.
+
+#### Troubleshooting
+
+| You see | Why, and what to do |
+|---|---|
+| `gh is not installed` / `gh is not signed in` (exit 4) | Nothing was changed. Install `gh` and run `gh auth login`, then re-run. The output also lists the commands it would run, with your workspace, issuer, sandbox and ids filled in, if you want to do it by hand. |
+| `The template repository … has no .thoryn/template.json` or `declares apiVersion '…/v1'` (exit 4) | The published template is missing or older than this CLI. Nothing was changed. Re-run once the v2 template is published, or point `--template` at a repository that has one. |
+| `These files already exist with different content: …` (exit 4) | Move them aside and re-run, or re-run with `--force` to overwrite them. |
+| `Your session does not hold …` (exit 4) / `scope_not_grantable` (exit 2) | A trust can carry only scopes you hold. Run `thoryn login`: its default scopes include every scope the templates use. |
+| `You do not manage sandbox …` / `needs you to manage the workspace` (exit 4) | Managers delegate. Ask a workspace admin for `thoryn access grant member:<you> manager environment:<id>` (or `workspace:<id>`). |
+| `the protection step failed — gh: … (HTTP 422)` (exit 3) | GitHub supports required reviewers on a **private** repository only with GitHub Team or Enterprise. Upgrade, or use a public repository. You also need admin rights on the repository. |
+| `cannot yet grant a machine client workspace-wide management` (exit 2, config) | The platform does not yet support `manager` on `workspace:<id>` for a client. Everything before it is kept and no variable is set. Re-run once it does. |
+| `Trust 'starter-…' … exists but pins another …` (exit 4) | A trust with the deterministic name exists with other pins or scopes. Delete it (`thoryn workload-identity trusts delete <id> --environment <env>`) and re-run. |
 
 ### Least-privilege access grants (SSO-3113, epic SSO-3108)
 

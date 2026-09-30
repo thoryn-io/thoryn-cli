@@ -39,6 +39,15 @@ class ThorynMainTest {
         assertThat(out).contains("tenant")
         // SSO-3113 — least-privilege access grants.
         assertThat(out).contains("access")
+        // SSO-3435 — config / app project repositories through the user's own gh.
+        assertThat(out).contains("project")
+    }
+
+    @Test
+    fun `project init with no kind prints both kinds to stderr and exits 64`() {
+        val (exitCode, _, err) = run("project", "init")
+        assertThat(exitCode).isEqualTo(64)
+        assertThat(err).contains("Usage: thoryn project init config|app").contains("config").contains("app")
     }
 
     @Test
