@@ -40,6 +40,19 @@ import java.time.Duration
  * Any probe failure other than a `410` — unreachable, `404`, unparseable — answers [Status.Live]:
  * the probe exists only to recognise retirement, and every other failure is reported by the flow
  * that follows exactly as it was before.
+ *
+ * ## SSO-3415 — a workspace that moved to its custom domain names its successor
+ *
+ * Once a workspace's custom domain is ACTIVE, its platform host `{slug}.auth.<env>` answers the same
+ * `410`, and (oathy ADR `2026-09-25-custom-domains.md`, amendment 2026-09-28) the body NAMES the
+ * workspace's current issuer as the problem-details member `issuer` — `https://auth.acme.com`, or
+ * `https://auth.acme.com/{env}` on a sandbox path. [classify] reads it into [Status.Retired.successor]
+ * after [successorOf] has checked it. [resolve] follows it **once** for an issuer the CLI DERIVED from a
+ * workspace slug (the connection contract, `--workspace`): the platform host the CLI was already going to
+ * trust names where the workspace went, so no application repository has to change when a domain goes
+ * live. A successor that is itself retired is a chain and is refused, never followed further.
+ *
+ * The SSO-3377 fleet-wide retirement (`hub.` → `auth.`) names no successor and keeps its guidance.
  */
 object RetiredIssuer {
 
@@ -63,8 +76,11 @@ object RetiredIssuer {
         /** Not retired as far as the probe can tell (includes every non-410 answer and no answer). */
         data object Live : Status
 
-        /** `410` with `errorCode: issuer_retired` — the platform retired this host. */
-        data class Retired(val issuer: String, val detail: String?) : Status
+        /**
+         * `410` with `errorCode: issuer_retired` — the platform retired this host. [successor] is the
+         * issuer the platform named in its `issuer` member (SSO-3415), when it passed [successorOf].
+         */
+        data class Retired(val issuer: String, val detail: String?, val successor: String? = null) : Status
 
         /** A `410` that does not say `issuer_retired` — gone, for a reason the CLI does not recognise. */
         data class Gone(val issuer: String, val detail: String?) : Status
@@ -104,11 +120,115 @@ object RetiredIssuer {
         val detail = problem?.get("detail")?.asString()?.takeIf { it.isNotBlank() }
             ?: problem?.get("error_description")?.asString()?.takeIf { it.isNotBlank() }
         return if (isRetiredError(errorCode) || type == PROBLEM_TYPE) {
-            Status.Retired(issuer, detail)
+            Status.Retired(issuer, detail, successorOf(issuer, problem?.get(SUCCESSOR_MEMBER)?.asString()))
         } else {
             Status.Gone(issuer, detail)
         }
     }
+
+    /** SSO-3415 — the problem-details member a workspace's retired platform host names its current issuer in. */
+    const val SUCCESSOR_MEMBER: String = "issuer"
+
+    /**
+     * SSO-3415 — [raw] as a successor of [retiredIssuer], or null when it is not one the CLI will follow:
+     *
+     *  - `https` on a plain DNS name (at least two labels, an alphabetic top label — no IP literal, no
+     *    `localhost`), default port, no user-info / query / fragment; `http` only on a loopback host and
+     *    only when [retiredIssuer] is itself a loopback `http` issuer (a local stack — the same exception
+     *    [IssuerUrlValidator] makes). A remote platform can never send the CLI to plain HTTP.
+     *  - the same path as [retiredIssuer] — none for a workspace issuer, the same `/{env}` for a sandbox —
+     *    so a successor can move the HOST, never change which environment the caller asked about;
+     *  - not the retired issuer itself.
+     *
+     * The value is normalised (lower-case host, no trailing slash).
+     */
+    fun successorOf(retiredIssuer: String, raw: String?): String? {
+        val candidate = raw?.trim()?.trimEnd('/')?.takeIf { it.isNotEmpty() } ?: return null
+        return try {
+            val from = URI(retiredIssuer.trim().trimEnd('/'))
+            val to = URI(candidate)
+            if (to.rawUserInfo != null || to.rawQuery != null || to.rawFragment != null) return null
+            val host = to.host?.lowercase() ?: return null
+            val scheme = to.scheme?.lowercase() ?: return null
+            val acceptable = when (scheme) {
+                "https" -> isPublicDnsName(host) && (to.port == -1 || to.port == 443)
+                "http" -> isLoopback(host) && from.scheme?.lowercase() == "http" && isLoopback(from.host?.lowercase())
+                else -> false
+            }
+            if (!acceptable) return null
+            val path = to.rawPath.orEmpty().trimEnd('/')
+            if (path != from.rawPath.orEmpty().trimEnd('/')) return null
+            if (path.isNotEmpty() && !ENV_PATH.matches(path)) return null
+            normalize(to).takeIf { it != normalize(from) }
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /** SSO-3415 — how a DERIVED issuer resolved: still served, moved (once), or refused. */
+    sealed interface Resolution {
+        /** Not retired — use it as it is. */
+        data class Current(val issuer: String) : Resolution
+
+        /** Retired, and the platform named a live successor: use [to]. */
+        data class Moved(val from: String, val to: String) : Resolution
+
+        /** Retired with no usable successor, or gone: the SSO-3377 refusal applies. */
+        data class Stop(val status: Status) : Resolution
+
+        /** The named successor is itself retired or gone — a chain, which is never followed. */
+        data class ChainRefused(val from: String, val to: String, val next: Status) : Resolution
+    }
+
+    /**
+     * SSO-3415 — probe [issuer]; when it is retired and names a successor, probe the successor ONCE and
+     * use it if it is served. Never more than two discovery GETs, never a second hop.
+     */
+    fun resolve(issuer: String): Resolution {
+        val base = issuer.trim().trimEnd('/')
+        return when (val first = check(base)) {
+            Status.Live -> Resolution.Current(base)
+            is Status.Gone -> Resolution.Stop(first)
+            is Status.Retired -> {
+                val next = first.successor ?: return Resolution.Stop(first)
+                when (val second = check(next)) {
+                    Status.Live -> Resolution.Moved(base, next)
+                    else -> Resolution.ChainRefused(base, next, second)
+                }
+            }
+        }
+    }
+
+    /** SSO-3415 — the one line a sign-in prints when it followed a workspace to its new issuer. */
+    fun movedNotice(moved: Resolution.Moved, workspace: String?): String =
+        (workspace?.let { "Workspace '$it'" } ?: "This workspace") +
+            " now signs in at ${moved.to} (${moved.from} answered HTTP 410 $ERROR_CODE naming it); using ${moved.to}."
+
+    /** SSO-3415 — the guidance when the named successor is retired too: the CLI follows one hop only. */
+    fun chainGuidance(refused: Resolution.ChainRefused): String = buildString {
+        appendLine(
+            "Error: the issuer ${refused.from} has been retired (HTTP 410 $ERROR_CODE) and names ${refused.to}, " +
+                "which is not served either (HTTP 410). The CLI follows one move only.",
+        )
+        append("Check the workspace's current issuer (`thoryn domain status --json` prints it as `.issuer`) and sign in with it.")
+    }
+
+    /** `scheme://host[:port][/path]` — lower-case scheme and host, default https port dropped, no trailing slash. */
+    private fun normalize(uri: URI): String {
+        val scheme = uri.scheme?.lowercase()
+        val port = if (scheme == "https" && uri.port == 443) -1 else uri.port
+        val path = uri.rawPath.orEmpty().trimEnd('/').ifEmpty { null }
+        return URI(scheme, null, uri.host?.lowercase(), port, path, null, null).toString().trimEnd('/')
+    }
+
+    private fun isLoopback(host: String?): Boolean =
+        host != null && host.trim('[', ']') in setOf("127.0.0.1", "localhost", "::1")
+
+    private fun isPublicDnsName(host: String): Boolean =
+        DNS_NAME.matches(host) && host.substringAfterLast('.').any { it.isLetter() }
+
+    private val DNS_NAME = Regex("^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$")
+    private val ENV_PATH = Regex("^/[a-z0-9][a-z0-9-]{0,62}$")
 
     /** True when a token-endpoint / API error code is the retired-issuer one. */
     fun isRetiredError(errorCode: String?): Boolean = errorCode == ERROR_CODE
@@ -167,6 +287,8 @@ object RetiredIssuer {
         append("Error: the issuer ${retired.issuer} has been retired (HTTP 410 $ERROR_CODE)")
         retired.detail?.let { append(" — $it") }
         appendLine()
+        // SSO-3415 — an issuer the user NAMED is never swapped for them; say where the platform points.
+        retired.successor?.let { appendLine("The platform names this workspace's current issuer: $it") }
         if (remembered) {
             appendLine(
                 "$base was remembered from your previous sign-in on this machine; " +

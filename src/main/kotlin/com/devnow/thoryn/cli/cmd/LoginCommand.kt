@@ -367,26 +367,65 @@ class LoginCommand : Callable<Int> {
     ): Int? {
         for (candidate in candidates.map { it.trim().trimEnd('/') }.distinct()) {
             when (val status = RetiredIssuer.check(candidate)) {
-                is RetiredIssuer.Status.Retired -> {
-                    System.err.println(
-                        RetiredIssuer.loginGuidance(
-                            retired = status,
-                            base = baseIssuer.ifBlank { candidate },
-                            workspace = workspaceForSuggestion,
-                            remembered = hubSource == ThorynConfig.HubSource.PREVIOUS_SESSION,
-                            fix = fix,
-                        ),
-                    )
-                    return EXIT_USAGE
-                }
-                is RetiredIssuer.Status.Gone -> {
-                    System.err.println(RetiredIssuer.goneGuidance(status))
-                    return EXIT_USAGE
-                }
                 RetiredIssuer.Status.Live -> Unit
+                else -> return printRetiredRefusal(status, candidate, workspaceForSuggestion, fix)
             }
         }
         return null
+    }
+
+    /** SSO-3377 — print the refusal for a retired / gone [status] and answer [EXIT_USAGE]. */
+    private fun printRetiredRefusal(
+        status: RetiredIssuer.Status,
+        candidate: String,
+        workspaceForSuggestion: String?,
+        fix: (RetiredIssuer.Suggestion?) -> String,
+    ): Int {
+        when (status) {
+            is RetiredIssuer.Status.Retired -> System.err.println(
+                RetiredIssuer.loginGuidance(
+                    retired = status,
+                    base = baseIssuer.ifBlank { candidate },
+                    workspace = workspaceForSuggestion,
+                    remembered = hubSource == ThorynConfig.HubSource.PREVIOUS_SESSION,
+                    fix = fix,
+                ),
+            )
+            is RetiredIssuer.Status.Gone -> System.err.println(RetiredIssuer.goneGuidance(status))
+            RetiredIssuer.Status.Live -> Unit
+        }
+        return EXIT_USAGE
+    }
+
+    /** SSO-3415 — the issuer a derived sign-in goes on with, or the exit code it stops with. */
+    private sealed interface Followed {
+        data class Use(val issuer: String) : Followed
+        data class Stop(val exitCode: Int) : Followed
+    }
+
+    /**
+     * SSO-3415 — for an issuer the CLI DERIVED from a workspace slug (never one the user named): when its
+     * host is retired because the workspace now issues on its ACTIVE custom domain, the platform's `410`
+     * names the successor; follow it ONCE, say so on stderr, and go on with it. A `410` without a usable
+     * successor refuses exactly as [refuseRetiredIssuer] does (SSO-3377); a successor that is itself retired
+     * is a chain and is refused.
+     */
+    private fun followRetiredIssuer(
+        candidate: String,
+        workspaceForSuggestion: String?,
+        fix: (RetiredIssuer.Suggestion?) -> String,
+    ): Followed = when (val resolution = RetiredIssuer.resolve(candidate)) {
+        is RetiredIssuer.Resolution.Current -> Followed.Use(resolution.issuer)
+        is RetiredIssuer.Resolution.Moved -> {
+            System.err.println(RetiredIssuer.movedNotice(resolution, workspaceForSuggestion))
+            Followed.Use(resolution.to)
+        }
+        is RetiredIssuer.Resolution.Stop ->
+            Followed.Stop(printRetiredRefusal(resolution.status, candidate.trim().trimEnd('/'), workspaceForSuggestion, fix))
+        is RetiredIssuer.Resolution.ChainRefused -> {
+            System.err.println(RetiredIssuer.chainGuidance(resolution))
+            Followed.Stop(EXIT_USAGE)
+        }
     }
 
     /**
@@ -471,9 +510,16 @@ class LoginCommand : Callable<Int> {
         // SSO-3104 — the interactive flows sign in ON A WORKSPACE, never on the shared default tenant.
         if (!selectWorkspaceIssuer()) return EXIT_USAGE
         // SSO-3377 — before a browser opens (or a device code is requested) at a host that can only answer 410.
-        refuseRetiredIssuer(listOf(issuer), workspaceForSuggestion = signedInWorkspace) {
-            RetiredIssuer.defaultFix(it, if (useDeviceCode) "thoryn login --device-code" else "thoryn login")
-        }?.let { return it }
+        // SSO-3415 — the workspace issuer is DERIVED from the slug: when the workspace moved to its custom
+        // domain the platform names the new issuer, and the sign-in goes on there.
+        when (
+            val followed = followRetiredIssuer(issuer, workspaceForSuggestion = signedInWorkspace) {
+                RetiredIssuer.defaultFix(it, if (useDeviceCode) "thoryn login --device-code" else "thoryn login")
+            }
+        ) {
+            is Followed.Use -> issuer = followed.issuer
+            is Followed.Stop -> return followed.exitCode
+        }
         if (useDeviceCode) {
             return runDeviceCodeFlow()
         }
@@ -655,13 +701,19 @@ class LoginCommand : Callable<Int> {
         // `--issuer` (which `--connection` refuses).
         baseIssuer = hubBase.trim().trimEnd('/')
         val issuerEnv = if (connection.hubBaseUrlEnv == Connection.DEFAULT_HUB_BASE_URL_ENV) ThorynConfig.ISSUER_ENV else connection.hubBaseUrlEnv
-        refuseRetiredIssuer(listOf(derivedIssuer), workspaceForSuggestion = connection.slug) { suggestion ->
-            val value = suggestion?.issuer ?: "<the platform's current issuer>"
-            "Set $issuerEnv=$value and run `thoryn login --connection ${file.path}` again."
-        }?.let { return it }
+        // SSO-3415 — a workspace that moved to its custom domain is followed to it (the 410 names it).
+        val workspaceIssuer = when (
+            val followed = followRetiredIssuer(derivedIssuer, workspaceForSuggestion = connection.slug) { suggestion ->
+                val value = suggestion?.issuer ?: "<the platform's current issuer>"
+                "Set $issuerEnv=$value and run `thoryn login --connection ${file.path}` again."
+            }
+        ) {
+            is Followed.Use -> followed.issuer
+            is Followed.Stop -> return followed.exitCode
+        }
 
         val flow = ClientCredentialsFlow(
-            issuer = derivedIssuer,
+            issuer = workspaceIssuer,
             clientId = connection.clientId,
             clientSecret = secret,
             sender = realHttpSender(),
@@ -674,11 +726,13 @@ class LoginCommand : Callable<Int> {
             val tokens = flow.run(requestedScope)
             persistSession(
                 tokens.copy(
-                    issuer = derivedIssuer,
+                    issuer = workspaceIssuer,
                     gateway = derivedGateway,
                     platformIssuer = hubBase.trim().trimEnd('/'), // SSO-3379 — the base the workspace issuer was composed from
                     authMode = Tokens.AUTH_MODE_CLIENT_CREDENTIALS,
                     clientId = connection.clientId,
+                    // SSO-3415 — the contract's workspace; a custom-domain issuer does not spell the slug.
+                    workspace = connection.slug,
                 ),
             )
             // SSO-2863 — a fresh login resets the base tenant; drop any stale workspace selection.
@@ -772,9 +826,24 @@ class LoginCommand : Callable<Int> {
                 return EXIT_USAGE
             }
         }
+        // SSO-3415 — a DERIVED audience whose platform host is retired because the workspace moved to its custom
+        // domain: the 410 names the custom-domain issuer (with the same `/{env}`), which IS the trust's audience
+        // now (oathy SSO-3307 D5). Follow it once; the token endpoint is then derived from it.
+        var followedAudience = audience
+        if (connection.audience == null) {
+            baseIssuer = hubBase?.trim()?.trimEnd('/') ?: baseIssuer
+            when (
+                val followed = followRetiredIssuer(audience, workspaceForSuggestion = connection.slug) { suggestion ->
+                    customDomainAudienceFix(suggestion, connection, file)
+                }
+            ) {
+                is Followed.Use -> followedAudience = followed.issuer
+                is Followed.Stop -> return followed.exitCode
+            }
+        }
         return signInWithWorkloadIdentity(
             clientIdValue = connection.clientId,
-            audience = audience,
+            audience = followedAudience,
             explicitTokenEndpoint = connection.tokenEndpoint,
             requestedScope = connection.scopes.joinToString(" "),
             platformBase = hubBase?.trim()?.trimEnd('/'),
@@ -786,6 +855,8 @@ class LoginCommand : Callable<Int> {
             } else {
                 null
             },
+            // SSO-3415 — a derived audience was already probed (and, if it moved, its successor too).
+            alreadyProbed = connection.audience == null,
         )
     }
 
@@ -795,9 +866,10 @@ class LoginCommand : Callable<Int> {
      * Two causes share that answer. When the retired host is a pre-SSO-3297 `hub.` host, [suggestion] names the
      * platform's successor and the fix is the base-issuer env var. Otherwise the platform host of THIS workspace
      * is retired because the workspace now issues on its ACTIVE custom domain (custom-domains ADR §5 — one issuer
-     * at a time), and the trust's audience moved with it (oathy SSO-3307 D5). The platform's `410` deliberately
-     * does not name the custom domain, and nothing else answers anonymously, so the CLI cannot resolve it at run
-     * time: the contract must name it in `auth.audience`, exactly as the trust prints it.
+     * at a time), and the trust's audience moved with it (oathy SSO-3307 D5). Since SSO-3415 the platform's `410`
+     * names the custom-domain issuer and [followRetiredIssuer] follows it, so this guidance is reached only when the
+     * answer names no usable successor (a platform older than SSO-3415, or a successor on another environment path):
+     * the contract must then name the audience in `auth.audience`, exactly as the trust prints it.
      */
     private fun customDomainAudienceFix(suggestion: RetiredIssuer.Suggestion?, connection: Connection, file: File): String {
         if (suggestion != null) {
@@ -831,6 +903,8 @@ class LoginCommand : Callable<Int> {
         reLogin: String,
         /** SSO-3413 — how to fix a retired audience, when the caller knows better than the default line. */
         retiredFix: ((RetiredIssuer.Suggestion?) -> String)? = null,
+        /** SSO-3415 — the caller already resolved [audience] through [followRetiredIssuer]. */
+        alreadyProbed: Boolean = false,
     ): Int {
         try {
             IssuerUrlValidator.validate(audience, devMode)
@@ -857,13 +931,15 @@ class LoginCommand : Callable<Int> {
 
         // SSO-3377 — a retired host can only refuse; stop before asking GitHub for a job token.
         baseIssuer = base
-        refuseRetiredIssuer(listOf(audience), workspaceForSuggestion = null) { suggestion ->
-            retiredFix?.invoke(suggestion) ?: (
-                "The trust's audience moved with the platform" +
-                    (suggestion?.let { " (now ${it.issuer})" } ?: "") +
-                    ": read the current one with `thoryn workload-identity trusts get <id>` and sign in with it."
-                )
-        }?.let { return it }
+        if (!alreadyProbed) {
+            refuseRetiredIssuer(listOf(audience), workspaceForSuggestion = null) { suggestion ->
+                retiredFix?.invoke(suggestion) ?: (
+                    "The trust's audience moved with the platform" +
+                        (suggestion?.let { " (now ${it.issuer})" } ?: "") +
+                        ": read the current one with `thoryn workload-identity trusts get <id>` and sign in with it."
+                    )
+            }?.let { return it }
+        }
 
         val binding = WorkloadIdentityBinding(clientIdValue, audience, tokenEndpoint, requestedScope, pins)
         val flow = WorkloadIdentityFlow(
