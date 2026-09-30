@@ -24,7 +24,7 @@ import java.util.concurrent.Callable
  *  - subjects: `member:<sub>`, `client:<clientId>`
  *  - objects:  `workspace:<tenantId>`, `environment:<id>`, `application:<clientId>`, `user:<id>`,
  *              `federation_member:<id>`, `email_provider:<envSlug>`, `login_theme:<envSlug>`,
- *              `login_flow:<envSlug>`, `login_methods:<envSlug>`
+ *              `login_flow:<envSlug>`, `login_methods:<envSlug>`, `custom_domain:<tenantId>` (SSO-3434)
  *  - relations: `manager`, `viewer`
  *
  * Subcommands:
@@ -230,6 +230,8 @@ class AccessCommand : Callable<Int> {
         val OBJECT_TYPES: Set<String> = setOf(
             "workspace", "environment", "application", "user", "federation_member",
             "email_provider", "login_theme", "login_flow", "login_methods",
+            // SSO-3434 — the workspace's custom-domain singleton (SSO-3413), `custom_domain:<tenantId>`.
+            "custom_domain",
         )
 
         /** Relations of the SSO-3112 contract. */
