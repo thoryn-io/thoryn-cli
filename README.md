@@ -152,6 +152,9 @@ thoryn examples share    <name> [--output <file>]   # SSO-2876 — export the se
 # band ⇒ re-created. Apply twice issues no writes. Secrets never enter the file — name the env var (`passwordEnv`,
 # `smtpPasswordEnv`, `clientSecretEnv`) or use `{{env.NAME}}`; they are resolved at apply and never
 # recorded. Production-plane removals need `--confirm <workspace-slug>` (the SSO-2413 gate).
+# SSO-3430: a resource's `environment:` may also be `{{env.NAME}}` (e.g. "{{env.THORYN_ENVIRONMENT}}", how an
+# unrendered starter repository names its sandbox from a CI variable); it is resolved when the file is read,
+# and an unset variable is an error for plan and apply alike.
 thoryn provision plan    [--file <path>] [--prune]                                  # read-only: what apply would create / remove (+ grant changes)
 thoryn provision apply   [--file <path>] [--prune] [--confirm <ws>] [--yes] \
                          [--secret-file <path>] [--force-stdout]                   # converge; environments first, dependants into them.
