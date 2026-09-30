@@ -354,7 +354,7 @@ class ProjectCommand : Callable<Int> {
                 "error" to code,
                 "errorDescription" to description,
                 "hint" to hint,
-                "changed" to (init?.steps?.isNotEmpty() ?: false),
+                "changed" to (init?.steps?.any { it.status in CHANGED } ?: false),
                 "completedSteps" to init?.steps.orEmpty().map { linkedMapOf("step" to it.name, "status" to it.status, "detail" to it.detail) },
             ).apply { putAll(extra) }
 

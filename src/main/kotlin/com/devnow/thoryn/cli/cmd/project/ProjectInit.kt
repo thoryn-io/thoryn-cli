@@ -248,7 +248,11 @@ internal class ProjectInit(
         val productionGithubEnvironment = manifest.productionGithubEnvironment
         if (config) {
             currentStep = STEP_PROTECTION
-            github.protectEnvironment(repo, productionGithubEnvironment!!, reviewerIds, repo.defaultBranch, STEP_PROTECTION)
+            try {
+                github.protectEnvironment(repo, productionGithubEnvironment!!, reviewerIds, repo.defaultBranch, STEP_PROTECTION)
+            } catch (ex: GhPlanLimitException) {
+                throw planLimitRefusal(repo)
+            }
             step(STEP_PROTECTION, "set", "GitHub environment $productionGithubEnvironment: reviewers ${request.reviewers.joinToString(", ")}; deploys from ${repo.defaultBranch} only")
             report["productionEnvironment"] = linkedMapOf(
                 "githubEnvironment" to productionGithubEnvironment, "reviewers" to request.reviewers, "branch" to repo.defaultBranch,
@@ -659,6 +663,29 @@ internal class ProjectInit(
             "$what. Nothing was changed — not on GitHub, not in Thoryn.",
             "$fix, then re-run: ${request.commandLine}",
             mapOf("manualSteps" to manual),
+        )
+    }
+
+    /**
+     * A private config repository on a GitHub plan without environment reviewers: refused, no fallback (product-owner
+     * settlement 2026-09-30). Protection runs before any Thoryn write, so the only thing that can remain is a
+     * repository this run created with --repo — it is kept, never deleted. Exit [EXIT_CHECK] when nothing changed,
+     * [EXIT_GH] when that repository was created.
+     */
+    private fun planLimitRefusal(repo: GhRepository): Stop {
+        val created = steps.firstOrNull { it.name == STEP_REPOSITORY }?.status == "created"
+        val remains = if (created) {
+            "What remains: the repository ${repo.fullName}, which this run created (private, from ${request.template}). It is kept; " +
+                "delete it yourself if you do not want it (gh repo delete ${repo.fullName}), or re-run with --public on a new name. " +
+                "Nothing was created in Thoryn."
+        } else {
+            "Nothing was changed — not on GitHub, not in Thoryn."
+        }
+        return Stop(
+            if (created) EXIT_GH else EXIT_CHECK, "github_plan_required",
+            "Production approval needs GitHub Team or Enterprise for a private repository. Upgrade the plan or use a public repository.",
+            remains,
+            mapOf("repositoryCreated" to created, "repository" to repo.fullName),
         )
     }
 

@@ -139,11 +139,8 @@ class GitHubCli(private val gh: GhRunner) {
         )
         val put = gh.run(listOf("api", "--method", "PUT", path, "--input", "-"), stdin = json.writeValueAsBytes(body))
         if (!put.ok) {
-            throw GhCommandException(
-                step, put,
-                "GitHub refused to protect the environment. Required reviewers on a PRIVATE repository need GitHub " +
-                    "Team or Enterprise (or make the repository public); you need admin rights on the repository.",
-            )
+            if (reviewersNeedPaidPlan(repository, put)) throw GhPlanLimitException(step, put)
+            throw GhCommandException(step, put, "GitHub refused to protect the environment; you need admin rights on the repository.")
         }
         val list = gh.run(listOf("api", "$path/deployment-branch-policies"))
         if (!list.ok) throw GhCommandException(step, list)
@@ -186,12 +183,28 @@ class GitHubCli(private val gh: GhRunner) {
         return reviewerIds.isNotEmpty() && reviewers.containsAll(reviewerIds) && customBranches
     }
 
+    /**
+     * True when GitHub refused the environment's required reviewers because the repository is PRIVATE on a plan
+     * without them (GitHub Free / Pro for a private repository): a 422 whose message names reviewers or the plan.
+     * Any other refusal — another 422, a 403 for missing admin rights — is not relabelled.
+     */
+    internal fun reviewersNeedPaidPlan(repository: GhRepository, put: GhResult): Boolean =
+        repository.private && put.httpStatus() == 422 && PLAN_LIMIT.containsMatchIn(put.stderr + "\n" + put.text)
+
     /** Create or update one Actions variable (never a secret) at repository level, or in [environment]. */
     fun setVariable(repository: GhRepository, name: String, value: String, environment: String?, step: String) {
         val args = mutableListOf("variable", "set", name, "--body", value, "--repo", repository.fullName)
         if (environment != null) args += listOf("--env", environment)
         val r = gh.run(args)
         if (!r.ok) throw GhCommandException(step, r)
+    }
+
+    companion object {
+        /** GitHub's wording when a plan lacks environment protection rules for a private repository. */
+        private val PLAN_LIMIT = Regex(
+            "(?i)(required reviewers|reviewers? (are|is) not available|protection rules? (are|is) not available|" +
+                "upgrade to github|github (team|enterprise|pro)\\b|your (current )?plan|not available for (this|private) repositor)",
+        )
     }
 
     private fun node(r: GhResult, step: String): JsonNode = try {

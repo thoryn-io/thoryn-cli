@@ -188,15 +188,44 @@ class ProjectInitConfigTest : ProjectTestBase() {
     }
 
     @Test
-    fun `GitHub refusing the protection stops before any Thoryn trust exists`() {
-        gh.failProtectionWith = "gh: Failed to create the environment: required reviewers are not available for this repository (HTTP 422)"
+    fun `a private repository on a plan without environment reviewers is refused, and the repository it created is named and kept`() {
+        gh.failProtectionWith = "gh: Failed to create the environment protection rules: required reviewers are not available for this repository (HTTP 422)"
 
-        val (exit, _, err) = runCli(*base, "--repo", "acme/platform")
+        val (exit, out, err) = runCli(*base, "--repo", "acme/platform")
 
-        assertThat(exit).isEqualTo(ProjectInit.EXIT_GH)
-        assertThat(err).contains("the protection step failed").contains("GitHub Team or Enterprise")
+        assertThat(exit).isEqualTo(ProjectInit.EXIT_GH) // the run created the repository, so not "nothing changed"
+        assertThat(err).contains("Production approval needs GitHub Team or Enterprise for a private repository. Upgrade the plan or use a public repository.")
+            .contains("What remains: the repository acme/platform, which this run created").contains("Nothing was created in Thoryn")
+        assertThat(out).isEmpty()
+        assertThat(gh.repos).containsKey("acme/platform") // kept, never deleted
+        assertThat(gh.invocations).noneMatch { it.contains("DELETE") && !it.contains("deployment-branch-policies") }
+        assertThat(api.writes).isEmpty()
         assertThat(api.trusts).isEmpty()
-        assertThat(api.grants).isEmpty()
         assertThat(gh.variables).isEmpty()
+
+        val json = runCli(*base, "--repo", "acme/platform", "--json")
+        assertThat(json.exit).isEqualTo(ProjectInit.EXIT_CHECK) // the repository now exists: this run changed nothing
+        assertThat(parseJson(json.out)).containsEntry("error", "github_plan_required").containsEntry("repositoryCreated", false)
+            .containsEntry("changed", false)
+        assertThat(api.writes).isEmpty()
+    }
+
+    @Test
+    fun `other GitHub refusals of the protection are not relabelled as a plan limit`() {
+        gh.failProtectionWith = "gh: Validation Failed: branch name is invalid (HTTP 422)"
+        val otherValidation = runCli(*base, "--repo", "acme/platform")
+        assertThat(otherValidation.exit).isEqualTo(ProjectInit.EXIT_GH)
+        assertThat(otherValidation.err).contains("the protection step failed — gh: gh: Validation Failed").doesNotContain("GitHub Team or Enterprise")
+
+        gh.seedRepo("acme/open", private = false)
+        gh.failProtectionWith = "gh: required reviewers are not available for this repository (HTTP 422)"
+        val publicRepo = runCli(*base, "--repo", "acme/open")
+        assertThat(publicRepo.err).doesNotContain("GitHub Team or Enterprise")
+
+        gh.failProtectionWith = "gh: Must have admin rights to Repository. (HTTP 403)"
+        val forbidden = runCli(*base, "--repo", "acme/platform")
+        assertThat(forbidden.exit).isEqualTo(ProjectInit.EXIT_GH)
+        assertThat(forbidden.err).contains("admin rights").doesNotContain("GitHub Team or Enterprise")
+        assertThat(api.writes).isEmpty()
     }
 }

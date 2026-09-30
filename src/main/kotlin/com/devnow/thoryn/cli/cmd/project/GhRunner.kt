@@ -81,3 +81,9 @@ class ProcessGhRunner(
         val EXTRA_ENV: Map<String, String> = mapOf("GH_PROMPT_DISABLED" to "1")
     }
 }
+
+/**
+ * GitHub refused the production environment's required reviewers because the repository is private on a plan
+ * without them (product-owner settlement 2026-09-30, epic SSO-3304: refuse and explain; there is no fallback).
+ */
+class GhPlanLimitException(val step: String, val result: GhResult) : RuntimeException("required reviewers unavailable on this plan")
