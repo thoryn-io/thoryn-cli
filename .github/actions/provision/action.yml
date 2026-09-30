@@ -27,7 +27,8 @@
 #      `thoryn provision apply --file <file> --yes`. The receipt the CLI writes NEXT TO the file
 #      (`<name>.receipt.json`, secret-free) is the ownership ledger.
 #   4. Exposes the workspace slug (from the contract), the provisioned environment slug, the client
-#      id, the per-tenant issuer and the receipt path as outputs (read from the receipt).
+#      id and the receipt path (read from the receipt), and the per-workspace issuer the CLI resolved at
+#      sign-in (`thoryn whoami --output json` — the custom domain once it is ACTIVE, SSO-3415).
 #   5. `thoryn provision destroy --file <file> --yes` in an `if: always()` step (unless
 #      `destroy: "false"`): removes everything the receipt owns, child-first — the sandbox hard-delete
 #      cascades the client. Guaranteed on failure so a broken run never leaks a sandbox.
@@ -122,7 +123,10 @@ outputs:
     description: "Client id of the (first) OAuth application the file provisioned."
     value: ${{ steps.apply.outputs.client-id }}
   issuer:
-    description: "Per-workspace OIDC issuer (https://<slug>.<label>.<env> — auth. after the SSO-3297 cutover)."
+    description: >-
+      Per-workspace OIDC issuer as the CLI resolved it at sign-in: https://<slug>.auth.<env>, or the
+      workspace's custom domain (https://auth.acme.com) once that is ACTIVE (SSO-3415). Never carries a
+      sandbox /{env} segment.
     value: ${{ steps.apply.outputs.issuer }}
   receipt:
     description: "Path of the secret-free provisioning receipt (<file-name>.receipt.json, next to the file)."
@@ -218,7 +222,6 @@ runs:
       shell: bash
       env:
         FILE: ${{ inputs.file }}
-        ISSUER: ${{ inputs.issuer != '' && inputs.issuer || inputs.hub }}
         CONNECTION: ${{ inputs.connection }}
         THORYN_CI_PLAINTEXT_TOKENS: "1"
       run: |
@@ -242,10 +245,13 @@ runs:
 
         environment="$(jq -r '[.resources[] | select(.kind=="environment") | .attributes.slug] | first // ""' "$receipt")"
         client="$(jq -r '[.resources[] | select(.kind=="application") | .id] | first // ""' "$receipt")"
-        # Per-workspace issuer: <label>.<env> -> <slug>.<label>.<env> (mirrors ThorynConfig.tenantIssuer).
-        # SSO-3296 — the LABEL is captured from the base issuer, never hard-coded, so this is correct
-        # before and after the SSO-3297 cutover (hub. today, auth. after).
-        tenant_issuer="$(printf '%s' "$ISSUER" | sed -E "s#://(auth|hub)\.#://${slug}.\1.#")"
+        # SSO-3415 — the per-workspace issuer is the one the CLI RESOLVED at sign-in (the session's
+        # issuer), never re-derived here: once the workspace's custom domain is ACTIVE its platform host
+        # answers 410 naming the custom-domain issuer, and the CLI signed in there. The session issuer of
+        # a sandbox workload-identity sign-in carries `/{env}`; the workspace issuer is its origin (a
+        # workspace issuer — platform host or custom domain — never has a path).
+        tenant_issuer="$(java -jar thoryn.jar whoami --output json | jq -r '(.issuer // "") | (capture("^(?<origin>https?://[^/]+)").origin // "")')"
+        [ -n "$tenant_issuer" ] || { echo "::error::the CLI session names no issuer after sign-in (thoryn whoami --output json)." >&2; exit 1; }
 
         {
           echo "workspace-slug=$slug"

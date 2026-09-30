@@ -275,6 +275,13 @@ thoryn domain status                     # PENDING → VERIFIED → ACTIVE; SUSP
 thoryn domain remove --yes
 ```
 
+- Once the domain is `ACTIVE`, the workspace's platform host answers `410 issuer_retired` and names the new
+  issuer (SSO-3415). A sign-in whose issuer the CLI derives from the workspace slug — `--workspace`, a
+  `--connection` contract, a derived workload-identity audience — follows it **once** and prints
+  `Workspace 'acme' now signs in at https://auth.acme.com …`, so application projects need no change when
+  the domain goes live. Only `https` on a plain DNS name, with the same `/<environment>` path, is followed;
+  a successor that is itself retired is refused. An issuer or `--audience` you named yourself is never
+  swapped: the refusal names the platform's successor and you choose.
 - A custom domain **changes the workspace's issuer** once it is `ACTIVE`. If the workspace already has
   production users, `add` is refused (`production_users_present`) until you pass `--accept-re-sign-in`;
   the acceptance is recorded and audited.
@@ -416,7 +423,8 @@ Or commit the binding as a connection contract and run `thoryn login --connectio
 
 - `audience` is the trust's audience **exactly** (the workspace issuer, plus `/<environment>` for a
   sandbox, or the custom domain when one is active). Omit it and give `"environment": "<slug>"` to have the
-  CLI derive it from `workspace.slug` and `THORYN_ISSUER`. `tokenEndpoint` (default `<audience>/oauth2/token`)
+  CLI derive it from `workspace.slug` and `THORYN_ISSUER`; when the workspace's custom domain is active, the
+  derived audience's platform host names the custom-domain issuer and the CLI uses that (SSO-3415). `tokenEndpoint` (default `<audience>/oauth2/token`)
   must be on the audience's origin — the CLI never sends a job token anywhere else.
 - `github` is optional and grants nothing: it only lets the CLI name the field that differs when a
   sign-in is refused.
@@ -615,6 +623,11 @@ call, made with `--issuer`. After that sign-in, later ones reuse the new issuer.
 contract is told which env var to change instead (`Set THORYN_ISSUER=… and run … again`), since it
 refuses `--issuer`. A `410` that does not say `issuer_retired` is reported as a plain "answered HTTP 410
 Gone" with no suggestion.
+
+A **workspace** that moved to its custom domain is different (SSO-3415): its platform host's `410` names
+the new issuer, and a sign-in whose issuer the CLI derived from the workspace slug follows it once (see
+[Custom domain](#custom-domain-sso-3303-epic-sso-3290)). The fleet-wide `hub.` → `auth.` move above names no successor and keeps
+this guidance.
 
 Commands that run on a session remembered from a retired issuer (a refresh, an API-key re-mint, a
 `workspace switch` exchange, a hub call) print the same guidance instead of a bare `HTTP 401` or
