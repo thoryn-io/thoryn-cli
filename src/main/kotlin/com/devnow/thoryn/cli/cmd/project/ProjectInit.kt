@@ -214,7 +214,24 @@ internal class ProjectInit(
         } else {
             emptyList()
         }
-        val files = if (request.repo == null) planFiles() else emptyList()
+        val codeowners = if (config) codeownersFor(request.reviewers) else null
+        // --repo on an existing repository: its CODEOWNERS is committed through the API; a different one is a conflict.
+        val remoteCodeowners = if (config && request.repo != null && repository != null) {
+            github.readFile(repository, CODEOWNERS_PATH, STEP_PREFLIGHT).also { existing ->
+                if (existing != null && existing.content != codeowners && !request.force) {
+                    throw Stop(
+                        EXIT_CHECK, "file_conflicts",
+                        "${repository.fullName} already has a different $CODEOWNERS_PATH. Nothing was changed.",
+                        "The config project's reviewers must own /.thoryn/environments/production/ and /.github/workflows/. " +
+                            "Merge those two lines into it yourself and re-run, or re-run with --force to replace it.",
+                        mapOf("conflicts" to listOf(CODEOWNERS_PATH)),
+                    )
+                }
+            }
+        } else {
+            null
+        }
+        val files = if (request.repo == null) planFiles(codeowners) else emptyList()
 
         val targets = buildList {
             val (sandboxName, sandboxSpec) = manifest.sandboxConnection
@@ -246,16 +263,40 @@ internal class ProjectInit(
         )
 
         val productionGithubEnvironment = manifest.productionGithubEnvironment
+        var rulesetId: Long? = null
+        var environmentReviewers = false
         if (config) {
-            currentStep = STEP_PROTECTION
-            try {
-                github.protectEnvironment(repo, productionGithubEnvironment!!, reviewerIds, repo.defaultBranch, STEP_PROTECTION)
+            // Production approval, all BEFORE any Thoryn write (a plan refusal leaves nothing in the workspace).
+            currentStep = STEP_APPROVAL
+            rulesetId = try {
+                approvalRuleset(repo, codeowners!!, remoteCodeowners)
             } catch (ex: GhPlanLimitException) {
                 throw planLimitRefusal(repo)
             }
-            step(STEP_PROTECTION, "set", "GitHub environment $productionGithubEnvironment: reviewers ${request.reviewers.joinToString(", ")}; deploys from ${repo.defaultBranch} only")
-            report["productionEnvironment"] = linkedMapOf(
-                "githubEnvironment" to productionGithubEnvironment, "reviewers" to request.reviewers, "branch" to repo.defaultBranch,
+            currentStep = STEP_PROTECTION
+            environmentReviewers = github.protectEnvironment(repo, productionGithubEnvironment!!, reviewerIds, repo.defaultBranch, STEP_PROTECTION)
+            step(
+                STEP_PROTECTION, "set",
+                "GitHub environment $productionGithubEnvironment: deploys from ${repo.defaultBranch} only; " +
+                    if (environmentReviewers) "required reviewers ${request.reviewers.joinToString(", ")}" else "required reviewers not offered by this GitHub plan (the ruleset carries the approval)",
+            )
+            report["productionApproval"] = linkedMapOf(
+                "mechanisms" to buildList {
+                    add("pull_request_ruleset")
+                    if (environmentReviewers) add("environment_reviewers")
+                },
+                "ruleset" to linkedMapOf(
+                    "name" to GitHubCli.RULESET_NAME, "id" to rulesetId, "enforcement" to GitHubCli.ENFORCEMENT_ACTIVE, "branch" to repo.defaultBranch,
+                    "requiredApprovingReviews" to 1, "codeOwnerReview" to true, "dismissStaleReviews" to true,
+                    "blocksForcePush" to true, "blocksDeletion" to true, "bypassActors" to listOf<String>(),
+                ),
+                "codeowners" to linkedMapOf("path" to CODEOWNERS_PATH, "owners" to request.reviewers, "paths" to CODEOWNED_PATHS),
+                "environmentReviewers" to linkedMapOf(
+                    "active" to environmentReviewers, "reviewers" to request.reviewers,
+                    "note" to if (environmentReviewers) null else "GitHub offers environment reviewers on a private repository only on GitHub Enterprise.",
+                ),
+                "githubEnvironment" to productionGithubEnvironment,
+                "deploymentBranch" to repo.defaultBranch,
             )
         }
 
@@ -326,12 +367,18 @@ internal class ProjectInit(
         // Repository-level first; the production-environment variable only once its protection is confirmed.
         manifest.variables.entries.sortedBy { it.value.level == StarterTemplateManifest.LEVEL_ENVIRONMENT }.forEach { (name, v) ->
             val value = values[name] ?: throw Stop(EXIT_CHECK, "starter_template_invalid", "The template declares $name, which has no value.")
-            if (v.environment != null && !github.environmentProtected(repo, v.environment, reviewerIds, STEP_VARIABLES)) {
-                throw Stop(
-                    EXIT_GH, "github_environment_unprotected",
-                    "GitHub environment ${v.environment} does not show the required reviewers and branch policy, so $name was not set.",
-                    "Check the environment's protection rules in the repository settings, then re-run.",
-                )
+            if (v.environment != null) {
+                val required = if (environmentReviewers) reviewerIds else emptyList()
+                val protectedNow = rulesetId != null && github.rulesetActive(repo, rulesetId, STEP_VARIABLES) &&
+                    github.environmentProtected(repo, v.environment, required, STEP_VARIABLES)
+                if (!protectedNow) {
+                    throw Stop(
+                        EXIT_GH, "github_environment_unprotected",
+                        "The production approval (ruleset ${GitHubCli.RULESET_NAME} on ${repo.defaultBranch}, and GitHub environment ${v.environment}) " +
+                            "is not in place, so $name was not set.",
+                        "Check the repository's rulesets and the environment's protection rules, then re-run.",
+                    )
+                }
             }
             github.setVariable(repo, name, value, v.environment, STEP_VARIABLES)
             variables += linkedMapOf("name" to name, "value" to value, "level" to v.level, "environment" to v.environment)
@@ -441,7 +488,7 @@ internal class ProjectInit(
         }
     }
 
-    private fun planFiles(): List<PlannedFile> {
+    private fun planFiles(codeowners: String?): List<PlannedFile> {
         val tarball = github.templateTarball(request.template, STEP_PREFLIGHT)
         val entries = try {
             TemplateArchive.read(tarball)
@@ -449,7 +496,9 @@ internal class ProjectInit(
             throw Stop(EXIT_CHECK, "starter_template_invalid", "The template's files could not be read: ${ex.message}.")
         }
         val root = request.dir.toAbsolutePath().normalize()
-        val planned = entries.map { e ->
+        // A config project's CODEOWNERS (the reviewers own production and the workflows) replaces the template's.
+        val all = if (codeowners == null) entries else entries.filter { it.path != CODEOWNERS_PATH } + TemplateArchive.Entry(CODEOWNERS_PATH, codeowners.toByteArray(), false)
+        val planned = all.map { e ->
             val target = root.resolve(e.path).normalize()
             if (!target.startsWith(root) || e.path.split('/').firstOrNull() == ".git") {
                 throw Stop(EXIT_CHECK, "starter_template_invalid", "The template has a file outside the repository (${e.path}).")
@@ -486,6 +535,50 @@ internal class ProjectInit(
             ?: throw Stop(EXIT_HTTP, "environment_not_found", "Sandbox '$slug' could not be created or found.")
         if (env.production) throw Stop(EXIT_USAGE, "sandbox_required", "'$slug' is the production environment.")
         return env.id
+    }
+
+    /**
+     * The default-branch approval: the `thoryn-production-approval` ruleset (adopted and updated when it exists) and,
+     * with --repo, the reviewers' CODEOWNERS committed through the contents API. A commit to the default branch is
+     * made while the ruleset is not yet (or briefly not) enforced — the ruleset itself forbids direct pushes — and the
+     * ruleset is active when this returns. In an existing clone CODEOWNERS is written to the working tree instead.
+     * Throws [GhPlanLimitException] when GitHub has no rulesets for this private repository (GitHub Free).
+     */
+    private fun approvalRuleset(repo: GhRepository, codeowners: String, remote: GitHubCli.RepoFile?): Long {
+        val createdRepo = steps.firstOrNull { it.name == STEP_REPOSITORY }?.status == "created"
+        var existing = remote
+        if (request.repo != null && createdRepo) {
+            github.awaitDefaultBranch(repo, STEP_APPROVAL)
+            existing = github.readFile(repo, CODEOWNERS_PATH, STEP_APPROVAL)
+        }
+        val commit = request.repo != null && existing?.content != codeowners
+        var id = github.rulesetId(repo, GitHubCli.RULESET_NAME, STEP_APPROVAL)
+        val created = id == null
+        if (id == null) {
+            id = github.createRuleset(repo, if (commit) GitHubCli.ENFORCEMENT_DISABLED else GitHubCli.ENFORCEMENT_ACTIVE, STEP_APPROVAL)
+        } else if (commit) {
+            github.updateRuleset(repo, id, GitHubCli.ENFORCEMENT_DISABLED, STEP_APPROVAL)
+        }
+        if (commit) {
+            github.writeFile(repo, CODEOWNERS_PATH, codeowners, existing?.sha, "Thoryn config project: reviewers own production and the workflows", STEP_APPROVAL)
+        }
+        if (commit || !created) github.updateRuleset(repo, id, GitHubCli.ENFORCEMENT_ACTIVE, STEP_APPROVAL)
+        step(
+            STEP_CODEOWNERS,
+            when {
+                request.repo == null -> "pending"
+                commit -> "committed"
+                else -> "unchanged"
+            },
+            "$CODEOWNERS_PATH: ${request.reviewers.joinToString(" ") { "@$it" }} own ${CODEOWNED_PATHS.joinToString(" and ")}" +
+                if (request.repo == null) " (written with the template's files; it lands with your pull request)" else "",
+        )
+        step(
+            STEP_RULESET, if (created) "created" else "updated",
+            "${GitHubCli.RULESET_NAME} on ${repo.defaultBranch}: pull request with 1 approval + code-owner review, stale approvals dismissed, " +
+                "no force-push or deletion, no bypass",
+        )
+        return id
     }
 
     /** Adopt a matching trust (by name, or one the orchestrator made — by its pins), else create it. */
@@ -591,7 +684,14 @@ internal class ProjectInit(
                 @Suppress("UNCHECKED_CAST")
                 val files = report["files"] as Map<String, List<String>>
                 val touched = (files["added"].orEmpty() + files["overwritten"].orEmpty()).map { it.substringBefore('/') }.distinct().sorted()
-                if (touched.isNotEmpty()) {
+                if (touched.isNotEmpty() && config) {
+                    // The default branch now takes reviewed pull requests only (the approval ruleset).
+                    add(
+                        "The default branch now accepts only a reviewed pull request. Push the files on a branch and open one: " +
+                            "git switch -c thoryn-config && git add ${touched.joinToString(" ")} && git commit -m \"Add the Thoryn config project\" && " +
+                            "git push -u origin thoryn-config && gh pr create --fill — then ${request.reviewers.joinToString(" or ")} approves it.",
+                    )
+                } else if (touched.isNotEmpty()) {
                     add("Commit and push the added files: git add ${touched.joinToString(" ")} && git commit -m \"Add the Thoryn ${request.kind.label} project\" && git push")
                 } else {
                     add("The template's files are already in this clone; push a commit (or re-run the workflow) to start a run.")
@@ -612,7 +712,14 @@ internal class ProjectInit(
             else -> add("Push a commit (or re-run the workflow) to start a run with the variables set.")
         }
         if (config) {
-            add("Production runs wait in the GitHub environment $productionGithubEnvironment for approval by: ${request.reviewers.joinToString(", ")}.")
+            val reviewers = request.reviewers.joinToString(", ")
+            @Suppress("UNCHECKED_CAST")
+            val envReviewers = ((report["productionApproval"] as? Map<String, Any?>)?.get("mechanisms") as? List<String>)?.contains("environment_reviewers") == true
+            add(
+                "Production changes need a pull request to ${repo.defaultBranch} approved by a code owner ($reviewers); only ${repo.defaultBranch} deploys to " +
+                    "the GitHub environment $productionGithubEnvironment" +
+                    if (envReviewers) ", and each production run also waits for approval by: $reviewers." else ". (Environment reviewers are not offered by this GitHub plan.)",
+            )
         }
     }
 
@@ -628,7 +735,9 @@ internal class ProjectInit(
             add("gh api repos/$repo --jq '{id: .id, ownerId: .owner.id, defaultBranch: .default_branch}'   # the ids the trusts pin")
             if (request.kind == Kind.CONFIG) {
                 request.reviewers.forEach { add("gh api users/$it --jq .id   # reviewer id") }
-                add("gh api --method PUT repos/$repo/environments/$prodEnv --input protection.json   # {\"reviewers\":[{\"type\":\"User\",\"id\":<reviewer id>}],\"deployment_branch_policy\":{\"protected_branches\":false,\"custom_branch_policies\":true}}")
+                add("# .github/CODEOWNERS: ${CODEOWNED_PATHS.joinToString("; ") { "$it ${request.reviewers.joinToString(" ") { r -> "@$r" }}" }} — commit it to the default branch")
+                add("gh api --method POST repos/$repo/rulesets --input ruleset.json   # name ${GitHubCli.RULESET_NAME}, target ~DEFAULT_BRANCH: pull_request (1 approval, require_code_owner_review, dismiss_stale_reviews_on_push), non_fast_forward, deletion; bypass_actors []")
+                add("gh api --method PUT repos/$repo/environments/$prodEnv --input protection.json   # reviewers need GitHub Enterprise on a private repository; omit them otherwise — {\"reviewers\":[{\"type\":\"User\",\"id\":<reviewer id>}],\"deployment_branch_policy\":{\"protected_branches\":false,\"custom_branch_policies\":true}}")
                 add("gh api --method POST repos/$repo/environments/$prodEnv/deployment-branch-policies -f name=<default branch> -f type=branch")
                 if (sandbox == null) add("thoryn env create --slug $sandboxSlug --name \"Sandbox $sandboxSlug\"")
                 add(
@@ -667,9 +776,9 @@ internal class ProjectInit(
     }
 
     /**
-     * A private config repository on a GitHub plan without environment reviewers: refused, no fallback (product-owner
-     * settlement 2026-09-30). Protection runs before any Thoryn write, so the only thing that can remain is a
-     * repository this run created with --repo — it is kept, never deleted. Exit [EXIT_CHECK] when nothing changed,
+     * A private config repository on GitHub Free, which has no rulesets for private repositories: refused, no fallback
+     * (product-owner settlement 2026-09-30, revised). The approval runs before any Thoryn write, so the only thing that
+     * can remain is a repository this run created with --repo — it is kept, never deleted. Exit [EXIT_CHECK] when nothing changed,
      * [EXIT_GH] when that repository was created.
      */
     private fun planLimitRefusal(repo: GhRepository): Stop {
@@ -683,7 +792,8 @@ internal class ProjectInit(
         }
         return Stop(
             if (created) EXIT_GH else EXIT_CHECK, "github_plan_required",
-            "Production approval needs GitHub Team or Enterprise for a private repository. Upgrade the plan or use a public repository.",
+            "Production approval needs a reviewed pull request on the default branch, which GitHub Free does not support for private repositories. " +
+                "Use GitHub Pro, Team or Enterprise, or a public repository.",
             remains,
             mapOf("repositoryCreated" to created, "repository" to repo.fullName),
         )
@@ -719,6 +829,19 @@ internal class ProjectInit(
         const val STEP_FILES: String = "files"
 
         const val DEFAULT_SANDBOX: String = "sandbox"
+        const val STEP_APPROVAL: String = "approval"
+        const val STEP_CODEOWNERS: String = "codeowners"
+        const val STEP_RULESET: String = "ruleset"
+        const val CODEOWNERS_PATH: String = ".github/CODEOWNERS"
+        val CODEOWNED_PATHS: List<String> = listOf("/.thoryn/environments/production/", "/.github/workflows/")
+
+        /** The config project's CODEOWNERS: the --reviewer logins own production's configuration and the workflows. */
+        fun codeownersFor(reviewers: List<String>): String = buildString {
+            append("# Thoryn config project (thoryn project init): changes to production's configuration and to the\n")
+            append("# workflows need a review by one of these code owners (ruleset ${GitHubCli.RULESET_NAME}).\n")
+            val owners = reviewers.joinToString(" ") { "@$it" }
+            CODEOWNED_PATHS.forEach { append("$it $owners\n") }
+        }
         private const val MAX_TRUST_PAGES = 20
 
         /**

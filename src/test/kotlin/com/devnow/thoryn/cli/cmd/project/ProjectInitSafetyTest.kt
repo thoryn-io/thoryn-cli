@@ -134,8 +134,8 @@ class ProjectInitSafetyTest : ProjectTestBase() {
         assertThat(publicClone.exit).isEqualTo(ProjectInit.EXIT_USAGE)
         assertThat(publicClone.err).contains("--public applies when --repo creates a repository")
 
-        val forceRepo = runCli("project", "init", "app", "--stack", "express", "--environment", "dev", "--repo", "acme/web", "--force")
-        assertThat(forceRepo.exit).isEqualTo(ProjectInit.EXIT_USAGE)
+        val dirRepo = runCli("project", "init", "app", "--stack", "express", "--environment", "dev", "--repo", "acme/web", "--dir", ".")
+        assertThat(dirRepo.exit).isEqualTo(ProjectInit.EXIT_USAGE)
 
         val badRepo = runCli("project", "init", "app", "--stack", "express", "--environment", "dev", "--repo", "web")
         assertThat(badRepo.err).contains("--repo must be <owner>/<name>")

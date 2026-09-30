@@ -26,8 +26,13 @@ internal class FakeGh : GhRunner {
     val users = mutableMapOf("alice" to 501L, "bob" to 502L, "acme" to 900L)
     /** fullName → repository record. */
     val repos = linkedMapOf<String, MutableMap<String, Any?>>()
-    /** fullName → paths present on the default branch (for the contents API). */
-    val files = mutableMapOf<String, MutableSet<String>>()
+    /** fullName → path → content on the default branch (the contents API). */
+    val files = mutableMapOf<String, MutableMap<String, String>>()
+    /** The account's GitHub plan: `free` (no rulesets / env reviewers on private repositories), `team` (no env reviewers there), `enterprise`. */
+    var plan = "enterprise"
+    /** fullName → ruleset id → ruleset body. */
+    val rulesets = mutableMapOf<String, MutableMap<Long, Map<String, Any?>>>()
+    private var nextRulesetId = 4200L
     /** template fullName → its declaration (null ⇒ the template repository is empty). */
     val declarations = mutableMapOf<String, String?>()
     val tarballs = mutableMapOf<String, ByteArray>()
@@ -93,6 +98,9 @@ internal class FakeGh : GhRunner {
             method == "GET" && seg[0] == "users" && seg.size == 2 -> users[seg[1]]?.let { okJson(mapOf("id" to it, "login" to seg[1])) } ?: notFound()
             method == "GET" && seg[0] == "repos" && seg.size == 3 -> repos["${seg[1]}/${seg[2]}"]?.let { okJson(it) } ?: notFound()
             method == "GET" && seg[0] == "repos" && seg.size >= 4 && seg[3] == "contents" -> contents("${seg[1]}/${seg[2]}", seg.drop(4).joinToString("/"))
+            method == "PUT" && seg[0] == "repos" && seg.size >= 4 && seg[3] == "contents" -> putContents("${seg[1]}/${seg[2]}", seg.drop(4).joinToString("/"), stdin)
+            method == "GET" && seg[0] == "repos" && seg.size == 5 && seg[3] == "branches" -> if ("${seg[1]}/${seg[2]}" in repos) okJson(mapOf("name" to seg[4])) else notFound()
+            seg[0] == "repos" && seg.size >= 4 && seg[3] == "rulesets" -> ruleset("${seg[1]}/${seg[2]}", seg.getOrNull(4)?.toLong(), method, stdin)
             method == "GET" && seg[0] == "repos" && seg.size == 4 && seg[3] == "tarball" -> tarballs["${seg[1]}/${seg[2]}"]?.let { GhResult(0, it, "") } ?: notFound()
             method == "POST" && seg[0] == "repos" && seg.size == 4 && seg[3] == "generate" -> generate("${seg[1]}/${seg[2]}", fields)
             seg[0] == "repos" && seg.size >= 5 && seg[3] == "environments" -> environment("${seg[1]}/${seg[2]}", seg[4], seg.drop(5), method, fields, stdin)
@@ -109,7 +117,8 @@ internal class FakeGh : GhRunner {
                 notFound()
             }
         }
-        return if (files[fullName]?.contains(path) == true) okJson(mapOf("type" to "file", "content" to "")) else notFound()
+        val content = files[fullName]?.get(path) ?: return notFound()
+        return okJson(mapOf("type" to "file", "sha" to "sha-${content.hashCode()}", "content" to Base64.getMimeEncoder().encodeToString(content.toByteArray())))
     }
 
     private fun generate(template: String, fields: Map<String, String>): GhResult {
@@ -118,8 +127,44 @@ internal class FakeGh : GhRunner {
         if (fullName in repos) return GhResult(1, ByteArray(0), "gh: Name already exists on this account (HTTP 422)")
         val repo = seedRepo(fullName, private = fields["private"] == "true")
         repo["template_repository"] = mapOf("full_name" to template)
-        files[fullName] = mutableSetOf(StarterTemplateManifest.PATH)
+        files[fullName] = mutableMapOf(StarterTemplateManifest.PATH to (declarations[template] ?: ""))
         return okJson(repo)
+    }
+
+    private fun isPrivate(fullName: String) = repos[fullName]?.get("private") == true
+
+    private fun putContents(fullName: String, path: String, stdin: ByteArray?): GhResult {
+        if (fullName !in repos) return notFound()
+        if (rulesets[fullName].orEmpty().values.any { it["enforcement"] == "active" }) {
+            return GhResult(1, ByteArray(0), "gh: Repository rule violations found (HTTP 409)")
+        }
+        @Suppress("UNCHECKED_CAST")
+        val body = json.readValue(stdin, Map::class.java) as Map<String, Any?>
+        val existing = files[fullName]?.get(path)
+        if (existing != null && body["sha"] != "sha-${existing.hashCode()}") return GhResult(1, ByteArray(0), "gh: sha wasn't supplied (HTTP 422)")
+        files.getOrPut(fullName) { mutableMapOf() }[path] = String(Base64.getDecoder().decode(body["content"] as String))
+        return okJson(mapOf("content" to mapOf("path" to path)))
+    }
+
+    private fun ruleset(fullName: String, id: Long?, method: String, stdin: ByteArray?): GhResult {
+        if (fullName !in repos) return notFound()
+        val mine = rulesets.getOrPut(fullName) { linkedMapOf() }
+        @Suppress("UNCHECKED_CAST")
+        fun body() = json.readValue(stdin, Map::class.java) as Map<String, Any?>
+        return when {
+            id == null && method == "GET" -> okJson(mine.map { (k, v) -> mapOf("id" to k, "name" to v["name"], "enforcement" to v["enforcement"]) })
+            id == null && method == "POST" -> {
+                if (plan == "free" && isPrivate(fullName)) {
+                    return GhResult(1, "{\"message\":\"Upgrade to GitHub Pro or make this repository public to enable this feature.\"}".toByteArray(), "gh: Upgrade to GitHub Pro or make this repository public to enable this feature. (HTTP 403)")
+                }
+                val newId = nextRulesetId++
+                mine[newId] = body()
+                okJson(body() + ("id" to newId))
+            }
+            id != null && method == "PUT" -> mine[id]?.let { mine[id] = body(); okJson(body() + ("id" to id)) } ?: notFound()
+            id != null && method == "GET" -> mine[id]?.let { okJson(it + ("id" to id)) } ?: notFound()
+            else -> unexpected(listOf(method, fullName, "rulesets"))
+        }
     }
 
     private fun environment(fullName: String, name: String, tail: List<String>, method: String, fields: Map<String, String>, stdin: ByteArray?): GhResult {
@@ -130,9 +175,16 @@ internal class FakeGh : GhRunner {
                 failProtectionWith?.let { return GhResult(1, ByteArray(0), it) }
                 @Suppress("UNCHECKED_CAST")
                 val body = json.readValue(stdin, Map::class.java) as Map<String, Any?>
-                val env = environments.getOrPut(key) { Env() }
                 @Suppress("UNCHECKED_CAST")
-                env.reviewers = (body["reviewers"] as List<Map<String, Any?>>).map { (it["id"] as Number).toLong() }
+                val reviewers = (body["reviewers"] as List<Map<String, Any?>>?).orEmpty().map { (it["id"] as Number).toLong() }
+                if (reviewers.isNotEmpty() && isPrivate(fullName) && plan != "enterprise") {
+                    return GhResult(
+                        1, ByteArray(0),
+                        "gh: Failed to create the environment protection rule. Please ensure the billing plan supports the required reviewers protection rule. (HTTP 422)",
+                    )
+                }
+                val env = environments.getOrPut(key) { Env() }
+                env.reviewers = reviewers
                 @Suppress("UNCHECKED_CAST")
                 env.custom = (body["deployment_branch_policy"] as Map<String, Any?>)["custom_branch_policies"] == true
                 okJson(mapOf("name" to name))

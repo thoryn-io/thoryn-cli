@@ -32,12 +32,18 @@ data class GhRepository(
  * | the template declaration | `gh api repos/<template>/contents/.thoryn/template.json` |
  * | the template's files | `gh api repos/<template>/tarball` |
  * | create the repository | `gh api --method POST repos/<template>/generate -f owner=… -f name=… -F private=… -f description=…` |
- * | protect the production environment | `gh api --method PUT repos/<o>/<r>/environments/<env> --input -` |
+ * | (config) CODEOWNERS | `gh api repos/<o>/<r>/contents/.github/CODEOWNERS`, `gh api --method PUT … --input -` (with `--repo`); `gh api repos/<o>/<r>/branches/<default>` while a new repository is generated |
+ * | (config) approval ruleset | `gh api repos/<o>/<r>/rulesets`, `gh api --method POST repos/<o>/<r>/rulesets --input -`, `gh api --method PUT repos/<o>/<r>/rulesets/<id> --input -`, `gh api repos/<o>/<r>/rulesets/<id>` |
+ * | protect the production environment | `gh api --method PUT repos/<o>/<r>/environments/<env> --input -` (again without reviewers on a billing-plan 422) |
  * | its branch policies | `gh api repos/<o>/<r>/environments/<env>/deployment-branch-policies`, `… --method POST … -f name=<branch> -f type=branch`, `… --method DELETE …/<id>` |
  * | verify the protection | `gh api repos/<o>/<r>/environments/<env>` |
  * | a variable (upsert) | `gh variable set <NAME> --body <value> --repo <o>/<r> [--env <env>]` |
  */
-class GitHubCli(private val gh: GhRunner) {
+class GitHubCli(
+    private val gh: GhRunner,
+    /** Waits between polls for a generating repository's branch; tests pass a no-op. */
+    private val sleeper: (Long) -> Unit = { Thread.sleep(it) },
+) {
 
     private val json = JsonMapper.builder().build()
 
@@ -127,20 +133,32 @@ class GitHubCli(private val gh: GhRunner) {
     }
 
     /**
-     * Bring the GitHub [environment] to the required shape: exactly [reviewerIds] as required reviewers and a
-     * deployment branch policy admitting only [branch]. Idempotent: a re-run converges an existing environment.
+     * Bring the GitHub [environment] to the required shape: a deployment branch policy admitting only [branch], and
+     * [reviewerIds] as required reviewers WHEN the plan offers them. GitHub offers environment reviewers on a private
+     * repository only on GitHub Enterprise; on another plan it answers the reviewers PUT with a `422` naming the
+     * billing plan, and the environment is then set up without them (the approval is carried by the default-branch
+     * ruleset instead). Returns whether the reviewers are active. Idempotent: a re-run converges an existing environment.
      */
-    fun protectEnvironment(repository: GhRepository, environment: String, reviewerIds: List<Long>, branch: String, step: String) {
+    fun protectEnvironment(repository: GhRepository, environment: String, reviewerIds: List<Long>, branch: String, step: String): Boolean {
         val path = "repos/${repository.fullName}/environments/$environment"
-        val body = linkedMapOf(
+        val branchOnly = linkedMapOf("protected_branches" to false, "custom_branch_policies" to true)
+        val withReviewers = linkedMapOf(
             "reviewers" to reviewerIds.map { linkedMapOf("type" to "User", "id" to it) },
             "prevent_self_review" to false,
-            "deployment_branch_policy" to linkedMapOf("protected_branches" to false, "custom_branch_policies" to true),
+            "deployment_branch_policy" to branchOnly,
         )
-        val put = gh.run(listOf("api", "--method", "PUT", path, "--input", "-"), stdin = json.writeValueAsBytes(body))
+        var reviewersActive = true
+        val put = gh.run(listOf("api", "--method", "PUT", path, "--input", "-"), stdin = json.writeValueAsBytes(withReviewers))
         if (!put.ok) {
-            if (reviewersNeedPaidPlan(repository, put)) throw GhPlanLimitException(step, put)
-            throw GhCommandException(step, put, "GitHub refused to protect the environment; you need admin rights on the repository.")
+            if (!environmentReviewersNeedPlan(put)) {
+                throw GhCommandException(step, put, "GitHub refused to protect the environment; you need admin rights on the repository.")
+            }
+            reviewersActive = false
+            val retry = gh.run(
+                listOf("api", "--method", "PUT", path, "--input", "-"),
+                stdin = json.writeValueAsBytes(linkedMapOf("deployment_branch_policy" to branchOnly)),
+            )
+            if (!retry.ok) throw GhCommandException(step, retry, "GitHub refused to create the environment; you need admin rights on the repository.")
         }
         val list = gh.run(listOf("api", "$path/deployment-branch-policies"))
         if (!list.ok) throw GhCommandException(step, list)
@@ -161,11 +179,12 @@ class GitHubCli(private val gh: GhRunner) {
             val add = gh.run(listOf("api", "--method", "POST", "$path/deployment-branch-policies", "-f", "name=$branch", "-f", "type=branch"))
             if (!add.ok) throw GhCommandException(step, add)
         }
+        return reviewersActive
     }
 
     /**
-     * Read the environment back: true when it has required reviewers (all of [reviewerIds]) and a custom
-     * deployment branch policy. Checked before any production variable is set.
+     * Read the environment back: true when it has a custom deployment branch policy and — when [reviewerIds] is not
+     * empty — all of them as required reviewers. Checked before any production variable is set.
      */
     fun environmentProtected(repository: GhRepository, environment: String, reviewerIds: List<Long>, step: String): Boolean {
         val r = gh.run(listOf("api", "repos/${repository.fullName}/environments/$environment"))
@@ -180,16 +199,147 @@ class GitHubCli(private val gh: GhRunner) {
             .flatMap { rule -> rule.path("reviewers").let { rs -> (0 until rs.size()).map { rs.get(it).path("reviewer").path("id").asLong(0) } } }
             .toSet()
         val customBranches = n.path("deployment_branch_policy").path("custom_branch_policies").asBoolean(false)
-        return reviewerIds.isNotEmpty() && reviewers.containsAll(reviewerIds) && customBranches
+        return reviewers.containsAll(reviewerIds) && customBranches
     }
 
     /**
-     * True when GitHub refused the environment's required reviewers because the repository is PRIVATE on a plan
-     * without them (GitHub Free / Pro for a private repository): a 422 whose message names reviewers or the plan.
-     * Any other refusal — another 422, a 403 for missing admin rights — is not relabelled.
+     * GitHub's refusal of environment reviewers for the account's billing plan: a `422` whose message names the
+     * billing plan ("Failed to create the environment protection rule. Please ensure the billing plan supports the
+     * required reviewers protection rule." / the older "… please ensure billing plan include protected branch gate.").
+     * Any other `422` (an invalid name, a conflicting policy) is not this.
      */
-    internal fun reviewersNeedPaidPlan(repository: GhRepository, put: GhResult): Boolean =
-        repository.private && put.httpStatus() == 422 && PLAN_LIMIT.containsMatchIn(put.stderr + "\n" + put.text)
+    internal fun environmentReviewersNeedPlan(put: GhResult): Boolean =
+        put.httpStatus() == 422 && (put.stderr + "\n" + put.text).contains("billing plan", ignoreCase = true)
+
+    /**
+     * GitHub's refusal of a repository ruleset on a PRIVATE repository under GitHub Free: a `403` "Upgrade to GitHub
+     * Pro or make this repository public to enable this feature." Nothing else (a `403` for missing admin rights, a
+     * `422` for an invalid rule) is treated as a plan limit.
+     */
+    internal fun rulesetsNeedPlan(repository: GhRepository, r: GhResult): Boolean =
+        repository.private && r.httpStatus() == 403 &&
+            (r.stderr + "\n" + r.text).contains("Upgrade to GitHub Pro or make this repository public", ignoreCase = true)
+
+    // ── The default-branch approval ruleset + CODEOWNERS ────────────────────────────────────────
+
+    /** A file on the default branch: its text and blob sha. */
+    data class RepoFile(val content: String, val sha: String)
+
+    /** [path] on the default branch, or null when it does not exist. */
+    fun readFile(repository: GhRepository, path: String, step: String): RepoFile? {
+        val r = gh.run(listOf("api", "repos/${repository.fullName}/contents/$path"))
+        if (!r.ok) {
+            if (r.httpStatus() == 404) return null
+            throw GhCommandException(step, r)
+        }
+        val n = node(r, step)
+        if (n.path("type").asString("") != "file") return null
+        val content = runCatching {
+            String(Base64.getDecoder().decode(n.path("content").asString("").filterNot { it.isWhitespace() }), Charsets.UTF_8)
+        }.getOrDefault("")
+        return RepoFile(content, n.path("sha").asString(""))
+    }
+
+    /** Create or replace [path] on the default branch with one commit (`sha` = the blob it replaces). */
+    fun writeFile(repository: GhRepository, path: String, content: String, sha: String?, message: String, step: String) {
+        val body = linkedMapOf<String, Any?>(
+            "message" to message,
+            "content" to Base64.getEncoder().encodeToString(content.toByteArray()),
+            "branch" to repository.defaultBranch,
+        )
+        if (sha != null) body["sha"] = sha
+        val r = gh.run(listOf("api", "--method", "PUT", "repos/${repository.fullName}/contents/$path", "--input", "-"), stdin = json.writeValueAsBytes(body))
+        if (!r.ok) throw GhCommandException(step, r)
+    }
+
+    /**
+     * A repository GitHub is still generating from its template has no default branch yet: wait (bounded) until it
+     * has, before committing to it.
+     */
+    fun awaitDefaultBranch(repository: GhRepository, step: String) {
+        var last: GhResult? = null
+        repeat(BRANCH_ATTEMPTS) { attempt ->
+            val r = gh.run(listOf("api", "repos/${repository.fullName}/branches/${repository.defaultBranch}"))
+            if (r.ok) return
+            if (r.httpStatus() != 404) throw GhCommandException(step, r)
+            last = r
+            if (attempt < BRANCH_ATTEMPTS - 1) sleeper(BRANCH_WAIT_MILLIS)
+        }
+        throw GhCommandException(step, last!!, "GitHub had not finished creating the repository's ${repository.defaultBranch} branch; re-run in a minute.")
+    }
+
+    /** The id of the repository's ruleset named [name], or null. */
+    fun rulesetId(repository: GhRepository, name: String, step: String): Long? {
+        val r = gh.run(listOf("api", "repos/${repository.fullName}/rulesets"))
+        if (!r.ok) {
+            if (rulesetsNeedPlan(repository, r)) throw GhPlanLimitException(step, r)
+            throw GhCommandException(step, r)
+        }
+        val list = node(r, step)
+        return (0 until list.size()).map { list.get(it) }.firstOrNull { it.path("name").asString("") == name }?.path("id")?.asLong(0)?.takeIf { it > 0 }
+    }
+
+    /** Create the approval ruleset ([enforcement] `active` or `disabled`); returns its id. */
+    fun createRuleset(repository: GhRepository, enforcement: String, step: String): Long {
+        val r = gh.run(listOf("api", "--method", "POST", "repos/${repository.fullName}/rulesets", "--input", "-"), stdin = json.writeValueAsBytes(approvalRuleset(enforcement)))
+        if (!r.ok) {
+            if (rulesetsNeedPlan(repository, r)) throw GhPlanLimitException(step, r)
+            throw GhCommandException(step, r, "GitHub refused the ruleset; you need admin rights on the repository.")
+        }
+        return node(r, step).path("id").asLong(0).takeIf { it > 0 }
+            ?: throw GhCommandException(step, GhResult(1, ByteArray(0), "GitHub returned a ruleset without an id"))
+    }
+
+    /** Replace ruleset [id] with the required shape at [enforcement] (adopt and update). */
+    fun updateRuleset(repository: GhRepository, id: Long, enforcement: String, step: String) {
+        val r = gh.run(listOf("api", "--method", "PUT", "repos/${repository.fullName}/rulesets/$id", "--input", "-"), stdin = json.writeValueAsBytes(approvalRuleset(enforcement)))
+        if (!r.ok) {
+            if (rulesetsNeedPlan(repository, r)) throw GhPlanLimitException(step, r)
+            throw GhCommandException(step, r, "GitHub refused the ruleset; you need admin rights on the repository.")
+        }
+    }
+
+    /** True when ruleset [id] is active on the default branch with its pull-request rule. Checked before the production variable. */
+    fun rulesetActive(repository: GhRepository, id: Long, step: String): Boolean {
+        val r = gh.run(listOf("api", "repos/${repository.fullName}/rulesets/$id"))
+        if (!r.ok) {
+            if (r.httpStatus() == 404) return false
+            throw GhCommandException(step, r)
+        }
+        val n = node(r, step)
+        val rules = n.path("rules")
+        val pr = (0 until rules.size()).map { rules.get(it) }.firstOrNull { it.path("type").asString("") == "pull_request" }
+        return n.path("enforcement").asString("") == "active" &&
+            pr != null && pr.path("parameters").path("required_approving_review_count").asInt(0) >= 1 &&
+            pr.path("parameters").path("require_code_owner_review").asBoolean(false)
+    }
+
+    /**
+     * The production-approval ruleset (product-owner settlement 2026-09-30, revised): on the default branch, a pull
+     * request with at least one approving review, code-owner review required, stale approvals dismissed on push,
+     * force-pushes and deletion blocked, and NO bypass actors.
+     */
+    fun approvalRuleset(enforcement: String): Map<String, Any?> = linkedMapOf(
+        "name" to RULESET_NAME,
+        "target" to "branch",
+        "enforcement" to enforcement,
+        "bypass_actors" to listOf<Any>(),
+        "conditions" to linkedMapOf("ref_name" to linkedMapOf("include" to listOf("~DEFAULT_BRANCH"), "exclude" to listOf<String>())),
+        "rules" to listOf(
+            linkedMapOf(
+                "type" to "pull_request",
+                "parameters" to linkedMapOf(
+                    "required_approving_review_count" to 1,
+                    "require_code_owner_review" to true,
+                    "dismiss_stale_reviews_on_push" to true,
+                    "require_last_push_approval" to false,
+                    "required_review_thread_resolution" to false,
+                ),
+            ),
+            linkedMapOf("type" to "non_fast_forward"),
+            linkedMapOf("type" to "deletion"),
+        ),
+    )
 
     /** Create or update one Actions variable (never a secret) at repository level, or in [environment]. */
     fun setVariable(repository: GhRepository, name: String, value: String, environment: String?, step: String) {
@@ -200,11 +350,12 @@ class GitHubCli(private val gh: GhRunner) {
     }
 
     companion object {
-        /** GitHub's wording when a plan lacks environment protection rules for a private repository. */
-        private val PLAN_LIMIT = Regex(
-            "(?i)(required reviewers|reviewers? (are|is) not available|protection rules? (are|is) not available|" +
-                "upgrade to github|github (team|enterprise|pro)\\b|your (current )?plan|not available for (this|private) repositor)",
-        )
+        /** The deterministic name of the production-approval ruleset (adopted and updated on a re-run). */
+        const val RULESET_NAME: String = "thoryn-production-approval"
+        const val ENFORCEMENT_ACTIVE: String = "active"
+        const val ENFORCEMENT_DISABLED: String = "disabled"
+        private const val BRANCH_ATTEMPTS = 10
+        private const val BRANCH_WAIT_MILLIS = 1500L
     }
 
     private fun node(r: GhResult, step: String): JsonNode = try {

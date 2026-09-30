@@ -29,6 +29,12 @@ class ProjectInitConfigTest : ProjectTestBase() {
             "gh api users/alice",
             "gh api users/bob",
             "gh api --method POST repos/thoryn-io/starter-config/generate -f owner=acme -f name=platform -F private=true -f description=Thoryn config project: workspace acme",
+            "gh api repos/acme/platform/branches/main",
+            "gh api repos/acme/platform/contents/.github/CODEOWNERS",
+            "gh api repos/acme/platform/rulesets",
+            "gh api --method POST repos/acme/platform/rulesets --input -", // created disabled: CODEOWNERS is committed first
+            "gh api --method PUT repos/acme/platform/contents/.github/CODEOWNERS --input -",
+            "gh api --method PUT repos/acme/platform/rulesets/4200 --input -", // then enforced
             "gh api --method PUT $env --input -",
             "gh api $env/deployment-branch-policies",
             "gh api --method POST $env/deployment-branch-policies -f name=main -f type=branch",
@@ -36,10 +42,11 @@ class ProjectInitConfigTest : ProjectTestBase() {
             "gh variable set THORYN_WORKSPACE --body acme --repo acme/platform",
             "gh variable set THORYN_SANDBOX_ENVIRONMENT --body sandbox --repo acme/platform",
             "gh variable set THORYN_SANDBOX_WIF_CLIENT_ID --body wi_client1 --repo acme/platform",
-            "gh api $env", // protection verified before the production variable
+            "gh api repos/acme/platform/rulesets/4200", // the approval verified before the production variable
+            "gh api $env",
             "gh variable set THORYN_PRODUCTION_WIF_CLIENT_ID --body wi_client2 --repo acme/platform --env thoryn-production",
         )
-        assertThat(parseJson(gh.calls.first { it.args.contains("PUT") }.stdin!!)).isEqualTo(
+        assertThat(parseJson(gh.calls.first { it.args.contains("PUT") && it.args.contains(env) }.stdin!!)).isEqualTo(
             mapOf(
                 "reviewers" to listOf(mapOf("type" to "User", "id" to 501), mapOf("type" to "User", "id" to 502)),
                 "prevent_self_review" to false,
@@ -66,8 +73,12 @@ class ProjectInitConfigTest : ProjectTestBase() {
             mapOf("subject" to "client:wi_client2", "relation" to "manager", "object" to "workspace:${FakeProjectApi.TENANT_ID}"),
         )
         assertThat(out).contains("Set up the config project acme/platform for workspace acme")
-            .contains("GitHub environment thoryn-production: reviewers alice, bob; deploys from main only")
-            .contains("wait in the GitHub environment thoryn-production for approval by: alice, bob")
+            .contains("GitHub environment thoryn-production: deploys from main only; required reviewers alice, bob")
+            .contains("thoryn-production-approval on main: pull request with 1 approval + code-owner review")
+            .contains("each production run also waits for approval by: alice, bob")
+        assertThat(gh.files.getValue("acme/platform")[".github/CODEOWNERS"])
+            .contains("/.thoryn/environments/production/ @alice @bob").contains("/.github/workflows/ @alice @bob")
+        assertThat(gh.rulesets.getValue("acme/platform").values.single()["enforcement"]).isEqualTo("active")
     }
 
     @Test
@@ -84,7 +95,12 @@ class ProjectInitConfigTest : ProjectTestBase() {
         assertThat(gh.variables).containsEntry("acme/platform:THORYN_SANDBOX_ENVIRONMENT", "qa")
             .containsEntry("acme/platform@thoryn-production:THORYN_PRODUCTION_WIF_CLIENT_ID", "wi_client2")
         assertThat(Files.exists(dir.resolve(".thoryn/environments/production/provision.yaml"))).isTrue()
-        assertThat(out).contains("files").contains("5 added")
+        assertThat(out).contains("files").contains("6 added")
+        assertThat(Files.readString(dir.resolve(".github/CODEOWNERS"))).contains("/.github/workflows/ @alice @bob")
+        assertThat(gh.files["acme/platform"].orEmpty()).doesNotContainKey(".github/CODEOWNERS") // not committed: it lands with the pull request
+        assertThat(gh.invocations).contains("gh api --method POST repos/acme/platform/rulesets --input -") // active at once, nothing to commit
+            .noneMatch { it.contains("contents/.github/CODEOWNERS") }
+        assertThat(out).contains("git switch -c thoryn-config").contains("gh pr create --fill")
     }
 
     @Test
@@ -185,47 +201,5 @@ class ProjectInitConfigTest : ProjectTestBase() {
         assertThat(retry.exit).describedAs(retry.err).isEqualTo(0)
         assertThat(api.trusts).hasSize(2)
         assertThat(gh.variables).hasSize(5)
-    }
-
-    @Test
-    fun `a private repository on a plan without environment reviewers is refused, and the repository it created is named and kept`() {
-        gh.failProtectionWith = "gh: Failed to create the environment protection rules: required reviewers are not available for this repository (HTTP 422)"
-
-        val (exit, out, err) = runCli(*base, "--repo", "acme/platform")
-
-        assertThat(exit).isEqualTo(ProjectInit.EXIT_GH) // the run created the repository, so not "nothing changed"
-        assertThat(err).contains("Production approval needs GitHub Team or Enterprise for a private repository. Upgrade the plan or use a public repository.")
-            .contains("What remains: the repository acme/platform, which this run created").contains("Nothing was created in Thoryn")
-        assertThat(out).isEmpty()
-        assertThat(gh.repos).containsKey("acme/platform") // kept, never deleted
-        assertThat(gh.invocations).noneMatch { it.contains("DELETE") && !it.contains("deployment-branch-policies") }
-        assertThat(api.writes).isEmpty()
-        assertThat(api.trusts).isEmpty()
-        assertThat(gh.variables).isEmpty()
-
-        val json = runCli(*base, "--repo", "acme/platform", "--json")
-        assertThat(json.exit).isEqualTo(ProjectInit.EXIT_CHECK) // the repository now exists: this run changed nothing
-        assertThat(parseJson(json.out)).containsEntry("error", "github_plan_required").containsEntry("repositoryCreated", false)
-            .containsEntry("changed", false)
-        assertThat(api.writes).isEmpty()
-    }
-
-    @Test
-    fun `other GitHub refusals of the protection are not relabelled as a plan limit`() {
-        gh.failProtectionWith = "gh: Validation Failed: branch name is invalid (HTTP 422)"
-        val otherValidation = runCli(*base, "--repo", "acme/platform")
-        assertThat(otherValidation.exit).isEqualTo(ProjectInit.EXIT_GH)
-        assertThat(otherValidation.err).contains("the protection step failed — gh: gh: Validation Failed").doesNotContain("GitHub Team or Enterprise")
-
-        gh.seedRepo("acme/open", private = false)
-        gh.failProtectionWith = "gh: required reviewers are not available for this repository (HTTP 422)"
-        val publicRepo = runCli(*base, "--repo", "acme/open")
-        assertThat(publicRepo.err).doesNotContain("GitHub Team or Enterprise")
-
-        gh.failProtectionWith = "gh: Must have admin rights to Repository. (HTTP 403)"
-        val forbidden = runCli(*base, "--repo", "acme/platform")
-        assertThat(forbidden.exit).isEqualTo(ProjectInit.EXIT_GH)
-        assertThat(forbidden.err).contains("admin rights").doesNotContain("GitHub Team or Enterprise")
-        assertThat(api.writes).isEmpty()
     }
 }

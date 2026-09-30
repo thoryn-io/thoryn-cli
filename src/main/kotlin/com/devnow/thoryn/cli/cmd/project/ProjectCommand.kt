@@ -79,7 +79,10 @@ class ProjectCommand : Callable<Int> {
         @Option(names = ["--dir"], paramLabel = "<path>", description = ["The root of the existing clone (without --repo). Default: the current directory."])
         var dir: String? = null
 
-        @Option(names = ["--force"], description = ["In an existing clone, overwrite files that differ from the template's (default: stop and list them)."])
+        @Option(names = ["--force"], description = [
+                "Overwrite files that differ: in an existing clone, the template's files; for a config project with --repo,",
+                "an existing .github/CODEOWNERS. Default: stop and list them.",
+            ])
         var force: Boolean = false
 
         @Option(
@@ -174,7 +177,7 @@ class ProjectCommand : Callable<Int> {
         private fun validateCommon(): String? {
             repo?.trim()?.let {
                 if (!REPO.matches(it)) return "invalid_repo|--repo must be <owner>/<name> (was '$it')."
-                if (dir != null || force) return "invalid_request|--dir and --force apply to an existing clone; drop them with --repo."
+                if (dir != null) return "invalid_request|--dir applies to an existing clone; drop it with --repo."
             }
             if (repo == null && public) return "invalid_request|--public applies when --repo creates a repository."
             template?.trim()?.let { if (!REPO.matches(it)) return "invalid_template|--template must be <owner>/<repo> (was '$it')." }

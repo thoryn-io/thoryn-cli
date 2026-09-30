@@ -486,8 +486,8 @@ key; its `--tenant`, `--wif-*` and `--subject-token` flags are gone).
 GitHub CLI (`gh`) and no GitHub App**. There are two kinds:
 
 - **config** — the repository that manages your workspace's configuration. It gets two secret-less
-  workload identity connections: **production** (manager of the workspace; its runs wait for a
-  reviewer's approval) and one **sandbox** (manager of that sandbox).
+  workload identity connections: **production** (manager of the workspace; a change reaches it only
+  through a pull request a reviewer approved) and one **sandbox** (manager of that sandbox).
 - **app** — a repository that connects one application to an existing **sandbox**. It gets one
   connection to that sandbox. It never gets a production trust.
 
@@ -514,7 +514,9 @@ thoryn project init config --repo acme/thoryn-config \
 Set up the config project acme/thoryn-config for workspace acme.
 
   repository      created  acme/thoryn-config (private) from thoryn-io/starter-config
-  protection      set      GitHub environment thoryn-production: reviewers alice, bob; deploys from main only
+  codeowners      committed  .github/CODEOWNERS: @alice @bob own /.thoryn/environments/production/ and /.github/workflows/
+  ruleset         created  thoryn-production-approval on main: pull request with 1 approval + code-owner review, stale approvals dismissed, no force-push or deletion, no bypass
+  protection      set      GitHub environment thoryn-production: deploys from main only; required reviewers not offered by this GitHub plan (the ruleset carries the approval)
   environments    created  sandbox sandbox
   workload-trust  created  sandbox: starter-sandbox-1044556677 → wi_… (in sandbox)
   workload-trust  created  production: starter-production-1044556677 → wi_… (in production, GitHub environment thoryn-production)
@@ -525,16 +527,40 @@ Set up the config project acme/thoryn-config for workspace acme.
 Next steps:
   1. Clone it: gh repo clone acme/thoryn-config
   2. GitHub's initial commit started a first workflow run before the variables existed, so its Thoryn jobs skipped. Re-run it …
-  3. Production runs wait in the GitHub environment thoryn-production for approval by: alice, bob.
+  3. Production changes need a pull request to main approved by a code owner (alice, bob); only main deploys to the GitHub environment thoryn-production. (Environment reviewers are not offered by this GitHub plan.)
 ```
 
 The rules match the console's flow. There is one production connection. `--reviewer` (1–6 GitHub
 logins) and `--confirm-production` are required. You must be a manager of the workspace, and you must
 be signed in as yourself: a person, not a machine identity. The production trust pins the repository's
-immutable ids, the GitHub environment `thoryn-production` and the default branch. The GitHub environment
-is protected, with the required reviewers and a deployment-branch policy for the default branch only,
-**before** the production client id is set in it. The CLI reads the protection back before it sets
-`THORYN_PRODUCTION_WIF_CLIENT_ID`.
+immutable ids, the GitHub environment `thoryn-production` and the default branch.
+
+**Production approval.** All of this is set up **before** anything is written in Thoryn:
+
+1. **A reviewed pull request on the default branch.** A repository ruleset named
+   `thoryn-production-approval` (adopted and updated on a re-run) requires a pull request with at least
+   one approving review, requires a code-owner review, dismisses stale approvals on a new push, blocks
+   force-pushes and deletion, and has **no bypass actors**.
+2. **CODEOWNERS.** `.github/CODEOWNERS` makes the `--reviewer` logins the owners of
+   `/.thoryn/environments/production/` and `/.github/workflows/`. With `--repo` it is committed through the
+   GitHub API. The ruleset is enforced right after that commit, because the ruleset itself forbids direct
+   commits. In an existing clone it is written to the working tree and reaches GitHub with your pull
+   request. An existing, different CODEOWNERS is a conflict: the command stops unless you pass `--force`.
+3. **The production GitHub environment** accepts deployments from the default branch only.
+4. **Environment reviewers**, when your plan offers them. GitHub offers required reviewers for a private
+   repository only on GitHub Enterprise. On another plan it refuses them, and the environment is set up
+   without them: the ruleset carries the approval. The output, and `productionApproval.mechanisms` in
+   JSON (`pull_request_ruleset`, `environment_reviewers`), show which mechanisms are active.
+
+Before it sets `THORYN_PRODUCTION_WIF_CLIENT_ID`, the CLI reads back the ruleset (it must be active) and
+the environment.
+
+| Repository | GitHub plan | Result |
+|---|---|---|
+| public | any | ruleset + CODEOWNERS + environment reviewers |
+| private | Enterprise | ruleset + CODEOWNERS + environment reviewers |
+| private | Pro or Team | ruleset + CODEOWNERS (no environment reviewers on this plan) |
+| private | Free | **refused**: GitHub Free has no rulesets for private repositories |
 
 #### An app project
 
@@ -565,7 +591,8 @@ cd web && thoryn project init app --stack express --environment dev
 |---|---|---|
 | `--repo <owner/name>` | both | The GitHub repository. It is created from the template when it does not exist, and used as it is when it does. Leave it out to work on the clone. |
 | `--public` | both | Create the repository public. The default is private. Only with `--repo`. |
-| `--dir <path>` / `--force` | both | The clone's root / overwrite files that differ. Only without `--repo`. |
+| `--dir <path>` | both | The clone's root. Only without `--repo`. |
+| `--force` | both | Overwrite files that differ: the template's files in a clone, or (config, `--repo`) an existing `.github/CODEOWNERS`. |
 | `--template <owner/repo>` | both | Start from another template repository, such as a mirror. The default is `thoryn-io/starter-<stack>`; for config, `thoryn-io/starter-config`. |
 | `--sandbox <slug>` | config | The sandbox to configure. It is created when it does not exist. |
 | `--reviewer <login>` | config | A GitHub user who approves every production run. Repeatable, 1–6, required. |
@@ -585,9 +612,12 @@ gh api repos/<template>/contents/.thoryn/template.json             # the templat
 gh api repos/<owner>/<name> ; gh api users/<login>                 # the repository's ids; the owner / each reviewer
 gh repo view --json nameWithOwner ; gh api repos/<template>/tarball # (clone only) the repository; the template's files
 gh api --method POST repos/<template>/generate -f owner=… -f name=… -F private=… -f description=…
-gh api --method PUT repos/<o>/<r>/environments/thoryn-production --input -      # (config) reviewers + custom branch policy
+gh api repos/<o>/<r>/branches/<default>                              # (config, new repo) wait until GitHub has generated it
+gh api repos/<o>/<r>/contents/.github/CODEOWNERS ; gh api --method PUT … --input -   # (config, --repo) the reviewers' CODEOWNERS
+gh api repos/<o>/<r>/rulesets ; gh api --method POST|PUT repos/<o>/<r>/rulesets[/<id>] --input -  # (config) thoryn-production-approval
+gh api --method PUT repos/<o>/<r>/environments/thoryn-production --input -      # (config) reviewers + branch policy; again without reviewers on a billing-plan 422
 gh api [--method POST|DELETE] repos/<o>/<r>/environments/thoryn-production/deployment-branch-policies[/<id>]
-gh api repos/<o>/<r>/environments/thoryn-production                 # (config) protection read back before its variable
+gh api repos/<o>/<r>/rulesets/<id> ; gh api repos/<o>/<r>/environments/thoryn-production   # (config) read back before its variable
 gh variable set <NAME> --body <value> --repo <o>/<r> [--env thoryn-production]
 ```
 
@@ -603,13 +633,13 @@ in; the template (v2 and valid); the scope ceiling (a trust carries exactly the 
 you can grant only scopes you hold); the repository (it resolves, or its owner exists); the reviewers
 exist; file conflicts in a clone; and a conflicting trust.
 
-A later step can still fail on something no check can see, such as GitHub refusing the environment
-protection. The CLI then lists the steps it completed and stops. Every step can be repeated, so run
+A later step can still fail on something no check can see, such as GitHub refusing the ruleset for
+the plan. The CLI then lists the steps it completed and stops. Every step can be repeated, so run
 the same command again:
 
 - The repository is re-used.
-- The protection is brought back to the required shape (other reviewers and extra branch policies are
-  replaced).
+- The approval ruleset `thoryn-production-approval` is adopted and brought back to the required shape,
+  and the environment protection too (other reviewers and extra branch policies are replaced).
 - Trusts are adopted. A trust is found by its deterministic name, `starter-<connection>-<repository id>`.
   A trust the console's GitHub App flow created is found by its pins: the same repository id,
   GitHub environment, ref and scopes.
@@ -625,7 +655,9 @@ the same command again:
 | `These files already exist with different content: …` (exit 4) | Move them aside and re-run, or re-run with `--force` to overwrite them. |
 | `Your session does not hold …` (exit 4) / `scope_not_grantable` (exit 2) | A trust can carry only scopes you hold. Run `thoryn login`: its default scopes include every scope the templates use. |
 | `You do not manage sandbox …` / `needs you to manage the workspace` (exit 4) | Managers delegate. Ask a workspace admin for `thoryn access grant member:<you> manager environment:<id>` (or `workspace:<id>`). |
-| `Production approval needs GitHub Team or Enterprise for a private repository.` (config; exit 4, or 3 when this run created the repository) | GitHub offers required reviewers on a **private** repository only on GitHub Team or Enterprise, and a config project's production runs must wait for a reviewer. This is refused: there is no unprotected fallback. Upgrade the plan, or use a public repository. The protection is set before anything is written in Thoryn, so nothing exists there. If `--repo` created the repository in this run, it is kept and the message names it; delete it yourself (`gh repo delete <owner>/<name>`) if you do not want it. |
+| `Production approval needs a reviewed pull request on the default branch, which GitHub Free does not support for private repositories.` (config; exit 4, or 3 when this run created the repository) | GitHub Free has no rulesets for a private repository, and a config project's production changes must go through a reviewed pull request. It is refused: there is no fallback. Use GitHub Pro, Team or Enterprise, or a public repository. This happens before anything is written in Thoryn, so nothing exists there. If `--repo` created the repository in this run, it is kept and the message names it. Delete it yourself (`gh repo delete <owner>/<name>`) if you do not want it. |
+| `required reviewers not offered by this GitHub plan` (config, success) | Not an error. GitHub offers environment reviewers for a private repository only on GitHub Enterprise. The reviewed pull request (ruleset + CODEOWNERS) carries the approval. |
+| `already has a different .github/CODEOWNERS` (config, exit 4) | Merge the two ownership lines into your CODEOWNERS and re-run, or re-run with `--force` to replace it. |
 | `the protection step failed — gh: …` (exit 3) | GitHub refused the environment for another reason. Most often you lack admin rights on the repository. The message is GitHub's own. |
 | `cannot yet grant a machine client workspace-wide management` (exit 2, config) | The platform does not yet support `manager` on `workspace:<id>` for a client. Everything before it is kept and no variable is set. Re-run once it does. |
 | `Trust 'starter-…' … exists but pins another …` (exit 4) | A trust with the deterministic name exists with other pins or scopes. Delete it (`thoryn workload-identity trusts delete <id> --environment <env>`) and re-run. |
