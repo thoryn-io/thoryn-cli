@@ -21,8 +21,8 @@
       "required": ["kind", "spec"],
       "properties": {
         "kind": {
-          "description": "CLOSED allowlist of resource kinds, each mapping to one supported product API. `emailProvider`, `loginTheme`, `loginFlow` and `loginMethods` are singletons per environment (no `name` needed). `loginMethods` (SSO-3100) is the sign-in METHOD allow-list the hosted login offers (`PUT /api/v1/login-methods`; `destroy` resets it to the default via `DELETE`). `user` exists so a scenario can declare its test account; a customer's real users self-register.",
-          "enum": ["environment", "application", "emailProvider", "loginTheme", "loginFlow", "loginMethods", "federationMember", "user"]
+          "description": "CLOSED allowlist of resource kinds, each mapping to one supported product API. `emailProvider`, `loginTheme`, `loginFlow` and `loginMethods` are singletons per environment (no `name` needed). `loginMethods` (SSO-3100) is the sign-in METHOD allow-list the hosted login offers (`PUT /api/v1/login-methods`; `destroy` resets it to the default via `DELETE`). `user` exists so a scenario can declare its test account; a customer's real users self-register. `customDomain` (SSO-3413) is the workspace's ONE custom domain (`/api/v1/custom-domain`): workspace-level (no `environment`) and a singleton (no `name` needed). `plan` shows the DNS records to publish, `apply` claims `spec.host` and verifies it, and only `--prune` / `destroy` with `--confirm <workspace-slug>` release it. The signed-in identity needs `tenant:domains.*` and, unless it is a workspace admin, an explicit grant (`thoryn access grant client:<id> manager custom_domain:<workspace-id>`).",
+          "enum": ["environment", "application", "emailProvider", "loginTheme", "loginFlow", "loginMethods", "federationMember", "user", "customDomain"]
         },
         "name": {
           "description": "Stable converge key (unique per kind within the file). Required for every non-singleton kind.",
@@ -40,7 +40,7 @@
           "propertyNames": { "not": { "pattern": "([Pp]assword|[Ss]ecret|[Tt]oken)$" } }
         },
         "grants": {
-          "description": "SSO-3113 (epic SSO-3108) — least-privilege ACCESS GRANTS on this resource, converged with it by `apply`: a listed grant that is missing is created, a grant on this object the file no longer lists is revoked (the workspace admin userset `workspace:<id>#admin` is never revoked; grants on objects the file does not own are never touched). The OBJECT is implicit — it derives from the receipt id (`environment:<id>`, `application:<clientId>`, `user:<id>`, `federation_member:<id>`, `<singleton>:<envSlug>`). Omit to leave the object's grants unmanaged; `[]` declares none. Needs `tenant:access.write` (a session without it fails closed).",
+          "description": "SSO-3113 (epic SSO-3108) — least-privilege ACCESS GRANTS on this resource, converged with it by `apply`: a listed grant that is missing is created, a grant on this object the file no longer lists is revoked (the workspace admin userset `workspace:<id>#admin` is never revoked; grants on objects the file does not own are never touched). The OBJECT is implicit — it derives from the receipt id (`environment:<id>`, `application:<clientId>`, `user:<id>`, `federation_member:<id>`, `<singleton>:<envSlug>`, `custom_domain:<workspace-id>`). Omit to leave the object's grants unmanaged; `[]` declares none. Needs `tenant:access.write` (a session without it fails closed).",
           "type": "array",
           "uniqueItems": true,
           "items": {
@@ -74,7 +74,14 @@
         { "if": { "properties": { "kind": { "const": "loginMethods" } } },
           "then": { "properties": { "spec": { "type": "object", "required": ["methods"], "properties": {
                       "methods": { "description": "The FULL sign-in method allow-list, in display order (e.g. password, magic_link, magic_code, passkey, totp, sms); the server rejects an unknown token. Converged as a SET (order-insensitive).",
-                                   "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "string", "minLength": 1 } } } } } } }
+                                   "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "string", "minLength": 1 } } } } } } },
+        { "if": { "properties": { "kind": { "const": "customDomain" } } },
+          "then": { "not": { "required": ["environment"] },
+                    "properties": { "spec": { "type": "object", "additionalProperties": false, "required": ["host"], "properties": {
+                      "host": { "description": "The host to claim: a subdomain you control, e.g. `auth.acme.com` (the platform refuses apex domains, IP addresses and Thoryn domains).",
+                                "type": "string", "minLength": 1 },
+                      "acceptReSignIn": { "description": "Required `true` when the workspace already has production users: a custom domain changes the workspace's issuer, so every production user signs in again once. Recorded on the claim and in the audit log.",
+                                          "type": "boolean" } } } } } }
       ]
     }
   }

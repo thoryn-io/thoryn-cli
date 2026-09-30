@@ -2,6 +2,7 @@ package com.devnow.thoryn.cli.cmd.provision
 
 import com.devnow.thoryn.cli.auth.FakeJobTokens
 import com.devnow.thoryn.cli.auth.FileTokenStore
+import com.devnow.thoryn.cli.auth.RetiredIssuer
 import com.devnow.thoryn.cli.auth.Tokens
 import com.devnow.thoryn.cli.cmd.CommandSupport
 import com.devnow.thoryn.cli.cmd.CommandTestBase
@@ -128,6 +129,25 @@ class ProvisionWorkloadIdentityTest : CommandTestBase() {
         val refused = runCli("login", "--connection", foreign.path)
         assertThat(refused.exit).isEqualTo(LoginCommand.EXIT_USAGE)
         assertThat(refused.err).contains("is on workspace 'acme' but the connection's workspace.slug is 'thoryn'")
+    }
+
+    @Test
+    fun `a derived audience whose platform host is retired for the workspace's custom domain names auth-audience as the fix`() {
+        // SSO-3413 — the workspace moved to its ACTIVE custom domain: its platform host answers 410 on every path.
+        RetiredIssuer.fetcher = { url ->
+            RetiredIssuer.Answer(410, """{"type":"https://thoryn.io/problems/issuer_retired","status":410,"errorCode":"issuer_retired"}""")
+                .takeIf { url.startsWith(baseUrl()) }
+        }
+
+        val (exit, _, err) = runCli("login", "--connection", connection(workloadAuth).path)
+
+        assertThat(exit).isEqualTo(LoginCommand.EXIT_USAGE)
+        assertThat(err)
+            .contains("now issues on its custom domain")
+            .contains("Set auth.audience")
+            .contains("thoryn workload-identity trusts get <id>")
+            .contains("thoryn domain status --json")
+        assertThat(platform.jobTokens).isEmpty() // stopped before asking GitHub for a job token
     }
 
     @Test
