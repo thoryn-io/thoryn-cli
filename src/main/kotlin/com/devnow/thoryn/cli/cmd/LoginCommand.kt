@@ -781,7 +781,34 @@ class LoginCommand : Callable<Int> {
             workspaceSlug = connection.slug,
             pins = connection.github,
             reLogin = "thoryn login --connection ${file.path}",
+            retiredFix = if (connection.audience == null) {
+                { suggestion -> customDomainAudienceFix(suggestion, connection, file) }
+            } else {
+                null
+            },
         )
+    }
+
+    /**
+     * SSO-3413 — the guidance when an audience DERIVED from `workspace.slug` answers `410 issuer_retired`.
+     *
+     * Two causes share that answer. When the retired host is a pre-SSO-3297 `hub.` host, [suggestion] names the
+     * platform's successor and the fix is the base-issuer env var. Otherwise the platform host of THIS workspace
+     * is retired because the workspace now issues on its ACTIVE custom domain (custom-domains ADR §5 — one issuer
+     * at a time), and the trust's audience moved with it (oathy SSO-3307 D5). The platform's `410` deliberately
+     * does not name the custom domain, and nothing else answers anonymously, so the CLI cannot resolve it at run
+     * time: the contract must name it in `auth.audience`, exactly as the trust prints it.
+     */
+    private fun customDomainAudienceFix(suggestion: RetiredIssuer.Suggestion?, connection: Connection, file: File): String {
+        if (suggestion != null) {
+            return "The platform moved to ${suggestion.issuer}: export ${ThorynConfig.ISSUER_ENV}=${suggestion.issuer} " +
+                "and run `thoryn login --connection ${file.path}` again."
+        }
+        val env = connection.environment?.let { "/$it" } ?: ""
+        return "Workspace '${connection.slug}' now issues on its custom domain, so its platform host no longer answers " +
+            "and the trust's audience is the custom-domain issuer$env. Set auth.audience in ${file.path} to the audience " +
+            "`thoryn workload-identity trusts get <id>` prints (the custom domain's issuer is also `.issuer` in " +
+            "`thoryn domain status --json`), and drop auth.environment."
     }
 
     /**
@@ -802,6 +829,8 @@ class LoginCommand : Callable<Int> {
         workspaceSlug: String?,
         pins: TrustPins?,
         reLogin: String,
+        /** SSO-3413 — how to fix a retired audience, when the caller knows better than the default line. */
+        retiredFix: ((RetiredIssuer.Suggestion?) -> String)? = null,
     ): Int {
         try {
             IssuerUrlValidator.validate(audience, devMode)
@@ -829,9 +858,11 @@ class LoginCommand : Callable<Int> {
         // SSO-3377 — a retired host can only refuse; stop before asking GitHub for a job token.
         baseIssuer = base
         refuseRetiredIssuer(listOf(audience), workspaceForSuggestion = null) { suggestion ->
-            "The trust's audience moved with the platform" +
-                (suggestion?.let { " (now ${it.issuer})" } ?: "") +
-                ": read the current one with `thoryn workload-identity trusts get <id>` and sign in with it."
+            retiredFix?.invoke(suggestion) ?: (
+                "The trust's audience moved with the platform" +
+                    (suggestion?.let { " (now ${it.issuer})" } ?: "") +
+                    ": read the current one with `thoryn workload-identity trusts get <id>` and sign in with it."
+                )
         }?.let { return it }
 
         val binding = WorkloadIdentityBinding(clientIdValue, audience, tokenEndpoint, requestedScope, pins)

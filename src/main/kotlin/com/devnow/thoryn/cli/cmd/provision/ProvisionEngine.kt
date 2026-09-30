@@ -3,6 +3,10 @@ package com.devnow.thoryn.cli.cmd.provision
 import com.devnow.thoryn.cli.api.ProductApiClient
 import com.devnow.thoryn.cli.api.ProductApiException
 import com.devnow.thoryn.cli.cmd.AccessCommand
+import com.devnow.thoryn.cli.cmd.CustomDomainView
+import com.devnow.thoryn.cli.cmd.DnsRecord
+import com.devnow.thoryn.cli.cmd.DomainCommand
+import com.devnow.thoryn.cli.cmd.DomainWaiter
 import com.devnow.thoryn.cli.cmd.SecretIo
 import com.devnow.thoryn.cli.config.ThorynConfig
 import tools.jackson.databind.JsonNode
@@ -30,6 +34,11 @@ internal data class PlannedChange(
     val grantAdds: List<String> = emptyList(),
     /** SSO-3113 — grants live on this object that the file no longer declares (never the admin userset). */
     val grantRemoves: List<String> = emptyList(),
+    /**
+     * SSO-3413 / SSO-3414 — a `customDomain`'s live view: host, state, entitlement, the issuer in use, and
+     * the DNS records to publish as `{type, name, value, ttl}` ([com.devnow.thoryn.cli.cmd.DnsRecord]).
+     */
+    val customDomain: Map<String, Any?>? = null,
 ) {
     val hasGrantChanges: Boolean get() = grantAdds.isNotEmpty() || grantRemoves.isNotEmpty()
 
@@ -39,6 +48,7 @@ internal data class PlannedChange(
         if (diff.isNotEmpty()) put("diff", diff)
         if (adopted) put("adopted", true)
         if (hasGrantChanges) put("grants", mapOf("add" to grantAdds, "remove" to grantRemoves))
+        customDomain?.let { put("customDomain", it) }
     }
 }
 
@@ -119,6 +129,11 @@ internal class ProvisionEngine(
     private val now: () -> Instant = { Instant.now() },
     /** SSO-3113 — the single channel a minted `client_secret` leaves through; the default delivers nothing. */
     private val secretSink: SecretSink = SecretSink.undeliverable(),
+    /**
+     * SSO-3413 — the signed-in workspace's id (the token's `tnt`): the id of the workspace-level
+     * `customDomain` singleton, and so of its access object `custom_domain:<workspaceId>`.
+     */
+    private val workspaceId: String? = null,
 ) {
 
     /**
@@ -206,6 +221,7 @@ internal class ProvisionEngine(
 
     /** Live lookup by converge key → create / update / adopt / noop for one declared resource. */
     private fun probe(r: ProvisionResource, file: ProvisionFile, owned: OwnedResource?, envSlugs: Map<String, String>): PlannedChange {
+        if (r.kind == ProvisionFile.KIND_CUSTOM_DOMAIN) return probeCustomDomain(r, owned)
         val slug: String? = when {
             r.kind == ProvisionFile.KIND_ENVIRONMENT -> null
             r.environment == null -> null
@@ -521,6 +537,7 @@ internal class ProvisionEngine(
             ProvisionFile.KIND_LOGIN_THEME -> putLoginTheme(r, targetSlug(r, file, owned), spec, "+")
             ProvisionFile.KIND_LOGIN_FLOW -> applyLoginFlow(r, targetSlug(r, file, owned), spec, "+")
             ProvisionFile.KIND_LOGIN_METHODS -> putLoginMethods(r, targetSlug(r, file, owned), spec, "+")
+            ProvisionFile.KIND_CUSTOM_DOMAIN -> claimCustomDomain(r, spec)
             else -> throw ProvisionException("${r.key}: unsupported kind '${r.kind}'")
         }
     }
@@ -559,6 +576,7 @@ internal class ProvisionEngine(
             ProvisionFile.KIND_LOGIN_THEME -> putLoginTheme(r, slug, spec, "~").copy(adopted = change.adopted)
             ProvisionFile.KIND_LOGIN_FLOW -> applyLoginFlow(r, slug, spec, "~").copy(adopted = change.adopted)
             ProvisionFile.KIND_LOGIN_METHODS -> putLoginMethods(r, slug, spec, "~").copy(adopted = change.adopted)
+            ProvisionFile.KIND_CUSTOM_DOMAIN -> verifyDomain(r, spec).copy(adopted = change.adopted)
             else -> throw ProvisionException("${r.key}: unsupported kind '${r.kind}'")
         }
     }
@@ -572,6 +590,7 @@ internal class ProvisionEngine(
         val attributes = when (r.kind) {
             ProvisionFile.KIND_ENVIRONMENT -> mapOf("slug" to resolved["slug"].toString())
             ProvisionFile.KIND_USER -> mapOf("email" to resolved["email"].toString())
+            ProvisionFile.KIND_CUSTOM_DOMAIN -> mapOf("host" to hostOf(resolved))
             else -> emptyMap()
         }
         return OwnedResource(r.kind, r.name, id, slug, attributes, adopted = true)
@@ -646,6 +665,160 @@ internal class ProvisionEngine(
         out.println("  $mark loginMethods: ${stored.joinToString(", ")}")
         return OwnedResource(r.kind, r.name, "login-methods", slug, mapOf("methods" to stored.joinToString(",")))
     }
+
+    // ── customDomain (SSO-3413 / SSO-3414) ───────────────────────────────────────────────────────
+
+    /**
+     * SSO-3413 — the workspace's ONE custom domain, read LIVE (`GET /api/v1/custom-domain`) and converged by
+     * claim + verify rather than by a field diff:
+     *
+     * | Live | Action | `apply` does |
+     * |---|---|---|
+     * | no domain (`NONE`) | create | claims `spec.host` (`PUT`), then verifies once |
+     * | `spec.host`, `PENDING` / `SUSPENDED` | update | verifies the DNS records (`POST /verify`) |
+     * | `spec.host`, `VERIFIED` / `ACTIVE`, not yet in the receipt | adopt | nothing (recorded, never released) |
+     * | `spec.host`, `VERIFIED` / `ACTIVE`, owned | noop | nothing |
+     * | another host | — | refuses: moving the issuer to another host is a deliberate `thoryn domain remove` first |
+     *
+     * A failing DNS proof is NOT an apply failure — the records are the customer's to publish, and DNS takes
+     * a while to propagate: the change reports the state and the reason, and a re-run (or `--wait`) converges.
+     * A workspace without the operator entitlement is planned but stops `apply` with the operator step named
+     * ([com.devnow.thoryn.cli.cmd.DomainWaiter.NOT_ENTITLED]); an identity with no reach gets the grant it needs
+     * named ([com.devnow.thoryn.cli.cmd.DomainWaiter.NO_ACCESS]).
+     */
+    private fun probeCustomDomain(r: ProvisionResource, owned: OwnedResource?): PlannedChange {
+        val host = hostOf(resolveSpec(r, strict = false))
+        val body = try {
+            clients(null).getCustomDomain()
+        } catch (ex: ProductApiException) {
+            if (ex.httpStatus == 404) throw ProvisionException("${r.key}: ${DomainWaiter.NO_ACCESS}")
+            throw ProvisionException("${r.key}: could not read live state (${ex.message})")
+        }
+        val view = CustomDomainView.of(body)
+        val id = customDomainId()
+        val details = view.toStructured() + ("desiredHost" to host)
+        return when {
+            view.state == CustomDomainView.NONE && !view.entitled -> PlannedChange(
+                r.kind, r.name, ChangeAction.CREATE,
+                "claim $host — NOT ENTITLED: ${DomainWaiter.NOT_ENTITLED} (apply stops here until then)",
+                resource = r, owned = owned, customDomain = details,
+            )
+            view.state == CustomDomainView.NONE -> PlannedChange(
+                r.kind, r.name, ChangeAction.CREATE,
+                (if (owned != null) "owned domain no longer exists — " else "") +
+                    "claim $host and verify it (the claim issues the TXT ownership value; the CNAME points at ${view.cnameTarget ?: "the platform host"})",
+                resource = r, owned = owned, customDomain = details + ("records" to plannedRecords(host, view)),
+            )
+            !view.domain.equals(host, ignoreCase = true) -> throw ProvisionException(
+                "${r.key}: the workspace already has the custom domain '${view.domain}' (${view.state}), not '$host'. " +
+                    "A workspace has one domain and moving it changes the issuer; remove the current one deliberately " +
+                    "(`thoryn domain remove`) or declare '${view.domain}'.",
+            )
+            view.state in CustomDomainView.VERIFIABLE -> PlannedChange(
+                r.kind, r.name, ChangeAction.UPDATE,
+                "${view.state}${view.lastCheckReason?.let { " ($it)" } ?: ""} — apply verifies the DNS records" +
+                    (view.releaseAt?.let { "; released at $it unless it verifies before" } ?: ""),
+                resource = r, owned = owned, liveId = id, diff = mapOf("state" to "${view.state} → verify"),
+                adopted = owned?.adopted ?: true, customDomain = details,
+            )
+            owned == null -> PlannedChange(
+                r.kind, r.name, ChangeAction.ADOPT,
+                "exists (${view.state}) — adopted under management (never released by destroy)",
+                resource = r, liveId = id, adopted = true, customDomain = details,
+            )
+            else -> PlannedChange(
+                r.kind, r.name, ChangeAction.NOOP, "owned and ${view.state}",
+                resource = r, owned = owned, liveId = id, adopted = owned.adopted, customDomain = details,
+            )
+        }
+    }
+
+    /** Before the claim only the CNAME is known (the TXT value is minted by the claim); after it, the live records. */
+    private fun plannedRecords(host: String, view: CustomDomainView): List<Map<String, Any>> =
+        view.records.map { it.toStructured() }.ifEmpty {
+            listOfNotNull(view.cnameTarget?.let { DnsRecord("CNAME", host, it, DnsRecord.DEFAULT_TTL_SECONDS).toStructured() })
+        }
+
+    /** `PUT /api/v1/custom-domain`, then one verify attempt. */
+    private fun claimCustomDomain(r: ProvisionResource, spec: Map<String, Any?>): OwnedResource {
+        val host = hostOf(spec)
+        val claimed = try {
+            clients(null).putCustomDomain(host, coerceBool(spec["acceptReSignIn"]))
+        } catch (ex: ProductApiException) {
+            throw customDomainFailure(r, ex)
+        }
+        out.println("  + customDomain: claimed $host (${CustomDomainView.of(claimed).state})")
+        printDomainRecords(claimed)
+        return verifyDomain(r, spec, after = claimed)
+    }
+
+    /**
+     * `POST /api/v1/custom-domain/verify` while the domain is `PENDING` / `SUSPENDED`. A failing proof
+     * (`422 verification_failed`) or an inconclusive resolver (`503 dns_unavailable`) is reported, not thrown.
+     */
+    private fun verifyDomain(r: ProvisionResource, spec: Map<String, Any?>, after: JsonNode? = null): OwnedResource {
+        val host = hostOf(spec)
+        val client = clients(null)
+        var body = after ?: client.getCustomDomain()
+        if (CustomDomainView.of(body).state in CustomDomainView.VERIFIABLE) {
+            body = try {
+                client.verifyCustomDomain()
+            } catch (ex: ProductApiException) {
+                when (ex.errorCode) {
+                    "verification_failed" -> {
+                        val reason = DomainWaiter.problemReason(ex)
+                        out.println(
+                            "  ~ customDomain: $host — DNS does not prove the claim yet: ${DomainCommand.reasonText(reason)} " +
+                                "Publish the records, then re-run (or add --wait).",
+                        )
+                        client.getCustomDomain()
+                    }
+                    "dns_unavailable" -> {
+                        out.println("  ~ customDomain: $host — DNS could not be checked right now; nothing changed. Re-run to verify.")
+                        client.getCustomDomain()
+                    }
+                    else -> throw customDomainFailure(r, ex)
+                }
+            }
+        }
+        val view = CustomDomainView.of(body)
+        out.println("  = customDomain: $host is ${view.state}; the workspace issues on ${view.issuer ?: "its platform host"}")
+        return OwnedResource(r.kind, r.name, customDomainId(), null, buildMap {
+            put("host", host)
+            put("state", view.state)
+            view.issuer?.let { put("issuer", it) }
+        })
+    }
+
+    private fun printDomainRecords(body: JsonNode) {
+        val records = CustomDomainView.of(body).records
+        if (records.isEmpty()) return
+        out.println("    DNS records to publish at your DNS provider:")
+        records.forEach { out.println("      ${it.type}  ${it.name}  ${it.value}  (ttl ${it.ttl})") }
+    }
+
+    /** The custom-domain refusals, each with what to do next. */
+    private fun customDomainFailure(r: ProvisionResource, ex: ProductApiException): ProvisionException = ProvisionException(
+        "${r.key}: " + when (ex.errorCode) {
+            "entitlement_required" -> DomainWaiter.NOT_ENTITLED
+            "custom_domain_not_found" -> DomainWaiter.NO_ACCESS
+            "production_users_present" ->
+                "the workspace already has production users, so a custom domain makes each of them sign in again once. " +
+                    "Accept that explicitly with `acceptReSignIn: true` in the resource's spec and re-run."
+            "domain_not_allowed", "invalid_domain" -> "the host is not allowed (${ex.errorDescription ?: ex.errorCode}); use a subdomain you control, e.g. auth.<your-domain>."
+            "domain_taken" -> "the host is already in use by another workspace."
+            "custom_domain_exists" -> "the workspace already has another custom domain; remove it first (`thoryn domain remove`)."
+            "claim_expired" -> "the claim expired before it was verified; re-run to claim it again and publish the new TXT value."
+            else -> ex.message ?: "the custom-domain API refused the request"
+        },
+    )
+
+    /** The receipt id of the workspace-level singleton: the workspace id (`tnt`), else a stable placeholder. */
+    private fun customDomainId(): String = workspaceId?.takeIf { it.isNotBlank() } ?: CUSTOM_DOMAIN_FALLBACK_ID
+
+    private fun hostOf(spec: Map<String, Any?>): String =
+        spec["host"]?.toString()?.trim()?.trimEnd('.')?.lowercase()?.takeIf { it.isNotEmpty() }
+            ?: throw ProvisionException("customDomain: spec.host is required")
 
     // ── grants (SSO-3113) ────────────────────────────────────────────────────────────────────────
 
@@ -747,6 +920,11 @@ internal class ProvisionEngine(
                 // SSO-3100 — the delete path IS a reset: back to the default (every method offered).
                 clients(o.environment).resetLoginMethods()
                 out.println("  - loginMethods: reset to the default (every method offered)")
+            }
+            ProvisionFile.KIND_CUSTOM_DOMAIN -> {
+                // SSO-3413 — reached only through `--prune` / `destroy`, both production-plane gated by `--confirm`.
+                clients(null).deleteCustomDomain()
+                out.println("  - customDomain: released ${o.attributes["host"] ?: ""} — the workspace issues on its platform host again")
             }
             else -> throw ProvisionException("${o.key}: no delete API for kind '${o.kind}'")
         }
@@ -873,6 +1051,9 @@ internal class ProvisionEngine(
 
     companion object {
         val ENV_NAME_PATTERN = Regex("^[A-Za-z_][A-Za-z0-9_]*$")
+
+        /** SSO-3413 — the customDomain receipt id when the session carries no `tnt` (grants then cannot name it). */
+        const val CUSTOM_DOMAIN_FALLBACK_ID = "custom-domain"
         val ENV_PLACEHOLDER = Regex("""\{\{\s*env\.([A-Za-z_][A-Za-z0-9_]*)\s*}}""")
 
         /** Kinds the customer plane can delete; `loginTheme` / `loginFlow` have no delete surface (`loginMethods` resets via DELETE, SSO-3100). */
@@ -891,7 +1072,8 @@ internal class ProvisionEngine(
          * SSO-3112 contract): `environment:<id>`, `application:<clientId>`, `user:<id>`,
          * `federation_member:<id>`; the per-environment singletons are keyed by their environment SLUG
          * (`email_provider:<envSlug>`, `login_theme:<envSlug>`, `login_flow:<envSlug>`,
-         * `login_methods:<envSlug>`; the production plane ⇒ `production`).
+         * `login_methods:<envSlug>`; the production plane ⇒ `production`); SSO-3413 — the workspace's
+         * custom domain is `custom_domain:<workspaceId>`.
          */
         fun objectRef(kind: String, id: String, environmentSlug: String?): String {
             val envSlug = environmentSlug?.takeIf { it.isNotBlank() } ?: ThorynConfig.PRODUCTION_ENV_SLUG
@@ -904,6 +1086,8 @@ internal class ProvisionEngine(
                 ProvisionFile.KIND_LOGIN_THEME -> "login_theme:$envSlug"
                 ProvisionFile.KIND_LOGIN_FLOW -> "login_flow:$envSlug"
                 ProvisionFile.KIND_LOGIN_METHODS -> "login_methods:$envSlug"
+                // SSO-3413 — the workspace-level singleton; its receipt id IS the workspace id (`tnt`).
+                ProvisionFile.KIND_CUSTOM_DOMAIN -> "custom_domain:$id"
                 else -> throw ProvisionException("$kind: no access object type for this kind")
             }
         }

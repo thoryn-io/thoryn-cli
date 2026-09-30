@@ -85,15 +85,29 @@ internal class ProvisionFile private constructor(
         const val KIND_LOGIN_METHODS = "loginMethods"
         const val KIND_FEDERATION_MEMBER = "federationMember"
         const val KIND_USER = "user"
+        /**
+         * SSO-3413 — the workspace's ONE custom domain (`/api/v1/custom-domain`): WORKSPACE-level (never an
+         * `environment`), a singleton, converged by claim + verify. See [ProvisionEngine] for the semantics.
+         */
+        const val KIND_CUSTOM_DOMAIN = "customDomain"
 
         /** The CLOSED kind allowlist — must equal the schema's `kind` enum (asserted by the conformance test). */
         val KINDS: Set<String> = setOf(
             KIND_ENVIRONMENT, KIND_APPLICATION, KIND_EMAIL_PROVIDER, KIND_LOGIN_THEME,
-            KIND_LOGIN_FLOW, KIND_LOGIN_METHODS, KIND_FEDERATION_MEMBER, KIND_USER,
+            KIND_LOGIN_FLOW, KIND_LOGIN_METHODS, KIND_FEDERATION_MEMBER, KIND_USER, KIND_CUSTOM_DOMAIN,
         )
 
-        /** One-per-environment kinds: `name` is optional (defaults to the kind) and their API is a PUT. */
-        val SINGLETON_KINDS: Set<String> = setOf(KIND_EMAIL_PROVIDER, KIND_LOGIN_THEME, KIND_LOGIN_FLOW, KIND_LOGIN_METHODS)
+        /**
+         * One-per-environment kinds — and, SSO-3413, the one-per-WORKSPACE [KIND_CUSTOM_DOMAIN]: `name` is
+         * optional (defaults to the kind) and their API is a PUT.
+         */
+        val SINGLETON_KINDS: Set<String> = setOf(KIND_EMAIL_PROVIDER, KIND_LOGIN_THEME, KIND_LOGIN_FLOW, KIND_LOGIN_METHODS, KIND_CUSTOM_DOMAIN)
+
+        /** SSO-3413 — kinds that live on the WORKSPACE, not in an environment: `environment` is refused on them. */
+        val WORKSPACE_KINDS: Set<String> = setOf(KIND_CUSTOM_DOMAIN)
+
+        /** SSO-3413 — the `spec` members a `customDomain` accepts (the schema's `additionalProperties: false`). */
+        val CUSTOM_DOMAIN_SPEC_KEYS: Set<String> = setOf("host", "acceptReSignIn")
 
         /** Required `spec` members per kind — mirrors the schema's per-kind `then.required`. */
         val REQUIRED_SPEC: Map<String, Set<String>> = mapOf(
@@ -105,6 +119,7 @@ internal class ProvisionFile private constructor(
             KIND_LOGIN_FLOW to setOf("templateId"),
             KIND_LOGIN_THEME to emptySet(),
             KIND_LOGIN_METHODS to setOf("methods"),
+            KIND_CUSTOM_DOMAIN to setOf("host"),
         )
 
         val NAME_PATTERN = Regex("^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
@@ -245,6 +260,7 @@ internal class ProvisionFile private constructor(
                 r["environment"]?.takeIf { !it.isNull }?.let { env ->
                     if (env.asString().isBlank()) v += "$where environment must be non-empty when present"
                     if (kind == KIND_ENVIRONMENT) v += "$where an environment resource cannot itself carry 'environment'"
+                    if (kind in WORKSPACE_KINDS) v += "$where a $kind belongs to the workspace, not an environment — remove 'environment'"
                 }
                 val spec = r["spec"]
                 if (spec == null || !spec.isObject()) {
@@ -278,6 +294,12 @@ internal class ProvisionFile private constructor(
                             if (subject != null && relation != null && !seen.add("$subject $relation")) v += "$gw duplicates grant '$subject $relation'"
                         }
                     }
+                }
+                // SSO-3413 — `customDomain`: exactly { host, acceptReSignIn? }.
+                if (kind == KIND_CUSTOM_DOMAIN) {
+                    rejectUnknownKeys(spec, CUSTOM_DOMAIN_SPEC_KEYS, "$where spec", v)
+                    spec["host"]?.takeIf { !it.isNull && !it.isTextual() }?.let { v += "$where (customDomain) spec.host must be a host name" }
+                    spec["acceptReSignIn"]?.takeIf { !it.isNull && !it.isBoolean() }?.let { v += "$where (customDomain) spec.acceptReSignIn must be true or false" }
                 }
                 // SSO-3100 — `loginMethods.methods` is the FULL allow-list: a non-empty array of method tokens.
                 if (kind == KIND_LOGIN_METHODS) spec["methods"]?.takeIf { it.isArray() }?.let { methods ->

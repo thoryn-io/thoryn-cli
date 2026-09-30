@@ -144,7 +144,9 @@ thoryn examples share    <name> [--output <file>]   # SSO-2876 — export the se
 # Provisioning-as-code (SSO-3088, epic SSO-3087) — converge the DESIRED STATE in .thoryn/provision.yaml
 # (resources with a stable `name`: environment, application, user, federationMember, and the
 # per-environment singletons emailProvider / loginTheme / loginFlow / loginMethods — the last, SSO-3100,
-# is the sign-in METHOD allow-list `login-methods set` writes; destroy resets it). The receipt next to the file
+# is the sign-in METHOD allow-list `login-methods set` writes; destroy resets it — and, SSO-3413, the
+# workspace-level singleton customDomain: plan shows the DNS records, apply claims + verifies, only
+# --prune/destroy with --confirm release it). The receipt next to the file
 # (<name>.receipt.json) is the ownership ledger. SSO-3089: every resource is read LIVE by its converge
 # key before any write (env slug, app displayName within its env, user email, member displayName, the
 # singletons by existence): equal ⇒ no-op, different ⇒ update with only the changed fields, existing
@@ -157,7 +159,10 @@ thoryn examples share    <name> [--output <file>]   # SSO-2876 — export the se
 # and an unset variable is an error for plan and apply alike.
 thoryn provision plan    [--file <path>] [--prune]                                  # read-only: what apply would create / remove (+ grant changes)
 thoryn provision apply   [--file <path>] [--prune] [--confirm <ws>] [--yes] \
-                         [--secret-file <path>] [--force-stdout]                   # converge; environments first, dependants into them.
+                         [--secret-file <path>] [--force-stdout] \
+                         [--wait [--wait-until ACTIVE|VERIFIED] [--wait-timeout 15m] [--wait-interval 20s]]
+                                             # converge; environments first, dependants into them.
+                                             # SSO-3414 — --wait blocks until the file's customDomain is ACTIVE (or VERIFIED), verifying each round.
                                              # SSO-3113 — a confidential application it CREATES gets a one-time client secret, delivered via
                                              # SecretIo (--secret-file, or an interactive TTY; a pipe is refused unless --force-stdout); undeliverable
                                              # ⇒ the client is still recorded, exit 65, `thoryn clients rotate-secret <id>` named. A resource's
@@ -167,7 +172,8 @@ thoryn provision destroy [--file <path>|--receipt <path>] [--confirm <ws>] [--ye
 # Least-privilege access grants (SSO-3113, epic SSO-3108) — who may manage / view which resource.
 # Thin wrappers over product-api /api/v1/access (the SSO-3112 contract). Subjects: member:<sub> | client:<clientId>;
 # objects: workspace:<tenantId> | environment:<id> | application:<clientId> | user:<id> | federation_member:<id> |
-# email_provider:<envSlug> | login_theme:<envSlug> | login_flow:<envSlug> | login_methods:<envSlug>; relations: manager | viewer.
+# email_provider:<envSlug> | login_theme:<envSlug> | login_flow:<envSlug> | login_methods:<envSlug> |
+# custom_domain:<tenantId> (SSO-3413 — how a workspace admin lets ONE machine client manage the custom domain); relations: manager | viewer.
 # Scopes: tenant:access.read (list, mine) / tenant:access.write (grant, revoke).
 thoryn access grant  <subject> <relation> <object>   # POST   /api/v1/access/grants  (idempotent: 201, or 200 when it already exists)
 thoryn access revoke <subject> <relation> <object>   # DELETE /api/v1/access/grants  (grant identified in the JSON body; 204)
@@ -175,12 +181,15 @@ thoryn access list   [--object <ref>] [--subject <ref>]   # GET /api/v1/access/g
 thoryn access mine   [--type <objectType>] [--relation <relation>]   # GET /api/v1/access/mine — the objects YOU hold a relation on
 
 # Custom domain (SSO-3303, epic SSO-3290) — serve the workspace's sign-in (and its token issuer) on a host
-# you own, e.g. auth.acme.com. One per workspace; workspace admins only (others get 404). Needs the
-# feature enabled for the workspace by Thoryn (else 403 entitlement_required).
+# you own, e.g. auth.acme.com. One per workspace; workspace admins, and machine clients an admin granted
+# `manager` on custom_domain:<tenantId> (SSO-3413) — everyone else gets 404. Needs the feature enabled for
+# the workspace by Thoryn (else 403 entitlement_required).
 # Scopes: tenant:domains.read (status) / tenant:domains.write (add, verify, remove).
 thoryn domain add <host> [--accept-re-sign-in]   # PUT    /api/v1/custom-domain — prints the TXT + CNAME records to create
-thoryn domain status                             # GET    /api/v1/custom-domain — state, records, issuer, certificate, last check, release countdown when SUSPENDED
-thoryn domain verify                             # POST   /api/v1/custom-domain/verify — exit 4 while the DNS does not prove it yet
+thoryn domain status [--wait …]                  # GET    /api/v1/custom-domain — state, records, issuer, certificate, last check, release countdown when SUSPENDED
+thoryn domain verify [--wait …]                  # POST   /api/v1/custom-domain/verify — exit 4 while the DNS does not prove it yet
+                                                 # SSO-3414 — --wait [--until ACTIVE|VERIFIED] [--timeout 15m] [--interval 20s]: block until reached;
+                                                 # exit 4 with the last-check reason on a timeout. --json records: {type, name, value, ttl}
 thoryn domain remove [--yes]                     # DELETE /api/v1/custom-domain — asks for confirmation unless --yes
 
 # On-demand signing-key rotation (SSO-3369) — a new version of one of the SELECTED environment's keys
@@ -281,6 +290,22 @@ thoryn domain remove --yes
   Once that time has passed it says `release pending`; a server that predates SSO-3371 sends no
   `releaseAt` and the line is omitted. `--output json|yaml` carries `suspension.releaseAt` as-is.
 - Every subcommand accepts `--output json|yaml|table`; `--json` is shorthand for `--output json`.
+  SSO-3414: `dnsRecords` are always `{type, name, value, ttl}` (a product-api that sends no `ttl` gets the
+  recommended `300`), and `issuer` is the issuer the workspace mints on right now — the value to export
+  for your applications (a sandbox appends `/<environment>`).
+- SSO-3414 — `status --wait` / `verify --wait` block until the domain is `ACTIVE` (`--until VERIFIED` to
+  stop earlier), bounded by `--timeout` (default 15m), checking every `--interval` (default 20s).
+  `verify --wait` verifies each round; `status --wait` only reads (the platform re-checks a pending claim
+  every 15 minutes). A timeout exits `4` with the last-check reason; no domain, an expired claim, a
+  workspace without the entitlement or no access stop at once.
+- SSO-3413 — as code: a `customDomain` resource in `.thoryn/provision.yaml`
+  (`spec: { host: auth.acme.com, acceptReSignIn: false }`, workspace-level, no `environment`).
+  `provision plan` shows the records (`--output json` → `changes[].customDomain.records`), `apply`
+  claims and verifies (a failing DNS proof is reported, not an error; re-run or `--wait` converges), and
+  the domain is released only by `--prune` / `destroy` with `--confirm <workspace-slug>`. A machine
+  identity needs `tenant:domains.*` AND an explicit grant from a workspace admin:
+  `thoryn access grant client:<id> manager custom_domain:<tenantId>`. Enabling custom domains for the
+  workspace stays a Thoryn operator step (`thoryn operator custom-domain entitle <workspace>`).
 - The scopes are part of the default `thoryn login` set. They are granted to the `cli` client by oathy
   hub V181, which must be deployed before a CLI release that requests them.
 
