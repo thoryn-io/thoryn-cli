@@ -1272,6 +1272,17 @@ Your sign-in session has expired and carries no refresh token, so it cannot be r
 Run `thoryn login --workspace thoryn` to sign in again.
 ```
 
+**And then it stops (SSO-3568).** Having said that, the CLI makes no further
+calls: the command exits non-zero with the sign-in instruction as its last
+word, rather than going on to the gateway with a credential it has just
+reported as dead. It used to continue, so the message a reader was left with
+was whatever the server said to the doomed call next — in the reported case
+`HTTP 401: invalid_token - DPoP proof has already been used.`, which reads like
+an RFC 9449 protocol fault and sends you looking in entirely the wrong place.
+On `--output json|yaml` the same guidance arrives as `hint`, beside the stable
+`errorCode: session_cannot_be_renewed`, so a script can branch on "go and sign
+in" instead of on a `401`. The exit code is unchanged.
+
 **Caveat (hub-side).** The authorization server issues **no refresh token to a public client on the
 authorization-code grant** (Spring Authorization Server's `OAuth2RefreshTokenGenerator`), and the CLI's
 `cli` login client is a public RFC 8252 native client. A loopback `thoryn login` session therefore ends
