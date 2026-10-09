@@ -74,6 +74,22 @@ class ProductApiClient(
      * `token_type: DPoP`, `Bearer` otherwise, so nothing changes until the hub flips the `cli` client.
      */
     private val dpop: DpopSession? = null,
+    /**
+     * SSO-3568 — non-null when this process has already told the user that their sign-in session
+     * CANNOT be renewed (see `CommandSupport.unrenewableSessionGuidance`). Every send is then refused
+     * **before any I/O**, with the guidance carried on the exception, instead of being attempted with a
+     * credential known to be dead.
+     *
+     * Read through a supplier rather than captured, because the proactive renewal that fails is not
+     * always the one that ran before this client was built: the reactive on-`401` [reauthenticate] can
+     * discover the same thing mid-command, and the next send must refuse too.
+     *
+     * The reported shape (SSO-3568) was `provision apply` printing the correct "sign in again" line and
+     * then CONTINUING, so the command exited on `HTTP 401: invalid_token - DPoP proof has already been
+     * used.` — a message that reads like an RFC 9449 protocol fault and sent the reader into the hub's
+     * replay cache instead of to the one line above it that mattered.
+     */
+    private val sessionUnrenewable: () -> String? = { null },
 ) {
 
     /** Current bearer material; swapped in place by the reactive refresh-on-401 retry. */
@@ -1013,10 +1029,17 @@ class ProductApiClient(
         handler: HttpResponse.BodyHandler<T>,
         build: (accessToken: String) -> HttpRequest,
     ): HttpResponse<T> {
+        // SSO-3568 — a session this process has already reported as unrenewable is not retried on the
+        // wire. Refusing here is what makes the sign-in instruction the LAST thing the user reads.
+        sessionUnrenewable()?.let { throw ProductApiException.sessionUnrenewable(it) }
         val first = sendProofed(build(tokens.accessToken), handler)
         if (first.statusCode() != 401) return first
         val reauth = reauthenticate ?: return first
-        val refreshed = runCatching { reauth() }.getOrNull() ?: return first
+        val refreshed = runCatching { reauth() }.getOrNull()
+        // The reactive renewal has just run. If IT was the one that found the session unrenewable, the
+        // original `401` is no longer the honest answer — the dead session is.
+        sessionUnrenewable()?.let { throw ProductApiException.sessionUnrenewable(it) }
+        if (refreshed == null) return first
         if (refreshed.accessToken == tokens.accessToken) return first
         tokens = refreshed
         return sendProofed(build(tokens.accessToken), handler)
@@ -1137,6 +1160,13 @@ class ProductApiException(
         get() = wwwAuthenticate?.let { Regex("max_age=\"?(\\d+)\"?").find(it)?.groupValues?.get(1)?.toLongOrNull() }
 
     /**
+     * SSO-3568 — this request was never sent: the CLI had already told the user their session cannot be
+     * renewed. Callers must render [errorDescription] (the sign-in guidance) rather than an HTTP story.
+     */
+    val isSessionUnrenewable: Boolean
+        get() = errorCode == ERROR_CODE_SESSION_UNRENEWABLE
+
+    /**
      * SSO-2413 — the destructive action targets a **production** workspace and no
      * (valid) `X-Thoryn-Confirm` header was sent (product-api's
      * `ProductionConfirmationInterceptor` → `428 production_confirmation_required`).
@@ -1160,6 +1190,16 @@ class ProductApiException(
 
         /** RFC 9457 `errorCode` emitted with 422 when the confirm header does not match the workspace slug. */
         const val ERROR_CODE_CONFIRMATION_MISMATCH: String = "production_confirmation_mismatch"
+
+        /**
+         * SSO-3568 — CLIENT-SIDE ONLY: no server ever sends this. It marks a request the CLI refused to
+         * send because this process had already reported the sign-in session as unrenewable.
+         */
+        const val ERROR_CODE_SESSION_UNRENEWABLE: String = "session_cannot_be_renewed"
+
+        /** SSO-3568 — the refusal above, carrying the sign-in guidance as its description. */
+        fun sessionUnrenewable(guidance: String): ProductApiException =
+            ProductApiException(401, ERROR_CODE_SESSION_UNRENEWABLE, guidance, "")
 
         fun fromResponse(status: Int, body: String, mapper: ObjectMapper, wwwAuthenticate: String? = null): ProductApiException {
             val (code, description) = parseOAuthError(body, mapper)

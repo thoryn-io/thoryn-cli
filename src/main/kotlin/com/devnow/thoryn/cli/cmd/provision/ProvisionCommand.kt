@@ -155,10 +155,22 @@ class ProvisionCommand : Callable<Int> {
             )
         }
 
-        fun fail(ex: Exception, gateway: String, format: OutputFormat): Int = when (ex) {
-            is ProvisionException -> { System.err.println("Error: ${ex.message}"); CommandSupport.EXIT_HTTP_ERROR }
-            is ProductApiException -> CommandSupport.renderError(format, ex, requiredScope = "tenant:applications.write")
-            else -> CommandSupport.renderRequestFailure(ex, gateway)
+        /**
+         * SSO-3568 — a session this process has already reported as unrenewable takes precedence over
+         * every other rendering. [com.devnow.thoryn.cli.cmd.provision.ProvisionEngine] wraps a refused
+         * read into a `ProvisionException` naming the resource, which is right for a real API failure
+         * and wrong here: it produced the reported
+         * `Error: application/forge-oauth2-proxy: could not read live state (HTTP 401: invalid_token -
+         * DPoP proof has already been used.)` AFTER the correct "sign in again" line, and that is the
+         * line the reader keeps. Returning quietly leaves the sign-in instruction as the final word.
+         */
+        fun fail(ex: Exception, gateway: String, format: OutputFormat): Int {
+            CommandSupport.unrenewableSessionGuidance()?.let { return CommandSupport.renderUnrenewableSession(format, it) }
+            return when (ex) {
+                is ProvisionException -> { System.err.println("Error: ${ex.message}"); CommandSupport.EXIT_HTTP_ERROR }
+                is ProductApiException -> CommandSupport.renderError(format, ex, requiredScope = "tenant:applications.write")
+                else -> CommandSupport.renderRequestFailure(ex, gateway)
+            }
         }
     }
 
