@@ -109,6 +109,9 @@ internal object CommandSupport {
             // SSO-3199 — RFC 9449 proof on every request; the presentation scheme still follows the
             // token the hub issued (Bearer until the `cli` client is flipped to dpop_required).
             dpop = Dpop.session(),
+            // SSO-3568 — refuse to send once the renewal above has definitively failed, rather than
+            // calling the gateway with a credential we have just told the user is dead.
+            sessionUnrenewable = { unrenewableGuidance },
         )
 
     /**
@@ -189,10 +192,10 @@ internal object CommandSupport {
             // SSO-3182 — name the HOME session that could not be renewed and the exact re-login line
             // (the old text said only "Run `thoryn login`", which on a thoryn-homed session re-ran the
             // same workspace-less login the user had already done).
-            err.println(
-                "Could not enter workspace '${selected.slug}': the sign-in session could not be renewed. " +
-                    "Run `${LoginCommand.reLoginCommand(baseTokens)}` and retry.",
-            )
+            val guidance = "Could not enter workspace '${selected.slug}': the sign-in session could not be renewed. " +
+                "Run `${LoginCommand.reLoginCommand(baseTokens)}` and retry."
+            markUnrenewable(guidance) // SSO-3568 — and so the blank bearer below is never actually sent.
+            err.println(guidance)
         }
         return ProductApiClient(
             gateway = gateway,
@@ -202,6 +205,7 @@ internal object CommandSupport {
             reauthenticate = { mint() },
             environmentSlug = environmentSlug, // SSO-2870 — ride the selected environment on every request.
             dpop = Dpop.session(), // SSO-3199 — RFC 9449 proof on every request.
+            sessionUnrenewable = { unrenewableGuidance }, // SSO-3568
         )
     }
 
@@ -285,6 +289,42 @@ internal object CommandSupport {
     @Volatile
     private var sessionHintPrinted: Boolean = false
 
+    /**
+     * SSO-3568 — set, to the guidance that was printed, once this process has told the user that their
+     * sign-in session CANNOT be renewed. It is the single fact every renderer below needs: having said
+     * "run `thoryn login …` to sign in again", the CLI must not then exit on a *different* story.
+     *
+     * The reported failure (SSO-3568) was `provision apply` printing that line correctly and then
+     * carrying on with the dead session, so the command's final word was
+     * `HTTP 401: invalid_token - DPoP proof has already been used.` — which reads like an RFC 9449
+     * fault and costs the reader an hour in the hub's replay cache before they notice the line above.
+     *
+     * Keyed on the latch rather than on an exception TYPE deliberately: the refusal is raised deep
+     * inside [ProductApiClient] and is re-wrapped on the way out by intermediate layers that have every
+     * right to do so ([com.devnow.thoryn.cli.cmd.provision.ProvisionEngine] turns it into a
+     * `ProvisionException` naming the resource). A latch is immune to all of that re-wrapping; a
+     * `catch` clause would have to be taught about each layer.
+     */
+    @Volatile
+    private var unrenewableGuidance: String? = null
+
+    /**
+     * SSO-3568 — the guidance printed when this session was found unrenewable, or null when no such
+     * report has been made. Non-null means "do not tell this user anything else; they already have the
+     * only instruction that helps".
+     */
+    internal fun unrenewableSessionGuidance(): String? = unrenewableGuidance
+
+    /**
+     * SSO-3568 — record that [guidance] has been printed and that the session is beyond renewal. Called
+     * from every site that definitively reports a failed renewal; the sites that return null WITHOUT
+     * saying anything (no store, no issuer, nothing to renew with) deliberately do not latch — the
+     * latch means "the user has been told", not merely "a renewal did not happen".
+     */
+    private fun markUnrenewable(guidance: String) {
+        unrenewableGuidance = guidance
+    }
+
     /** SSO-3377 — set once this process has told the user the session's issuer is retired. */
     @Volatile
     private var retiredSessionReported: Boolean = false
@@ -292,13 +332,19 @@ internal object CommandSupport {
     private fun warnOnce(err: PrintStream, message: () -> String) {
         if (sessionHintPrinted) return
         sessionHintPrinted = true
-        err.println(message())
+        // SSO-3568 — every current caller means exactly "this session cannot be renewed, here is the
+        // one command that helps", so printing it and latching it are the same event. Evaluated inside
+        // the guard because `retiredSessionGuidance` has a side effect of its own.
+        val text = message()
+        markUnrenewable(text)
+        err.println(text)
     }
 
     /** Test seam — reset the once-per-process hint latch. */
     internal fun resetSessionHintForTest() {
         sessionHintPrinted = false
         retiredSessionReported = false
+        unrenewableGuidance = null
     }
 
     /**
@@ -387,10 +433,10 @@ internal object CommandSupport {
         val clientId = current.clientId?.takeIf { it.isNotBlank() } ?: return null
         val secret = ThorynConfig.resolveApiKeySecret()
         if (secret == null) {
-            err.println(
-                "The API-key session for '$clientId' has expired and no secret is available to re-mint it. " +
-                    "Set ${ThorynConfig.API_KEY_ENV} or THORYN_CLIENT_SECRET, or run `thoryn login --client-credentials`.",
-            )
+            val guidance = "The API-key session for '$clientId' has expired and no secret is available to re-mint it. " +
+                "Set ${ThorynConfig.API_KEY_ENV} or THORYN_CLIENT_SECRET, or run `thoryn login --client-credentials`."
+            markUnrenewable(guidance) // SSO-3568 — said out loud, so nothing else may be said after it.
+            err.println(guidance)
             return null
         }
         return try {
@@ -417,10 +463,10 @@ internal object CommandSupport {
                 warnOnce(err) { retiredSessionGuidance(current) }
                 return null
             }
-            err.println(
-                "Could not re-mint the API-key session (${e.oauthError}); check the credentials, " +
-                    "or run `thoryn login --client-credentials`.",
-            )
+            val guidance = "Could not re-mint the API-key session (${e.oauthError}); check the credentials, " +
+                "or run `thoryn login --client-credentials`."
+            markUnrenewable(guidance) // SSO-3568
+            err.println(guidance)
             null
         }
     }
@@ -520,6 +566,9 @@ internal object CommandSupport {
      * no host, no cause, nothing to act on. Returns [EXIT_IO_ERROR].
      */
     fun renderRequestFailure(ex: Throwable, target: String, err: PrintStream = System.err): Int {
+        // SSO-3568 — a dead session is not a transport problem. When the renewal has already been
+        // reported, "could not reach <host>" is both wrong and the last thing the user would read.
+        unrenewableSessionGuidance()?.let { return renderUnrenewableSession(OutputFormat.TABLE, it) }
         err.println("Request failed: could not reach $target — ${describeThrowable(ex)}")
         return EXIT_IO_ERROR
     }
@@ -630,6 +679,12 @@ internal object CommandSupport {
         out: PrintStream = System.out,
         err: PrintStream = System.err,
     ): Int {
+        // SSO-3568 — highest precedence: this request was never sent, because the session had already
+        // been reported unrenewable. Anything else printed here would displace the only actionable line.
+        val unrenewable = unrenewableSessionGuidance() ?: ex.errorDescription.takeIf { ex.isSessionUnrenewable }
+        if (unrenewable != null && (ex.isSessionUnrenewable || ex.httpStatus == 401)) {
+            return renderUnrenewableSession(format, unrenewable, out)
+        }
         // SSO-2413 — production destructive-action confirmation guard takes precedence:
         // its guidance ("re-run with --confirm <slug>") is more actionable than the
         // generic HTTP-error rendering.
@@ -699,6 +754,41 @@ internal object CommandSupport {
             OutputFormat.JSON -> Printers.json(confirmationStructured(ex, hint), out)
             OutputFormat.YAML -> Printers.yaml(confirmationStructured(ex, hint), out)
             OutputFormat.TABLE -> if (!alreadyReported) err.println(hint)
+        }
+        return EXIT_HTTP_ERROR
+    }
+
+    /**
+     * SSO-3568 — render a session that cannot be renewed. The guidance has ALREADY been printed, at the
+     * moment the renewal failed, so TABLE deliberately prints nothing more: silence is what makes that
+     * line the final word, which is the whole point of the fix. JSON/YAML carry it as `hint` next to a
+     * stable `errorCode` so a script can branch on it.
+     *
+     * Same shape as [renderRetiredIssuer]'s `alreadyReported` suppression.
+     *
+     * Returns [EXIT_HTTP_ERROR], the code every one of these paths already returned. [EXIT_NOT_SIGNED_IN]
+     * would read better — nothing was sent, and "there is no usable session" is exactly what that code
+     * means — but it would move an exit code that scripts branch on, for a change whose whole point is
+     * the MESSAGE. SSO-3568 asks for non-zero, not for a new number.
+     */
+    internal fun renderUnrenewableSession(
+        format: OutputFormat,
+        guidance: String,
+        out: PrintStream = System.out,
+    ): Int {
+        val structured = linkedMapOf<String, Any?>(
+            "error" to ProductApiException.ERROR_CODE_SESSION_UNRENEWABLE,
+            "errorDescription" to guidance,
+            "httpStatus" to 401,
+            "hint" to guidance,
+        )
+        when (format) {
+            OutputFormat.JSON -> Printers.json(structured, out)
+            OutputFormat.YAML -> Printers.yaml(structured, out)
+            // Nothing. [markUnrenewable] is only ever called alongside the print of the very same
+            // line, so the latch being set means the user already has it — and printing it twice would
+            // be the only way to make an actionable message look like noise.
+            OutputFormat.TABLE -> Unit
         }
         return EXIT_HTTP_ERROR
     }

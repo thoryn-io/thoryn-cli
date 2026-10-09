@@ -58,6 +58,11 @@ abstract class CommandTestBase {
         // probe would conclude, without a GET eating a response queued for the test's own call. The
         // probe itself is covered by `LoginRetiredIssuerTest`.
         RetiredIssuer.fetcher = { null }
+        // SSO-3568 — the "this session cannot be renewed" latch is process-wide, which is right for a
+        // CLI (one command per process) and a trap in a shared test JVM: one class whose fixture lets a
+        // renewal fail would otherwise make every later class's first request refuse before it is sent.
+        // Same class of hazard as SSO-3339's `Dpop.ladder` leak — reset it for everyone, in one place.
+        CommandSupport.resetSessionHintForTest()
     }
 
     @AfterEach
