@@ -531,7 +531,7 @@ class ProvisionCommand : Callable<Int> {
         private fun renderEntries(entries: List<ImportedResource>): String {
             if (entries.isEmpty()) return ""
             val node = tools.jackson.databind.json.JsonMapper.builder().build().valueToTree<tools.jackson.databind.JsonNode>(entries.map { it.toEntry() })
-            return com.devnow.thoryn.cli.output.YamlWriter.write(node).lines().filter { it.isNotEmpty() }.joinToString("\n") { "  $it" } + "\n"
+            return ProvisionYamlEdit.fragment(node)
         }
 
         /**
@@ -543,16 +543,11 @@ class ProvisionCommand : Callable<Int> {
         private fun appendEntries(target: File, fragment: String, existing: ProvisionFile?) {
             if (existing == null) {
                 target.absoluteFile.parentFile?.mkdirs()
-                target.writeText("apiVersion: ${ProvisionFile.API_VERSION}\nresources:\n$fragment")
+                target.writeText(ProvisionYamlEdit.fresh(fragment))
             } else {
                 val original = target.readBytes()
-                val root = tools.jackson.dataformat.yaml.YAMLMapper.builder().build().readTree(original)
-                val lastKey = root.properties().lastOrNull()?.key
-                if (lastKey != "resources") {
-                    throw ProvisionException("${target.path}: 'resources' is not the last top-level key, so entries cannot be appended to it — run without --write and add them by hand")
-                }
-                val text = original.toString(Charsets.UTF_8)
-                target.writeText(text + (if (text.endsWith("\n")) "" else "\n") + fragment)
+                // The shared edit rule (ProvisionYamlEdit): append under `resources:` only when it is the last top-level key.
+                target.writeText(ProvisionYamlEdit.append(original.toString(Charsets.UTF_8), fragment, target.path))
                 try {
                     ProvisionFile.load(target)
                 } catch (ex: ProvisionException) {
