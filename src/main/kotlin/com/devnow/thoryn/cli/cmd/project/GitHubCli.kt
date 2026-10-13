@@ -34,10 +34,13 @@ data class GhRepository(
  * | create the repository | `gh api --method POST repos/<template>/generate -f owner=… -f name=… -F private=… -f description=…` |
  * | (config) CODEOWNERS | `gh api repos/<o>/<r>/contents/.github/CODEOWNERS`, `gh api --method PUT … --input -` (with `--repo`); `gh api repos/<o>/<r>/branches/<default>` while a new repository is generated |
  * | (config) approval ruleset | `gh api repos/<o>/<r>/rulesets`, `gh api --method POST repos/<o>/<r>/rulesets --input -`, `gh api --method PUT repos/<o>/<r>/rulesets/<id> --input -`, `gh api repos/<o>/<r>/rulesets/<id>` |
- * | protect the production environment | `gh api --method PUT repos/<o>/<r>/environments/<env> --input -` (again without reviewers on a billing-plan 422) |
+ * | protect the production environment | `gh api repos/<o>/<r>/environments/<env>` (read first), then `gh api --method PUT repos/<o>/<r>/environments/<env> --input -` only when not in shape (again without reviewers on a billing-plan 422) |
  * | its branch policies | `gh api repos/<o>/<r>/environments/<env>/deployment-branch-policies`, `… --method POST … -f name=<branch> -f type=branch`, `… --method DELETE …/<id>` |
  * | verify the protection | `gh api repos/<o>/<r>/environments/<env>` |
- * | a variable (upsert) | `gh variable set <NAME> --body <value> --repo <o>/<r> [--env <env>]` |
+ * | the variables (read first) | `gh variable list --repo <o>/<r> [--env <env>] --json name,value` |
+ * | a variable (only when it differs) | `gh variable set <NAME> --body <value> --repo <o>/<r> [--env <env>]` |
+ * | (app, new repo) the seeded `.thoryn/` files | `gh api repos/<o>/<r>/contents/<path>`, `gh api --method PUT repos/<o>/<r>/contents/<path> --input -` |
+ * | (config, new repo) the seeded `.thoryn/` files | the pull-request set above, on `thoryn/provisioning` |
  */
 class GitHubCli(
     private val gh: GhRunner,

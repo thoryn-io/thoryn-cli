@@ -529,11 +529,13 @@ Set up the config project acme/thoryn-config for workspace acme.
   access          granted  client:wi_… manager environment:<id>
   access          granted  client:wi_… manager workspace:<id>
   variables       set      THORYN_ISSUER, THORYN_WORKSPACE, THORYN_SANDBOX_ENVIRONMENT, THORYN_SANDBOX_WIF_CLIENT_ID (repository); THORYN_PRODUCTION_WIF_CLIENT_ID (environment thoryn-production)
+  provisioning    pending review  pull request pending review: https://github.com/acme/thoryn-config/pull/1 — .thoryn/environments/sandbox/connection.json (pending review), …
 
 Next steps:
   1. Clone it: gh repo clone acme/thoryn-config
   2. GitHub's initial commit started a first workflow run before the variables existed, so its Thoryn jobs skipped. Re-run it …
-  3. Production changes need a pull request to main approved by a code owner (alice, bob); only main deploys to the GitHub environment thoryn-production. (Environment reviewers are not offered by this GitHub plan.)
+  3. Provisioning files pending review: https://github.com/acme/thoryn-config/pull/1 — each connection's connection.json and starter provision.yaml. Merge it, and the repository converges its own configuration from then on …
+  4. Production changes need a pull request to main approved by a code owner (alice, bob); only main deploys to the GitHub environment thoryn-production. (Environment reviewers are not offered by this GitHub plan.)
 ```
 
 The rules match the console's flow. There is one production connection. `--reviewer` (1–6 GitHub
@@ -607,6 +609,39 @@ tree:
 cd web && thoryn project init app --stack express --environment dev
 ```
 
+#### The `.thoryn/` files it seeds
+
+Once the trusts exist, the command seeds two files per connection, so the repository is in the
+provisioning-as-code loop from its first commit (`thoryn provision plan` on a pull request,
+`thoryn provision apply` on the default branch — oauthy ADR 2026-10-13). Both sit next to the
+connection's `provisionFile` from `.thoryn/template.json`: `.thoryn/` for an app project,
+`.thoryn/environments/<connection>/` for a config project.
+
+- **`connection.json`** — who the repository is: a `workload_identity` connection contract
+  (`thoryn login --connection .thoryn/connection.json`, no secret) with the trust's client id, audience
+  and scopes, and its GitHub pins. It is derived from the trust and validated against the bundled
+  connection schema before it is written. A re-run rewrites it when this repository's own copy differs
+  (the trust was recreated); an identical one is left alone. A connection.json that is **not** this
+  repository's — another repository's, or a `client_credentials` one — is a conflict like any other
+  differing file: the command stops, and `--force` replaces it.
+- **`provision.yaml`** — what the repository owns, as a starter in the same shapes
+  `thoryn provision` already converges. An app project declares its OAuth client in its sandbox
+  (`kind: application`, public with PKCE, a framework-default redirect URI to adjust). A config project's
+  production section declares the workspace's sandbox environment (adopted by its slug, named as it is);
+  its sandbox section anchors on that sandbox by slug only — that connection holds
+  `tenant:environments.read`, so nothing in the starter can need a write — and names the kinds to add
+  (`loginMethods`, `federationMember`, `emailProvider`, `loginTheme`, `loginFlow`). It is seeded only
+  when **absent** and never overwritten afterwards: from then on the file is in control.
+
+Where they go depends on how the command ran:
+
+| Run | The seeded files |
+|---|---|
+| in a clone | written to the working tree; they land with your commit or pull request |
+| `--repo`, repository created by this run, **app** | committed to the default branch |
+| `--repo`, repository created by this run, **config** | proposed in a pull request from the branch `thoryn/provisioning` (the approval ruleset protects the default branch by then); a re-run converges and names the same pull request |
+| `--repo`, repository that already existed | not added — like the template's files; the output says whether they are present and how to add them (run inside a clone) |
+
 #### Flags
 
 | Flag | Kind | Meaning |
@@ -614,14 +649,14 @@ cd web && thoryn project init app --stack express --environment dev
 | `--repo <owner/name>` | both | The GitHub repository. It is created from the template when it does not exist, and used as it is when it does. Leave it out to work on the clone. |
 | `--public` | both | Create the repository public. The default is private. Only with `--repo`. |
 | `--dir <path>` | both | The clone's root. Only without `--repo`. |
-| `--force` | both | Overwrite files that differ: the template's files in a clone, or (config, `--repo`) propose replacing an existing `.github/CODEOWNERS`. `--force` never weakens the approval ruleset: under an existing ruleset the replacement is a pull request. |
+| `--force` | both | Overwrite files that differ: the template's files and a foreign `connection.json` in a clone, or (config, `--repo`) propose replacing an existing `.github/CODEOWNERS`. `--force` never weakens the approval ruleset: under an existing ruleset the replacement is a pull request. It never overwrites an existing `provision.yaml`. |
 | `--template <owner/repo>` | both | Start from another template repository, such as a mirror. The default is `thoryn-io/starter-<stack>`; for config, `thoryn-io/starter-config`. |
 | `--sandbox <slug>` | config | The sandbox to configure. It is created when it does not exist. |
 | `--reviewer <login>` | config | A GitHub user who approves every production run. Repeatable, 1–6, required. |
 | `--confirm-production` | config | Required. The project gets a production workload identity that manages the workspace. |
 | `--stack <stack>` | app | `express`, `spring-boot` or `aspnet-core`. |
 | `--environment <sandbox>` | app | The existing sandbox the application connects to. `production` is refused. |
-| `--output json\|yaml\|table`, `--json` | both | The report (steps, trusts, grants, variables, files, next steps) as JSON/YAML. |
+| `--output json\|yaml\|table`, `--json` | both | The report (steps, trusts, grants, variables, files, the seeded provisioning files, next steps) as JSON/YAML. |
 
 Exit codes: `0` done · `1` not signed in to Thoryn · `2` product-api refused a call · `3` a `gh` step
 failed · `4` a pre-flight check refused (nothing was changed) · `64` invalid flags.
@@ -637,16 +672,21 @@ gh api --method POST repos/<template>/generate -f owner=… -f name=… -F priva
 gh api repos/<o>/<r>/branches/<default>                              # (config, new repo) wait until GitHub has generated it
 gh api repos/<o>/<r>/contents/.github/CODEOWNERS ; gh api --method PUT … --input -   # (config, --repo) the reviewers' CODEOWNERS (direct only when this run creates the ruleset)
 gh api repos/<o>/<r>/git/ref/heads/thoryn/codeowners ; gh api --method POST repos/<o>/<r>/git/refs … ; gh api [--method POST] repos/<o>/<r>/pulls …   # CODEOWNERS change under an existing ruleset
-gh api repos/<o>/<r>/rulesets ; gh api --method POST|PUT repos/<o>/<r>/rulesets[/<id>] --input -  # (config) thoryn-production-approval
-gh api --method PUT repos/<o>/<r>/environments/thoryn-production --input -      # (config) reviewers + branch policy; again without reviewers on a billing-plan 422
+gh api repos/<o>/<r>/rulesets ; gh api repos/<o>/<r>/rulesets/<id> ; gh api --method POST|PUT repos/<o>/<r>/rulesets[/<id>] --input -  # (config) thoryn-production-approval — read first, written only when not in shape
+gh api repos/<o>/<r>/environments/thoryn-production                              # (config) read first
+gh api --method PUT repos/<o>/<r>/environments/thoryn-production --input -      # (config) reviewers + branch policy, only when not in shape; again without reviewers on a billing-plan 422
 gh api [--method POST|DELETE] repos/<o>/<r>/environments/thoryn-production/deployment-branch-policies[/<id>]
 gh api repos/<o>/<r>/rulesets/<id> ; gh api repos/<o>/<r>/environments/thoryn-production   # (config) read back before its variable
-gh variable set <NAME> --body <value> --repo <o>/<r> [--env thoryn-production]
+gh variable list --repo <o>/<r> [--env thoryn-production] --json name,value       # read first
+gh variable set <NAME> --body <value> --repo <o>/<r> [--env thoryn-production]   # only a variable that differs
+gh api repos/<o>/<r>/contents/.thoryn/… ; gh api --method PUT repos/<o>/<r>/contents/.thoryn/… --input -   # (app, new repo) the seeded files
+gh api repos/<o>/<r>/git/ref/heads/thoryn/provisioning ; gh api --method POST repos/<o>/<r>/git/refs … ; gh api [--method POST] repos/<o>/<r>/pulls …   # (config, new repo) the seeded files' pull request
 ```
 
 On Thoryn it uses your own session and the public customer-plane API: `GET /api/v1/environments`,
 `GET /api/v1/access/mine`, `POST /api/v1/environments` (config, only when the sandbox is missing),
-`GET`/`POST /api/v1/workload-identity/trusts` and `POST /api/v1/access/grants`.
+`GET`/`POST /api/v1/workload-identity/trusts`, and `GET`/`POST /api/v1/access/grants` (a grant is read
+first and posted only when missing).
 
 #### Nothing half-done, and safe to re-run
 
@@ -666,8 +706,14 @@ the same command again:
 - Trusts are adopted. A trust is found by its deterministic name, `starter-<connection>-<repository id>`.
   A trust the console's GitHub App flow created is found by its pins: the same repository id,
   GitHub environment, ref and scopes.
-- Grants and variables are upserts.
-- Identical files are skipped.
+- Grants are read first; an existing grant is left alone. Variables are read first (`gh variable list`);
+  only one that differs is set.
+- Identical files are skipped; an existing `provision.yaml` is kept; this repository's own
+  `connection.json` is rewritten only when it differs.
+
+**A second run makes no write** — not to product-api, not to GitHub, not to the working tree. Every
+step reads before it writes, and the report says `Checked the … project` instead of `Set up …`; in JSON,
+`steps[].status` is `existing` / `adopted` / `in place` / `unchanged` / `kept` throughout.
 
 #### Troubleshooting
 
@@ -682,6 +728,8 @@ the same command again:
 | `required reviewers not offered by this GitHub plan` (config, success) | Not an error. GitHub offers environment reviewers for a private repository only on GitHub Enterprise. The reviewed pull request (ruleset + CODEOWNERS) carries the approval. |
 | `already has a different .github/CODEOWNERS` (config, exit 4) | Merge the three ownership lines into your CODEOWNERS and re-run, or re-run with `--force` to replace it. Once the approval ruleset exists, that replacement is a pull request. |
 | `CODEOWNERS update pending review: <url>` (config, success) | The default branch is already protected, so the CLI does not commit to it: it opened (or reused) a pull request from `thoryn/codeowners`. Have a reviewer approve and merge it. |
+| `Provisioning files pending review: <url>` (config, success) | The seeded `connection.json` + starter `provision.yaml` of each connection went through a pull request from `thoryn/provisioning`, because the approval ruleset protects the default branch. Merge it; the repository then converges its own configuration. A re-run converges and names the same pull request. |
+| `These files already exist with different content: .thoryn/connection.json` (exit 4) | The clone has a connection.json that is not this repository's own (another repository's, or a `client_credentials` one). Move it aside, or re-run with `--force` to replace it with the trust's `workload_identity` contract. An existing `provision.yaml` is never a conflict: it is kept. |
 | `the protection step failed — gh: …` (exit 3) | GitHub refused the environment for another reason. Most often you lack admin rights on the repository. The message is GitHub's own. |
 | `cannot yet grant a machine client workspace-wide management` (exit 2, config) | The platform does not yet support `manager` on `workspace:<id>` for a client. Everything before it is kept and no variable is set. Re-run once it does. |
 | `Trust 'starter-…' … exists but pins another …` (exit 4) | A trust with the deterministic name exists with other pins or scopes. Delete it (`thoryn workload-identity trusts delete <id> --environment <env>`) and re-run. |
