@@ -35,16 +35,35 @@ class ProjectInitConfigTest : ProjectTestBase() {
             "gh api --method POST repos/acme/platform/rulesets --input -", // created disabled: CODEOWNERS is committed first
             "gh api --method PUT repos/acme/platform/contents/.github/CODEOWNERS --input -",
             "gh api --method PUT repos/acme/platform/rulesets/4200 --input -", // then enforced
+            "gh api $env", // read first: absent
             "gh api --method PUT $env --input -",
             "gh api $env/deployment-branch-policies",
             "gh api --method POST $env/deployment-branch-policies -f name=main -f type=branch",
+            "gh variable list --repo acme/platform --json name,value", // read first: none set yet
             "gh variable set THORYN_ISSUER --body https://auth.stg.thoryn.org --repo acme/platform",
             "gh variable set THORYN_WORKSPACE --body acme --repo acme/platform",
             "gh variable set THORYN_SANDBOX_ENVIRONMENT --body sandbox --repo acme/platform",
             "gh variable set THORYN_SANDBOX_WIF_CLIENT_ID --body wi_client1 --repo acme/platform",
             "gh api repos/acme/platform/rulesets/4200", // the approval verified before the production variable
             "gh api $env",
+            "gh variable list --repo acme/platform --env thoryn-production --json name,value",
             "gh variable set THORYN_PRODUCTION_WIF_CLIENT_ID --body wi_client2 --repo acme/platform --env thoryn-production",
+            // The seeded .thoryn/ files: the default branch is protected now, so they go through a pull request.
+            "gh api repos/acme/platform/git/ref/heads/thoryn/provisioning",
+            "gh api repos/acme/platform/git/ref/heads/main",
+            "gh api --method POST repos/acme/platform/git/refs -f ref=refs/heads/thoryn/provisioning -f sha=commit-main",
+            "gh api repos/acme/platform/contents/.thoryn/environments/sandbox/connection.json?ref=thoryn/provisioning",
+            "gh api --method PUT repos/acme/platform/contents/.thoryn/environments/sandbox/connection.json --input -",
+            "gh api repos/acme/platform/contents/.thoryn/environments/sandbox/provision.yaml?ref=thoryn/provisioning",
+            "gh api --method PUT repos/acme/platform/contents/.thoryn/environments/sandbox/provision.yaml --input -",
+            "gh api repos/acme/platform/contents/.thoryn/environments/production/connection.json?ref=thoryn/provisioning",
+            "gh api --method PUT repos/acme/platform/contents/.thoryn/environments/production/connection.json --input -",
+            "gh api repos/acme/platform/contents/.thoryn/environments/production/provision.yaml?ref=thoryn/provisioning",
+            "gh api --method PUT repos/acme/platform/contents/.thoryn/environments/production/provision.yaml --input -",
+            "gh api repos/acme/platform/pulls?head=acme:thoryn/provisioning&state=open",
+            "gh api --method POST repos/acme/platform/pulls -f title=${ProjectSeeds.PROVISIONING_MESSAGE} -f head=thoryn/provisioning -f base=main " +
+                "-f body=Proposed by `thoryn project init config`: each connection's `connection.json` (its workload identity, no secret) and a starter " +
+                "`provision.yaml`, so this repository converges its own configuration — `thoryn provision plan` on a pull request, `apply` on main.",
         )
         assertThat(parseJson(gh.calls.first { it.args.contains("PUT") && it.args.contains(env) }.stdin!!)).isEqualTo(
             mapOf(
@@ -98,7 +117,7 @@ class ProjectInitConfigTest : ProjectTestBase() {
         assertThat(gh.variables).containsEntry("acme/platform:THORYN_SANDBOX_ENVIRONMENT", "qa")
             .containsEntry("acme/platform@thoryn-production:THORYN_PRODUCTION_WIF_CLIENT_ID", "wi_client2")
         assertThat(Files.exists(dir.resolve(".thoryn/environments/production/provision.yaml"))).isTrue()
-        assertThat(out).contains("files").contains("6 added")
+        assertThat(out).contains("files").contains("4 added") // the template's two provision.yaml placeholders are seeded instead
         assertThat(Files.readString(dir.resolve(".github/CODEOWNERS"))).contains("/.github/workflows/ @alice @bob")
         assertThat(gh.files["acme/platform"].orEmpty()).doesNotContainKey(".github/CODEOWNERS") // not committed: it lands with the pull request
         assertThat(gh.invocations).contains("gh api --method POST repos/acme/platform/rulesets --input -") // active at once, nothing to commit
@@ -124,7 +143,7 @@ class ProjectInitConfigTest : ProjectTestBase() {
         assertThat(env.policies.map { it.second }).containsExactly("main")
         assertThat(api.trusts).hasSize(2)
         assertThat(api.environments.count { it["slug"] == "sandbox" }).isEqualTo(1)
-        assertThat(api.writes.drop(writes).map { it.path }).containsOnly("/api/v1/access/grants")
+        assertThat(api.writes.drop(writes)).isEmpty() // the grants exist: read, not re-posted
     }
 
     @Test

@@ -69,6 +69,11 @@ internal class FakeProjectApi : Dispatcher() {
             }
             route == "/api/v1/access/mine" && method == "GET" ->
                 ok(mapOf("data" to mine.filter { query["type"] == null || it.startsWith("${query["type"]}:") }))
+            route == "/api/v1/access/grants" && method == "GET" -> {
+                val objectRef = query["object"]
+                if (objectRef != null && objectRef.startsWith("workspace:") && workspaceGrantUnavailable) return problem(404, "not_found")
+                ok(mapOf("data" to grants.filter { objectRef == null || it["object"] == objectRef }, "pagination" to mapOf("cursor" to null, "hasMore" to false)))
+            }
             route == "/api/v1/access/grants" && method == "POST" -> {
                 val objectRef = body["object"] as String
                 if (objectRef.startsWith("workspace:") && workspaceGrantUnavailable) return problem(404, "not_found")

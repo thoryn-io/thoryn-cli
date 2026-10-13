@@ -137,9 +137,10 @@ class GitHubCli(
      * [reviewerIds] as required reviewers WHEN the plan offers them. GitHub offers environment reviewers on a private
      * repository only on GitHub Enterprise; on another plan it answers the reviewers PUT with a `422` naming the
      * billing plan, and the environment is then set up without them (the approval is carried by the default-branch
-     * ruleset instead). Returns whether the reviewers are active. Idempotent: a re-run converges an existing environment.
+     * ruleset instead). Returns whether the reviewers are active and whether anything was written. Idempotent: a re-run
+     * converges an existing environment, and one already in shape is read, not written.
      */
-    fun protectEnvironment(repository: GhRepository, environment: String, reviewerIds: List<Long>, branch: String, step: String): Boolean {
+    fun protectEnvironment(repository: GhRepository, environment: String, reviewerIds: List<Long>, branch: String, step: String): EnvironmentProtection {
         val path = "repos/${repository.fullName}/environments/$environment"
         val branchOnly = linkedMapOf("protected_branches" to false, "custom_branch_policies" to true)
         val withReviewers = linkedMapOf(
@@ -148,17 +149,23 @@ class GitHubCli(
             "deployment_branch_policy" to branchOnly,
         )
         var reviewersActive = true
-        val put = gh.run(listOf("api", "--method", "PUT", path, "--input", "-"), stdin = json.writeValueAsBytes(withReviewers))
-        if (!put.ok) {
-            if (!environmentReviewersNeedPlan(put)) {
-                throw GhCommandException(step, put, "GitHub refused to protect the environment; you need admin rights on the repository.")
+        var changed = false
+        // Read first: an environment already in the required shape is not written again (a re-run makes no writes).
+        val current = environmentState(repository, environment, step)
+        if (current == null || !current.customBranchPolicies || current.reviewers != reviewerIds.toSet()) {
+            changed = true
+            val put = gh.run(listOf("api", "--method", "PUT", path, "--input", "-"), stdin = json.writeValueAsBytes(withReviewers))
+            if (!put.ok) {
+                if (!environmentReviewersNeedPlan(put)) {
+                    throw GhCommandException(step, put, "GitHub refused to protect the environment; you need admin rights on the repository.")
+                }
+                reviewersActive = false
+                val retry = gh.run(
+                    listOf("api", "--method", "PUT", path, "--input", "-"),
+                    stdin = json.writeValueAsBytes(linkedMapOf("deployment_branch_policy" to branchOnly)),
+                )
+                if (!retry.ok) throw GhCommandException(step, retry, "GitHub refused to create the environment; you need admin rights on the repository.")
             }
-            reviewersActive = false
-            val retry = gh.run(
-                listOf("api", "--method", "PUT", path, "--input", "-"),
-                stdin = json.writeValueAsBytes(linkedMapOf("deployment_branch_policy" to branchOnly)),
-            )
-            if (!retry.ok) throw GhCommandException(step, retry, "GitHub refused to create the environment; you need admin rights on the repository.")
         }
         val list = gh.run(listOf("api", "$path/deployment-branch-policies"))
         if (!list.ok) throw GhCommandException(step, list)
@@ -170,16 +177,29 @@ class GitHubCli(
             if (policyName == branch && type == "branch") {
                 present = true
             } else {
+                changed = true
                 val id = p.path("id").asLong(0)
                 val del = gh.run(listOf("api", "--method", "DELETE", "$path/deployment-branch-policies/$id"))
                 if (!del.ok) throw GhCommandException(step, del)
             }
         }
         if (!present) {
+            changed = true
             val add = gh.run(listOf("api", "--method", "POST", "$path/deployment-branch-policies", "-f", "name=$branch", "-f", "type=branch"))
             if (!add.ok) throw GhCommandException(step, add)
         }
-        return reviewersActive
+        return EnvironmentProtection(reviewersActive, changed)
+    }
+
+    /** [protectEnvironment]'s outcome: whether required reviewers are active, and whether this run wrote anything. */
+    class EnvironmentProtection(val reviewersActive: Boolean, val changed: Boolean)
+
+    /** The URL of the open pull request from [branch], or null when there is none. */
+    fun openPullRequest(repository: GhRepository, branch: String, step: String): String? {
+        val open = gh.run(listOf("api", "repos/${repository.fullName}/pulls?head=${repository.ownerLogin}:$branch&state=open"))
+        if (!open.ok) throw GhCommandException(step, open)
+        val list = node(open, step)
+        return if (list.isArray && list.size() > 0) list.get(0).path("html_url").asString("").takeIf { it.isNotBlank() } else null
     }
 
     /**
@@ -187,9 +207,18 @@ class GitHubCli(
      * empty — all of them as required reviewers. Checked before any production variable is set.
      */
     fun environmentProtected(repository: GhRepository, environment: String, reviewerIds: List<Long>, step: String): Boolean {
+        val state = environmentState(repository, environment, step) ?: return false
+        return state.reviewers.containsAll(reviewerIds) && state.customBranchPolicies
+    }
+
+    /** A GitHub environment as read back: its required reviewers' ids and whether it has a custom deployment branch policy. */
+    class EnvironmentState(val reviewers: Set<Long>, val customBranchPolicies: Boolean)
+
+    /** The environment's protection as GitHub reports it, or null when it does not exist. */
+    fun environmentState(repository: GhRepository, environment: String, step: String): EnvironmentState? {
         val r = gh.run(listOf("api", "repos/${repository.fullName}/environments/$environment"))
         if (!r.ok) {
-            if (r.httpStatus() == 404) return false
+            if (r.httpStatus() == 404) return null
             throw GhCommandException(step, r)
         }
         val n = node(r, step)
@@ -198,8 +227,7 @@ class GitHubCli(
             .filter { it.path("type").asString("") == "required_reviewers" }
             .flatMap { rule -> rule.path("reviewers").let { rs -> (0 until rs.size()).map { rs.get(it).path("reviewer").path("id").asLong(0) } } }
             .toSet()
-        val customBranches = n.path("deployment_branch_policy").path("custom_branch_policies").asBoolean(false)
-        return reviewers.containsAll(reviewerIds) && customBranches
+        return EnvironmentState(reviewers, n.path("deployment_branch_policy").path("custom_branch_policies").asBoolean(false))
     }
 
     /**
@@ -282,8 +310,20 @@ class GitHubCli(
      * differs, and the open pull request from it is reused or opened. Returns the pull request's URL. The default
      * branch is never written.
      */
-    fun proposeFile(repository: GhRepository, path: String, content: String, branch: String, title: String, body: String, step: String): String {
+    fun proposeFile(repository: GhRepository, path: String, content: String, branch: String, title: String, body: String, step: String): String =
+        proposeFiles(repository, listOf(path to content), branch, title, body, step).url
+
+    /** A proposal's outcome: the pull request's URL, and whether this run wrote anything (a branch, a file, the pull request). */
+    class Proposal(val url: String, val changed: Boolean)
+
+    /**
+     * [proposeFile] for several files on ONE branch and one pull request: each file is committed where it differs
+     * from the branch's copy (one commit per file), and an existing open pull request from the branch is reused.
+     * The default branch is never written.
+     */
+    fun proposeFiles(repository: GhRepository, files: List<Pair<String, String>>, branch: String, title: String, body: String, step: String): Proposal {
         val full = repository.fullName
+        var changed = false
         val ref = gh.run(listOf("api", "repos/$full/git/ref/heads/$branch"))
         if (!ref.ok) {
             if (ref.httpStatus() != 404) throw GhCommandException(step, ref)
@@ -292,13 +332,16 @@ class GitHubCli(
             val sha = node(base, step).path("object").path("sha").asString("")
             val created = gh.run(listOf("api", "--method", "POST", "repos/$full/git/refs", "-f", "ref=refs/heads/$branch", "-f", "sha=$sha"))
             if (!created.ok) throw GhCommandException(step, created)
+            changed = true
         }
-        val onBranch = readFile(repository, path, step, ref = branch)
-        if (onBranch?.content != content) writeFile(repository, path, content, onBranch?.sha, title, step, branch = branch)
-        val open = gh.run(listOf("api", "repos/$full/pulls?head=${repository.ownerLogin}:$branch&state=open"))
-        if (!open.ok) throw GhCommandException(step, open)
-        val list = node(open, step)
-        if (list.size() > 0) return list.get(0).path("html_url").asString("")
+        files.forEach { (path, content) ->
+            val onBranch = readFile(repository, path, step, ref = branch)
+            if (onBranch?.content != content) {
+                writeFile(repository, path, content, onBranch?.sha, title, step, branch = branch)
+                changed = true
+            }
+        }
+        openPullRequest(repository, branch, step)?.let { return Proposal(it, changed) }
         val pr = gh.run(
             listOf(
                 "api", "--method", "POST", "repos/$full/pulls",
@@ -306,7 +349,7 @@ class GitHubCli(
             ),
         )
         if (!pr.ok) throw GhCommandException(step, pr)
-        return node(pr, step).path("html_url").asString("")
+        return Proposal(node(pr, step).path("html_url").asString(""), changed = true)
     }
 
     /** The id of the repository's ruleset named [name], or null. */
@@ -342,17 +385,42 @@ class GitHubCli(
 
     /** True when ruleset [id] is active on the default branch with its pull-request rule. Checked before the production variable. */
     fun rulesetActive(repository: GhRepository, id: Long, step: String): Boolean {
-        val r = gh.run(listOf("api", "repos/${repository.fullName}/rulesets/$id"))
-        if (!r.ok) {
-            if (r.httpStatus() == 404) return false
-            throw GhCommandException(step, r)
-        }
-        val n = node(r, step)
+        val n = ruleset(repository, id, step) ?: return false
         val rules = n.path("rules")
         val pr = (0 until rules.size()).map { rules.get(it) }.firstOrNull { it.path("type").asString("") == "pull_request" }
         return n.path("enforcement").asString("") == "active" &&
             pr != null && pr.path("parameters").path("required_approving_review_count").asInt(0) >= 1 &&
             pr.path("parameters").path("require_code_owner_review").asBoolean(false)
+    }
+
+    /**
+     * True when ruleset [id], as GitHub reports it, already IS the required shape ([approvalRuleset] at `active`):
+     * active, no bypass actors, the default branch only, exactly our three rule types, and every pull-request
+     * parameter we set at our value (GitHub may report extra parameters at their defaults; they do not count). A
+     * re-run then leaves the ruleset alone instead of writing it again.
+     */
+    fun rulesetInShape(repository: GhRepository, id: Long, step: String): Boolean {
+        val n = ruleset(repository, id, step) ?: return false
+        val wanted = json.valueToTree<JsonNode>(approvalRuleset(ENFORCEMENT_ACTIVE))
+        if (n.path("enforcement").asString("") != ENFORCEMENT_ACTIVE) return false
+        if (n.path("bypass_actors").let { !it.isArray || it.size() != 0 }) return false
+        if (n.path("conditions") != wanted.path("conditions")) return false
+        val rules = n.path("rules").takeIf { it.isArray }?.let { (0 until it.size()).map { i -> it.get(i) } } ?: return false
+        val wantedRules = wanted.path("rules").let { (0 until it.size()).map { i -> it.get(i) } }
+        if (rules.map { it.path("type").asString("") }.toSet() != wantedRules.map { it.path("type").asString("") }.toSet()) return false
+        val pr = rules.first { it.path("type").asString("") == "pull_request" }.path("parameters")
+        val wantedPr = wantedRules.first { it.path("type").asString("") == "pull_request" }.path("parameters")
+        return wantedPr.propertyNames().all { key -> pr.path(key) == wantedPr.path(key) }
+    }
+
+    /** Ruleset [id] as GitHub reports it, or null on 404. */
+    private fun ruleset(repository: GhRepository, id: Long, step: String): JsonNode? {
+        val r = gh.run(listOf("api", "repos/${repository.fullName}/rulesets/$id"))
+        if (!r.ok) {
+            if (r.httpStatus() == 404) return null
+            throw GhCommandException(step, r)
+        }
+        return node(r, step)
     }
 
     /**
@@ -388,6 +456,23 @@ class GitHubCli(
         if (environment != null) args += listOf("--env", environment)
         val r = gh.run(args)
         if (!r.ok) throw GhCommandException(step, r)
+    }
+
+    /**
+     * The Actions variables at repository level, or in [environment], as `name → value` — read before any is set so a
+     * re-run writes only what differs. Null when `gh` cannot list them (an older `gh` without `--json`): the caller
+     * then sets every variable, as before.
+     */
+    fun listVariables(repository: GhRepository, environment: String?): Map<String, String>? {
+        val args = mutableListOf("variable", "list", "--repo", repository.fullName)
+        if (environment != null) args += listOf("--env", environment)
+        args += listOf("--json", "name,value")
+        val r = gh.run(args)
+        if (!r.ok) return null
+        val list = runCatching { json.readTree(r.text) }.getOrNull()?.takeIf { it.isArray } ?: return null
+        return (0 until list.size()).map { list.get(it) }
+            .filter { it.path("name").isString && it.path("value").isString }
+            .associate { it.path("name").asString() to it.path("value").asString() }
     }
 
     companion object {
