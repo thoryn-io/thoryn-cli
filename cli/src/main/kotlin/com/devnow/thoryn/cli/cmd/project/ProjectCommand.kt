@@ -22,7 +22,8 @@ import java.util.concurrent.Callable
  * your own `thoryn login` session. See [ProjectInit] for the steps, the checks and the re-run guarantees.
  *
  *  - `project init config [--repo owner/name] [--sandbox <slug>] --reviewer <login>… --confirm-production`
- *  - `project init app --stack express|spring-boot|aspnet-core --environment <sandbox> [--repo owner/name]`
+ *  - `project init app --stack express|spring-boot|aspnet-core --environment <sandbox> [--repo owner/name]
+ *    [--config-repo owner/name --production-url https://…]` (SSO-3669: the production client, as a pull request on the config repository)
  *
  * Without `--repo` it works on the clone in the current directory (or `--dir`): it adds the template's files
  * (never overwriting one unless `--force`) and commits nothing.
@@ -115,6 +116,9 @@ class ProjectCommand : Callable<Int> {
         abstract fun reviewers(): List<String>
         abstract fun confirmProduction(): Boolean
         abstract fun kindArgs(): List<String>
+        /** SSO-3669 — the app project's config repository and production URL; null for a config project. */
+        open fun configRepo(): String? = null
+        open fun productionUrl(): String? = null
 
         override fun call(): Int {
             if (json && outputRaw != null && !outputRaw.equals("json", ignoreCase = true)) {
@@ -153,6 +157,8 @@ class ProjectCommand : Callable<Int> {
                 sandbox = sandbox(),
                 reviewers = reviewers(),
                 confirmProduction = confirmProduction(),
+                configRepo = configRepo(),
+                productionUrl = productionUrl(),
                 commandLine = commandLine(),
             )
             val init = ProjectInit(request, GitHubCli(ghRunner()), api, session)
@@ -276,6 +282,24 @@ class ProjectCommand : Callable<Int> {
         @Option(names = ["--environment"], required = true, paramLabel = "<sandbox>", description = ["The existing sandbox the application connects to (its slug)."])
         var environment: String = ""
 
+        @Option(
+            names = ["--config-repo"],
+            paramLabel = "<owner/name>",
+            description = [
+                "The workspace's config repository. After the sandbox steps, a pull request on it (branch thoryn/app-<name>, reused on a re-run)",
+                "declares the app's PRODUCTION client — public with PKCE, its id published to this repository's `production` GitHub environment.",
+                "Needs --production-url. Never merged, never on the config repository's default branch; it is never created here.",
+            ],
+        )
+        var configRepoArg: String? = null
+
+        @Option(
+            names = ["--production-url"],
+            paramLabel = "<https://…>",
+            description = ["Where the app runs in production: the client's redirect URIs are <url>/callback and <url>/signed-out (the starters' paths). With --config-repo."],
+        )
+        var productionUrlArg: String? = null
+
         override val kind: ProjectInit.Kind = ProjectInit.Kind.APP
         override val stack: String get() = stackArg.trim()
 
@@ -287,13 +311,36 @@ class ProjectCommand : Callable<Int> {
                     "Name a sandbox with --environment <slug> (thoryn env list)."
             }
             if (!SLUG.matches(env)) return "invalid_environment|--environment must be a sandbox slug (was '$env')."
+            // SSO-3669 — the production client goes to the config repository; both flags, or neither.
+            val cfg = configRepo()
+            val url = productionUrl()
+            if (cfg != null && !REPO.matches(cfg)) return "invalid_config_repo|--config-repo must be <owner>/<name> (was '$cfg')."
+            if (cfg != null && repo?.trim()?.equals(cfg, ignoreCase = true) == true) {
+                return "invalid_config_repo|--config-repo names the app repository itself; an app repository never declares its production client — the workspace's config repository does."
+            }
+            if (cfg != null && url == null) {
+                return "production_url_required|--config-repo declares the app's production client on the config repository; its redirect URIs need " +
+                    "--production-url https://<where the app runs> (${ProjectSeeds.CALLBACK_PATH} and ${ProjectSeeds.SIGNED_OUT_PATH} are appended)."
+            }
+            if (url != null && cfg == null) {
+                return "config_repo_required|--production-url goes with --config-repo <owner>/<name>: the production client is declared on the workspace's " +
+                    "config repository, never in the app repository."
+            }
+            if (url != null && !PRODUCTION_URL.matches(url)) return "invalid_production_url|--production-url must be an https URL without query or fragment (was '$url')."
             return null
         }
 
         override fun sandbox(): String = environment.trim()
         override fun reviewers(): List<String> = emptyList()
         override fun confirmProduction(): Boolean = false
-        override fun kindArgs(): List<String> = listOf("--stack $stack", "--environment ${environment.trim()}")
+        override fun configRepo(): String? = configRepoArg?.trim()?.takeIf { it.isNotEmpty() }
+        override fun productionUrl(): String? = productionUrlArg?.trim()?.takeIf { it.isNotEmpty() }
+        override fun kindArgs(): List<String> = buildList {
+            add("--stack $stack")
+            add("--environment ${environment.trim()}")
+            configRepo()?.let { add("--config-repo $it") }
+            productionUrl()?.let { add("--production-url $it") }
+        }
     }
 
     companion object {
@@ -306,6 +353,8 @@ class ProjectCommand : Callable<Int> {
         private val REPO = Regex("^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/(?!\\.\\.?$)[A-Za-z0-9._-]{1,100}$")
         private val LOGIN = Regex("^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$")
         private val SLUG = Regex("^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
+        /** SSO-3669 — a production URL: https, a host (optional port), an optional path; no query, fragment or whitespace. */
+        private val PRODUCTION_URL = Regex("^https://[A-Za-z0-9.-]+(:\\d{1,5})?(/[^?#\\s]*)?$")
 
         /** Test seam: how `gh` is run. Production spawns the real `gh`. */
         @Volatile

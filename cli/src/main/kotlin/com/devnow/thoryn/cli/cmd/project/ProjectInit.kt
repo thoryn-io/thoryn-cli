@@ -2,6 +2,9 @@ package com.devnow.thoryn.cli.cmd.project
 
 import com.devnow.thoryn.cli.api.ProductApiClient
 import com.devnow.thoryn.cli.api.ProductApiException
+import com.devnow.thoryn.cli.cmd.provision.ProvisionYamlEdit
+import com.devnow.thoryn.provision.ProvisionException
+import com.devnow.thoryn.provision.ProvisionFile
 import tools.jackson.databind.JsonNode
 import java.nio.file.Files
 import java.nio.file.Path
@@ -30,6 +33,15 @@ import java.nio.file.attribute.PosixFilePermission
  * repository is reused, the environment protection re-applied to the required shape, trusts adopted (by
  * their deterministic name, or — for one the orchestrator created — by their pins), grants are idempotent,
  * variables upserted, identical files skipped.
+ *
+ * **The app's PRODUCTION client (SSO-3669, ADR 2026-10-13 production-clients-declared-in-the-config-project §1).**
+ * An app repository is sandbox-only; with `--config-repo` + `--production-url`, the run ends by proposing the app's
+ * production client ON THE CONFIG REPOSITORY: a pull request from the deterministic branch `thoryn/app-<app repo>`
+ * (reused on a re-run — never a second one) adding an `application` entry to its production section, converged by
+ * `name` (added when absent, replaced when different, nothing proposed when identical), with the `publishTo` block
+ * that lands the id in the app repository's `production` GitHub environment. The config repository is resolved and
+ * the file computed at pre-flight (a missing repository stops the run before any write, with the by-hand steps; it is
+ * never created); the default branch is never written; the command never merges.
  */
 internal class ProjectInit(
     private val request: Request,
@@ -60,6 +72,10 @@ internal class ProjectInit(
         val confirmProduction: Boolean,
         /** The command line to repeat, for the hints. */
         val commandLine: String,
+        /** SSO-3669 (app) — `owner/name` of the workspace's config repository the production client is proposed on; null ⇒ no proposal. */
+        val configRepo: String? = null,
+        /** SSO-3669 (app) — where the app runs in production; the redirect URIs hang off it. Set together with [configRepo]. */
+        val productionUrl: String? = null,
     )
 
     /** The Thoryn session facts the project needs, from the current login / workspace selection. */
@@ -114,6 +130,17 @@ internal class ProjectInit(
     private enum class FileAction { WRITE, OVERWRITE, SAME }
 
     private class PlannedFile(val entry: TemplateArchive.Entry, val target: Path, val action: FileAction)
+
+    /** SSO-3669 — the config repository and the production-section file as it must read after this app's production client is converged into it. */
+    private class ConfigProject(
+        val repository: GhRepository,
+        val appRepository: String,
+        val entry: JsonNode,
+        val converged: ProvisionYamlEdit.Converged,
+    ) {
+        val branch: String get() = ProjectSeeds.productionClientBranch(appRepository.substringAfter('/'))
+        val name: String get() = ProjectSeeds.productionClientName(appRepository)
+    }
 
     // ── Entry point ──────────────────────────────────────────────────────────────────────────────
 
@@ -247,6 +274,8 @@ internal class ProjectInit(
         }
         // An existing repository may already carry trusts: refuse up front when one of ours conflicts.
         repository?.let { repo -> targets.filter { it.envId != null }.forEach { findTrust(it, repo) } }
+        // SSO-3669 — the config repository must be reachable, and its production file editable, BEFORE the first change.
+        val configProject = request.configRepo?.let { preflightConfigProject(it, "$repoOwner/$repoName") }
 
         // ── The run ──────────────────────────────────────────────────────────────────────────────
         report["repository"] = linkedMapOf("fullName" to "$repoOwner/$repoName")
@@ -422,6 +451,10 @@ internal class ProjectInit(
         }
         currentStep = STEP_PROVISIONING
         seedFiles(targets, repo, workspaceSlug, sandboxSlug, sandboxName, createdRepo)
+        if (configProject != null) {
+            currentStep = STEP_CONFIG_PROJECT
+            proposeProductionClient(configProject, repo)
+        }
         report["steps"] = steps.map { linkedMapOf("step" to it.name, "status" to it.status, "detail" to it.detail) }
         report["nextSteps"] = nextSteps(repo, config, productionGithubEnvironment)
         return report
@@ -901,6 +934,32 @@ internal class ProjectInit(
                     "converges its own configuration from then on (`thoryn provision plan` on a pull request, `thoryn provision apply` on ${repo.defaultBranch}).",
             )
         }
+        @Suppress("UNCHECKED_CAST")
+        (report["configProject"] as? Map<String, Any?>)?.let { cp ->
+            val variable = ProjectSeeds.PRODUCTION_CLIENT_ID_VARIABLE
+            val environment = ProjectSeeds.PRODUCTION_GITHUB_ENVIRONMENT
+            val url = cp["pullRequest"] as? String
+            if (url != null) {
+                add(
+                    "Production client pending review: $url — a reviewer of ${cp["repository"]} merges it, and the config project's production run " +
+                        "(approved in its GitHub environment) creates the client and publishes its id to ${repo.fullName} as $variable on its GitHub " +
+                        "environment `$environment` (created when absent). Until then the app has no production client. If that publish cannot reach " +
+                        "${repo.fullName}, set it by hand with the id from ${ProjectSeeds.CONFIG_PRODUCTION_PROVISION_FILE}'s receipt: " +
+                        "gh variable set $variable --body <id> --repo ${repo.fullName} --env $environment",
+                )
+            } else {
+                add(
+                    "${cp["repository"]} already declares the production client of ${repo.fullName}; the config project's production run publishes its id " +
+                        "as $variable on ${repo.fullName}'s GitHub environment `$environment`.",
+                )
+            }
+        }
+        if (!config && request.configRepo == null) {
+            add(
+                "No production client was proposed. Re-run with --config-repo <owner>/<config-repo> --production-url https://<where the app runs> to open a " +
+                    "pull request on the workspace's config repository declaring one (public, PKCE; its id is published to this repository's `production` GitHub environment).",
+            )
+        }
         if (config) {
             val reviewers = request.reviewers.joinToString(", ")
             @Suppress("UNCHECKED_CAST")
@@ -918,6 +977,129 @@ internal class ProjectInit(
     private fun seededPaths(vararg statuses: String): List<String> =
         ((report["provisioning"] as? Map<String, Any?>)?.get("files") as? List<Map<String, Any?>>).orEmpty()
             .filter { it["status"] in statuses }.map { it["path"] as String }
+
+    // ── SSO-3669: the app's production client, proposed on the config repository (ADR 2026-10-13 §1) ──
+
+    /**
+     * Pre-flight (reads only): the config repository as the signed-in `gh` sees it — absent or invisible stops the
+     * run with the by-hand steps; it is NEVER created here — and its production-section file converged with this
+     * app's production client ([ProjectSeeds.productionClientEntry]): the entry is appended when absent (every other
+     * line of the file is kept), replaced when it differs, and left alone when identical. The result must be a file
+     * the provisioning loader accepts, or the run stops before the first change.
+     */
+    private fun preflightConfigProject(configRepo: String, appRepository: String): ConfigProject {
+        val path = ProjectSeeds.CONFIG_PRODUCTION_PROVISION_FILE
+        val manual = configProjectManualSteps(configRepo, appRepository)
+        val repository = github.repository(configRepo.substringBefore('/'), configRepo.substringAfter('/'), STEP_PREFLIGHT)
+            ?: throw Stop(
+                EXIT_CHECK, "config_repository_not_found",
+                "GitHub does not show the config repository $configRepo to your gh sign-in: it does not exist, or you have no access to it. " +
+                    "Nothing was changed — not on GitHub, not in Thoryn.",
+                "`thoryn project init app` never creates the config repository. Create it (thoryn project init config --repo $configRepo " +
+                    "--reviewer <login> --confirm-production) or ask for access, then re-run: ${request.commandLine}",
+                mapOf("manualSteps" to manual, "configRepository" to configRepo),
+            )
+        val existing = github.readFile(repository, path, STEP_PREFLIGHT)
+        val entry = ProjectSeeds.productionClientEntry(appRepository, request.productionUrl!!)
+        val source = "$configRepo:$path"
+        val converged = try {
+            ProvisionYamlEdit.converge(existing?.content, entry, source, ProjectSeeds.productionClientHeader(appRepository)) {
+                ProjectSeeds.isProductionClientOf(it, appRepository)
+            }.also { ProvisionFile.parse(it.content.toByteArray(), source) }
+        } catch (ex: ProvisionException) {
+            throw Stop(
+                EXIT_CHECK, "config_provision_file_unusable",
+                "The production client cannot be added to $source: ${ex.message}. Nothing was changed — not on GitHub, not in Thoryn.",
+                "Fix the file on ${repository.defaultBranch} (or add the entry by hand — the steps below) and re-run: ${request.commandLine}",
+                mapOf("manualSteps" to manual, "configRepository" to configRepo),
+            )
+        }
+        return ConfigProject(repository, appRepository, entry, converged)
+    }
+
+    /**
+     * Propose the converged production-section file through the deterministic branch and ONE pull request
+     * ([GitHubCli.proposeFiles]: the branch is created from the default branch when absent, the file committed only
+     * where it differs from the branch's copy, an open pull request reused) — or nothing, when the default branch
+     * already declares the entry as it must be. The default branch is never written; nothing is merged.
+     */
+    private fun proposeProductionClient(cp: ConfigProject, appRepo: GhRepository) {
+        val path = ProjectSeeds.CONFIG_PRODUCTION_PROVISION_FILE
+        val spec = cp.entry["spec"]
+        val target = cp.entry["publishTo"].get(0)
+        val application = linkedMapOf<String, Any?>(
+            "name" to cp.name, "clientType" to text(spec, "clientType"),
+            "grantTypes" to spec["grantTypes"].toList().map { it.asString() }, "scopes" to spec["scopes"].toList().map { it.asString() },
+            "redirectUris" to spec["redirectUris"].toList().map { it.asString() },
+            "postLogoutRedirectUris" to spec["postLogoutRedirectUris"].toList().map { it.asString() },
+            "publishTo" to linkedMapOf(
+                "kind" to text(target, "kind"), "repository" to text(target, "repository"),
+                "environment" to text(target, "environment"), "name" to text(target, "name"),
+            ),
+        )
+        val outcome = cp.converged.outcome
+        var pullRequest: String? = null
+        var changed = false
+        if (outcome == ProvisionYamlEdit.Outcome.UNCHANGED) {
+            step(
+                STEP_CONFIG_PROJECT, "declared",
+                "${cp.repository.fullName}: $path on ${cp.repository.defaultBranch} already declares application ${cp.name} with these redirect URIs and publish target; nothing proposed",
+            )
+        } else {
+            val proposal = github.proposeFiles(
+                cp.repository, listOf(path to cp.converged.content), cp.branch,
+                "Thoryn: the production client of ${appRepo.fullName}", productionClientPullRequestBody(cp, appRepo), STEP_CONFIG_PROJECT,
+            )
+            pullRequest = proposal.url
+            changed = proposal.changed
+            step(
+                STEP_CONFIG_PROJECT, if (changed) "pending review" else "open",
+                "pull request ${if (changed) "pending review" else "open"}: ${proposal.url} — application ${cp.name} ${outcome.name.lowercase()} in " +
+                    "${cp.repository.fullName}:$path (branch ${cp.branch})" +
+                    if (outcome == ProvisionYamlEdit.Outcome.UPDATED) "; the entry differed, so the file was re-rendered and its comments are not kept" else "",
+            )
+        }
+        report["configProject"] = linkedMapOf(
+            "repository" to cp.repository.fullName, "file" to path, "branch" to cp.branch, "pullRequest" to pullRequest,
+            "outcome" to if (pullRequest == null) "declared" else outcome.name.lowercase(), "changed" to changed, "application" to application,
+        )
+    }
+
+    /** The pull request's body: what the reviewer approves — a production public client, its redirect URIs, where its id is published. */
+    private fun productionClientPullRequestBody(cp: ConfigProject, appRepo: GhRepository): String {
+        val spec = cp.entry["spec"]
+        val redirects = spec["redirectUris"].toList().map { it.asString() }
+        val signedOut = spec["postLogoutRedirectUris"].toList().map { it.asString() }
+        return buildString {
+            appendLine("Proposed by `thoryn project init app` for the application repository ${appRepo.fullName}.")
+            appendLine()
+            appendLine("Approving and merging this pull request approves, for this config project's next production run:")
+            appendLine()
+            appendLine("- **A production OAuth client** `${cp.name}` (`kind: application`, production plane): a PUBLIC client — PKCE proves it, no secret exists anywhere — with grant type `authorization_code` and scopes `openid profile email`.")
+            appendLine("- **Its redirect URIs**: sign-in callback ${redirects.joinToString(", ") { "`$it`" }}; post-logout ${signedOut.joinToString(", ") { "`$it`" }} (the starter stack's `${ProjectSeeds.CALLBACK_PATH}` and `${ProjectSeeds.SIGNED_OUT_PATH}` under `${request.productionUrl}`).")
+            appendLine("- **Where its id is published**: as the GitHub Actions variable `${ProjectSeeds.PRODUCTION_CLIENT_ID_VARIABLE}` on the `${ProjectSeeds.PRODUCTION_GITHUB_ENVIRONMENT}` environment of ${appRepo.fullName}, on every production apply (`publishTo`). A variable, never a secret: a client id is public by construction.")
+            appendLine()
+            appendLine("Nothing is created until this is merged and the production run is approved. ${appRepo.fullName}'s own `.thoryn/provision.yaml` is unchanged: it declares only its sandbox client. ")
+            append("A later `thoryn project init app` run for the same repository updates this branch and pull request; it never opens a second one.")
+        }
+    }
+
+    /** The by-hand version of the config-repository pull request — printed when `gh` is unavailable or the config repository is not. */
+    private fun configProjectManualSteps(configRepo: String, appRepository: String): List<String> {
+        val path = ProjectSeeds.CONFIG_PRODUCTION_PROVISION_FILE
+        val placeholder = appRepository.startsWith("<")
+        val name = if (placeholder) "<app repository name>" else ProjectSeeds.productionClientName(appRepository)
+        val branch = ProjectSeeds.productionClientBranch(if (placeholder) "<app repository name>" else appRepository.substringAfter('/'))
+        val entry = ProjectSeeds.productionClientEntry(appRepository, request.productionUrl ?: "https://<where the app runs>", name)
+        val fragment = ProvisionYamlEdit.fragment(tools.jackson.databind.json.JsonMapper.builder().build().createArrayNode().add(entry))
+        return listOf(
+            "# The app's PRODUCTION client is declared on the config repository $configRepo — a pull request, never its default branch:",
+            "gh repo clone $configRepo && cd ${configRepo.substringAfter('/')} && git switch -c $branch",
+            "# append to $path (under its resources: list):\n$fragment".trimEnd(),
+            "git add $path && git commit -m \"Thoryn: the production client of $appRepository\" && git push -u origin $branch && " +
+                "gh pr create --repo $configRepo --title \"Thoryn: the production client of $appRepository\" --fill",
+        )
+    }
 
     // ── gh unavailable: say what would run, change nothing ───────────────────────────────────────
 
@@ -965,7 +1147,8 @@ internal class ProjectInit(
                     "\"auth\":{\"method\":\"workload_identity\",\"clientId\":\"<client id>\",\"audience\":\"<the trust's audience>\",\"scopes\":[<the trust's scopes>]}} " +
                     "— and a starter provision.yaml (apiVersion thoryn.io/provision/v1) declaring what the connection owns; commit both",
             )
-        }
+        }.toMutableList()
+        request.configRepo?.let { manual.addAll(configProjectManualSteps(it, repo)) }
         val what = if (signedOut) "gh is not signed in" else "the GitHub CLI (gh) is not installed"
         val fix = if (signedOut) "Run `gh auth login`" else "Install gh (https://cli.github.com) and run `gh auth login`"
         return Stop(
@@ -1030,6 +1213,8 @@ internal class ProjectInit(
         const val STEP_FILES: String = "files"
         /** The seeded `.thoryn/` files: connection.json + the starter provision.yaml per connection (ADR 2026-10-13). */
         const val STEP_PROVISIONING: String = "provisioning"
+        /** SSO-3669 — the app's production client, proposed on the config repository. */
+        const val STEP_CONFIG_PROJECT: String = "config-project"
 
         const val DEFAULT_SANDBOX: String = "sandbox"
         const val STEP_APPROVAL: String = "approval"

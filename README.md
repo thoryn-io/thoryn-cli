@@ -231,6 +231,7 @@ thoryn workload-identity trusts delete <id> [--yes] [--confirm <slug>] # DELETE 
 # (config) or connects one application (app), with your OWN gh CLI and no GitHub App. See "Project repositories".
 thoryn project init config [--repo owner/name] [--sandbox <slug>] --reviewer <login>… --confirm-production
 thoryn project init app --stack express|spring-boot|aspnet-core --environment <sandbox> [--repo owner/name]
+                        [--config-repo owner/name --production-url https://…]   # + the production client, as a PR on the config repo
     # without --repo: works on the clone in the current directory (or --dir); [--force] [--public] [--template owner/repo]
 
 # Operator plane (SSO-3356) — Thoryn staff / self-managed platform operators only. Passkey sign-in on the
@@ -598,7 +599,64 @@ the environment.
 # The sandbox must exist and you must manage it (thoryn env list):
 thoryn project init app --stack express --environment dev --repo acme/web
 # stacks: express | spring-boot | aspnet-core
+
+# … and its PRODUCTION client, proposed on the workspace's config repository (SSO-3669):
+thoryn project init app --stack express --environment dev --repo acme/web \
+  --config-repo acme/thoryn-config --production-url https://web.acme.example
 ```
+
+#### The app's production client — `--config-repo` + `--production-url` (SSO-3669)
+
+An app repository is **sandbox-only**: it never gets a production trust, and its `.thoryn/provision.yaml` declares
+only its sandbox client. Its **production** OAuth client is declared in the workspace's **config repository**, in
+`.thoryn/environments/production/provision.yaml`, where every production change is a reviewed pull request plus an
+approved production run (oauthy ADR `2026-10-13-production-clients-declared-in-the-config-project`, §1). With
+`--config-repo <owner>/<name>` and `--production-url <https://…>`, `thoryn project init app` proposes that entry for
+you **after** its sandbox steps succeeded, with your own `gh`:
+
+- **One pull request, from the deterministic branch `thoryn/app-<app repository name>`.** A re-run updates the same
+  branch and the same pull request; it never opens a second one. The config repository's default branch is never
+  written, and the command never merges.
+- **The entry**, converged by `name` (the app repository's name): added when absent — every other line of the file,
+  comments included, is kept as it is — replaced when it differs (the file is then re-rendered from its parsed tree,
+  so its comments are not kept; the output says so), and **nothing is proposed** when the default branch already
+  declares it exactly:
+
+  ```yaml
+    - kind: application          # no `environment`: the production plane
+      name: web                  # = the app repository's name
+      spec:
+        displayName: acme/web
+        clientType: public       # PKCE proves the client; no secret exists anywhere
+        grantTypes: [authorization_code]
+        scopes: [openid, profile, email]
+        redirectUris: ["https://web.acme.example/callback"]
+        postLogoutRedirectUris: ["https://web.acme.example/signed-out"]
+      publishTo:
+        - kind: githubActionsVariable
+          repository: acme/web   # the app repository
+          environment: production
+          name: THORYN_PRODUCTION_CLIENT_ID
+  ```
+
+  The redirect URIs are `--production-url` plus `/callback` and `/signed-out`: the paths every application
+  starter registers in its shared `.thoryn/provision.yaml` (the template's `template.json` does not declare them).
+  Edit them in the pull request if your deployment differs.
+- **`publishTo`** (SSO-3668): on every approved production apply, the config project publishes the client's id to the
+  app repository's `production` GitHub environment as the Actions **variable** `THORYN_PRODUCTION_CLIENT_ID`
+  (a variable, never a secret — a client id is public). The app's production deploy job reads
+  `${{ vars.THORYN_PRODUCTION_CLIENT_ID }}`; nothing production-related is written into the app repository.
+- **The pull request body says what the reviewer approves**: a production public client, its redirect URIs, and
+  where its id is published.
+- **Pre-flight, before any write:** the config repository must be visible to your `gh` sign-in and its production
+  file must take the entry. A config repository `gh` cannot see stops the run (exit 4, `config_repository_not_found`)
+  with the by-hand steps — it is **never created** by this command (`thoryn project init config` does that). When
+  `gh` is missing or signed out, the by-hand steps include this pull request.
+
+The report carries it as `configProject` (`repository`, `file`, `branch`, `pullRequest`, `outcome`
+`added | updated | declared`, `application`), and as the step `config-project` (`pending review`, `open` on a re-run
+with nothing new, `declared` when the config repository already has it). Without the two flags the run is unchanged
+and the last next-step says how to add the production client.
 
 #### In an existing clone
 
@@ -662,6 +720,8 @@ Where they go depends on how the command ran:
 | `--confirm-production` | config | Required. The project gets a production workload identity that manages the workspace. |
 | `--stack <stack>` | app | `express`, `spring-boot` or `aspnet-core`. |
 | `--environment <sandbox>` | app | The existing sandbox the application connects to. `production` is refused. |
+| `--config-repo <owner/name>` | app | The workspace's config repository. The app's production client is proposed on it as a pull request (branch `thoryn/app-<name>`, reused on a re-run). Requires `--production-url`. Never created here, never merged, never its default branch. |
+| `--production-url <https://…>` | app | Where the app runs in production; the client's redirect URIs are `<url>/callback` and `<url>/signed-out`. https only, no query or fragment. With `--config-repo`. |
 | `--output json\|yaml\|table`, `--json` | both | The report (steps, trusts, grants, variables, files, the seeded provisioning files, next steps) as JSON/YAML. |
 
 Exit codes: `0` done · `1` not signed in to Thoryn · `2` product-api refused a call · `3` a `gh` step
@@ -687,6 +747,8 @@ gh variable list --repo <o>/<r> [--env thoryn-production] --json name,value     
 gh variable set <NAME> --body <value> --repo <o>/<r> [--env thoryn-production]   # only a variable that differs
 gh api repos/<o>/<r>/contents/.thoryn/… ; gh api --method PUT repos/<o>/<r>/contents/.thoryn/… --input -   # (app, new repo) the seeded files
 gh api repos/<o>/<r>/git/ref/heads/thoryn/provisioning ; gh api --method POST repos/<o>/<r>/git/refs … ; gh api [--method POST] repos/<o>/<r>/pulls …   # (config, new repo) the seeded files' pull request
+gh api repos/<cfg> ; gh api repos/<cfg>/contents/.thoryn/environments/production/provision.yaml   # (app, --config-repo) pre-flight: the config repository and its production file
+gh api repos/<cfg>/git/ref/heads/thoryn/app-<name> ; gh api --method POST repos/<cfg>/git/refs … ; gh api repos/<cfg>/contents/…?ref=thoryn/app-<name> ; gh api --method PUT repos/<cfg>/contents/… --input - ; gh api [--method POST] repos/<cfg>/pulls …   # (app, --config-repo) the production client's pull request — only what differs is written
 ```
 
 On Thoryn it uses your own session and the public customer-plane API: `GET /api/v1/environments`,
@@ -716,6 +778,8 @@ the same command again:
   only one that differs is set.
 - Identical files are skipped; an existing `provision.yaml` is kept; this repository's own
   `connection.json` is rewritten only when it differs.
+- The production client's pull request on the config repository (`--config-repo`) is reused: the branch
+  `thoryn/app-<name>` is read first, its file committed only when it differs, the open pull request named again.
 
 **A second run makes no write** — not to product-api, not to GitHub, not to the working tree. Every
 step reads before it writes, and the report says `Checked the … project` instead of `Set up …`; in JSON,
@@ -739,6 +803,10 @@ step reads before it writes, and the report says `Checked the … project` inste
 | `the protection step failed — gh: …` (exit 3) | GitHub refused the environment for another reason. Most often you lack admin rights on the repository. The message is GitHub's own. |
 | `cannot yet grant a machine client workspace-wide management` (exit 2, config) | The platform does not yet support `manager` on `workspace:<id>` for a client. Everything before it is kept and no variable is set. Re-run once it does. |
 | `Trust 'starter-…' … exists but pins another …` (exit 4) | A trust with the deterministic name exists with other pins or scopes. Delete it (`thoryn workload-identity trusts delete <id> --environment <env>`) and re-run. |
+| `GitHub does not show the config repository … to your gh sign-in` (app, exit 4, `config_repository_not_found`) | `--config-repo` names a repository that does not exist or that your `gh` login cannot see. Nothing was changed on either side. The command never creates the config repository: create it with `thoryn project init config --repo <owner>/<name> …`, or ask for access, and re-run. The output lists the by-hand steps (clone, branch `thoryn/app-<name>`, the entry to append, `gh pr create`). |
+| `The production client cannot be added to <cfg>:.thoryn/environments/production/provision.yaml: …` (app, exit 4, `config_provision_file_unusable`) | The config repository's production file is not valid YAML, its `resources:` list is not the last top-level key, or the result would not validate. Nothing was changed. Fix the file on its default branch (or add the entry by hand — the output shows it) and re-run. |
+| `Production client pending review: <url>` (app, success) | The entry went to the config repository as a pull request from `thoryn/app-<name>`. A reviewer of the config project merges it; the approved production run creates the client and publishes its id to this repository's `production` GitHub environment as `THORYN_PRODUCTION_CLIENT_ID`. If that publish cannot reach this repository, the output names the one `gh variable set` to run with the id from the production receipt. |
+| `… the file was re-rendered and its comments are not kept` (app, success) | The config repository already declared this client with other values (another `--production-url`, say). Replacing an entry re-renders the file from its parsed tree, so its comments are lost on the branch; review the diff in the pull request. Adding an entry keeps every existing line. |
 
 ### Least-privilege access grants (SSO-3113, epic SSO-3108)
 
