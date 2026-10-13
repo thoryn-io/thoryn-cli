@@ -6,8 +6,8 @@ the same two files and the same commands.
 
 | File | Declares | Schema | Verb |
 |---|---|---|---|
-| `connection.json` | **who I am** — the `thoryn` workspace, the CI machine client id, the *name* of the env var carrying its secret, the exact scope set | `src/main/resources/examples/connection.schema.json` (SSO-2948) | `thoryn login --connection .thoryn/connection.json` |
-| `provision.yaml` | **what I own** — the desired state: the CLI's own login client `cli` and the least-privilege CI identity `cli-ci` in the `thoryn` workspace (SSO-3104 / SSO-3113), plus a sandbox environment `cli-ci` with a public loopback OAuth client inside it | `src/main/resources/provision/provision.schema.json` (SSO-3088) | `thoryn provision plan / apply / destroy --file .thoryn/provision.yaml` |
+| `connection.json` | **who I am** — the `thoryn` workspace, the CI machine client id, the *name* of the env var carrying its secret, the exact scope set | `cli/src/main/resources/examples/connection.schema.json` (SSO-2948) | `thoryn login --connection .thoryn/connection.json` |
+| `provision.yaml` | **what I own** — the desired state: the CLI's own login client `cli` and the least-privilege CI identity `cli-ci` in the `thoryn` workspace (SSO-3104 / SSO-3113), plus a sandbox environment `cli-ci` with a public loopback OAuth client inside it | `engine/src/main/resources/provision/provision.schema.json` (SSO-3088) | `thoryn provision plan / apply / destroy --file .thoryn/provision.yaml` |
 
 The provisioning Action (`.github/actions/provision`) runs, in order:
 

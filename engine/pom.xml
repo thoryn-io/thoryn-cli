@@ -1,0 +1,132 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns="http://maven.apache.org/POM/4.0.0"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+    <parent>
+        <groupId>io.thoryn</groupId>
+        <artifactId>thoryn-cli-parent</artifactId>
+        <version>${revision}</version>
+        <relativePath>../pom.xml</relativePath>
+    </parent>
+    <artifactId>thoryn-provision-engine</artifactId>
+    <name>thoryn-provision-engine</name>
+    <description>
+        SSO-3662 (epic SSO-3087) — the provisioning engine behind `thoryn provision plan | apply | destroy`
+        as a library: the `.thoryn/provision.yaml` file model + schema, the secret-free receipt model, the
+        converge engine (plan / apply / destroy / import, the SSO-3659 ownership gate) and the SecretSink
+        abstraction. The thoryn CLI is built on it; any other in-process host converges a file through the
+        same classes. The module has NO picocli, NO TTY handling and NO CLI-only type on its public
+        surface — pinned by ProvisionEngineLibraryBoundaryArchTest. ADR:
+        adrs/2026-10-13-provision-engine-shared-library.md.
+    </description>
+
+    <!--
+        SSO-3662 — the publish target, READY BUT NOT WIRED: no release job deploys this module today,
+        because its only consumer is the CLI in the same reactor (SSO-3665: the App dispatches a job
+        that runs the CLI's Action rather than converging in-process). When an in-process consumer
+        appears, the ADR's measured recipe is one job in release.yml (`./mvnw -pl engine
+        -Drevision=<version> deploy` with GITHUB_TOKEN; `packages: write`). GitHub Packages requires a
+        token to READ even a public Maven package, which is why the ADR names Maven Central as the
+        channel for that day.
+    -->
+    <distributionManagement>
+        <repository>
+            <id>github</id>
+            <name>GitHub Packages — thoryn-io/thoryn-cli</name>
+            <url>https://maven.pkg.github.com/thoryn-io/thoryn-cli</url>
+        </repository>
+    </distributionManagement>
+
+    <dependencies>
+        <dependency>
+            <groupId>org.jetbrains.kotlin</groupId>
+            <artifactId>kotlin-stdlib</artifactId>
+        </dependency>
+        <!-- Jackson 3 (tools.jackson.*): the file model is read from YAML, the receipt written as JSON,
+             and live product-api answers are handled as JsonNode. Same line oauthy's Spring Boot 4
+             services run on, so an in-process host there adds no second Jackson. -->
+        <dependency>
+            <groupId>tools.jackson.core</groupId>
+            <artifactId>jackson-databind</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>tools.jackson.module</groupId>
+            <artifactId>jackson-module-kotlin</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>tools.jackson.dataformat</groupId>
+            <artifactId>jackson-dataformat-yaml</artifactId>
+        </dependency>
+
+        <!-- Test deps -->
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.assertj</groupId>
+            <artifactId>assertj-core</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <!-- SSO-3662 — the library-boundary rule (no picocli, no java.io.Console / System.console,
+             no CLI package) is a bytecode-level invariant; ArchUnit is the tool that sees it. -->
+        <dependency>
+            <groupId>com.tngtech.archunit</groupId>
+            <artifactId>archunit-junit5</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <!-- SSO-3662 — compile against the Kotlin 2.3 language/API level. MEASURED in the spike: oauthy's
+                 BOM manages its services' runtime kotlin-stdlib to 2.3.21 ("version managed from 2.4.10" in
+                 the starter-orchestrator's dependency tree) while this reactor compiles with Kotlin 2.4.x. A
+                 2.4-only stdlib call would compile here and fail there at runtime. Pinning the API level makes
+                 the artifact consumable by a Kotlin 2.3 runtime by construction; raise it with oauthy's BOM. -->
+            <plugin>
+                <groupId>org.jetbrains.kotlin</groupId>
+                <artifactId>kotlin-maven-plugin</artifactId>
+                <configuration>
+                    <jvmTarget>${java.version}</jvmTarget>
+                    <languageVersion>2.3</languageVersion>
+                    <apiVersion>2.3</apiVersion>
+                    <args>
+                        <arg>-Xjsr305=strict</arg>
+                    </args>
+                </configuration>
+            </plugin>
+            <!-- SSO-3662 — the deployed POM must be SELF-CONTAINED: the resolved version (not the literal
+                 ${revision}), every dependency version inlined, and NO <parent> — the reactor parent
+                 io.thoryn:thoryn-cli-parent is never published, and a consumer that cannot fetch the parent
+                 cannot read the artifact descriptor at all (measured in the SSO-3662 spike with
+                 resolveCiFriendliesOnly: "Could not find artifact io.thoryn:thoryn-cli-parent:pom").
+                 `oss` is the mode that does this, and the shape Maven Central requires. -->
+            <plugin>
+                <groupId>org.codehaus.mojo</groupId>
+                <artifactId>flatten-maven-plugin</artifactId>
+                <configuration>
+                    <updatePomFile>true</updatePomFile>
+                    <flattenMode>oss</flattenMode>
+                </configuration>
+                <executions>
+                    <execution>
+                        <id>flatten</id>
+                        <phase>process-resources</phase>
+                        <goals>
+                            <goal>flatten</goal>
+                        </goals>
+                    </execution>
+                    <execution>
+                        <id>flatten-clean</id>
+                        <phase>clean</phase>
+                        <goals>
+                            <goal>clean</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+</project>
