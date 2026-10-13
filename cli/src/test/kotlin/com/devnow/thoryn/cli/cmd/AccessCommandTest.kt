@@ -43,6 +43,20 @@ class AccessCommandTest : CommandTestBase() {
     }
 
     @Test
+    fun `grant accepts the owner relation — the workspace admin's way to make a repository the one owner of a resource`() {
+        // SSO-3667 / SSO-3673 — `owner` is grantable through the access API (never through a provisioning file).
+        server.enqueue(jsonResponse(201, """{"subject":"client:wi_repo","relation":"owner","object":"application:billing-web","createdAt":"2026-10-13T10:00:00Z"}"""))
+
+        val (exit, out, _) = runCli("access", "grant", "client:wi_repo", "owner", "application:billing-web", "--gateway", baseUrl())
+
+        assertThat(exit).isEqualTo(0)
+        assertThat(out).contains("owner").contains("application:billing-web")
+        val req = server.takeRequest()
+        assertThat(req.path).isEqualTo("/api/v1/access/grants")
+        assertThat(parseJson(req.body.readUtf8())).isEqualTo(mapOf("subject" to "client:wi_repo", "relation" to "owner", "object" to "application:billing-web"))
+    }
+
+    @Test
     fun `grant is idempotent — a 200 for an existing grant still succeeds`() {
         server.enqueue(jsonResponse(200, """{"subject":"member:alice","relation":"viewer","object":"application:app-1","createdAt":"2026-09-15T10:00:00Z"}"""))
 
