@@ -156,8 +156,17 @@ class ProvisionFile private constructor(
         /** A `spec` property name that would carry a secret VALUE — rejected; use `<key>Env`. */
         val SECRET_KEY_PATTERN = Regex("([Pp]assword|[Ss]ecret|[Tt]oken)$")
 
-        /** SSO-3113 — the relations a `grants:` entry may carry (the SSO-3112 contract; equals the schema enum). */
-        val GRANT_RELATIONS: Set<String> = AccessRefs.RELATIONS
+        /**
+         * SSO-3113 — the relations a `grants:` entry may carry (the SSO-3112 contract; equals the schema enum).
+         * SSO-3673 — deliberately WITHOUT [AccessRefs.RELATION_OWNER]: a repository cannot claim ownership by
+         * writing YAML; a workspace admin grants `owner` with `thoryn access grant` (see [GRANT_OWNER_REFUSED]).
+         */
+        val GRANT_RELATIONS: Set<String> = setOf(AccessRefs.RELATION_MANAGER, AccessRefs.RELATION_VIEWER)
+
+        /** SSO-3673 — the violation text for `relation: owner` in a `grants:` entry; names the fix. */
+        const val GRANT_OWNER_REFUSED: String =
+            "relation 'owner' cannot be declared in a provisioning file — a repository cannot claim ownership by writing YAML; " +
+                "a workspace admin grants it with `thoryn access grant <subject> owner <object>`"
 
         /** SSO-3659 — the resource-level `readOnly` flag (ADR 2026-10-13 §1): a dependency, not an owned resource. */
         const val READ_ONLY = "readOnly"
@@ -356,6 +365,8 @@ class ProvisionFile private constructor(
                             if (subject.isNullOrEmpty()) v += "$gw subject is required (member:<sub> | client:<clientId>)"
                             else AccessRefs.validateSubject(subject)?.let { v += "$gw $it" }
                             if (relation.isNullOrEmpty()) v += "$gw relation is required (${GRANT_RELATIONS.joinToString(" | ")})"
+                            // SSO-3673 — `owner` is a real platform relation, so it gets its own answer: not "unknown", but "not from a file".
+                            else if (relation == AccessRefs.RELATION_OWNER) v += "$gw $GRANT_OWNER_REFUSED"
                             else if (relation !in GRANT_RELATIONS) v += "$gw relation '$relation' must be one of ${GRANT_RELATIONS.joinToString(", ")}"
                             if (subject != null && relation != null && !seen.add("$subject $relation")) v += "$gw duplicates grant '$subject $relation'"
                         }

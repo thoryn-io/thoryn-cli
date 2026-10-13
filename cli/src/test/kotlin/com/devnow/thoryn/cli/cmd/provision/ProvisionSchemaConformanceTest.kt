@@ -193,7 +193,8 @@ class ProvisionSchemaConformanceTest {
         )
         val v = ProvisionFile.validate(bad)
         assertThat(v).anyMatch { it.contains("resources[0] grants[0]") && it.contains("subject type 'robot'") }
-        assertThat(v).anyMatch { it.contains("resources[1] grants[0]") && it.contains("relation 'owner'") }
+        // SSO-3673 — `owner` is a real platform relation but never a file's to declare: refused, naming the admin's fix.
+        assertThat(v).anyMatch { it.contains("resources[1] grants[0]") && it.contains("relation 'owner'") && it.contains("cannot claim ownership by writing YAML") && it.contains("thoryn access grant <subject> owner <object>") }
         assertThat(v).anyMatch { it.contains("resources[2] grants[1]") && it.contains("duplicates grant 'client:x manager'") }
         assertThat(v).anyMatch { it.contains("resources[3] grants[0]") && it.contains("unknown property 'object'") }
         assertThat(v).anyMatch { it.contains("resources[4] grants must be an array") }

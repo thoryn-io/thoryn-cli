@@ -125,9 +125,9 @@ class AccessCommandTest : CommandTestBase() {
         assertThat(badSubject.exit).isEqualTo(CommandSupport.EXIT_USAGE)
         assertThat(badSubject.err).contains("subject type 'robot'").contains("member, client")
 
-        val badRelation = runCli("access", "grant", "client:cli-ci", "owner", "environment:$envId", "--gateway", baseUrl())
+        val badRelation = runCli("access", "grant", "client:cli-ci", "editor", "environment:$envId", "--gateway", baseUrl())
         assertThat(badRelation.exit).isEqualTo(CommandSupport.EXIT_USAGE)
-        assertThat(badRelation.err).contains("relation 'owner'")
+        assertThat(badRelation.err).contains("relation 'editor'").contains("manager, viewer, owner")
 
         val badObject = runCli("access", "revoke", "client:cli-ci", "manager", "sandbox:$envId", "--gateway", baseUrl())
         assertThat(badObject.exit).isEqualTo(CommandSupport.EXIT_USAGE)

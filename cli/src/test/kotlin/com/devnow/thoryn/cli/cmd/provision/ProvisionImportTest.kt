@@ -3,9 +3,9 @@ package com.devnow.thoryn.cli.cmd.provision
 import com.devnow.thoryn.provision.Access
 import com.devnow.thoryn.provision.OwnedResource
 import com.devnow.thoryn.provision.ProvisionEngine
-import com.devnow.thoryn.provision.ProvisionFile
 import com.devnow.thoryn.provision.ProvisionFileRef
 import com.devnow.thoryn.provision.ProvisionReceipt
+import com.devnow.thoryn.provision.ProvisionFile
 import com.devnow.thoryn.provision.ProvisionReceiptStore
 import com.devnow.thoryn.cli.api.ProductApiClient
 import com.devnow.thoryn.cli.auth.Tokens
@@ -47,10 +47,10 @@ class ProvisionImportTest : CommandTestBase() {
         api.seedGrant("client:repo", "viewer", "application:shared")
     }
 
-    private fun engine(peers: List<ProvisionReceipt> = emptyList()) = ProvisionEngine(
+    private fun engine() = ProvisionEngine(
         clients = { slug -> ProductApiClient(gateway = baseUrl(), tokens = Tokens(accessToken = "AT-test"), environmentSlug = slug) },
         out = PrintStream(console), err = PrintStream(console),
-        workspaceId = api.tenantId, subject = "client:repo", peers = peers,
+        workspaceId = api.tenantId, subject = "client:repo",
     )
 
     @Test
@@ -99,7 +99,7 @@ class ProvisionImportTest : CommandTestBase() {
     }
 
     @Test
-    fun `import leaves out what the file already declares and renders a peer-owned object readOnly`() {
+    fun `import leaves out what the file already declares and renders an object the platform says another repository owns readOnly`() {
         val existing = ProvisionFile.parse(
             """
             apiVersion: thoryn.io/provision/v1
@@ -109,20 +109,26 @@ class ProvisionImportTest : CommandTestBase() {
             """.trimIndent().toByteArray(),
             "provision.yaml",
         )
-        val other = ProvisionReceipt(
-            file = ProvisionFileRef("other/.thoryn/provision.yaml", "sha256:y"), appliedAt = "now", subject = "client:wi_other",
-            resources = listOf(OwnedResource("user", "tester", "u-9", "ci-sbx")),
-        )
-        val result = engine(peers = listOf(other)).import(existing, receipt = null)
+        // SSO-3673 — `other-rp` sits in the sandbox this identity manages (so it is listed as `manager`), but the
+        // platform's `owner` relation names another repository: imported as a reference, naming no subject.
+        api.seedApplication("ci-sbx", "Other RP", listOf("http://127.0.0.1/other"), clientId = "other-rp")
+        api.seedGrant("client:wi_other", "owner", "application:other-rp")
+        val result = engine().import(existing, receipt = null)
         val byKey = result.resources.associateBy { it.resource.key }
-        assertThat(byKey.keys).containsExactlyInAnyOrder("application/loopback-rp", "user/tester", "loginMethods/loginMethods")
+        assertThat(byKey.keys).containsExactlyInAnyOrder("application/loopback-rp", "application/other-rp", "user/tester", "loginMethods/loginMethods")
         // The child names the ALREADY DECLARED environment resource, not the slug.
         assertThat(byKey.getValue("application/loopback-rp").resource.environment).isEqualTo("ci")
+        val other = byKey.getValue("application/other-rp")
+        assertThat(other.access).isEqualTo(Access.MANAGER)
+        assertThat(other.resource.readOnly).isTrue()
+        assertThat(other.owned).isNull()
+        assertThat(other.note).contains("owned by another repository").doesNotContain("wi_other")
+        assertThat(api.checksOn("application:other-rp")).containsExactly("owner")
+        // An object nobody owns that this identity manages is imported as owned, with no owner recorded.
         val tester = byKey.getValue("user/tester")
-        assertThat(tester.access).isEqualTo(Access.MANAGER)
-        assertThat(tester.resource.readOnly).isTrue()
-        assertThat(tester.owned).isNull()
-        assertThat(tester.note).contains("other/.thoryn/provision.yaml (client:wi_other)")
+        assertThat(tester.resource.readOnly).isFalse()
+        assertThat(tester.owned!!.owner).isNull()
+        assertThat(byKey.getValue("application/loopback-rp").owned!!.owner).isNull()
     }
 
     @Test

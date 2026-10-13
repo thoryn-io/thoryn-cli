@@ -17,7 +17,14 @@ internal class FakeProductApi : Dispatcher() {
 
     data class Write(val method: String, val path: String, val env: String?, val confirm: String?, val body: Map<String, Any?>)
 
+    /** SSO-3673 — one `POST /api/v1/access/check` the engine asked: the object and the relation (a READ, never in [writes]). */
+    data class Check(val objectRef: String, val relation: String)
+
     val writes = mutableListOf<Write>()
+    /** SSO-3673 — every forward check asked, in order; `checksOn(ref)` narrows to one object. */
+    val checks = mutableListOf<Check>()
+    /** SSO-3673 — every `GET /api/v1/access/mine` listing asked (`type relation`), so a test can show `plan` no longer lists. */
+    val mineReads = mutableListOf<String>()
     val environments = mutableListOf<MutableMap<String, Any?>>()
     val applications = mutableListOf<MutableMap<String, Any?>>()
     val users = mutableListOf<MutableMap<String, Any?>>()
@@ -30,13 +37,15 @@ internal class FakeProductApi : Dispatcher() {
     /** SSO-3113 — access grants (`/api/v1/access/grants`, the SSO-3112 contract): `{subject, relation, object, createdAt}`. */
     val grants = mutableListOf<MutableMap<String, Any?>>()
     /**
-     * SSO-3659 — the caller's platform subject, the identity `/api/v1/access/mine` reports reach FOR (product-api
-     * derives it from the token; the fake has no token, so a test states it). Reach is COMPUTED from [grants] the
-     * way the platform model does — `manager = this ∪ parent.manager`, `viewer = this ∪ manager ∪ parent.viewer`,
-     * an application's parent being its environment (or the workspace on the production plane), an environment's
-     * and the custom domain's the workspace — so a test seeds grants, not answers.
+     * SSO-3659 — the caller's platform subject, the identity `/api/v1/access/mine` and `/api/v1/access/check`
+     * (SSO-3673) answer FOR (product-api derives it from the token; the fake has no token, so a test states it).
+     * Reach is COMPUTED from [grants] the way the platform model does — `manager = this ∪ owner ∪ parent.manager`,
+     * `viewer = this ∪ manager ∪ parent.viewer`, `owner = this` (direct only, never inherited), an application's
+     * parent being its environment (or the workspace on the production plane), an environment's and the custom
+     * domain's the workspace — so a test seeds grants, not answers. The DEFAULT is a PERSON (a founder), so
+     * creator-becomes-OWNER (a `client:` creator only, SSO-3667) does not fire unless a test makes the caller a client.
      */
-    var caller = "client:repo"
+    var caller = "member:founder"
     /** SSO-3659 — a workspace admin manages everything. The DEFAULT, so a test about something else sees a founder's reach. */
     var callerIsAdmin = true
     /** The workspace id (`tnt`) — the object `workspace:<tenantId>` and the custom domain's id. */
@@ -158,6 +167,25 @@ internal class FakeProductApi : Dispatcher() {
 
     fun grantsOn(objectRef: String): List<String> = grants.filter { it["object"] == objectRef }.map { "${it["subject"]} ${it["relation"]}" }
 
+    /** SSO-3673 — the forward checks asked about one object, as `relation`s in order. */
+    fun checksOn(objectRef: String): List<String> = checks.filter { it.objectRef == objectRef }.map { it.relation }
+
+    // ── SSO-3667 / SSO-3673 — the platform `owner` relation (one subject per application / environment) ──
+
+    private val ownableTypes = setOf("application", "environment")
+
+    /** The one `owner` subject of [objectRef], or null. */
+    fun ownerOf(objectRef: String): String? = grants.firstOrNull { it["object"] == objectRef && it["relation"] == "owner" }?.get("subject") as String?
+
+    /** Render a resource the way product-api does since SSO-3667: `owner: { subject } | null` (applications; environments ahead of product-api's EnvironmentResponse). */
+    private fun withOwner(rec: Map<String, Any?>, objectRef: String): Map<String, Any?> =
+        public(rec) + mapOf("owner" to ownerOf(objectRef)?.let { mapOf("subject" to it) })
+
+    /** Creator-becomes-owner (SSO-3667): a `client:` creator owns the ownable resource it creates; a person's create has no owner. */
+    private fun creatorBecomesOwner(objectRef: String) {
+        if (caller.startsWith("client:") && ownerOf(objectRef) == null) seedGrant(caller, "owner", objectRef)
+    }
+
     // ── SSO-3659 — the caller's reach, computed from the grants through the platform model's containment ──
 
     /** Every platform object of [type] that exists in the fake, as `<type>:<id>` (production-plane singletons by `production`). */
@@ -191,13 +219,25 @@ internal class FakeProductApi : Dispatcher() {
 
     private fun direct(ref: String, relation: String): Boolean = grants.any { it["object"] == ref && it["relation"] == relation && it["subject"] == caller }
 
-    /** `manager = this ∪ parent.manager`; `viewer = this ∪ manager ∪ parent.viewer`; a workspace admin holds both everywhere. */
+    /**
+     * `owner = this` (direct only — never inherited, never implied by admin standing); `manager = this ∪ owner ∪
+     * parent.manager`; `viewer = this ∪ manager ∪ parent.viewer`; a workspace admin holds manager and viewer everywhere.
+     */
     fun holds(ref: String, relation: String): Boolean {
+        if (relation == "owner") return direct(ref, "owner")
         if (callerIsAdmin || direct("workspace:$tenantId", "admin")) return true
         if (direct(ref, relation)) return true
+        if (direct(ref, "owner")) return true
         if (relation == "viewer" && direct(ref, "manager")) return true
         val parent = parentOf(ref) ?: return false
         return holds(parent, relation)
+    }
+
+    /** SSO-3673 — `POST /api/v1/access/check`'s `resolvedVia`: direct, owner, or inherited (product-api's precedence). */
+    private fun resolvedVia(ref: String, relation: String): String = when {
+        direct(ref, relation) -> "direct"
+        relation != "owner" && ref.substringBefore(':') in ownableTypes && direct(ref, "owner") -> "owner"
+        else -> "inherited"
     }
 
     /** What `/api/v1/access/mine?type=&relation=` answers: every object of the type the caller holds the relation on. */
@@ -233,14 +273,16 @@ internal class FakeProductApi : Dispatcher() {
         val confirm = req.getHeader("X-Thoryn-Confirm")
         // SSO-3113 — a DELETE may carry a JSON body (`DELETE /api/v1/access/grants`); `body` tolerates an empty one.
         val b = if (method == "GET") emptyMap() else body(req)
-        if (method != "GET") writes += Write(method, route, env, confirm, b)
+        // SSO-3673 — the forward check is a POST but a READ: it is recorded on `checks`, never as a write.
+        if (method != "GET" && route != "/api/v1/access/check") writes += Write(method, route, env, confirm, b)
         val seg = route.removePrefix("/api/v1/").split('/')
         return when {
             // ── environments ──
-            route == "/api/v1/environments" && method == "GET" -> json(200, mapOf("environments" to environments))
+            route == "/api/v1/environments" && method == "GET" -> json(200, mapOf("environments" to environments.map { withOwner(it, "environment:${it["id"]}") }))
             route == "/api/v1/environments" && method == "POST" -> {
                 val id = seedEnvironment(b["slug"].toString(), b["name"]?.toString() ?: b["slug"].toString())
-                json(201, environments.first { it["id"] == id })
+                creatorBecomesOwner("environment:$id")
+                json(201, withOwner(environments.first { it["id"] == id }, "environment:$id"))
             }
             seg[0] == "environments" && seg.size == 2 && method == "PATCH" -> {
                 val e = environments.firstOrNull { it["id"] == seg[1] } ?: return problem(404, "not_found")
@@ -252,7 +294,7 @@ internal class FakeProductApi : Dispatcher() {
                 environments.remove(e); MockResponse().setResponseCode(204)
             }
             // ── applications ──
-            route == "/api/v1/applications" && method == "GET" -> json(200, mapOf("data" to applications.filter { visible(it, env) }.map { public(it) }))
+            route == "/api/v1/applications" && method == "GET" -> json(200, mapOf("data" to applications.filter { visible(it, env) }.map { withOwner(it, "application:${it["clientId"]}") }))
             route == "/api/v1/applications" && method == "POST" -> {
                 // SSO-3104 / SSO-3119 — product-api honours a REQUESTED `clientId` (that is how the
                 // committed file pins `cli` / `cli-ci`); only an absent one is allocated. The fake used
@@ -261,9 +303,11 @@ internal class FakeProductApi : Dispatcher() {
                 val id = (b["clientId"] as? String)?.takeIf { it.isNotBlank() } ?: "app-${++seq}"
                 if (applications.any { it["clientId"] == id }) return problem(409, "client_id_taken")
                 applications += (b + mapOf("clientId" to id, "status" to "active", "_env" to env)).toMutableMap()
+                // SSO-3667 — a `client:` creator becomes the application's owner (rendered on the create response).
+                creatorBecomesOwner("application:$id")
                 // SSO-3113 — a CONFIDENTIAL client's one-shot secret rides ONLY on the create response (never on a later
                 // GET). product-api's `clientType` defaults to confidential, so only an explicit `public` is secret-less.
-                val response = public(applications.last()).toMutableMap()
+                val response = withOwner(applications.last(), "application:$id").toMutableMap()
                 if (b["clientType"] != "public") {
                     val secret = "minted-secret-$id"
                     mintedSecrets[id] = secret
@@ -274,8 +318,8 @@ internal class FakeProductApi : Dispatcher() {
             seg[0] == "applications" && seg.size == 2 -> {
                 val a = applications.firstOrNull { it["clientId"] == seg[1] && visible(it, env) } ?: return problem(404, "not_found")
                 when (method) {
-                    "GET" -> json(200, public(a))
-                    "PATCH" -> { a.putAll(b); json(200, public(a)) }
+                    "GET" -> json(200, withOwner(a, "application:${seg[1]}"))
+                    "PATCH" -> { a.putAll(b); json(200, withOwner(a, "application:${seg[1]}")) }
                     "DELETE" -> { applications.remove(a); MockResponse().setResponseCode(204) }
                     else -> problem(405, "method")
                 }
@@ -379,6 +423,11 @@ internal class FakeProductApi : Dispatcher() {
                 }
                 val existing = grants.firstOrNull { it["subject"] == b["subject"] && it["relation"] == b["relation"] && it["object"] == b["object"] }
                 if (existing != null) return json(200, existing)
+                // SSO-3667 — one owner per ownable object: a DIFFERENT owner is 409 owner_already_set, never a silent replace.
+                if (b["relation"] == "owner") {
+                    if (b["object"].toString().substringBefore(':') !in ownableTypes) return problem(400, "invalid_relation")
+                    if (ownerOf(b["object"].toString()) != null) return problem(409, "owner_already_set")
+                }
                 seedGrant(b["subject"].toString(), b["relation"].toString(), b["object"].toString())
                 json(201, grants.last())
             }
@@ -392,7 +441,20 @@ internal class FakeProductApi : Dispatcher() {
                 val q = query(path)
                 // SSO-3659 — the caller's OWN reach, computed from the grants (relation defaults to manager, as product-api's does).
                 val type = q["type"] ?: return problem(400, "invalid_type")
+                mineReads += "$type ${q["relation"] ?: "manager"}"
                 json(200, mapOf("data" to reach(type, q["relation"] ?: "manager")))
+            }
+            // SSO-3673 — the forward check for the caller's OWN subject (product-api AccessController.check): grammar is
+            // 400 (`owner` only on an ownable type), a foreign / unknown object is `allowed: false`, never an error.
+            route == "/api/v1/access/check" && method == "POST" -> {
+                if (denyGrantReads) return problem(403, "insufficient_scope")
+                val ref = (b["object"] as? String)?.takeIf { it.contains(':') } ?: return problem(400, "invalid_object")
+                val relation = (b["relation"] as? String) ?: return problem(400, "invalid_relation")
+                if (relation !in setOf("manager", "viewer", "owner")) return problem(400, "invalid_relation")
+                if (relation == "owner" && ref.substringBefore(':') !in ownableTypes) return problem(400, "invalid_relation")
+                checks += Check(ref, relation)
+                val allowed = objectsOf(ref.substringBefore(':')).contains(ref) && holds(ref, relation)
+                json(200, mapOf("allowed" to allowed, "resolvedVia" to if (allowed) resolvedVia(ref, relation) else null))
             }
             // ── custom domain (SSO-3413 / SSO-3414) ──
             route.startsWith("/api/v1/custom-domain") -> customDomain(method, route, b)
