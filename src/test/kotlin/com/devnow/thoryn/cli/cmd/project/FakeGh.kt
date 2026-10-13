@@ -69,7 +69,7 @@ internal class FakeGh : GhRunner {
     /** Calls that change GitHub (everything that is not a read). */
     val mutations: List<String>
         get() = calls.filter { c ->
-            c.args.firstOrNull() == "variable" || (c.args.firstOrNull() == "api" && c.args.getOrNull(1) == "--method")
+            (c.args.firstOrNull() == "variable" && c.args.getOrNull(1) == "set") || (c.args.firstOrNull() == "api" && c.args.getOrNull(1) == "--method")
         }.map { it.toString() }
 
     override fun run(args: List<String>, stdin: ByteArray?, dir: Path?): GhResult {
@@ -259,8 +259,17 @@ internal class FakeGh : GhRunner {
     }
 
     private fun variable(args: List<String>): GhResult {
-        // variable set NAME --body VALUE --repo O/N [--env E]
         failVariablesWith?.let { return GhResult(1, ByteArray(0), it) }
+        if (args.getOrNull(1) == "list") {
+            // variable list --repo O/N [--env E] --json name,value
+            val opts = args.drop(2).chunked(2).associate { it[0] to it.getOrNull(1) }
+            val repo = opts["--repo"] ?: return unexpected(args)
+            if (repo !in repos) return notFound()
+            if (opts["--json"] != "name,value") return unexpected(args)
+            val prefix = opts["--env"]?.let { "$repo@$it:" } ?: "$repo:"
+            return okJson(variables.filterKeys { it.startsWith(prefix) }.map { (k, v) -> mapOf("name" to k.removePrefix(prefix), "value" to v) })
+        }
+        // variable set NAME --body VALUE --repo O/N [--env E]
         if (args.getOrNull(1) != "set") return unexpected(args)
         val name = args[2]
         val opts = args.drop(3).chunked(2).associate { it[0] to it.getOrNull(1) }

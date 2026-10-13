@@ -96,7 +96,7 @@ internal class ProjectInit(
         private set
     val report: LinkedHashMap<String, Any?> = linkedMapOf()
 
-    private data class Env(val id: String, val slug: String, val production: Boolean, val suspended: Boolean)
+    private data class Env(val id: String, val slug: String, val name: String?, val production: Boolean, val suspended: Boolean)
 
     private data class Target(
         val connection: String,
@@ -104,7 +104,12 @@ internal class ProjectInit(
         val envSlug: String,
         var envId: String?,
         val githubEnvironment: String?,
-    )
+        /** The trust this connection uses, once [ensureTrust] ran. */
+        var trust: JsonNode? = null,
+    ) {
+        /** Where this connection's `connection.json` is seeded: beside its `provisionFile`. */
+        val connectionPath: String get() = ProjectSeeds.connectionPath(spec.provisionFile)
+    }
 
     private enum class FileAction { WRITE, OVERWRITE, SAME }
 
@@ -231,7 +236,7 @@ internal class ProjectInit(
         } else {
             null
         }
-        val files = if (request.repo == null) planFiles(codeowners) else emptyList()
+        val files = if (request.repo == null) planFiles(codeowners, manifest, repository!!) else emptyList()
 
         val targets = buildList {
             val (sandboxName, sandboxSpec) = manifest.sandboxConnection
@@ -274,9 +279,10 @@ internal class ProjectInit(
                 throw planLimitRefusal(repo)
             }
             currentStep = STEP_PROTECTION
-            environmentReviewers = github.protectEnvironment(repo, productionGithubEnvironment!!, reviewerIds, repo.defaultBranch, STEP_PROTECTION)
+            val protection = github.protectEnvironment(repo, productionGithubEnvironment!!, reviewerIds, repo.defaultBranch, STEP_PROTECTION)
+            environmentReviewers = protection.reviewersActive
             step(
-                STEP_PROTECTION, "set",
+                STEP_PROTECTION, if (protection.changed) "set" else "in place",
                 "GitHub environment $productionGithubEnvironment: deploys from ${repo.defaultBranch} only; " +
                     if (environmentReviewers) "required reviewers ${request.reviewers.joinToString(", ")}" else "required reviewers not offered by this GitHub plan (the ruleset carries the approval)",
             )
@@ -301,10 +307,12 @@ internal class ProjectInit(
         }
 
         currentStep = STEP_ENVIRONMENTS
+        var sandboxName = sandbox?.name ?: "Sandbox $sandboxSlug"
         if (config) {
             val sandboxTarget = targets.first { !it.spec.production }
             if (sandboxTarget.envId == null) {
                 sandboxTarget.envId = ensureSandbox(sandboxSlug)
+                sandboxName = "Sandbox $sandboxSlug"
                 step(STEP_ENVIRONMENTS, "created", "sandbox $sandboxSlug")
             } else {
                 step(STEP_ENVIRONMENTS, "existing", "sandbox $sandboxSlug; production ${production!!.slug}")
@@ -320,6 +328,7 @@ internal class ProjectInit(
             val (trust, adopted) = ensureTrust(t, repo)
             val clientId = text(trust, "clientId") ?: throw Stop(EXIT_HTTP, "invalid_response", "product-api returned a trust without a clientId.")
             clientIds[t.connection] = clientId
+            t.trust = trust
             step(
                 STEP_TRUSTS, if (adopted) "adopted" else "created",
                 "${t.connection}: ${text(trust, "name")} → $clientId (in ${t.envSlug}${t.githubEnvironment?.let { ", GitHub environment $it" } ?: ""})",
@@ -337,6 +346,12 @@ internal class ProjectInit(
         targets.forEach { t ->
             val subject = "client:" + encodeId(clientIds.getValue(t.connection))
             val objectRef = if (t.spec.grant.on == StarterTemplateManifest.GRANT_ON_WORKSPACE) "workspace:${encodeId(tenantId!!)}" else "environment:${t.envId}"
+            // An existing grant is left alone — read first, so a re-run writes nothing here.
+            if (grantExists(subject, t.spec.grant.relation, objectRef)) {
+                step(STEP_ACCESS, "existing", "$subject ${t.spec.grant.relation} $objectRef")
+                grants += linkedMapOf("subject" to subject, "relation" to t.spec.grant.relation, "object" to objectRef, "existing" to true)
+                return@forEach
+            }
             try {
                 thoryn.workspace.createGrant(subject, t.spec.grant.relation, objectRef)
             } catch (ex: ProductApiException) {
@@ -350,7 +365,7 @@ internal class ProjectInit(
                 throw ex
             }
             step(STEP_ACCESS, "granted", "$subject ${t.spec.grant.relation} $objectRef")
-            grants += linkedMapOf("subject" to subject, "relation" to t.spec.grant.relation, "object" to objectRef)
+            grants += linkedMapOf("subject" to subject, "relation" to t.spec.grant.relation, "object" to objectRef, "existing" to false)
         }
         report["grants"] = grants
 
@@ -364,6 +379,10 @@ internal class ProjectInit(
         }
         currentStep = STEP_VARIABLES
         val variables = mutableListOf<Map<String, Any?>>()
+        // Read before write: a variable already at its value is not set again (a re-run makes no writes).
+        val current = mutableMapOf<String?, Map<String, String>?>()
+        fun currentValue(name: String, environment: String?): String? =
+            current.getOrPut(environment) { github.listVariables(repo, environment) }?.get(name)
         // Repository-level first; the production-environment variable only once its protection is confirmed.
         manifest.variables.entries.sortedBy { it.value.level == StarterTemplateManifest.LEVEL_ENVIRONMENT }.forEach { (name, v) ->
             val value = values[name] ?: throw Stop(EXIT_CHECK, "starter_template_invalid", "The template declares $name, which has no value.")
@@ -380,12 +399,18 @@ internal class ProjectInit(
                     )
                 }
             }
-            github.setVariable(repo, name, value, v.environment, STEP_VARIABLES)
-            variables += linkedMapOf("name" to name, "value" to value, "level" to v.level, "environment" to v.environment)
+            val unchanged = currentValue(name, v.environment) == value
+            if (!unchanged) github.setVariable(repo, name, value, v.environment, STEP_VARIABLES)
+            variables += linkedMapOf("name" to name, "value" to value, "level" to v.level, "environment" to v.environment, "changed" to !unchanged)
         }
         val repoLevel = variables.filter { it["environment"] == null }.map { it["name"] }
         val envLevel = variables.filter { it["environment"] != null }
-        step(STEP_VARIABLES, "set", "${repoLevel.joinToString(", ")} (repository)" + envLevel.joinToString("") { "; ${it["name"]} (environment ${it["environment"]})" })
+        val changedVariables = variables.count { it["changed"] == true }
+        step(
+            STEP_VARIABLES, if (changedVariables > 0) "set" else "unchanged",
+            "${repoLevel.joinToString(", ")} (repository)" + envLevel.joinToString("") { "; ${it["name"]} (environment ${it["environment"]})" } +
+                if (changedVariables == variables.size) "" else "; ${variables.size - changedVariables} already at their value",
+        )
         report["variables"] = variables
 
         currentStep = STEP_FILES
@@ -395,6 +420,8 @@ internal class ProjectInit(
             request.repo == null || createdRepo -> true
             else -> github.fileExists(repo.fullName, StarterTemplateManifest.PATH, STEP_VARIABLES)
         }
+        currentStep = STEP_PROVISIONING
+        seedFiles(targets, repo, workspaceSlug, sandboxSlug, sandboxName, createdRepo)
         report["steps"] = steps.map { linkedMapOf("step" to it.name, "status" to it.status, "detail" to it.detail) }
         report["nextSteps"] = nextSteps(repo, config, productionGithubEnvironment)
         return report
@@ -408,7 +435,7 @@ internal class ProjectInit(
         return items.mapNotNull { n ->
             val id = text(n, "id") ?: return@mapNotNull null
             val slug = text(n, "slug") ?: return@mapNotNull null
-            Env(id, slug, production = text(n, "kind") == "production", suspended = n["suspended"]?.asBoolean(false) ?: false)
+            Env(id, slug, text(n, "name"), production = text(n, "kind") == "production", suspended = n["suspended"]?.asBoolean(false) ?: false)
         }
     }
 
@@ -488,7 +515,7 @@ internal class ProjectInit(
         }
     }
 
-    private fun planFiles(codeowners: String?): List<PlannedFile> {
+    private fun planFiles(codeowners: String?, manifest: StarterTemplateManifest, repository: GhRepository): List<PlannedFile> {
         val tarball = github.templateTarball(request.template, STEP_PREFLIGHT)
         val entries = try {
             TemplateArchive.read(tarball)
@@ -496,8 +523,19 @@ internal class ProjectInit(
             throw Stop(EXIT_CHECK, "starter_template_invalid", "The template's files could not be read: ${ex.message}.")
         }
         val root = request.dir.toAbsolutePath().normalize()
-        // A config project's CODEOWNERS (the reviewers own production, the workflows and CODEOWNERS) replaces the template's.
-        val all = if (codeowners == null) entries else entries.filter { it.path != CODEOWNERS_PATH } + TemplateArchive.Entry(CODEOWNERS_PATH, codeowners.toByteArray(), false)
+        // A config project's CODEOWNERS (the reviewers own production, the workflows and CODEOWNERS) replaces the template's;
+        // the seeded `.thoryn/` files (connection.json + the starter provision.yaml per connection) replace the template's
+        // placeholders at those paths — they are rendered once the trusts exist (see seedFiles).
+        val seeded = manifest.connections.values.flatMap { listOf(it.provisionFile, ProjectSeeds.connectionPath(it.provisionFile)) }.toSet()
+        val templateEntries = entries.filter { it.path !in seeded }
+        val all = if (codeowners == null) templateEntries else templateEntries.filter { it.path != CODEOWNERS_PATH } + TemplateArchive.Entry(CODEOWNERS_PATH, codeowners.toByteArray(), false)
+        // An existing connection.json that is not this repository's own (another repository's, or a client_credentials one)
+        // is a conflict like any other differing file; one this command wrote is re-rendered. provision.yaml is never a
+        // conflict: an existing one is kept as it is.
+        val seedConflicts = manifest.connections.values.map { ProjectSeeds.connectionPath(it.provisionFile) }.filter { path ->
+            val target = root.resolve(path).normalize()
+            Files.exists(target) && !(Files.isRegularFile(target) && ProjectSeeds.isOurConnection(Files.readAllBytes(target), repository.id))
+        }
         val planned = all.map { e ->
             val target = root.resolve(e.path).normalize()
             if (!target.startsWith(root) || e.path.split('/').firstOrNull() == ".git") {
@@ -510,7 +548,7 @@ internal class ProjectInit(
             }
             PlannedFile(e, target, action)
         }
-        val conflicts = planned.filter { it.action == FileAction.OVERWRITE }.map { it.entry.path }
+        val conflicts = planned.filter { it.action == FileAction.OVERWRITE }.map { it.entry.path } + seedConflicts
         if (conflicts.isNotEmpty() && !request.force) {
             throw Stop(
                 EXIT_CHECK, "file_conflicts",
@@ -560,6 +598,7 @@ internal class ProjectInit(
         val change = request.repo != null && existing?.content != codeowners
         val found = github.rulesetId(repo, GitHubCli.RULESET_NAME, STEP_APPROVAL)
         var pullRequest: String? = null
+        var inShape = false
         val id: Long
         if (found == null) {
             if (change) {
@@ -571,7 +610,9 @@ internal class ProjectInit(
             }
         } else {
             id = found
-            github.updateRuleset(repo, id, GitHubCli.ENFORCEMENT_ACTIVE, STEP_APPROVAL)
+            // Read first: a ruleset already in the required shape is left alone (a re-run makes no writes).
+            inShape = github.rulesetInShape(repo, id, STEP_APPROVAL)
+            if (!inShape) github.updateRuleset(repo, id, GitHubCli.ENFORCEMENT_ACTIVE, STEP_APPROVAL)
             if (change) {
                 pullRequest = github.proposeFile(
                     repo, CODEOWNERS_PATH, codeowners, GitHubCli.CODEOWNERS_BRANCH, CODEOWNERS_MESSAGE,
@@ -597,11 +638,117 @@ internal class ProjectInit(
             },
         )
         step(
-            STEP_RULESET, if (found == null) "created" else "enforced",
+            STEP_RULESET, if (found == null) "created" else if (inShape) "in place" else "enforced",
             "${GitHubCli.RULESET_NAME} on ${repo.defaultBranch}: pull request with 1 approval + code-owner review, stale approvals dismissed, " +
                 "no force-push or deletion, no bypass",
         )
         return id
+    }
+
+    /** True when [subject] already holds [relation] on [objectRef] — read so an existing grant is left alone. */
+    private fun grantExists(subject: String, relation: String, objectRef: String): Boolean = try {
+        val body = thoryn.workspace.listGrants(objectRef = objectRef)
+        body["data"]?.takeIf { it.isArray }?.toList().orEmpty().any { text(it, "subject") == subject && text(it, "relation") == relation }
+    } catch (ex: ProductApiException) {
+        false // the create decides, and names the real refusal
+    }
+
+    // ── The seeded .thoryn/ files (ADR 2026-10-13 §3 and §6) ────────────────────────────────────
+
+    /**
+     * Seed, per connection, its `connection.json` (derived from the trust, re-rendered when it differs) and — when
+     * absent — a starter `provision.yaml`, so the repository is in the converge loop from its first commit:
+     *  - **in a clone**: written to the working tree; they land with the user's commit or pull request;
+     *  - **`--repo` that CREATED the repository this run**: committed to the default branch for an app project;
+     *    proposed through a pull request from [ProjectSeeds.PROVISIONING_BRANCH] for a config project, whose default
+     *    branch the approval ruleset now protects;
+     *  - **`--repo` on an existing repository**: not added — the same rule as the template's files; the report says
+     *    whether they are present, and the next steps say how to add them (run inside a clone).
+     */
+    private fun seedFiles(targets: List<Target>, repo: GhRepository, workspaceSlug: String, sandboxSlug: String, sandboxName: String, createdRepo: Boolean) {
+        val seeds = targets.flatMap { t ->
+            val trust = t.trust ?: throw Stop(EXIT_HTTP, "invalid_response", "No trust for connection ${t.connection}.")
+            val clientId = text(trust, "clientId")!!
+            val provision = when {
+                request.kind == Kind.APP -> ProjectSeeds.appProvisionYaml(repo, request.stack, sandboxSlug, clientId)
+                t.spec.production -> ProjectSeeds.configProductionProvisionYaml(repo, sandboxSlug, sandboxName, clientId, t.githubEnvironment!!)
+                else -> ProjectSeeds.configSandboxProvisionYaml(repo, sandboxSlug, clientId)
+            }
+            listOf(
+                ProjectSeeds.Seed(t.connectionPath, ProjectSeeds.connectionJson(workspaceSlug, trust, t.envSlug, t.spec.production), ProjectSeeds.KIND_CONNECTION),
+                ProjectSeeds.Seed(t.spec.provisionFile, provision, ProjectSeeds.KIND_PROVISION),
+            )
+        }
+        val files = mutableListOf<Map<String, Any?>>()
+        var proposal: GitHubCli.Proposal? = null
+        fun record(seed: ProjectSeeds.Seed, status: String) {
+            files += linkedMapOf("path" to seed.path, "kind" to seed.kind, "status" to status)
+        }
+        when {
+            request.repo == null -> {
+                val root = request.dir.toAbsolutePath().normalize()
+                seeds.forEach { s ->
+                    val target = root.resolve(s.path).normalize()
+                    val bytes = s.content.toByteArray()
+                    val status = when {
+                        !Files.exists(target) -> "written"
+                        s.kind == ProjectSeeds.KIND_PROVISION -> "kept" // the file is in control: never overwritten
+                        Files.isRegularFile(target) && Files.readAllBytes(target).contentEquals(bytes) -> "unchanged"
+                        else -> "rewritten"
+                    }
+                    if (status == "written" || status == "rewritten") {
+                        target.parent?.let { Files.createDirectories(it) }
+                        Files.write(target, bytes)
+                    }
+                    record(s, status)
+                }
+            }
+            createdRepo && request.kind == Kind.CONFIG -> {
+                // The default branch is protected now: the seeds go through a reviewed pull request, like CODEOWNERS would.
+                proposal = github.proposeFiles(
+                    repo, seeds.map { it.path to it.content }, ProjectSeeds.PROVISIONING_BRANCH, ProjectSeeds.PROVISIONING_MESSAGE,
+                    "Proposed by `thoryn project init config`: each connection's `connection.json` (its workload identity, no secret) and a starter " +
+                        "`provision.yaml`, so this repository converges its own configuration — `thoryn provision plan` on a pull request, `apply` on ${repo.defaultBranch}.",
+                    STEP_PROVISIONING,
+                )
+                seeds.forEach { record(it, if (proposal!!.changed) "pending review" else "open") }
+            }
+            createdRepo -> {
+                github.awaitDefaultBranch(repo, STEP_PROVISIONING)
+                seeds.forEach { s ->
+                    val existing = github.readFile(repo, s.path, STEP_PROVISIONING)
+                    if (existing?.content == s.content) {
+                        record(s, "unchanged")
+                    } else {
+                        github.writeFile(repo, s.path, s.content, existing?.sha, ProjectSeeds.PROVISIONING_MESSAGE, STEP_PROVISIONING)
+                        record(s, "committed")
+                    }
+                }
+            }
+            // An existing repository: not added (the template's files aren't either) — except a config project whose earlier run
+            // proposed them: that pull request is converged (idempotent) and named again.
+            request.kind == Kind.CONFIG && github.openPullRequest(repo, ProjectSeeds.PROVISIONING_BRANCH, STEP_PROVISIONING) != null -> {
+                proposal = github.proposeFiles(
+                    repo, seeds.map { it.path to it.content }, ProjectSeeds.PROVISIONING_BRANCH, ProjectSeeds.PROVISIONING_MESSAGE, "", STEP_PROVISIONING,
+                )
+                seeds.forEach { record(it, if (proposal!!.changed) "pending review" else "open") }
+            }
+            else -> seeds.forEach { s -> record(s, if (github.fileExists(repo.fullName, s.path, STEP_PROVISIONING)) "present" else "not added") }
+        }
+        val pullRequest = proposal?.url
+        report["provisioning"] = linkedMapOf("files" to files, "pullRequest" to pullRequest)
+        val statuses = files.map { it["status"] as String }
+        val status = when {
+            proposal != null -> if (proposal.changed) "pending review" else "open"
+            "committed" in statuses -> "committed"
+            "written" in statuses || "rewritten" in statuses -> "written"
+            "not added" in statuses -> "not added"
+            else -> "unchanged"
+        }
+        step(
+            STEP_PROVISIONING, status,
+            (pullRequest?.let { "pull request ${if (proposal!!.changed) "pending review" else "open"}: $it — " } ?: "") + files.joinToString(", ") { "${it["path"]} (${it["status"]})" },
+        )
     }
 
     /** Adopt a matching trust (by name, or one the orchestrator made — by its pins), else create it. */
@@ -706,7 +853,8 @@ internal class ProjectInit(
             request.repo == null -> {
                 @Suppress("UNCHECKED_CAST")
                 val files = report["files"] as Map<String, List<String>>
-                val touched = (files["added"].orEmpty() + files["overwritten"].orEmpty()).map { it.substringBefore('/') }.distinct().sorted()
+                val touched = (files["added"].orEmpty() + files["overwritten"].orEmpty() + seededPaths("written", "rewritten"))
+                    .map { it.substringBefore('/') }.distinct().sorted()
                 if (touched.isNotEmpty() && config) {
                     // The default branch now takes reviewed pull requests only (the approval ruleset).
                     add(
@@ -723,19 +871,35 @@ internal class ProjectInit(
             }
             createdRepo -> {
                 add("Clone it: gh repo clone ${repo.fullName}")
-                add(
-                    "GitHub's initial commit started a first workflow run before the variables existed, so its Thoryn jobs skipped. " +
-                        "Re-run it (gh run list --repo ${repo.fullName}, then gh run rerun <id> --repo ${repo.fullName}) or push a commit; that run uses the variables.",
-                )
+                val committed = seededPaths("committed")
+                if (committed.isNotEmpty()) {
+                    add(
+                        "${committed.joinToString(" and ")} are committed on ${repo.defaultBranch}: the repository converges its own provisioning " +
+                            "(`thoryn provision plan` on a pull request, `thoryn provision apply` on ${repo.defaultBranch}); that commit's run uses the variables.",
+                    )
+                } else {
+                    add(
+                        "GitHub's initial commit started a first workflow run before the variables existed, so its Thoryn jobs skipped. " +
+                            "Re-run it (gh run list --repo ${repo.fullName}, then gh run rerun <id> --repo ${repo.fullName}) or push a commit; that run uses the variables.",
+                    )
+                }
             }
-            report["hasTemplateFiles"] == false -> add(
-                "${repo.fullName} does not contain the template's files yet: clone it and run `thoryn project init ${request.kind.label} …` " +
-                    "inside the clone (without --repo) to add them; the steps above are kept and re-used.",
+            report["hasTemplateFiles"] == false || seededPaths("not added").isNotEmpty() -> add(
+                "${repo.fullName} does not contain the template's files" +
+                    (if (seededPaths("not added").isNotEmpty()) " or its .thoryn/ connection.json + provision.yaml" else "") +
+                    " yet: clone it and run `thoryn project init ${request.kind.label} …` inside the clone (without --repo) to add them; the steps above are kept and re-used.",
             )
             else -> add("Push a commit (or re-run the workflow) to start a run with the variables set.")
         }
         (report["codeownersPullRequest"] as? String)?.let {
             add("CODEOWNERS update pending review: $it — the ruleset already requires an approved pull request; merge this one to make the reviewers the code owners.")
+        }
+        @Suppress("UNCHECKED_CAST")
+        ((report["provisioning"] as? Map<String, Any?>)?.get("pullRequest") as? String)?.let {
+            add(
+                "Provisioning files pending review: $it — each connection's connection.json and starter provision.yaml. Merge it, and the repository " +
+                    "converges its own configuration from then on (`thoryn provision plan` on a pull request, `thoryn provision apply` on ${repo.defaultBranch}).",
+            )
         }
         if (config) {
             val reviewers = request.reviewers.joinToString(", ")
@@ -748,6 +912,12 @@ internal class ProjectInit(
             )
         }
     }
+
+    /** The seeded `.thoryn/` paths whose status is one of [statuses]. */
+    @Suppress("UNCHECKED_CAST")
+    private fun seededPaths(vararg statuses: String): List<String> =
+        ((report["provisioning"] as? Map<String, Any?>)?.get("files") as? List<Map<String, Any?>>).orEmpty()
+            .filter { it["status"] in statuses }.map { it["path"] as String }
 
     // ── gh unavailable: say what would run, change nothing ───────────────────────────────────────
 
@@ -790,6 +960,11 @@ internal class ProjectInit(
                 add("gh variable set THORYN_ENVIRONMENT --body $sandboxSlug --repo $repo")
                 add("gh variable set THORYN_WIF_CLIENT_ID --body <sandbox client id> --repo $repo")
             }
+            add(
+                "# .thoryn/connection.json next to each connection's provision.yaml: {\"apiVersion\":\"thoryn.io/connection/v1\",\"workspace\":{\"slug\":\"$workspaceSlug\"}," +
+                    "\"auth\":{\"method\":\"workload_identity\",\"clientId\":\"<client id>\",\"audience\":\"<the trust's audience>\",\"scopes\":[<the trust's scopes>]}} " +
+                    "— and a starter provision.yaml (apiVersion thoryn.io/provision/v1) declaring what the connection owns; commit both",
+            )
         }
         val what = if (signedOut) "gh is not signed in" else "the GitHub CLI (gh) is not installed"
         val fix = if (signedOut) "Run `gh auth login`" else "Install gh (https://cli.github.com) and run `gh auth login`"
@@ -853,6 +1028,8 @@ internal class ProjectInit(
         const val STEP_ACCESS: String = "access"
         const val STEP_VARIABLES: String = "variables"
         const val STEP_FILES: String = "files"
+        /** The seeded `.thoryn/` files: connection.json + the starter provision.yaml per connection (ADR 2026-10-13). */
+        const val STEP_PROVISIONING: String = "provisioning"
 
         const val DEFAULT_SANDBOX: String = "sandbox"
         const val STEP_APPROVAL: String = "approval"

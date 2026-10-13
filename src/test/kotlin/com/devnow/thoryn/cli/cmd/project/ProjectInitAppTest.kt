@@ -30,10 +30,17 @@ class ProjectInitAppTest : ProjectTestBase() {
             "gh api repos/acme/web",
             "gh api users/acme",
             "gh api --method POST repos/thoryn-io/starter-express/generate -f owner=acme -f name=web -F private=true -f description=Thoryn application project",
+            "gh variable list --repo acme/web --json name,value", // read first: none set yet
             "gh variable set THORYN_ISSUER --body https://auth.stg.thoryn.org --repo acme/web",
             "gh variable set THORYN_WORKSPACE --body acme --repo acme/web",
             "gh variable set THORYN_ENVIRONMENT --body dev --repo acme/web",
             "gh variable set THORYN_WIF_CLIENT_ID --body wi_client1 --repo acme/web",
+            // The seeded .thoryn/ files, committed to the default branch (no approval ruleset on an app project).
+            "gh api repos/acme/web/branches/main",
+            "gh api repos/acme/web/contents/.thoryn/connection.json",
+            "gh api --method PUT repos/acme/web/contents/.thoryn/connection.json --input -",
+            "gh api repos/acme/web/contents/.thoryn/provision.yaml",
+            "gh api --method PUT repos/acme/web/contents/.thoryn/provision.yaml --input -",
         )
         val trust = api.trustsIn("dev").single()
         assertThat(trust["name"]).isEqualTo("starter-sandbox-$repoId")
@@ -50,7 +57,7 @@ class ProjectInitAppTest : ProjectTestBase() {
             .contains("Set up the app project acme/web for workspace acme")
             .contains("repository").contains("created").contains("acme/web (private) from thoryn-io/starter-express")
             .contains("starter-sandbox-$repoId → wi_client1")
-            .contains("Next steps:").contains("gh repo clone acme/web").contains("gh run rerun")
+            .contains("Next steps:").contains("gh repo clone acme/web").contains(".thoryn/connection.json and .thoryn/provision.yaml are committed on main")
     }
 
     @Test
@@ -72,7 +79,7 @@ class ProjectInitAppTest : ProjectTestBase() {
         assertThat(Files.readString(dir.resolve(".thoryn/template.json"))).contains("thoryn.io/starter-template/v2")
         assertThat(Files.readString(dir.resolve("src/app.js"))).contains("mine") // untouched
         assertThat(gh.variables).containsEntry("acme/web:THORYN_ENVIRONMENT", "dev")
-        assertThat(out).contains("5 added, 0 already identical").contains("git add .github .thoryn README.md && git commit")
+        assertThat(out).contains("4 added, 0 already identical").contains("git add .github .thoryn README.md && git commit") // the template's provision.yaml placeholder is seeded instead
     }
 
     @Test
@@ -87,8 +94,8 @@ class ProjectInitAppTest : ProjectTestBase() {
         assertThat(exit).describedAs(err).isEqualTo(0)
         assertThat(api.trusts).hasSize(1)
         assertThat(api.grants).hasSize(1)
-        // The only product-api write of the re-run is the idempotent grant (200, already present).
-        assertThat(api.writes.drop(writesAfterFirst).map { "${it.method} ${it.path}" }).containsExactly("POST /api/v1/access/grants")
+        // The re-run writes nothing to product-api: the grant is read and found, not re-posted.
+        assertThat(api.writes.drop(writesAfterFirst)).isEmpty()
         val report = parseJson(out)
         @Suppress("UNCHECKED_CAST")
         val connection = (report["connections"] as List<Map<String, Any?>>).single()
