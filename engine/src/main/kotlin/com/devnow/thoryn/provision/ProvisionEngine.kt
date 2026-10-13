@@ -47,6 +47,12 @@ data class PlannedChange(
     val readOnly: Boolean = false,
     /** SSO-3659 — the ownership-gate error code when [action] is [ChangeAction.ERROR] (`access_*`), else null. */
     val error: String? = null,
+    /**
+     * SSO-3668 — the outputs `apply` will PUBLISH this resource's id to once it is converged (every apply, an
+     * upsert). Shown as a line of the plan — a pull-request check shows where the id will land — and never
+     * written by `plan`. Empty on an [ChangeAction.ERROR] row and on a read-only reference.
+     */
+    val publishTo: List<PublishTarget> = emptyList(),
 ) {
     val hasGrantChanges: Boolean get() = grantAdds.isNotEmpty() || grantRemoves.isNotEmpty()
 
@@ -60,6 +66,9 @@ data class PlannedChange(
         access?.let { put("access", it) }
         if (readOnly) put("readOnly", true)
         error?.let { put("error", it) }
+        if (publishTo.isNotEmpty()) {
+            put("publishTo", publishTo.map { mapOf("kind" to it.kind, "repository" to it.repository, "environment" to it.environment, "name" to it.name) })
+        }
     }
 }
 
@@ -70,7 +79,13 @@ class ProvisionPlan(val changes: List<PlannedChange>) {
     val removes: List<PlannedChange> get() = changes.filter { it.action == ChangeAction.REMOVE }
     /** SSO-3113 — resources whose grants differ (a no-op resource can still carry grant changes). */
     val grantChanges: Int get() = changes.sumOf { it.grantAdds.size + it.grantRemoves.size }
-    val hasChanges: Boolean get() = creates.isNotEmpty() || updates.isNotEmpty() || adopts.isNotEmpty() || removes.isNotEmpty() || grantChanges > 0
+    /**
+     * SSO-3668 — outputs `apply` will publish (an upsert on EVERY apply, so a no-op resource with a `publishTo:`
+     * still gives `apply` something to do — that is what makes a re-created client propagate, and a re-run
+     * repair a variable someone changed by hand).
+     */
+    val publishes: Int get() = changes.sumOf { it.publishTo.size }
+    val hasChanges: Boolean get() = creates.isNotEmpty() || updates.isNotEmpty() || adopts.isNotEmpty() || removes.isNotEmpty() || grantChanges > 0 || publishes > 0
     /** SSO-3659 — resources that failed the ownership gate; a plan with one is red and `apply` refuses it. */
     val errors: List<PlannedChange> get() = changes.filter { it.action == ChangeAction.ERROR }
     val hasErrors: Boolean get() = errors.isNotEmpty()
@@ -90,6 +105,7 @@ class ProvisionPlan(val changes: List<PlannedChange>) {
             "skip" to changes.count { it.action == ChangeAction.SKIP },
             "grants" to grantChanges,
             "error" to errors.size,
+            "publish" to publishes,
         ),
     )
 }
@@ -179,6 +195,16 @@ data class RemovalOutcome(val remaining: ProvisionReceipt, val failures: List<St
  * environment-partitioned tenant tuple store, not the platform resource graph — `/api/v1/access/mine` is
  * the platform graph's list-objects, and the one customer-plane read of it that exists.
  *
+ * **Outputs (SSO-3668; ADR 2026-10-13 production-clients-declared-in-the-config-project §2).** An
+ * `application`'s `publishTo:` targets receive its clientId through [outputSink] — the sibling of
+ * [secretSink] for a value that is PUBLIC by construction — AFTER the resource is converged and recorded
+ * in the receipt (the id is known), on EVERY apply (an upsert: a re-created client propagates without a
+ * second step). A target the sink cannot reach does not undo anything: the client exists, the receipt
+ * records its id, and `apply` ends with [PublishTargetUnreachableException] (`publish_target_unreachable`)
+ * naming the one `gh variable set` a human can run with the id from the receipt. `plan` never publishes;
+ * it shows the pending publish as a line. The receipt records what WAS published ([OwnedResource.published]).
+ * Like [SecretSink], the library ships no [OutputSink] that runs a process: the CLI's is `gh variable set`.
+ *
  * [clients] yields a tenant-scoped [ProvisionApi] bound to an environment slug (`null` ⇒ the
  * production plane); [persist] is invoked after every successful write so the receipt on disk always
  * reflects reality even when a later step fails.
@@ -217,7 +243,47 @@ class ProvisionEngine(
      * client row carries no owner tag, so this guard only sees the receipts it is handed.
      */
     private val peers: List<ProvisionReceipt> = emptyList(),
+    /**
+     * SSO-3668 — the channel an application's clientId is PUBLISHED through to its `publishTo:` targets. The
+     * default reaches nothing, so a file that declares a target and an engine without a publisher fail loud
+     * (`publish_target_unreachable`) rather than silently skipping the publish.
+     */
+    private val outputSink: OutputSink = OutputSink.unavailable(),
 ) {
+
+    /**
+     * SSO-3668 — the port an application's clientId leaves the engine through on its way to a `publishTo:`
+     * target. Same shape as [SecretSink]: no picocli, no TTY, no process — the CLI implements it with
+     * `gh variable set … --env` (creating the environment when absent, never touching an existing one's
+     * protection); the GitHub App with its own gateway. [publish] answers `null` when the value landed,
+     * else WHY the target could not be reached (shown to the operator; never the value itself — which is a
+     * client id and public anyway, but the message names the receipt as its source).
+     */
+    fun interface OutputSink {
+        fun publish(target: PublishTarget, value: String): String?
+
+        companion object {
+            /** Reaches nothing — every target is reported unreachable (the engine's default). */
+            fun unavailable(): OutputSink = OutputSink { _, _ -> "no publisher is available in this context" }
+        }
+    }
+
+    /** SSO-3668 — one `publishTo:` target `apply` could not reach: which resource, which target, and why. */
+    data class PublishFailure(val resourceKey: String, val target: PublishTarget, val value: String, val reason: String) {
+        /** The one command a human runs instead, with the id from the receipt. */
+        val byHand: String get() = target.byHand(value)
+    }
+
+    /**
+     * SSO-3668 — `apply` converged and recorded every resource, but one or more outputs could not be
+     * published (`publish_target_unreachable`). Raised AFTER convergence, once the receipt is persisted
+     * ([receipt] is that receipt), so nothing is lost: the human fallback is each failure's [PublishFailure.byHand].
+     */
+    class PublishTargetUnreachableException(val failures: List<PublishFailure>, val receipt: ProvisionReceipt) : ProvisionException(
+        "$ERROR_PUBLISH_UNREACHABLE — every resource was converged and recorded in the receipt, but " +
+            "${failures.size} output(s) could not be published:\n  " +
+            failures.joinToString("\n  ") { "${it.resourceKey} → ${it.target.label}: ${it.reason}\n    publish it by hand: ${it.byHand}" },
+    )
 
     /**
      * SSO-3113 — clientIds of confidential applications created by the last [apply] whose one-time
@@ -259,6 +325,8 @@ class ProvisionEngine(
             // a resource that fails it plans no grants (its object may not even be visible to this identity).
             val change = gate(r, probe(r, file, owned, envSlugs), file, envSlugs, slug, reach)
                 .let { c -> if (c.action == ChangeAction.ERROR || c.readOnly) c else planGrants(r, c, slug, owned) }
+                // SSO-3668 — a resource that will be converged publishes its id afterwards (every apply); shown, never done, by plan.
+                .let { c -> if (c.action == ChangeAction.ERROR || c.readOnly || r.publishTo.isEmpty()) c else c.copy(publishTo = r.publishTo, reason = c.reason + "; publishes its id to ${r.publishTo.size} target(s)") }
             changes += change
             if (r.kind == ProvisionFile.KIND_ENVIRONMENT && change.liveId != null) {
                 // The RESOLVED slug (a `{{env.NAME}}` placeholder names a per-run sandbox), never the raw spec.
@@ -708,7 +776,11 @@ class ProvisionEngine(
             val i = owned.indexOfFirst { it.key == o.key }
             // SSO-3119 — a resource write carries no grants; keep the grant ownership the receipt holds,
             // so dropping a `grants:` block does not silently disown what this file granted.
-            val merged = if (i >= 0 && o.grants.isEmpty()) o.copy(grants = owned[i].grants) else o
+            // SSO-3668 — likewise the published outputs: the publish pass below sets them explicitly.
+            val merged = o.copy(
+                grants = if (i >= 0 && o.grants.isEmpty()) owned[i].grants else o.grants,
+                published = if (i >= 0 && o.published.isEmpty()) owned[i].published else o.published,
+            )
             if (i >= 0) owned[i] = merged else owned += merged
             persist(current())
         }
@@ -717,6 +789,13 @@ class ProvisionEngine(
             val i = owned.indexOfFirst { it.key == key }
             if (i < 0 || owned[i].grants == grants) return
             owned[i] = owned[i].copy(grants = grants)
+            persist(current())
+        }
+        /** SSO-3668 — set what this apply PUBLISHED for a resource EXPLICITLY (only the targets that were reached). */
+        fun recordPublished(key: String, published: List<PublishedOutput>) {
+            val i = owned.indexOfFirst { it.key == key }
+            if (i < 0 || owned[i].published == published) return
+            owned[i] = owned[i].copy(published = published)
             persist(current())
         }
         undelivered.clear()
@@ -734,6 +813,9 @@ class ProvisionEngine(
         // `record` rewrites the entry from the resource write, which carries no grants (SSO-3119).
         val ownedGrantsByKey = receipt?.resources.orEmpty().associate { it.key to it.grants }
         val pendingGrants = mutableListOf<Pair<ProvisionResource, String>>()
+        // SSO-3668 — outputs publish in their own pass too, once the resource is converged and RECORDED (the id
+        // is known and already in the receipt), so an unreachable target can never cost the id.
+        val pendingPublishes = mutableListOf<Pair<ProvisionResource, String>>()
         plan.changes.filter { it.resource != null }.forEach { change ->
             val r = change.resource!!
             // SSO-3659 — a read-only reference is never written and never owned: a receipt entry from before the
@@ -755,6 +837,30 @@ class ProvisionEngine(
             if (r.grants != null && resolved != null) {
                 pendingGrants += r to objectRef(r.kind, resolved.id, resolved.environment)
             }
+            if (r.publishTo.isNotEmpty() && resolved != null) {
+                pendingPublishes += r to resolved.id
+            }
+        }
+        // SSO-3668 — publish AFTER convergence: every resource exists and is in the receipt by now. Failures are
+        // collected, not thrown, so the grants and prune below still converge; they end the apply afterwards.
+        val publishFailures = mutableListOf<PublishFailure>()
+        pendingPublishes.forEach { (r, id) ->
+            val reached = mutableListOf<PublishedOutput>()
+            r.publishTo.forEach { target ->
+                val reason = try {
+                    outputSink.publish(target, id)
+                } catch (ex: Exception) {
+                    ex.message ?: ex.javaClass.simpleName
+                }
+                if (reason == null) {
+                    reached += PublishedOutput.of(target)
+                    out.println("  > ${r.kind} ${r.name}: published clientId=$id → ${target.label}")
+                } else {
+                    publishFailures += PublishFailure(r.key, target, id, reason)
+                    err.println("  ! ${r.kind} ${r.name}: could not publish its clientId to ${target.label} ($reason). The client exists and is recorded; by hand: ${target.byHand(id)}")
+                }
+            }
+            recordPublished(r.key, reached)
         }
         pendingGrants.forEach { (r, ref) ->
             recordGrants(r.key, convergeGrants(r, ref, ownedGrantsByKey[r.key].orEmpty()))
@@ -772,6 +878,8 @@ class ProvisionEngine(
         }
         val result = current()
         persist(result)
+        // SSO-3668 — raised LAST: the receipt above records every id, so the fallback is one command per target.
+        if (publishFailures.isNotEmpty()) throw PublishTargetUnreachableException(publishFailures, result)
         return result
     }
 
@@ -1478,6 +1586,12 @@ class ProvisionEngine(
         const val ERROR_NOT_OWNED = "access_not_owned"
         /** Another repository's receipt records the resource as owned. */
         const val ERROR_OWNED_ELSEWHERE = "access_owned_elsewhere"
+
+        /**
+         * SSO-3668 — an output's `publishTo:` target could not be reached by the signed-in credential; raised
+         * AFTER convergence (the resource exists and its id is in the receipt), never a refusal before it.
+         */
+        const val ERROR_PUBLISH_UNREACHABLE = "publish_target_unreachable"
 
         const val RELATION_MANAGER = "manager"
         const val RELATION_VIEWER = "viewer"

@@ -2,6 +2,7 @@ package com.devnow.thoryn.cli.cmd.provision
 
 import com.devnow.thoryn.provision.ProvisionException
 import com.devnow.thoryn.provision.ProvisionGrant
+import com.devnow.thoryn.provision.PublishTarget
 import com.devnow.thoryn.provision.ProvisionFile
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.assertThatThrownBy
@@ -244,6 +245,86 @@ class ProvisionSchemaConformanceTest {
         val exclusion = schema["\$defs"]["resource"]["allOf"].toList().last()
         assertThat(exclusion["if"]["properties"][ProvisionFile.READ_ONLY]["const"].asBoolean()).isTrue()
         assertThat(exclusion["then"]["not"]["required"].toList().map { it.asString() }).containsExactly("grants")
+    }
+
+    @Test
+    fun `publishTo is accepted on an application with a well-formed githubActionsVariable target, and parses`() {
+        // SSO-3668 (ADR 2026-10-13 production-clients-declared-in-the-config-project §2) — the config repository's fragment.
+        val ok = yaml.readTree(
+            """
+            apiVersion: thoryn.io/provision/v1
+            resources:
+              - kind: application
+                name: billing-web
+                spec: { displayName: "Billing web", clientType: public, redirectUris: ["https://billing.acme.example/callback"] }
+                publishTo:
+                  - { kind: githubActionsVariable, repository: acme/billing-web, environment: production, name: THORYN_PRODUCTION_CLIENT_ID }
+                  - { kind: githubActionsVariable, repository: acme/billing-web, environment: staging, name: THORYN_PRODUCTION_CLIENT_ID }
+              - kind: application
+                name: plain
+                spec: { displayName: "No outputs" }
+            """.trimIndent(),
+        )
+        assertThat(ProvisionFile.validate(ok)).isEmpty()
+        val parsed = ProvisionFile.parse(json.writeValueAsBytes(ok), "provision.json", yaml = false)
+        assertThat(parsed.resources[0].publishTo).containsExactly(
+            PublishTarget("githubActionsVariable", "acme/billing-web", "production", "THORYN_PRODUCTION_CLIENT_ID"),
+            PublishTarget("githubActionsVariable", "acme/billing-web", "staging", "THORYN_PRODUCTION_CLIENT_ID"),
+        )
+        assertThat(parsed.resources[1].publishTo).isEmpty()
+        assertThat(parsed.resources[0].publishTo[0].byHand("app-1")).isEqualTo("gh variable set THORYN_PRODUCTION_CLIENT_ID --body app-1 --repo acme/billing-web --env production")
+    }
+
+    @Test
+    fun `publishTo is rejected on other kinds, on a read-only reference, and on a malformed target`() {
+        val bad = yaml.readTree(
+            """
+            apiVersion: thoryn.io/provision/v1
+            resources:
+              - { kind: environment, name: ci, spec: { slug: ci }, publishTo: [ { kind: githubActionsVariable, repository: acme/x, environment: production, name: ENV_ID } ] }
+              - { kind: application, name: ref, readOnly: true, spec: { displayName: "Shared" }, publishTo: [ { kind: githubActionsVariable, repository: acme/x, environment: production, name: SHARED_ID } ] }
+              - { kind: application, name: a, spec: { displayName: a }, publishTo: [ { kind: forgejoVariable, repository: acme/x, environment: production, name: A_ID } ] }
+              - { kind: application, name: b, spec: { displayName: b }, publishTo: [ { kind: githubActionsVariable, repository: "acme/x/y", environment: production, name: B_ID } ] }
+              - { kind: application, name: c, spec: { displayName: c }, publishTo: [ { kind: githubActionsVariable, repository: acme/x, environment: production, name: "client-id" } ] }
+              - { kind: application, name: d, spec: { displayName: d }, publishTo: [ { kind: githubActionsVariable, repository: acme/x, environment: production, name: GITHUB_CLIENT_ID } ] }
+              - { kind: application, name: e, spec: { displayName: e }, publishTo: [ { kind: githubActionsVariable, repository: acme/x, name: E_ID, secret: true } ] }
+              - { kind: application, name: f, spec: { displayName: f }, publishTo: [ { kind: githubActionsVariable, repository: acme/x, environment: production, name: F_ID }, { kind: githubActionsVariable, repository: acme/x, environment: production, name: F_ID } ] }
+              - { kind: application, name: g, spec: { displayName: g }, publishTo: { kind: githubActionsVariable } }
+              - { kind: application, name: h, spec: { displayName: h }, publishTo: [] }
+            """.trimIndent(),
+        )
+        val v = ProvisionFile.validate(bad)
+        assertThat(v).anyMatch { it.contains("resources[0] publishTo is only supported on kind application") }
+        assertThat(v).anyMatch { it.contains("resources[1]") && it.contains("read-only reference cannot carry 'publishTo'") }
+        assertThat(v).anyMatch { it.contains("resources[2] publishTo[0] kind 'forgejoVariable'") }
+        assertThat(v).anyMatch { it.contains("resources[3] publishTo[0] repository 'acme/x/y'") }
+        assertThat(v).anyMatch { it.contains("resources[4] publishTo[0] name 'client-id'") }
+        assertThat(v).anyMatch { it.contains("resources[5] publishTo[0] name 'GITHUB_CLIENT_ID' is reserved") }
+        assertThat(v).anyMatch { it.contains("resources[6] publishTo[0] environment is required") }
+        assertThat(v).anyMatch { it.contains("resources[6] publishTo[0] has unknown property 'secret'") }
+        assertThat(v).anyMatch { it.contains("resources[7] publishTo[1] duplicates target") }
+        assertThat(v).anyMatch { it.contains("resources[8] publishTo must be an array") }
+        assertThat(v).anyMatch { it.contains("resources[9] publishTo must name at least one target") }
+        assertThatThrownBy { ProvisionFile.parse(json.writeValueAsBytes(bad), "bad.json", yaml = false) }
+            .isInstanceOf(ProvisionException::class.java)
+            .hasMessageContaining("publishTo")
+
+        // The schema pins the same rules: the closed kind enum, the two grammars, exactly four members, application-only, not with readOnly.
+        val publishTo = schema["\$defs"]["resource"]["properties"][ProvisionFile.PUBLISH_TO]
+        assertThat(publishTo["minItems"].asInt()).isEqualTo(1)
+        val item = publishTo["items"]
+        assertThat(item["additionalProperties"].asBoolean()).isFalse()
+        assertThat(item["required"].toList().map { it.asString() }.toSet()).isEqualTo(ProvisionFile.PUBLISH_TARGET_KEYS)
+        assertThat(item["properties"]["kind"]["enum"].toList().map { it.asString() }.toSet()).isEqualTo(ProvisionFile.PUBLISH_KINDS)
+        assertThat(item["properties"]["repository"]["pattern"].asString()).isEqualTo(ProvisionFile.REPOSITORY_PATTERN.pattern)
+        val name = Regex(item["properties"]["name"]["pattern"].asString())
+        assertThat(name.matches("THORYN_PRODUCTION_CLIENT_ID")).isTrue()
+        assertThat(name.matches("client-id")).isFalse()
+        assertThat(name.matches("GITHUB_CLIENT_ID")).isFalse()
+        val rules = schema["\$defs"]["resource"]["allOf"].toList()
+        val onlyApplication = rules.first { it["if"]["required"]?.toList()?.map { r -> r.asString() } == listOf(ProvisionFile.PUBLISH_TO) }
+        assertThat(onlyApplication["then"]["properties"]["kind"]["const"].asString()).isEqualTo(ProvisionFile.KIND_APPLICATION)
+        assertThat(rules).anyMatch { r -> r["if"]["properties"]?.get(ProvisionFile.READ_ONLY)?.get("const")?.asBoolean() == true && r["then"]["not"]["required"].toList().map { it.asString() } == listOf(ProvisionFile.PUBLISH_TO) }
     }
 
     @Test

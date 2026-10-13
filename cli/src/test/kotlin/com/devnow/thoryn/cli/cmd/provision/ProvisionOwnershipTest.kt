@@ -120,7 +120,7 @@ class ProvisionOwnershipTest : CommandTestBase() {
         assertThat(change.readOnly).isTrue()
         assertThat(change.reason).contains("access_read_only").contains("redirectUris")
         assertThat(plan.hasErrors).isTrue()
-        assertThat(plan.toStructured()["summary"]).isEqualTo(mapOf("create" to 0, "update" to 0, "adopt" to 0, "remove" to 0, "noop" to 0, "skip" to 0, "grants" to 0, "error" to 1))
+        assertThat(plan.toStructured()["summary"]).isEqualTo(mapOf("create" to 0, "update" to 0, "adopt" to 0, "remove" to 0, "noop" to 0, "skip" to 0, "grants" to 0, "error" to 1, "publish" to 0))
         assertThat(change.toStructured()).containsEntry("error", "access_read_only").containsEntry("access", "viewer").containsEntry("readOnly", true)
 
         val persisted = mutableListOf<ProvisionReceipt>()

@@ -8,7 +8,7 @@ import java.io.File
 import java.security.MessageDigest
 
 /** Thrown on any provisioning-file load / parse / validation failure, or a refused plan/apply/destroy. */
-class ProvisionException(message: String) : RuntimeException(message)
+open class ProvisionException(message: String) : RuntimeException(message)
 
 /**
  * SSO-3088 (epic SSO-3087) — one declared resource of a provisioning file: its `kind` (closed
@@ -34,9 +34,32 @@ data class ProvisionResource(
      * be declared with only `viewer` reach (an owned resource needs `manager`).
      */
     val readOnly: Boolean = false,
+    /**
+     * SSO-3668 (ADR 2026-10-13 production-clients-declared-in-the-config-project §2) — where `apply`
+     * PUBLISHES this resource's id once it is converged (see [PublishTarget]). `application` only: the
+     * clientId is the one output a resource has, and it is public by construction. Empty ⇒ nothing is
+     * published. Refused together with [readOnly] (a reference publishes nothing — the owner publishes).
+     */
+    val publishTo: List<PublishTarget> = emptyList(),
 ) {
     val isSingleton: Boolean get() = kind in ProvisionFile.SINGLETON_KINDS
     val key: String get() = "$kind/$name"
+}
+
+/**
+ * SSO-3668 — one OUTPUT target of an `application` resource: after `apply` has converged the client (so
+ * its id is known), the clientId is upserted into [repository]'s GitHub environment [environment] as the
+ * Actions **variable** [name] — never a secret; the value is a client id, public by construction. Done on
+ * EVERY apply, so a re-created client propagates without a second step. Today's only [kind] is
+ * [ProvisionFile.PUBLISH_KIND_GITHUB_ACTIONS_VARIABLE]. The engine hands it to its
+ * [ProvisionEngine.OutputSink]; the CLI's sink is `gh variable set`, the GitHub App's is its own gateway.
+ */
+data class PublishTarget(val kind: String, val repository: String, val environment: String, val name: String) {
+    /** `<kind> <owner/name> (environment <env>) <NAME>` — the display form in plans, receipts and errors. */
+    val label: String get() = "$kind $repository (environment $environment) $name"
+
+    /** The one command a human runs when the target could not be reached — with the id from the receipt. */
+    fun byHand(value: String): String = "gh variable set $name --body $value --repo $repository --env $environment"
 }
 
 /**
@@ -139,6 +162,25 @@ class ProvisionFile private constructor(
         /** SSO-3659 — the resource-level `readOnly` flag (ADR 2026-10-13 §1): a dependency, not an owned resource. */
         const val READ_ONLY = "readOnly"
 
+        // ── SSO-3668 — `publishTo:` (ADR 2026-10-13 production-clients-declared-in-the-config-project §2) ──
+
+        /** The resource-level output declaration: where `apply` publishes the converged id ([PublishTarget]). */
+        const val PUBLISH_TO = "publishTo"
+        /** A GitHub Actions VARIABLE on a repository's environment (`gh variable set … --env`). Never a secret. */
+        const val PUBLISH_KIND_GITHUB_ACTIONS_VARIABLE = "githubActionsVariable"
+        /** The CLOSED publish-target kind allowlist — must equal the schema's `publishTo.items.kind` enum. */
+        val PUBLISH_KINDS: Set<String> = setOf(PUBLISH_KIND_GITHUB_ACTIONS_VARIABLE)
+        /** The kinds a `publishTo:` may sit on: an application's clientId is the one output a resource has. */
+        val PUBLISHABLE_KINDS: Set<String> = setOf(KIND_APPLICATION)
+        /** The members of one target — exactly these four (the schema's `additionalProperties: false`). */
+        val PUBLISH_TARGET_KEYS: Set<String> = setOf("kind", "repository", "environment", "name")
+        /** `owner/name` — a GitHub owner (no leading / trailing hyphen, ≤ 39) and a repository name (≤ 100). */
+        val REPOSITORY_PATTERN = Regex("^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?/[A-Za-z0-9._-]{1,100}$")
+        /** An Actions variable name: upper-case, digits and underscores, not starting with a digit. */
+        val VARIABLE_NAME_PATTERN = Regex("^[A-Z_][A-Z0-9_]*$")
+        /** GitHub reserves the `GITHUB_` prefix for its own variables; such a name is refused at publish time. */
+        const val RESERVED_VARIABLE_PREFIX = "GITHUB_"
+
         private val jsonMapper = JsonMapper.builder().addModule(kotlinModule()).build()
         private val yamlMapper = YAMLMapper.builder().addModule(kotlinModule()).build()
 
@@ -198,6 +240,14 @@ class ProvisionFile private constructor(
                         ProvisionGrant(subject = g["subject"].asString().trim(), relation = g["relation"].asString().trim())
                     },
                     readOnly = r[READ_ONLY]?.takeIf { it.isBoolean() }?.asBoolean() ?: false,
+                    publishTo = r[PUBLISH_TO]?.takeIf { it.isArray() }?.toList()?.map { t ->
+                        PublishTarget(
+                            kind = t["kind"].asString().trim(),
+                            repository = t["repository"].asString().trim(),
+                            environment = t["environment"].asString().trim(),
+                            name = t["name"].asString().trim(),
+                        )
+                    } ?: emptyList(),
                 )
             }
             if (unresolved.isNotEmpty()) {
@@ -255,7 +305,7 @@ class ProvisionFile private constructor(
                     v += "$where must be an object"
                     return@forEachIndexed
                 }
-                rejectUnknownKeys(r, setOf("kind", "name", "environment", "spec", "grants", READ_ONLY), where, v)
+                rejectUnknownKeys(r, setOf("kind", "name", "environment", "spec", "grants", READ_ONLY, PUBLISH_TO), where, v)
                 // SSO-3659 — `readOnly: true` declares a dependency, not ownership: a boolean, and never with `grants`
                 // (a grant is a write on the object; a reference writes nothing).
                 r[READ_ONLY]?.takeIf { !it.isNull }?.let { ro ->
@@ -311,6 +361,9 @@ class ProvisionFile private constructor(
                         }
                     }
                 }
+                // SSO-3668 — `publishTo`: on an application only, never on a read-only reference, each target
+                // exactly { kind, repository, environment, name } with a closed kind, GitHub grammar, no duplicates.
+                r[PUBLISH_TO]?.takeIf { !it.isNull }?.let { targets -> validatePublishTo(targets, kind, r, where, v) }
                 // SSO-3413 — `customDomain`: exactly { host, acceptReSignIn? }.
                 if (kind == KIND_CUSTOM_DOMAIN) {
                     rejectUnknownKeys(spec, CUSTOM_DOMAIN_SPEC_KEYS, "$where spec", v)
@@ -324,6 +377,55 @@ class ProvisionFile private constructor(
             }
             keys.groupBy { it }.filterValues { it.size > 1 }.keys.forEach { v += "duplicate resource '$it' — kind + name must be unique" }
             return v
+        }
+
+        /**
+         * SSO-3668 — the `publishTo:` rules the schema also pins: only an `application` has an output to
+         * publish (its clientId); a `readOnly` reference publishes nothing (the owning repository does); a
+         * target is exactly `{ kind, repository, environment, name }` with a closed `kind`, an `owner/name`
+         * repository, a non-empty GitHub environment name and an `[A-Z_][A-Z0-9_]*` variable name outside
+         * GitHub's reserved `GITHUB_` prefix; no two targets name the same variable.
+         */
+        private fun validatePublishTo(targets: JsonNode, kind: String, r: JsonNode, where: String, v: MutableList<String>) {
+            if (kind !in PUBLISHABLE_KINDS) {
+                v += "$where $PUBLISH_TO is only supported on kind ${PUBLISHABLE_KINDS.joinToString(" | ")} — an application's clientId is the one output a resource publishes"
+            }
+            if (r[READ_ONLY]?.takeIf { it.isBoolean() }?.asBoolean() == true) {
+                v += "$where a read-only reference cannot carry '$PUBLISH_TO' — it publishes nothing; the repository that owns the resource publishes its id"
+            }
+            if (!targets.isArray()) {
+                v += "$where $PUBLISH_TO must be an array of { kind, repository, environment, name }"
+                return
+            }
+            if (targets.isEmpty()) v += "$where $PUBLISH_TO must name at least one target (or be omitted)"
+            val seen = mutableSetOf<String>()
+            targets.toList().forEachIndexed { ti, t ->
+                val tw = "$where $PUBLISH_TO[$ti]"
+                if (!t.isObject()) { v += "$tw must be an object { kind, repository, environment, name }"; return@forEachIndexed }
+                rejectUnknownKeys(t, PUBLISH_TARGET_KEYS, tw, v)
+                fun text(field: String): String? = t[field]?.takeIf { it.isTextual() }?.asString()?.trim()?.takeIf { it.isNotEmpty() }
+                val tKind = text("kind")
+                val repository = text("repository")
+                val environment = text("environment")
+                val name = text("name")
+                when {
+                    tKind == null -> v += "$tw kind is required (${PUBLISH_KINDS.joinToString(" | ")})"
+                    tKind !in PUBLISH_KINDS -> v += "$tw kind '$tKind' must be one of ${PUBLISH_KINDS.joinToString(", ")}"
+                }
+                when {
+                    repository == null -> v += "$tw repository is required (owner/name)"
+                    !REPOSITORY_PATTERN.matches(repository) -> v += "$tw repository '$repository' must be a GitHub owner/name (${REPOSITORY_PATTERN.pattern})"
+                }
+                if (environment == null) v += "$tw environment is required (the target repository's GitHub environment, e.g. production)"
+                when {
+                    name == null -> v += "$tw name is required (the Actions variable, e.g. THORYN_PRODUCTION_CLIENT_ID)"
+                    !VARIABLE_NAME_PATTERN.matches(name) -> v += "$tw name '$name' must be an Actions variable name (${VARIABLE_NAME_PATTERN.pattern})"
+                    name.startsWith(RESERVED_VARIABLE_PREFIX) -> v += "$tw name '$name' is reserved — GitHub refuses variables starting with $RESERVED_VARIABLE_PREFIX"
+                }
+                if (tKind != null && repository != null && environment != null && name != null && !seen.add("$tKind $repository $environment $name")) {
+                    v += "$tw duplicates target '$tKind $repository (environment $environment) $name'"
+                }
+            }
         }
 
         /** A required spec member is missing when absent, null, a blank scalar, or an empty array. */
