@@ -58,6 +58,12 @@ data class PlannedChange(
      * written by `plan`. Empty on an [ChangeAction.ERROR] row and on a read-only reference.
      */
     val publishTo: List<PublishTarget> = emptyList(),
+    /**
+     * SSO-3659 (ADR 2026-10-13 §5) — where `apply` will DELIVER the client secret this CREATE mints, the moment the
+     * client is converged and recorded. Shown as a line of the plan (a pull-request check shows where the secret
+     * will land); nothing is minted by `plan`. Only on a CREATE of a confidential application with a `secretSink:`.
+     */
+    val secretSink: SecretTarget? = null,
 ) {
     val hasGrantChanges: Boolean get() = grantAdds.isNotEmpty() || grantRemoves.isNotEmpty()
 
@@ -75,6 +81,7 @@ data class PlannedChange(
         if (publishTo.isNotEmpty()) {
             put("publishTo", publishTo.map { mapOf("kind" to it.kind, "repository" to it.repository, "environment" to it.environment, "name" to it.name) })
         }
+        secretSink?.let { put("secretSink", it.toStructured()) }
     }
 }
 
@@ -91,6 +98,8 @@ class ProvisionPlan(val changes: List<PlannedChange>) {
      * repair a variable someone changed by hand).
      */
     val publishes: Int get() = changes.sumOf { it.publishTo.size }
+    /** SSO-3659 — client secrets `apply` will mint AND deliver to a declared `secretSink:` (a CREATE each; never by plan). */
+    val deliveries: Int get() = changes.count { it.secretSink != null }
     val hasChanges: Boolean get() = creates.isNotEmpty() || updates.isNotEmpty() || adopts.isNotEmpty() || removes.isNotEmpty() || grantChanges > 0 || publishes > 0
     /** SSO-3659 — resources that failed the ownership gate; a plan with one is red and `apply` refuses it. */
     val errors: List<PlannedChange> get() = changes.filter { it.action == ChangeAction.ERROR }
@@ -112,6 +121,7 @@ class ProvisionPlan(val changes: List<PlannedChange>) {
             "grants" to grantChanges,
             "error" to errors.size,
             "publish" to publishes,
+            "deliver" to deliveries,
         ),
     )
 }
@@ -219,6 +229,19 @@ data class RemovalOutcome(val remaining: ProvisionReceipt, val failures: List<St
  * it shows the pending publish as a line. The receipt records what WAS published ([OwnedResource.published]).
  * Like [SecretSink], the library ships no [OutputSink] that runs a process: the CLI's is `gh variable set`.
  *
+ * **Declared secret delivery (SSO-3659; ADR 2026-10-13 converge §5, production-clients ADR §3 tier 3).** A
+ * confidential `application` may declare a `secretSink:` ([SecretTarget] — a key of an existing namespace's
+ * Kubernetes Secret, or an owner-only file): where the one-time `client_secret` is CONSUMED. `apply` hands
+ * the minted value to [declaredSecretSink] IMMEDIATELY AFTER the client is converged and recorded in the
+ * receipt (so an unreachable sink never costs the client its receipt entry), falls back to the generic
+ * [secretSink] (the CLI's `--secret-file` / guarded TTY) when the declared one answers a reason, and — when
+ * neither reaches — leaves the client in place and reports it on [undeliveredSecretDetails]
+ * (`undelivered_secrets`): the host exits non-zero naming the resource and the recovery
+ * `thoryn clients rotate-secret <clientId> --secret-file <path>`. The value never enters the receipt, the
+ * plan, the console or a log — a sink's reason is redacted of it before it is printed. `plan` shows the
+ * intended delivery as a line ([PlannedChange.secretSink]) and mints nothing. The library ships no sink
+ * that runs `kubectl` or writes a file: the CLI's does (`CliDeclaredSecretSink`).
+ *
  * [clients] yields a tenant-scoped [ProvisionApi] bound to an environment slug (`null` ⇒ the
  * production plane); [persist] is invoked after every successful write so the receipt on disk always
  * reflects reality even when a later step fails.
@@ -256,7 +279,38 @@ class ProvisionEngine(
      * (`publish_target_unreachable`) rather than silently skipping the publish.
      */
     private val outputSink: OutputSink = OutputSink.unavailable(),
+    /**
+     * SSO-3659 — the channel a minted client secret is DELIVERED through to its declared `secretSink:`. The
+     * default reaches nothing, so a file that declares a sink and a host without a delivery fall through to
+     * [secretSink] and then to `undelivered_secrets` — never a silent skip.
+     */
+    private val declaredSecretSink: DeclaredSecretSink = DeclaredSecretSink.unavailable(),
 ) {
+
+    /**
+     * SSO-3659 (ADR 2026-10-13 §5) — the port a minted client secret leaves the engine through on its way to a
+     * declared [SecretTarget]. Same shape as [OutputSink]: no picocli, no TTY, no process in the library — the
+     * CLI implements it with the operator's own `kubectl` (value on stdin, never argv) and the owner-only file
+     * writer. [deliver] answers `null` when the value landed, else WHY it did not (shown to the operator after
+     * the engine redacts the value from it; the message names the recovery, never the secret).
+     */
+    fun interface DeclaredSecretSink {
+        fun deliver(target: SecretTarget, clientId: String, secret: String): String?
+
+        companion object {
+            /** Reaches nothing — every declared sink is reported unreachable (the engine's default). */
+            fun unavailable(): DeclaredSecretSink = DeclaredSecretSink { _, _, _ -> "no secret delivery is available in this context" }
+        }
+    }
+
+    /**
+     * SSO-3659 — one client secret `apply` minted but could NOT deliver: the resource, its clientId, the declared
+     * target (if any) and the (redacted) reason. The client exists and is owned; [recovery] mints a new secret.
+     */
+    data class UndeliveredSecret(val resourceKey: String, val clientId: String, val target: SecretTarget?, val reason: String) {
+        /** The one command a human runs instead — with the clientId from the receipt. */
+        val recovery: String get() = recoverSecret(clientId)
+    }
 
     /**
      * SSO-3668 — the port an application's clientId leaves the engine through on its way to a `publishTo:`
@@ -297,8 +351,10 @@ class ProvisionEngine(
      * secret the [secretSink] could NOT deliver. The clients exist (and are owned); the operator must
      * mint a new secret with `thoryn clients rotate-secret <clientId>`.
      */
-    private val undelivered = mutableListOf<String>()
-    val undeliveredSecrets: List<String> get() = undelivered.toList()
+    private val undelivered = mutableListOf<UndeliveredSecret>()
+    val undeliveredSecrets: List<String> get() = undelivered.map { it.clientId }
+    /** SSO-3659 — the same, with the declared target and the (redacted) reason per client (`undelivered_secrets`). */
+    val undeliveredSecretDetails: List<UndeliveredSecret> get() = undelivered.toList()
 
     /**
      * SSO-3113 — the single channel a server-minted `client_secret` leaves the engine through. [emit]
@@ -334,6 +390,8 @@ class ProvisionEngine(
                 .let { c -> if (c.action == ChangeAction.ERROR || c.readOnly) c else planGrants(r, c, slug, owned) }
                 // SSO-3668 — a resource that will be converged publishes its id afterwards (every apply); shown, never done, by plan.
                 .let { c -> if (c.action == ChangeAction.ERROR || c.readOnly || r.publishTo.isEmpty()) c else c.copy(publishTo = r.publishTo, reason = c.reason + "; publishes its id to ${r.publishTo.size} target(s)") }
+                // SSO-3659 — a CREATE of a confidential application mints a secret; where it will be delivered is shown, never done, by plan.
+                .let { c -> if (c.action == ChangeAction.CREATE && !c.readOnly && r.secretSink != null && isConfidential(r.spec)) c.copy(secretSink = r.secretSink) else c }
             changes += change
             if (r.kind == ProvisionFile.KIND_ENVIRONMENT && change.liveId != null) {
                 // The RESOLVED slug (a `{{env.NAME}}` placeholder names a per-run sandbox), never the raw spec.
@@ -394,8 +452,12 @@ class ProvisionEngine(
     }
 
     /** SSO-3113 — the plan marker for a confidential application about to be created (its secret is shown once). */
-    private fun mintNote(r: ProvisionResource): String =
-        if (r.kind == ProvisionFile.KIND_APPLICATION && isConfidential(r.spec)) " (a client secret will be minted and shown once)" else ""
+    private fun mintNote(r: ProvisionResource): String = when {
+        r.kind != ProvisionFile.KIND_APPLICATION || !isConfidential(r.spec) -> ""
+        // SSO-3659 — with a declared sink the secret is delivered, not shown.
+        r.secretSink != null -> " (a client secret will be minted and delivered to ${r.secretSink.label})"
+        else -> " (a client secret will be minted and shown once)"
+    }
 
     /** product-api's `clientType` defaults to `confidential`; only an explicit `public` client is secret-less. */
     private fun isConfidential(spec: Map<String, Any?>): Boolean =
@@ -851,7 +913,9 @@ class ProvisionEngine(
                 return@forEach
             }
             val resolved: OwnedResource? = when (change.action) {
-                ChangeAction.CREATE -> create(r, file, owned).also { record(it) }
+                // SSO-3659 — a minted client secret is delivered AFTER the client is recorded: the receipt holds the id before
+                // any sink is reached for, so an unreachable sink can never cost the client its entry.
+                ChangeAction.CREATE -> create(r, file, owned).let { c -> record(c.owned); c.mintedSecret?.let { deliverSecret(r, c.owned.id, it) }; c.owned }
                 ChangeAction.UPDATE -> update(r, file, owned, change).also { record(it) }
                 ChangeAction.ADOPT -> adopt(r, file, owned, change).also { record(it) }
                 // SSO-3673 — a no-op still refreshes the owner the platform reported (an admin may have moved it since).
@@ -1032,9 +1096,13 @@ class ProvisionEngine(
 
     // ── per-kind create / update / adopt ─────────────────────────────────────────────────────────
 
-    private fun create(r: ProvisionResource, file: ProvisionFile, owned: List<OwnedResource>): OwnedResource {
+    /** A created resource and — for a confidential application — the one-time secret the create response carried. */
+    private class Created(val owned: OwnedResource, val mintedSecret: String? = null)
+
+    private fun create(r: ProvisionResource, file: ProvisionFile, owned: List<OwnedResource>): Created {
         val spec = resolveSpec(r, strict = true)
-        return when (r.kind) {
+        if (r.kind == ProvisionFile.KIND_APPLICATION) return createApplication(r, file, owned, spec)
+        return Created(when (r.kind) {
             ProvisionFile.KIND_ENVIRONMENT -> {
                 val slug = spec["slug"].toString()
                 val body = mapOf("slug" to slug, "name" to (spec["displayName"]?.toString()?.takeIf { it.isNotBlank() } ?: slug))
@@ -1043,28 +1111,6 @@ class ProvisionEngine(
                 val liveSlug = resp.str("slug") ?: slug
                 out.println("  + environment ${r.name}: id=$id slug=$liveSlug")
                 OwnedResource(r.kind, r.name, id, environment = null, attributes = mapOf("slug" to liveSlug), owner = ProvisionApi.ownerOf(resp))
-            }
-            ProvisionFile.KIND_APPLICATION -> {
-                val slug = targetSlug(r, file, owned)
-                val resp = clients(slug).createApplication(spec)
-                val id = resp.str("clientId") ?: resp.str("client_id") ?: throw ProvisionException("${r.key}: the application create returned no clientId")
-                // SSO-3113 — the ONE server-minted secret goes to the sink and NOWHERE else: never a field,
-                // the receipt, the plan, the console, or a log. The response node is not retained.
-                val secret = resp.str("clientSecret") ?: resp.str("client_secret")
-                val minted = !secret.isNullOrEmpty()
-                val delivered = if (minted) secretSink.emit(id, secret!!) else false
-                out.println("  + application ${r.name}: clientId=$id${slug?.let { " env=$it" } ?: ""}${if (minted) " (client secret minted — shown once)" else ""}")
-                if (minted && !delivered) {
-                    undelivered += id
-                    err.println(
-                        "  ! application ${r.name}: its client secret was minted but could NOT be delivered (clientId $id). " +
-                            "The client exists and is owned; mint a new secret with `thoryn clients rotate-secret $id --secret-file <path>`.",
-                    )
-                }
-                // SSO-3673 — the owner the create established (creator-becomes-owner for a `client:` caller), as reported.
-                OwnedResource(r.kind, r.name, id, slug, buildMap {
-                    (spec["redirectUris"] as? List<*>)?.firstOrNull()?.toString()?.let { put("redirectUri", it) }
-                }, owner = ProvisionApi.ownerOf(resp))
             }
             ProvisionFile.KIND_USER -> {
                 val slug = targetSlug(r, file, owned)
@@ -1087,7 +1133,64 @@ class ProvisionEngine(
             ProvisionFile.KIND_LOGIN_METHODS -> putLoginMethods(r, targetSlug(r, file, owned), spec, "+")
             ProvisionFile.KIND_CUSTOM_DOMAIN -> claimCustomDomain(r, spec)
             else -> throw ProvisionException("${r.key}: unsupported kind '${r.kind}'")
+        })
+    }
+
+    private fun createApplication(r: ProvisionResource, file: ProvisionFile, owned: List<OwnedResource>, spec: Map<String, Any?>): Created {
+        val slug = targetSlug(r, file, owned)
+        val resp = clients(slug).createApplication(spec)
+        val id = resp.str("clientId") ?: resp.str("client_id") ?: throw ProvisionException("${r.key}: the application create returned no clientId")
+        // SSO-3113 — the ONE server-minted secret goes to a sink and NOWHERE else: never a field, the receipt, the
+        // plan, the console, or a log. The response node is not retained. SSO-3659 — it is handed back to [apply],
+        // which delivers it only once the client is RECORDED ([deliverSecret]).
+        val secret = (resp.str("clientSecret") ?: resp.str("client_secret"))?.takeIf { it.isNotEmpty() }
+        val note = when {
+            secret == null -> ""
+            r.secretSink != null -> " (client secret minted)"
+            else -> " (client secret minted — shown once)"
         }
+        out.println("  + application ${r.name}: clientId=$id${slug?.let { " env=$it" } ?: ""}$note")
+        // SSO-3673 — the owner the create established (creator-becomes-owner for a `client:` caller), as reported.
+        val created = OwnedResource(r.kind, r.name, id, slug, buildMap {
+            (spec["redirectUris"] as? List<*>)?.firstOrNull()?.toString()?.let { put("redirectUri", it) }
+        }, owner = ProvisionApi.ownerOf(resp))
+        return Created(created, secret)
+    }
+
+    /**
+     * SSO-3659 (ADR 2026-10-13 §5) — deliver a minted client secret, called by [apply] right AFTER the client is
+     * recorded: first the declared `secretSink:` through [declaredSecretSink] (a reason ⇒ not delivered, printed
+     * redacted of the value), then the host's generic [secretSink] (`--secret-file` / guarded TTY). When neither
+     * reaches, the client stays (it exists and is owned) and lands on [undeliveredSecretDetails] with the recovery.
+     */
+    private fun deliverSecret(r: ProvisionResource, clientId: String, secret: String) {
+        fun redact(text: String?): String = (text ?: "unknown failure").replace(secret, "[redacted]")
+        val target = r.secretSink
+        var reason: String? = null
+        if (target != null) {
+            reason = try {
+                declaredSecretSink.deliver(target, clientId, secret)
+            } catch (ex: Exception) {
+                ex.message ?: ex.javaClass.simpleName
+            }
+            if (reason == null) {
+                out.println("  > application ${r.name}: client secret delivered → ${target.label}")
+                return
+            }
+            err.println("  ! application ${r.name}: could not deliver its client secret to ${target.label} (${redact(reason)})")
+        }
+        val delivered = try {
+            secretSink.emit(clientId, secret)
+        } catch (ex: Exception) {
+            reason = reason ?: ex.message ?: ex.javaClass.simpleName
+            false
+        }
+        if (delivered) return
+        undelivered += UndeliveredSecret(r.key, clientId, target, redact(reason ?: "no secret channel is available"))
+        err.println(
+            "  ! application ${r.name}: $ERROR_UNDELIVERED_SECRETS — its client secret was minted but could NOT be delivered (clientId $clientId). " +
+                "The client exists and is owned; mint a new secret with `${recoverSecret(clientId)}`.",
+        )
     }
 
     /** Converge an existing resource: send exactly the changed (non-secret) fields plus any write-only secret. */
@@ -1623,6 +1726,15 @@ class ProvisionEngine(
          * AFTER convergence (the resource exists and its id is in the receipt), never a refusal before it.
          */
         const val ERROR_PUBLISH_UNREACHABLE = "publish_target_unreachable"
+
+        /**
+         * SSO-3659 (ADR 2026-10-13 §5) — a minted client secret reached neither its declared `secretSink:` nor the
+         * host's generic channel. Reported AFTER the client is converged and recorded; the recovery is [recoverSecret].
+         */
+        const val ERROR_UNDELIVERED_SECRETS = "undelivered_secrets"
+
+        /** The one command a human runs for a client whose secret was not delivered (ADR production-clients §3 tier 3). */
+        fun recoverSecret(clientId: String): String = "thoryn clients rotate-secret $clientId --secret-file <path>"
 
         const val RELATION_MANAGER = AccessRefs.RELATION_MANAGER
         const val RELATION_VIEWER = AccessRefs.RELATION_VIEWER

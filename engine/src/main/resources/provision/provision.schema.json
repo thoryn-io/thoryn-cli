@@ -61,6 +61,30 @@
             }
           }
         },
+        "secretSink": {
+          "description": "SSO-3659 (ADR 2026-10-13 converge §5 — secrets are delivered where they are consumed, never into a CI secret store; production-clients ADR §3 tier 3) — WHERE `apply` DELIVERS the one-time `client_secret` a confidential `application` is minted with, the moment the client is converged and recorded in the receipt. `kubernetesSecret`: `data.<key>` of the Kubernetes Secret `<namespace>/<name>`, written through your own `kubectl` (`kubectl -n <namespace> create secret generic <name> --from-file=<key>=/dev/stdin --dry-run=client -o yaml | kubectl apply -f -` — the value rides on stdin, never on argv; the namespace must already exist, it is never created). `file`: an owner-only (`0600`) file at `path`, never overwritten unless `apply --force`. The secret itself never enters this file, the plan, the receipt or a log. A target that cannot be reached is the apply error `undelivered_secrets`: the client exists, the receipt records it, the exit is non-zero, and the recovery is `thoryn clients rotate-secret <clientId> --secret-file <path>`. `plan` prints the intended delivery as a line (no secret exists at plan time). Only on `kind: application`, only when the client is confidential (`clientType: public` is minted nothing), and never on a `readOnly` reference. Omitted ⇒ the CLI's `--secret-file` / interactive-TTY channel.",
+          "type": "object",
+          "oneOf": [
+            {
+              "additionalProperties": false,
+              "required": ["kind", "namespace", "name", "key"],
+              "properties": {
+                "kind": { "const": "kubernetesSecret" },
+                "namespace": { "description": "An EXISTING Kubernetes namespace (RFC 1123 label); thoryn never creates one.", "type": "string", "pattern": "^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$" },
+                "name": { "description": "The Secret to write (RFC 1123 subdomain, ≤ 253).", "type": "string", "maxLength": 253, "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$" },
+                "key": { "description": "The Secret's `data` key, e.g. `client-secret`.", "type": "string", "maxLength": 253, "pattern": "^[-._a-zA-Z0-9]+$" }
+              }
+            },
+            {
+              "additionalProperties": false,
+              "required": ["kind", "path"],
+              "properties": {
+                "kind": { "const": "file" },
+                "path": { "description": "The owner-only (`0600`) file the secret is written to; an existing file is not overwritten unless `apply --force`.", "type": "string", "minLength": 1 }
+              }
+            }
+          ]
+        },
         "grants": {
           "description": "SSO-3113 (epic SSO-3108) — least-privilege ACCESS GRANTS on this resource, converged with it by `apply`: a listed grant that is missing is created, a grant on this object the file no longer lists is revoked (the workspace admin userset `workspace:<id>#admin` is never revoked; grants on objects the file does not own are never touched). The OBJECT is implicit — it derives from the receipt id (`environment:<id>`, `application:<clientId>`, `user:<id>`, `federation_member:<id>`, `<singleton>:<envSlug>`, `custom_domain:<workspace-id>`). Omit to leave the object's grants unmanaged; `[]` declares none. Needs `tenant:access.write` (a session without it fails closed).",
           "type": "array",
@@ -108,6 +132,12 @@
           "then": { "properties": { "kind": { "const": "application" } } } },
         { "if": { "properties": { "readOnly": { "const": true } }, "required": ["readOnly"] },
           "then": { "not": { "required": ["publishTo"] } } },
+        { "if": { "required": ["secretSink"] },
+          "then": { "properties": { "kind": { "const": "application" } } } },
+        { "if": { "properties": { "readOnly": { "const": true } }, "required": ["readOnly"] },
+          "then": { "not": { "required": ["secretSink"] } } },
+        { "if": { "required": ["secretSink"] },
+          "then": { "properties": { "spec": { "not": { "properties": { "clientType": { "const": "public" } }, "required": ["clientType"] } } } } },
         { "if": { "properties": { "readOnly": { "const": true } }, "required": ["readOnly"] },
           "then": { "not": { "required": ["grants"] } } }
       ]

@@ -3,6 +3,7 @@ package com.devnow.thoryn.cli.cmd.provision
 import com.devnow.thoryn.provision.ProvisionException
 import com.devnow.thoryn.provision.ProvisionGrant
 import com.devnow.thoryn.provision.PublishTarget
+import com.devnow.thoryn.provision.SecretTarget
 import com.devnow.thoryn.provision.ProvisionFile
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.assertThatThrownBy
@@ -326,6 +327,92 @@ class ProvisionSchemaConformanceTest {
         val onlyApplication = rules.first { it["if"]["required"]?.toList()?.map { r -> r.asString() } == listOf(ProvisionFile.PUBLISH_TO) }
         assertThat(onlyApplication["then"]["properties"]["kind"]["const"].asString()).isEqualTo(ProvisionFile.KIND_APPLICATION)
         assertThat(rules).anyMatch { r -> r["if"]["properties"]?.get(ProvisionFile.READ_ONLY)?.get("const")?.asBoolean() == true && r["then"]["not"]["required"].toList().map { it.asString() } == listOf(ProvisionFile.PUBLISH_TO) }
+    }
+
+    @Test
+    fun `secretSink is accepted on a confidential application in both kinds, and parses`() {
+        // SSO-3659 (ADR 2026-10-13 converge §5) — the forge login client's fragment, and a file sink.
+        val ok = yaml.readTree(
+            """
+            apiVersion: thoryn.io/provision/v1
+            resources:
+              - kind: application
+                name: forge-login
+                spec: { displayName: "Forge login", grantTypes: [authorization_code], redirectUris: ["https://forge.example/cb"] }
+                secretSink: { kind: kubernetesSecret, namespace: forge, name: forge-login, key: client-secret }
+              - kind: application
+                name: worker
+                spec: { displayName: "Worker", clientType: confidential, grantTypes: [client_credentials] }
+                secretSink: { kind: file, path: .secrets/worker.secret }
+              - kind: application
+                name: plain
+                spec: { displayName: "No sink" }
+            """.trimIndent(),
+        )
+        assertThat(ProvisionFile.validate(ok)).isEmpty()
+        val parsed = ProvisionFile.parse(json.writeValueAsBytes(ok), "provision.json", yaml = false)
+        assertThat(parsed.resources[0].secretSink).isEqualTo(SecretTarget("kubernetesSecret", namespace = "forge", name = "forge-login", key = "client-secret"))
+        assertThat(parsed.resources[0].secretSink!!.label).isEqualTo("kubernetesSecret forge/forge-login key client-secret")
+        assertThat(parsed.resources[1].secretSink).isEqualTo(SecretTarget("file", path = ".secrets/worker.secret"))
+        assertThat(parsed.resources[1].secretSink!!.label).isEqualTo("file .secrets/worker.secret")
+        assertThat(parsed.resources[2].secretSink).isNull()
+    }
+
+    @Test
+    fun `secretSink is rejected on a public client, on other kinds, on a read-only reference, and on a malformed target`() {
+        val bad = yaml.readTree(
+            """
+            apiVersion: thoryn.io/provision/v1
+            resources:
+              - { kind: application, name: spa, spec: { displayName: SPA, clientType: public }, secretSink: { kind: file, path: spa.secret } }
+              - { kind: environment, name: ci, spec: { slug: ci }, secretSink: { kind: file, path: env.secret } }
+              - { kind: application, name: ref, readOnly: true, spec: { displayName: "Shared" }, secretSink: { kind: file, path: ref.secret } }
+              - { kind: application, name: a, spec: { displayName: a }, secretSink: { kind: vaultKv, path: secret/a } }
+              - { kind: application, name: b, spec: { displayName: b }, secretSink: { kind: kubernetesSecret, namespace: "Forge", name: b, key: k } }
+              - { kind: application, name: c, spec: { displayName: c }, secretSink: { kind: kubernetesSecret, namespace: forge, name: "b_c", key: k } }
+              - { kind: application, name: d, spec: { displayName: d }, secretSink: { kind: kubernetesSecret, namespace: forge, name: d, key: "client secret" } }
+              - { kind: application, name: e, spec: { displayName: e }, secretSink: { kind: kubernetesSecret, namespace: forge, name: e } }
+              - { kind: application, name: f, spec: { displayName: f }, secretSink: { kind: kubernetesSecret, namespace: forge, name: f, key: k, path: f.secret } }
+              - { kind: application, name: g, spec: { displayName: g }, secretSink: { kind: file } }
+              - { kind: application, name: h, spec: { displayName: h }, secretSink: [ { kind: file, path: h.secret } ] }
+              - { kind: application, name: i, spec: { displayName: i }, secretSink: { namespace: forge, name: i, key: k } }
+            """.trimIndent(),
+        )
+        val v = ProvisionFile.validate(bad)
+        assertThat(v).anyMatch { it.contains("resources[0] secretSink on a public client") }
+        assertThat(v).anyMatch { it.contains("resources[1] secretSink is only supported on kind application") }
+        assertThat(v).anyMatch { it.contains("resources[2]") && it.contains("read-only reference cannot carry 'secretSink'") }
+        assertThat(v).anyMatch { it.contains("resources[3] secretSink kind 'vaultKv'") }
+        assertThat(v).anyMatch { it.contains("resources[4] secretSink namespace 'Forge'") }
+        assertThat(v).anyMatch { it.contains("resources[5] secretSink name 'b_c'") }
+        assertThat(v).anyMatch { it.contains("resources[6] secretSink key 'client secret'") }
+        assertThat(v).anyMatch { it.contains("resources[7] secretSink key is required") }
+        assertThat(v).anyMatch { it.contains("resources[8] secretSink has unknown property 'path'") }
+        assertThat(v).anyMatch { it.contains("resources[9] secretSink path is required") }
+        assertThat(v).anyMatch { it.contains("resources[10] secretSink must be an object") }
+        assertThat(v).anyMatch { it.contains("resources[11] secretSink kind is required") }
+        assertThatThrownBy { ProvisionFile.parse(json.writeValueAsBytes(bad), "bad.json", yaml = false) }
+            .isInstanceOf(ProvisionException::class.java)
+            .hasMessageContaining("secretSink")
+
+        // The schema pins the same rules: the closed kind set (one oneOf branch per kind), exactly the members, the
+        // Kubernetes grammars, application-only, not with readOnly, not on a public client.
+        val secretSink = schema["\$defs"]["resource"]["properties"][ProvisionFile.SECRET_SINK]
+        val branches = secretSink["oneOf"].toList().associateBy { it["properties"]["kind"]["const"].asString() }
+        assertThat(branches.keys).isEqualTo(ProvisionFile.SECRET_SINK_KINDS)
+        branches.values.forEach { assertThat(it["additionalProperties"].asBoolean()).isFalse() }
+        val k8s = branches.getValue(ProvisionFile.SECRET_SINK_KIND_KUBERNETES_SECRET)
+        assertThat(k8s["required"].toList().map { it.asString() }.toSet()).isEqualTo(ProvisionFile.SECRET_SINK_KUBERNETES_KEYS)
+        assertThat(k8s["properties"]["namespace"]["pattern"].asString()).isEqualTo(ProvisionFile.K8S_NAMESPACE_PATTERN.pattern)
+        assertThat(k8s["properties"]["name"]["pattern"].asString()).isEqualTo(ProvisionFile.K8S_SECRET_NAME_PATTERN.pattern)
+        assertThat(k8s["properties"]["name"]["maxLength"].asInt()).isEqualTo(ProvisionFile.K8S_SECRET_NAME_MAX)
+        assertThat(k8s["properties"]["key"]["pattern"].asString()).isEqualTo(ProvisionFile.K8S_SECRET_KEY_PATTERN.pattern)
+        val file = branches.getValue(ProvisionFile.SECRET_SINK_KIND_FILE)
+        assertThat(file["required"].toList().map { it.asString() }.toSet()).isEqualTo(ProvisionFile.SECRET_SINK_FILE_KEYS)
+        val rules = schema["\$defs"]["resource"]["allOf"].toList().filter { it["if"]["required"]?.toList()?.map { r -> r.asString() } == listOf(ProvisionFile.SECRET_SINK) }
+        assertThat(rules).anyMatch { it["then"]["properties"]["kind"]?.get("const")?.asString() == ProvisionFile.KIND_APPLICATION }
+        assertThat(rules).anyMatch { it["then"]["properties"]["spec"]?.get("not")?.get("properties")?.get("clientType")?.get("const")?.asString() == ProvisionFile.CLIENT_TYPE_PUBLIC }
+        assertThat(schema["\$defs"]["resource"]["allOf"].toList()).anyMatch { r -> r["if"]["properties"]?.get(ProvisionFile.READ_ONLY)?.get("const")?.asBoolean() == true && r["then"]["not"]["required"].toList().map { it.asString() } == listOf(ProvisionFile.SECRET_SINK) }
     }
 
     @Test

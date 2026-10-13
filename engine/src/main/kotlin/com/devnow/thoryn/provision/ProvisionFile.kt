@@ -41,6 +41,14 @@ data class ProvisionResource(
      * published. Refused together with [readOnly] (a reference publishes nothing — the owner publishes).
      */
     val publishTo: List<PublishTarget> = emptyList(),
+    /**
+     * SSO-3659 (ADR 2026-10-13 converge §5; production-clients ADR §3 tier 3) — WHERE `apply` DELIVERS the
+     * one-time `client_secret` a confidential `application` is minted with (see [SecretTarget]): the moment the
+     * client is converged and recorded, into the place that consumes it — never a CI secret store, never the
+     * console. `null` ⇒ the host's generic channel (the CLI's `--secret-file` / guarded TTY). Refused on a
+     * public client (nothing is minted), on any other kind, and together with [readOnly].
+     */
+    val secretSink: SecretTarget? = null,
 ) {
     val isSingleton: Boolean get() = kind in ProvisionFile.SINGLETON_KINDS
     val key: String get() = "$kind/$name"
@@ -60,6 +68,46 @@ data class PublishTarget(val kind: String, val repository: String, val environme
 
     /** The one command a human runs when the target could not be reached — with the id from the receipt. */
     fun byHand(value: String): String = "gh variable set $name --body $value --repo $repository --env $environment"
+}
+
+/**
+ * SSO-3659 (ADR 2026-10-13 converge §5 "secrets are delivered where they are consumed, never into a CI secret
+ * store"; production-clients ADR §3 tier 3) — the declared DELIVERY TARGET of a confidential application's
+ * server-minted `client_secret`. Two kinds today:
+ *
+ *  - [ProvisionFile.SECRET_SINK_KIND_KUBERNETES_SECRET] — `data.<key>` of the Kubernetes Secret
+ *    `<namespace>/<name>`, written by the host through the operator's own `kubectl` (`create secret generic …
+ *    --from-file=<key>=/dev/stdin --dry-run=client -o yaml | kubectl apply -f -`, the `install-forge` pattern:
+ *    the value rides on stdin, never on argv). The namespace must already exist — it is never created.
+ *  - [ProvisionFile.SECRET_SINK_KIND_FILE] — an owner-only (`0600`) file at [path], never overwritten unless
+ *    the host is told to.
+ *
+ * The engine hands the minted value to its [ProvisionEngine.DeclaredSecretSink] right after the client is
+ * converged and recorded; the value itself never enters the file, the plan, the receipt, a log or argv. A
+ * target the host cannot reach is `undelivered_secrets`: the client exists, the receipt records it, and the
+ * recovery is `thoryn clients rotate-secret <clientId> --secret-file <path>`.
+ */
+data class SecretTarget(
+    val kind: String,
+    val namespace: String? = null,
+    val name: String? = null,
+    val key: String? = null,
+    val path: String? = null,
+) {
+    /** `kubernetesSecret <ns>/<name> key <key>` | `file <path>` — the display form in plans and messages. */
+    val label: String get() = when (kind) {
+        ProvisionFile.SECRET_SINK_KIND_KUBERNETES_SECRET -> "$kind $namespace/$name key $key"
+        else -> "$kind $path"
+    }
+
+    /** The target as a plan's `--output json` renders it — the declaration only, never a value. */
+    fun toStructured(): Map<String, String> = buildMap {
+        put("kind", kind)
+        namespace?.let { put("namespace", it) }
+        name?.let { put("name", it) }
+        key?.let { put("key", it) }
+        path?.let { put("path", it) }
+    }
 }
 
 /**
@@ -190,6 +238,33 @@ class ProvisionFile private constructor(
         /** GitHub reserves the `GITHUB_` prefix for its own variables; such a name is refused at publish time. */
         const val RESERVED_VARIABLE_PREFIX = "GITHUB_"
 
+        // ── SSO-3659 — `secretSink:` (ADR 2026-10-13 converge §5; production-clients ADR §3 tier 3) ──
+
+        /** The resource-level delivery declaration: where `apply` hands a minted client secret ([SecretTarget]). */
+        const val SECRET_SINK = "secretSink"
+        /** `data.<key>` of an EXISTING namespace's Kubernetes Secret, through the operator's own `kubectl` (value on stdin). */
+        const val SECRET_SINK_KIND_KUBERNETES_SECRET = "kubernetesSecret"
+        /** An owner-only (`0600`) file; never overwritten unless the host is told to. */
+        const val SECRET_SINK_KIND_FILE = "file"
+        /** The CLOSED sink kind allowlist — must equal the schema's `secretSink.oneOf[*].kind` consts. */
+        val SECRET_SINK_KINDS: Set<String> = setOf(SECRET_SINK_KIND_KUBERNETES_SECRET, SECRET_SINK_KIND_FILE)
+        /** The kinds a `secretSink:` may sit on: only a (confidential) application is minted a secret. */
+        val SECRET_SINK_KINDS_ALLOWED_ON: Set<String> = setOf(KIND_APPLICATION)
+        /** The members of a `kubernetesSecret` target — exactly these four (the schema's `additionalProperties: false`). */
+        val SECRET_SINK_KUBERNETES_KEYS: Set<String> = setOf("kind", "namespace", "name", "key")
+        /** The members of a `file` target — exactly these two. */
+        val SECRET_SINK_FILE_KEYS: Set<String> = setOf("kind", "path")
+        /** A Kubernetes namespace: an RFC 1123 DNS label (lower-case alphanumerics and `-`, ≤ 63). */
+        val K8S_NAMESPACE_PATTERN = Regex("^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$")
+        /** A Kubernetes Secret name: an RFC 1123 DNS subdomain (lower-case labels joined by `.`, ≤ 253 in total). */
+        val K8S_SECRET_NAME_PATTERN = Regex("^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$")
+        const val K8S_SECRET_NAME_MAX = 253
+        /** A Secret `data` key: alphanumerics, `-`, `_`, `.` (≤ 253), the grammar `kubectl create secret` accepts. */
+        val K8S_SECRET_KEY_PATTERN = Regex("^[-._a-zA-Z0-9]+$")
+        const val K8S_SECRET_KEY_MAX = 253
+        /** `clientType: public` — the one spec value that means no secret is minted (product-api defaults to confidential). */
+        const val CLIENT_TYPE_PUBLIC = "public"
+
         private val jsonMapper = JsonMapper.builder().addModule(kotlinModule()).build()
         private val yamlMapper = YAMLMapper.builder().addModule(kotlinModule()).build()
 
@@ -257,6 +332,10 @@ class ProvisionFile private constructor(
                             name = t["name"].asString().trim(),
                         )
                     } ?: emptyList(),
+                    secretSink = r[SECRET_SINK]?.takeIf { it.isObject() }?.let { t ->
+                        fun text(field: String): String? = t[field]?.takeIf { it.isTextual() }?.asString()?.trim()?.takeIf { it.isNotEmpty() }
+                        SecretTarget(kind = text("kind") ?: "", namespace = text("namespace"), name = text("name"), key = text("key"), path = text("path"))
+                    },
                 )
             }
             if (unresolved.isNotEmpty()) {
@@ -314,7 +393,7 @@ class ProvisionFile private constructor(
                     v += "$where must be an object"
                     return@forEachIndexed
                 }
-                rejectUnknownKeys(r, setOf("kind", "name", "environment", "spec", "grants", READ_ONLY, PUBLISH_TO), where, v)
+                rejectUnknownKeys(r, setOf("kind", "name", "environment", "spec", "grants", READ_ONLY, PUBLISH_TO, SECRET_SINK), where, v)
                 // SSO-3659 — `readOnly: true` declares a dependency, not ownership: a boolean, and never with `grants`
                 // (a grant is a write on the object; a reference writes nothing).
                 r[READ_ONLY]?.takeIf { !it.isNull }?.let { ro ->
@@ -375,6 +454,9 @@ class ProvisionFile private constructor(
                 // SSO-3668 — `publishTo`: on an application only, never on a read-only reference, each target
                 // exactly { kind, repository, environment, name } with a closed kind, GitHub grammar, no duplicates.
                 r[PUBLISH_TO]?.takeIf { !it.isNull }?.let { targets -> validatePublishTo(targets, kind, r, where, v) }
+                // SSO-3659 — `secretSink`: on a CONFIDENTIAL application only (nothing is minted for a public client), never on
+                // a read-only reference, exactly { kind: kubernetesSecret, namespace, name, key } or { kind: file, path }.
+                r[SECRET_SINK]?.takeIf { !it.isNull }?.let { target -> validateSecretSink(target, kind, r, spec, where, v) }
                 // SSO-3413 — `customDomain`: exactly { host, acceptReSignIn? }.
                 if (kind == KIND_CUSTOM_DOMAIN) {
                     rejectUnknownKeys(spec, CUSTOM_DOMAIN_SPEC_KEYS, "$where spec", v)
@@ -436,6 +518,56 @@ class ProvisionFile private constructor(
                 if (tKind != null && repository != null && environment != null && name != null && !seen.add("$tKind $repository $environment $name")) {
                     v += "$tw duplicates target '$tKind $repository (environment $environment) $name'"
                 }
+            }
+        }
+
+        /**
+         * SSO-3659 — the `secretSink:` rules the schema also pins: only an `application` is minted a secret, and only a
+         * confidential one (`clientType: public` has nothing to deliver); a `readOnly` reference is minted nothing (the
+         * owning repository delivers); the target is exactly `{ kind: kubernetesSecret, namespace, name, key }` with the
+         * Kubernetes name grammars (namespace: DNS label; name: DNS subdomain; key: `[-._a-zA-Z0-9]+`) or
+         * `{ kind: file, path }` with a non-empty path.
+         */
+        private fun validateSecretSink(target: JsonNode, kind: String, r: JsonNode, spec: JsonNode, where: String, v: MutableList<String>) {
+            if (kind !in SECRET_SINK_KINDS_ALLOWED_ON) {
+                v += "$where $SECRET_SINK is only supported on kind ${SECRET_SINK_KINDS_ALLOWED_ON.joinToString(" | ")} — only a confidential application is minted a secret"
+            } else if (spec["clientType"]?.takeIf { it.isTextual() }?.asString()?.trim().equals(CLIENT_TYPE_PUBLIC, ignoreCase = true)) {
+                v += "$where $SECRET_SINK on a public client — a public client (clientType: $CLIENT_TYPE_PUBLIC) is minted no secret, so there is nothing to deliver"
+            }
+            if (r[READ_ONLY]?.takeIf { it.isBoolean() }?.asBoolean() == true) {
+                v += "$where a read-only reference cannot carry '$SECRET_SINK' — nothing is minted for it; the repository that owns the application delivers its secret"
+            }
+            if (!target.isObject()) {
+                v += "$where $SECRET_SINK must be an object { kind: $SECRET_SINK_KIND_KUBERNETES_SECRET, namespace, name, key } or { kind: $SECRET_SINK_KIND_FILE, path }"
+                return
+            }
+            fun text(field: String): String? = target[field]?.takeIf { it.isTextual() }?.asString()?.trim()?.takeIf { it.isNotEmpty() }
+            val tw = "$where $SECRET_SINK"
+            when (val tKind = text("kind")) {
+                null -> v += "$tw kind is required (${SECRET_SINK_KINDS.joinToString(" | ")})"
+                SECRET_SINK_KIND_KUBERNETES_SECRET -> {
+                    rejectUnknownKeys(target, SECRET_SINK_KUBERNETES_KEYS, tw, v)
+                    val namespace = text("namespace")
+                    val name = text("name")
+                    val key = text("key")
+                    when {
+                        namespace == null -> v += "$tw namespace is required (an EXISTING Kubernetes namespace — thoryn never creates one)"
+                        !K8S_NAMESPACE_PATTERN.matches(namespace) -> v += "$tw namespace '$namespace' must be a Kubernetes namespace name (${K8S_NAMESPACE_PATTERN.pattern})"
+                    }
+                    when {
+                        name == null -> v += "$tw name is required (the Kubernetes Secret to write)"
+                        name.length > K8S_SECRET_NAME_MAX || !K8S_SECRET_NAME_PATTERN.matches(name) -> v += "$tw name '$name' must be a Kubernetes Secret name (RFC 1123 subdomain, ≤ $K8S_SECRET_NAME_MAX)"
+                    }
+                    when {
+                        key == null -> v += "$tw key is required (the Secret's data key, e.g. client-secret)"
+                        key.length > K8S_SECRET_KEY_MAX || !K8S_SECRET_KEY_PATTERN.matches(key) -> v += "$tw key '$key' must be a Secret data key (${K8S_SECRET_KEY_PATTERN.pattern}, ≤ $K8S_SECRET_KEY_MAX)"
+                    }
+                }
+                SECRET_SINK_KIND_FILE -> {
+                    rejectUnknownKeys(target, SECRET_SINK_FILE_KEYS, tw, v)
+                    if (text("path") == null) v += "$tw path is required (the owner-only file the secret is written to)"
+                }
+                else -> v += "$tw kind '$tKind' must be one of ${SECRET_SINK_KINDS.joinToString(", ")}"
             }
         }
 
