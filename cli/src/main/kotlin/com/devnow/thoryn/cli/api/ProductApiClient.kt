@@ -2,6 +2,7 @@ package com.devnow.thoryn.cli.api
 
 import com.devnow.thoryn.cli.auth.DpopSession
 import com.devnow.thoryn.cli.auth.Tokens
+import com.devnow.thoryn.provision.AccessCheck
 import com.devnow.thoryn.provision.ProvisionApi
 import tools.jackson.databind.JsonNode
 import tools.jackson.databind.ObjectMapper
@@ -517,6 +518,18 @@ class ProductApiClient(
     /** `DELETE /api/v1/access/grants` with the JSON body `{subject, relation, object}` — 204 No Content. */
     override fun deleteGrant(subjectRef: String, relation: String, objectRef: String): Unit =
         deleteWithBodyNoContent("/api/v1/access/grants", grantBody(subjectRef, relation, objectRef))
+
+    /**
+     * SSO-3673 — `POST /api/v1/access/check` `{object, relation}` → `{allowed, resolvedVia}` for the CALLER's own
+     * subject (product-api derives it from the token; the body never names one). Scope `tenant:access.read`.
+     */
+    override fun checkAccess(objectRef: String, relation: String): AccessCheck {
+        val node = post("/api/v1/access/check", linkedMapOf("object" to objectRef, "relation" to relation))
+        return AccessCheck(
+            allowed = node["allowed"]?.takeIf { it.isBoolean }?.asBoolean() ?: false,
+            resolvedVia = node["resolvedVia"]?.takeIf { it.isTextual }?.asString(),
+        )
+    }
 
     /** `GET /api/v1/access/mine?type=<objectType>&relation=<relation>` — `{ "data": [ "<type>:<id>", … ] }` for the caller. */
     override fun listMyAccess(type: String?, relation: String?): JsonNode {

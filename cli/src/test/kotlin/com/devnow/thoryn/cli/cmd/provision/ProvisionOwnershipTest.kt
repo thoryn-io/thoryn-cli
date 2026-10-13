@@ -1,10 +1,10 @@
 package com.devnow.thoryn.cli.cmd.provision
 
 import com.devnow.thoryn.provision.ChangeAction
-import com.devnow.thoryn.provision.OwnedResource
 import com.devnow.thoryn.provision.ProvisionException
-import com.devnow.thoryn.provision.ProvisionFileRef
+import com.devnow.thoryn.provision.OwnedResource
 import com.devnow.thoryn.provision.ProvisionEngine
+import com.devnow.thoryn.provision.ProvisionFileRef
 import com.devnow.thoryn.provision.ProvisionFile
 import com.devnow.thoryn.provision.ProvisionReceipt
 import com.devnow.thoryn.cli.api.ProductApiClient
@@ -18,15 +18,18 @@ import java.io.ByteArrayOutputStream
 import java.io.PrintStream
 
 /**
- * SSO-3659 (ADR 2026-10-13 §1) — ownership is decided by the signed-in identity's platform reach, read from
- * `GET /api/v1/access/mine` (the platform graph's list-objects) before any write. The fixture identity
- * `client:repo` is NOT a workspace admin: it manages ONE sandbox (`environment:env-1`, and by containment the
- * client inside it), may only view `application:shared`, and holds nothing on `application:foreign`.
+ * SSO-3659 (ADR 2026-10-13 §1) — ownership is decided by the signed-in identity's platform reach, asked PER
+ * OBJECT through `POST /api/v1/access/check` (SSO-3673; ADR 2026-10-13 platform-owner-relation-and-forward-check)
+ * before any write. The fixture identity `client:repo` is NOT a workspace admin: it manages ONE sandbox
+ * (`environment:env-1`, and by containment the client inside it), may only view `application:shared`, and holds
+ * nothing on `application:foreign`.
  *
  * The verdict table under test: `manager` ⇒ converge; `viewer` ⇒ only a matching `readOnly: true`
  * reference (any diff is `access_read_only`, declared without `readOnly` is `access_read_only` naming the
- * fix); none ⇒ `access_not_owned`; a create ⇒ `manager` on the parent, no grant step; a resource another
- * repository's receipt owns ⇒ `access_owned_elsewhere`. A plan with an error is refused WHOLE by `apply`.
+ * fix); none ⇒ `access_not_owned`; a create ⇒ `manager` on the parent (checked on the parent object), no grant
+ * step; a resource the PLATFORM says another identity owns (its `owner` relation) ⇒ `access_owned_elsewhere`,
+ * naming no subject. A plan with an error is refused WHOLE by `apply`. The receipt records the owner the
+ * platform reported next to the applying subject.
  */
 class ProvisionOwnershipTest : CommandTestBase() {
 
@@ -47,18 +50,17 @@ class ProvisionOwnershipTest : CommandTestBase() {
         api.seedGrant("client:repo", "viewer", "application:shared")
     }
 
-    private fun engine(peers: List<ProvisionReceipt> = emptyList()) = ProvisionEngine(
+    private fun engine(subject: String = "client:repo") = ProvisionEngine(
         clients = { slug -> ProductApiClient(gateway = baseUrl(), tokens = Tokens(accessToken = "AT-test"), environmentSlug = slug) },
         out = PrintStream(console), err = PrintStream(console),
         workspaceId = api.tenantId,
-        subject = "client:repo",
-        peers = peers,
+        subject = subject,
     )
 
     private fun file(yaml: String) = ProvisionFile.parse(yaml.trimIndent().toByteArray(), "provision.yaml")
 
-    private fun apply(f: ProvisionFile, receipt: ProvisionReceipt?, peers: List<ProvisionReceipt> = emptyList(), persist: (ProvisionReceipt) -> Unit = {}): ProvisionReceipt {
-        val e = engine(peers)
+    private fun apply(f: ProvisionFile, receipt: ProvisionReceipt?, persist: (ProvisionReceipt) -> Unit = {}): ProvisionReceipt {
+        val e = engine()
         return e.apply(f, receipt, e.plan(f, receipt, false), "acme", null, persist)
     }
 
@@ -98,6 +100,10 @@ class ProvisionOwnershipTest : CommandTestBase() {
         assertThat(receipt.resources.map { it.key }).containsExactly("environment/ci", "application/rp")
         // The reach was read from the platform graph, workspace-level (no environment header), nothing else was written.
         assertThat(api.writes.map { it.path }).noneMatch { it.startsWith("/api/v1/access") }
+        // SSO-3673 — asked PER OBJECT (`manager` on each live object), not per type: no `/access/mine` listing at all.
+        assertThat(api.checksOn("environment:$envId")).startsWith("manager")
+        assertThat(api.checksOn("application:rp")).startsWith("manager")
+        assertThat(api.mineReads).isEmpty()
     }
 
     @Test
@@ -243,6 +249,9 @@ class ProvisionOwnershipTest : CommandTestBase() {
         assertThat(writes()).containsExactly("POST /api/v1/users")
         assertThat(api.writes.single().env).isEqualTo("ci-sbx")
         assertThat(receipt.resources.map { it.key to it.adopted }).containsExactly("environment/ci" to true, "user/tester" to false)
+        // SSO-3673 — the create was gated by a forward check on the PARENT object, not by a per-type listing.
+        assertThat(api.checksOn("environment:$envId")).contains("manager")
+        assertThat(api.mineReads).isEmpty()
     }
 
     @Test
@@ -274,6 +283,9 @@ class ProvisionOwnershipTest : CommandTestBase() {
         assertThat(plan.errors).hasSize(3)
         assertThatThrownBy { engine().apply(f, null, plan, "acme", null) {} }.hasMessageContaining("3 resource(s) failed the ownership check")
         assertThat(api.writes).isEmpty()
+        // SSO-3673 — the production-plane and environment creates asked the platform about THE workspace object.
+        assertThat(api.checksOn("workspace:${api.tenantId}")).contains("manager")
+        assertThat(api.checksOn("environment:$otherEnv")).contains("manager")
 
         // The same file, as a workspace admin: every create is allowed (the parent of all three is the workspace / its sandbox).
         api.callerIsAdmin = true
@@ -305,11 +317,9 @@ class ProvisionOwnershipTest : CommandTestBase() {
     }
 
     @Test
-    fun `a resource another repository's receipt owns is refused unless declared readOnly — and the same identity's own receipt is not a peer`() {
-        val other = ProvisionReceipt(
-            file = ProvisionFileRef("thoryn-cicd/.thoryn/provision.yaml", "sha256:x"), appliedAt = "2026-10-09T00:00:00Z", subject = "client:wi_other",
-            resources = listOf(OwnedResource("application", "login", "rp", "ci-sbx")),
-        )
+    fun `a resource the platform says another identity owns is access_owned_elsewhere without naming that owner — unless declared readOnly, and the owner itself converges`() {
+        // SSO-3673 — the marker is the platform's `owner` relation, rendered on the application and re-checked per object.
+        api.seedGrant("client:wi_other", "owner", "application:rp")
         val f = file(
             managedEnv + "\n" + """
               - kind: application
@@ -318,12 +328,16 @@ class ProvisionOwnershipTest : CommandTestBase() {
                 spec: { clientId: rp, displayName: "RP", redirectUris: ["http://127.0.0.1/callback"] }
             """.trimIndent().prependIndent("  "),
         )
-        val refused = engine(peers = listOf(other)).plan(f, null, false).changes.single { it.kind == "application" }
+        val refused = engine().plan(f, null, false).changes.single { it.kind == "application" }
         assertThat(refused.action).isEqualTo(ChangeAction.ERROR)
         assertThat(refused.error).isEqualTo(ProvisionEngine.ERROR_OWNED_ELSEWHERE)
         assertThat(refused.access).isEqualTo("manager")
-        assertThat(refused.reason).contains("thoryn-cicd/.thoryn/provision.yaml (client:wi_other)").contains("`readOnly: true`")
-        assertThatThrownBy { apply(f, null, peers = listOf(other)) }.isInstanceOf(ProvisionException::class.java)
+        assertThat(refused.owner).isEqualTo("client:wi_other")
+        assertThat(refused.reason).contains("owned by another repository").contains("`readOnly: true`").contains("thoryn access grant <subject> owner application:rp")
+        // No oracle: the plan's wording never echoes the other subject.
+        assertThat(refused.reason).doesNotContain("wi_other")
+        assertThat(api.checksOn("application:rp")).contains("owner")
+        assertThatThrownBy { apply(f, null) }.isInstanceOf(ProvisionException::class.java).hasMessageContaining("access_owned_elsewhere")
         assertThat(api.writes).isEmpty()
 
         // Declared readOnly and matching what is live ⇒ a reference, allowed next to the owning repository.
@@ -336,22 +350,91 @@ class ProvisionOwnershipTest : CommandTestBase() {
                 spec: { clientId: rp, displayName: "RP", redirectUris: ["http://127.0.0.1/old"] }
             """.trimIndent().prependIndent("  "),
         )
-        val ref = engine(peers = listOf(other)).plan(reference, null, false).changes.single { it.kind == "application" }
+        val ref = engine().plan(reference, null, false).changes.single { it.kind == "application" }
         assertThat(ref.action).isEqualTo(ChangeAction.NOOP)
         assertThat(ref.readOnly).isTrue()
 
-        // A peer receipt applied by THIS identity is the same repository's earlier state, not another owner.
-        val mine = other.copy(subject = "client:repo")
-        assertThat(engine(peers = listOf(mine)).plan(f, null, false).hasErrors).isFalse()
-        // Without any peer the guard has nothing to compare against — the documented limit of a receipt-based marker.
-        assertThat(engine().plan(f, null, false).hasErrors).isFalse()
+        // The owner itself (`owner` implies `manager` on the model — it holds nothing else, not even on the sandbox)
+        // converges the client it owns, and its receipt records the owner.
+        api.caller = "client:wi_other"
+        val owner = engine(subject = "client:wi_other")
+        val ownersFile = file(
+            """
+            apiVersion: thoryn.io/provision/v1
+            resources:
+              - kind: application
+                name: rp
+                environment: ci-sbx
+                spec: { clientId: rp, displayName: "RP", redirectUris: ["http://127.0.0.1/callback"] }
+            """,
+        )
+        val ownerPlan = owner.plan(ownersFile, null, false)
+        assertThat(ownerPlan.hasErrors).isFalse()
+        val app = ownerPlan.changes.single { it.kind == "application" }
+        assertThat(app.action).isEqualTo(ChangeAction.UPDATE)
+        assertThat(app.owner).isEqualTo("client:wi_other")
+        // `manager` first (allowed through `owner`), then — because the live object has an owner — "is it me?": yes.
+        assertThat(api.checksOn("application:rp").takeLast(2)).containsExactly("manager", "owner")
+        val receipt = owner.apply(ownersFile, null, ownerPlan, "acme", null) {}
+        assertThat(writes()).containsExactly("PATCH /api/v1/applications/rp")
+        assertThat(receipt.subject).isEqualTo("client:wi_other")
+        assertThat(receipt.resources.single { it.kind == "application" }.owner).isEqualTo("client:wi_other")
     }
 
     @Test
-    fun `a session that cannot read its own reach fails closed naming tenant access read — before any resource is probed for writes`() {
+    fun `an unowned resource converges and the receipt records the owner the platform reports — null, then the owner an admin sets, then the creator on a create`() {
+        val f = file(
+            managedEnv + "\n" + """
+              - kind: application
+                name: rp
+                environment: ci
+                spec: { clientId: rp, displayName: "RP", redirectUris: ["http://127.0.0.1/callback"] }
+              - kind: application
+                name: fresh
+                environment: ci
+                spec: { displayName: "Fresh", clientType: public, redirectUris: ["http://127.0.0.1/fresh"] }
+            """.trimIndent().prependIndent("  "),
+        )
+        val first = apply(f, null)
+        val byKey = first.resources.associateBy { it.key }
+        // Nobody owns `rp` (a person created it): recorded as such; no owner check was needed for it.
+        assertThat(byKey.getValue("application/rp").owner).isNull()
+        assertThat(api.checksOn("application:rp")).doesNotContain("owner")
+        // Creator-becomes-owner on the platform: the `client:` creator is the owner the create response reports.
+        val freshId = byKey.getValue("application/fresh").id
+        assertThat(byKey.getValue("application/fresh").owner).isEqualTo("client:repo")
+        assertThat(api.ownerOf("application:$freshId")).isEqualTo("client:repo")
+
+        // A workspace admin makes this repository the owner of `rp`: the next (no-op) apply records what the platform reports.
+        api.seedGrant("client:repo", "owner", "application:rp")
+        api.reset()
+        val second = apply(f, first)
+        assertThat(api.writes).isEmpty()
+        assertThat(second.resources.single { it.key == "application/rp" }.owner).isEqualTo("client:repo")
+        assertThat(second.resources.single { it.key == "application/rp" }.adopted).isTrue()
+    }
+
+    @Test
+    fun `a grants entry with relation owner is refused by the loader and names the fix — a repository cannot claim ownership by writing YAML`() {
+        assertThatThrownBy {
+            file(
+                managedEnv.replace("spec: { slug: ci-sbx, displayName: \"CI sandbox\" }", "spec: { slug: ci-sbx }\n    grants: [ { subject: \"client:repo\", relation: owner } ]"),
+            )
+        }
+            .isInstanceOf(ProvisionException::class.java)
+            .hasMessageContaining("resources[0] grants[0]")
+            .hasMessageContaining("relation 'owner'")
+            .hasMessageContaining("cannot claim ownership by writing YAML")
+            .hasMessageContaining("thoryn access grant <subject> owner <object>")
+        assertThat(ProvisionFile.GRANT_RELATIONS).containsExactlyInAnyOrder("manager", "viewer")
+    }
+
+    @Test
+    fun `a session that cannot check its own access fails closed naming tenant access read — before any resource is probed for writes`() {
         api.denyGrantReads = true
         assertThatThrownBy { engine().plan(file(managedEnv), null, false) }
             .isInstanceOf(ProvisionException::class.java)
+            .hasMessageContaining("POST /api/v1/access/check")
             .hasMessageContaining("tenant:access.read")
             .hasMessageContaining("thoryn login --scope tenant:access.read")
         assertThat(api.writes).isEmpty()

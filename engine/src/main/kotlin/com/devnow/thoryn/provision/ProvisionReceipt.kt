@@ -25,10 +25,9 @@ data class ProvisionReceipt(
      * SSO-3659 (ADR 2026-10-13 §1, "one owning repository per resource") — the platform subject that applied
      * this receipt (`client:<clientId>` for a machine identity such as a repository's workload-identity
      * client, `member:<sub>` for a person), derived from the token exactly as product-api derives the
-     * caller. This is the OWNERSHIP MARKER another repository's `plan` compares against when it is handed
-     * this receipt as a peer (`--peer-receipt`): a resource recorded here as owned is `access_owned_elsewhere`
-     * for every other subject. Absent on a pre-SSO-3659 receipt (the resources it records still count as
-     * owned by that receipt). Not a secret.
+     * caller. Display / audit: who ran the apply. SSO-3673 — it is NOT the ownership marker any more: the
+     * platform's `owner` relation is (recorded per resource as [OwnedResource.owner]); the `--peer-receipt`
+     * comparison that read this field is gone. Absent on a pre-SSO-3659 receipt. Not a secret.
      */
     val subject: String? = null,
     val resources: List<OwnedResource> = emptyList(),
@@ -74,6 +73,14 @@ data class OwnedResource(
      * secret: a published value is a client id, public by construction. Absent on a pre-SSO-3668 receipt.
      */
     val published: List<PublishedOutput> = emptyList(),
+    /**
+     * SSO-3673 (ADR 2026-10-13 platform-owner-relation-and-forward-check §1) — the platform `owner` of this
+     * resource AS THE PLATFORM REPORTED IT at the last apply (`owner.subject` on the application response:
+     * `client:<clientId>`, the repository's workload identity), next to the receipt's [ProvisionReceipt.subject].
+     * Null when the platform reported no owner, or the kind does not render one. Informational: the gate
+     * never reads it back — it asks the platform (`POST /api/v1/access/check`). Absent on a pre-SSO-3673 receipt.
+     */
+    val owner: String? = null,
 ) {
     val key: String get() = "$kind/$name"
 }

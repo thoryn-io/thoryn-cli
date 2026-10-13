@@ -52,10 +52,13 @@ import java.util.concurrent.Callable
  *  - SSO-3659 (ADR 2026-10-13 §1/§2): ownership is decided by the signed-in identity's platform reach —
  *    `plan` and `apply` gate every declared resource (`manager` ⇒ converge; `viewer` ⇒ only a matching
  *    `readOnly: true` reference; none ⇒ `access_not_owned`); a failed gate is a red plan (exit
- *    [CommandSupport.EXIT_HTTP_ERROR]) and `apply` refuses before writing. `--peer-receipt` hands over
- *    other repositories' receipts so a resource one of them owns is refused here (`access_owned_elsewhere`).
+ *    [CommandSupport.EXIT_HTTP_ERROR]) and `apply` refuses before writing. SSO-3673: the gate asks the
+ *    platform PER OBJECT (`POST /api/v1/access/check`), and "owned elsewhere" (`access_owned_elsewhere`) is
+ *    the platform's `owner` relation on the resource — the former `--peer-receipt` flag (other repositories'
+ *    receipts as the marker) is REMOVED; nothing else consumed it.
  *    `import [--write]` renders what the identity may reach as `provision.yaml` entries (`manager` ⇒ owned,
- *    recorded `adopted: true`; `viewer` ⇒ `readOnly: true`); without `--write` it only prints them.
+ *    recorded `adopted: true`; `viewer` ⇒ `readOnly: true`, as is an object another repository owns); without
+ *    `--write` it only prints them.
  *  - SSO-3668 (ADR 2026-10-13 production-clients-declared-in-the-config-project §2): an `application`'s
  *    `publishTo:` targets receive its clientId after `apply` converged it — through [GitHubActionsVariablePublisher]
  *    (`gh variable set … --env`, the customer's own `gh` login) on every apply. `plan` prints the pending publish
@@ -97,15 +100,6 @@ class ProvisionCommand : Callable<Int> {
         @Option(names = ["--output"], description = ["Output format: json|yaml|table (default: table)."])
         var outputRaw: String? = null
 
-        @Option(
-            names = ["--peer-receipt"],
-            description = ["SSO-3659 — another repository's committed receipt (a path or an https:// URL; repeatable): a resource it owns is refused here unless declared readOnly."],
-        )
-        var peerReceipts: List<String> = emptyList()
-
-        /** SSO-3659 — the other repositories' receipts the ownership gate compares against (fail closed on an unreadable one). */
-        fun peers(): List<ProvisionReceipt> = PeerReceipts.load(peerReceipts)
-
         /** Resolve + load the file (or fail with a usage error) and locate its receipt. */
         fun open(): Session? {
             val target = file ?: ProvisionFile.resolveDefault() ?: run {
@@ -143,7 +137,6 @@ class ProvisionCommand : Callable<Int> {
             tokens: com.devnow.thoryn.cli.auth.Tokens,
             secretSink: ProvisionEngine.SecretSink = ProvisionEngine.SecretSink.undeliverable(),
             format: OutputFormat = OutputFormat.TABLE,
-            peers: List<ProvisionReceipt> = emptyList(),
             /** SSO-3668 — `apply` passes the `gh variable set` publisher; the read-only verbs reach nothing. */
             outputSink: ProvisionEngine.OutputSink = ProvisionEngine.OutputSink.unavailable(),
         ): ProvisionEngine = ProvisionEngine(
@@ -154,9 +147,8 @@ class ProvisionCommand : Callable<Int> {
             secretSink = secretSink,
             // SSO-3413 — the workspace id (`tnt`) names the workspace-level custom domain's access object.
             workspaceId = runCatching { JwtClaims.of(tokens.accessToken)["tnt"]?.asString() }.getOrNull()?.takeIf { it.isNotBlank() },
-            // SSO-3659 — the ownership marker on the receipt, and the other repositories' receipts to refuse against.
+            // SSO-3659 — who applied, on the receipt (display / audit; SSO-3673: the owner marker is the platform's).
             subject = subjectOf(tokens),
-            peers = peers,
             outputSink = outputSink,
         )
 
@@ -283,7 +275,7 @@ class ProvisionCommand : Callable<Int> {
             val tokens = CommandSupport.readTokens() ?: return CommandSupport.EXIT_NOT_SIGNED_IN
             gateway = CommandSupport.resolveGateway(gateway, tokens)
             return try {
-                val plan = engine(gateway, tokens, format = format, peers = peers()).plan(s.file, s.receipt, prune)
+                val plan = engine(gateway, tokens, format = format).plan(s.file, s.receipt, prune)
                 renderPlan(plan, s.file, format)
             } catch (ex: Exception) {
                 fail(ex, gateway, format)
@@ -340,7 +332,7 @@ class ProvisionCommand : Callable<Int> {
             gateway = CommandSupport.resolveGateway(gateway, tokens)
             val engine = try {
                 engine(
-                    gateway, tokens, CliSecretSink.toSecretIo(secretFile, forceStdout), format, peers(),
+                    gateway, tokens, CliSecretSink.toSecretIo(secretFile, forceStdout), format,
                     // SSO-3668 — the only verb that publishes; the publisher touches gh only when a target is reached for.
                     outputSink = GitHubActionsVariablePublisher(ghRunner()),
                 )
@@ -454,11 +446,11 @@ class ProvisionCommand : Callable<Int> {
     }
 
     /**
-     * `thoryn provision import [--file] [--write] [--peer-receipt …]` — SSO-3659 (ADR 2026-10-13 §2): the inverse
-     * of `plan`, bounded by the same relations. Lists what the signed-in identity may reach
-     * (`GET /api/v1/access/mine`, `manager` then `viewer`) and renders each live resource the file does not yet
-     * declare as a `provision.yaml` entry — `manager` objects as OWNED (recorded `adopted: true` in the receipt,
-     * never deleted by destroy), `viewer` objects (and objects another `--peer-receipt` owns) as `readOnly: true`.
+     * `thoryn provision import [--file] [--write]` — SSO-3659 (ADR 2026-10-13 §2): the inverse of `plan`,
+     * bounded by the same relations. Lists what the signed-in identity may reach (`GET /api/v1/access/mine`,
+     * `manager` then `viewer`) and renders each live resource the file does not yet declare as a `provision.yaml`
+     * entry — `manager` objects as OWNED (recorded `adopted: true` in the receipt, never deleted by destroy),
+     * `viewer` objects (and, SSO-3673, objects the platform says another repository OWNS) as `readOnly: true`.
      * Nothing the identity has no relation to is listed, so nothing it has no relation to can be imported — the
      * hub's rows stay the authority; `import` only writes the file and the receipt. Without `--write` it prints
      * the entries it would add (stdout; notes and skipped objects on stderr) and changes nothing.
@@ -486,7 +478,7 @@ class ProvisionCommand : Callable<Int> {
             gateway = CommandSupport.resolveGateway(gateway, tokens)
             return try {
                 val current = store.read(receiptPath)
-                val engine = engine(gateway, tokens, format = format, peers = peers())
+                val engine = engine(gateway, tokens, format = format)
                 val result = engine.import(existing, current)
                 val yaml = renderEntries(result.resources)
                 if (format == OutputFormat.TABLE) {

@@ -26,7 +26,9 @@ import java.util.concurrent.Callable
  *  - objects:  `workspace:<tenantId>`, `environment:<id>`, `application:<clientId>`, `user:<id>`,
  *              `federation_member:<id>`, `email_provider:<envSlug>`, `login_theme:<envSlug>`,
  *              `login_flow:<envSlug>`, `login_methods:<envSlug>`, `custom_domain:<tenantId>` (SSO-3434)
- *  - relations: `manager`, `viewer`
+ *  - relations: `manager`, `viewer`, and (SSO-3667 / SSO-3673) `owner` — the ONE owning workload identity of an
+ *    `application` / `environment`, grantable and revocable by a workspace admin only; a second owner is
+ *    `409 owner_already_set`. `owner` is deliberately not accepted in a provisioning file's `grants:`.
  *
  * Subcommands:
  *  - `grant <subject> <relation> <object>`  — POST   /api/v1/access/grants (idempotent: 201, or 200 when it exists)
@@ -63,7 +65,7 @@ class AccessCommand : Callable<Int> {
         @Parameters(index = "0", description = ["Subject: member:<sub> or client:<clientId>."])
         lateinit var subject: String
 
-        @Parameters(index = "1", description = ["Relation: manager or viewer."])
+        @Parameters(index = "1", description = ["Relation: manager, viewer, or owner (workspace admins only; one owner per application / environment)."])
         lateinit var relation: String
 
         @Parameters(index = "2", paramLabel = "<object>", description = ["Object: <type>:<id>, e.g. environment:<id>, application:<clientId>."])
@@ -101,7 +103,7 @@ class AccessCommand : Callable<Int> {
         @Parameters(index = "0", description = ["Subject: member:<sub> or client:<clientId>."])
         lateinit var subject: String
 
-        @Parameters(index = "1", description = ["Relation: manager or viewer."])
+        @Parameters(index = "1", description = ["Relation: manager, viewer, or owner."])
         lateinit var relation: String
 
         @Parameters(index = "2", paramLabel = "<object>", description = ["Object: <type>:<id>."])
@@ -184,7 +186,7 @@ class AccessCommand : Callable<Int> {
         @Option(names = ["--type"], description = ["Object type filter, e.g. environment, application."])
         var type: String? = null
 
-        @Option(names = ["--relation"], description = ["Relation filter: manager or viewer."])
+        @Option(names = ["--relation"], description = ["Relation filter: manager, viewer, or owner."])
         var relation: String? = null
 
         @Option(names = ["--gateway"], description = ["Override the customer-plane gateway URL (default: the gateway recorded at `thoryn login`)."], defaultValue = ThorynConfig.DEFAULT_GATEWAY)

@@ -71,7 +71,7 @@
             "required": ["subject", "relation"],
             "properties": {
               "subject": { "description": "`member:<sub>` or `client:<clientId>`.", "type": "string", "pattern": "^(member|client):[^\\s]+$" },
-              "relation": { "enum": ["manager", "viewer"] }
+              "relation": { "description": "`manager` or `viewer`. SSO-3673: `owner` is a platform relation (one owning repository per application / environment) but is NOT accepted here — a repository cannot claim ownership by writing YAML; a workspace admin grants it with `thoryn access grant <subject> owner <object>`.", "enum": ["manager", "viewer"] }
             }
           }
         }

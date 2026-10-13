@@ -199,3 +199,19 @@ triggered by the App; the engine is the same bytes either way.)
 - **For oauthy:** the orchestrator carries no dependency on the engine; SSO-3660's `ProvisionConverger`
   seam becomes the dispatcher of the SSO-3665 job rather than an in-process caller. The parent ADR §3
   gains a one-line pointer to this document.
+
+## Amendment 1, 2026-10-13 — `PeerReceipts` is gone; the gate asks the platform per object (SSO-3673)
+
+The "one-owner guard fed by `PeerReceipts`" described above was the interim for a platform marker that did
+not exist (parent ADR Amendment 2). oauthy SSO-3667 (`844bbbbc4`; ADR
+`2026-10-13-platform-owner-relation-and-forward-check.md`, parent ADR Amendment 4) shipped the marker — the
+`owner` relation on `application` / `environment`, rendered as `owner: { subject }` — and the per-object
+forward check `POST /api/v1/access/check`. SSO-3673 moves the engine onto both: the `ProvisionApi` port
+gains `checkAccess(object, relation): AccessCheck`; `gate()` asks it per object (`manager` for a change,
+`viewer` for a `readOnly` reference, `manager` on the parent for a create) and derives `access_owned_elsewhere`
+from the live object's `owner` plus `check(object, owner)`; `listMyAccess` stays for `import` only. The
+CLI-side `PeerReceipts` and the `--peer-receipt` flag are **removed** — nothing else consumed them, and a
+hint that can refuse is an authority — so the port is the engine's whole contract with product-api again
+(no second, file-shaped input), which is the shape the extraction wanted. `grants:` refuses
+`relation: owner` (`ProvisionFile.GRANT_OWNER_REFUSED`); `AccessRefs.RELATIONS` gains `owner` for
+`thoryn access grant | revoke | mine`. Receipts stay readable: `OwnedResource.owner` is additive.
