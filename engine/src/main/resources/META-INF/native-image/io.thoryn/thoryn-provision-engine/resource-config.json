@@ -1,0 +1,10 @@
+{
+  "resources": {
+    "includes": [
+      {
+        "pattern": "^provision/provision\\.schema\\.json$",
+        "comment": "SSO-3088 \u2014 the provisioning-file schema (.thoryn/provision.yaml), bundled beside the recipe + connection schemas for reference/validation. native-image strips un-referenced resources, so list it explicitly."
+      }
+    ]
+  }
+}

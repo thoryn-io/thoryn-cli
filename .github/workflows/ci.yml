@@ -61,7 +61,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: surefire-reports
-          path: target/surefire-reports/
+          path: '**/target/surefire-reports/'
           if-no-files-found: ignore
           retention-days: 7
 
@@ -127,7 +127,7 @@ jobs:
           THORYN_CI_PLAINTEXT_TOKENS: "1"
         run: |
           set -euo pipefail
-          thoryn() { java -jar target/thoryn.jar "$@"; }
+          thoryn() { java -jar cli/target/thoryn.jar "$@"; }
           thoryn login --workload-identity --client-id "$WIF_CLIENT_ID" --audience "$WIF_AUDIENCE" --scope tenant:environments.read
           thoryn login --status
           # A harmless read through the gateway with the exchanged token.

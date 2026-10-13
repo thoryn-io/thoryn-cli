@@ -118,7 +118,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: surefire-reports-release
-          path: target/surefire-reports/
+          path: '**/target/surefire-reports/'
           if-no-files-found: ignore
           retention-days: 7
 
@@ -218,7 +218,7 @@ jobs:
           export THORYN_CI_PLAINTEXT_TOKENS=1
           export THORYN_TOKEN_FILE="$RUNNER_TEMP/tokens.json"
           export THORYN_DPOP_KEY_FILE="$RUNNER_TEMP/dpop-key.json"
-          python3 -c "import pty,sys; pty.spawn([sys.argv[1],'whoami'])" ./target/thoryn 2>&1 \
+          python3 -c "import pty,sys; pty.spawn([sys.argv[1],'whoami'])" ./cli/target/thoryn 2>&1 \
             | tr -d '\r' | tee "$RUNNER_TEMP/whoami.txt" || true
           line="$(grep 'dpopKeyClass' "$RUNNER_TEMP/whoami.txt" || true)"
           if [ -z "$line" ]; then
@@ -239,9 +239,9 @@ jobs:
           set -euo pipefail
           mkdir -p dist
           if [ "${{ runner.os }}" = "Windows" ]; then
-            cp target/thoryn.exe "dist/${{ matrix.asset }}"
+            cp cli/target/thoryn.exe "dist/${{ matrix.asset }}"
           else
-            cp target/thoryn "dist/${{ matrix.asset }}"
+            cp cli/target/thoryn "dist/${{ matrix.asset }}"
           fi
       - uses: actions/upload-artifact@v4
         with:
@@ -269,7 +269,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: thoryn.jar
-          path: target/thoryn.jar
+          path: cli/target/thoryn.jar
           if-no-files-found: error
 
   # ── Publish the release + bump the Homebrew formula. ───────────────────────

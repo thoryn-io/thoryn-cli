@@ -1433,7 +1433,7 @@ file. A recipe that needs a throwaway environment inside the workspace you signe
 it in its provisioning file instead.
 
 **Recipes reference a provisioning file (SSO-3100, epic SSO-3087).** The provisioning file
-(`provision.yaml`, schema `src/main/resources/provision/provision.schema.json`) is **leading**
+(`provision.yaml`, schema `engine/src/main/resources/provision/provision.schema.json`) is **leading**
 for all the infrastructure a normal end user configures — environment (incl. a throwaway
 sandbox), application, demo user, sign-in methods (`loginMethods`), look-and-feel
 (`loginTheme`), `loginFlow`, `emailProvider`, `federationMember`. A recipe is the
@@ -1634,22 +1634,34 @@ system Maven install is needed.
 
 # Shaded fat jar (run via java -jar)
 ./mvnw -DskipTests package
-java -jar target/thoryn.jar login --status
+java -jar cli/target/thoryn.jar login --status
 
 # GraalVM native image (SSO-733; per-OS/arch matrix on CI).
 # Requires GRAALVM_HOME (or JAVA_HOME) to point at a GraalVM distribution
 # with `native-image` installed.
 ./mvnw -Pnative -DskipTests package
-./target/thoryn workspace list --issuer https://auth.stg.thoryn.org
+./cli/target/thoryn workspace list --issuer https://auth.stg.thoryn.org
 ```
 
 ## Module layout
 
 ```
 thoryn-cli/
-├── pom.xml
+├── pom.xml                                                  # reactor parent (SSO-3662): shared versions + plugin config
 ├── README.md                                                # this file
-└── src/
+├── adrs/                                                    # decisions about this repository
+├── engine/                                                  # io.thoryn:thoryn-provision-engine — the provisioning engine as a LIBRARY (SSO-3662)
+│   ├── pom.xml
+│   └── src/main/kotlin/com/devnow/thoryn/provision/
+│       ├── ProvisionEngine.kt                               # plan / apply / destroy / import, the ownership gate, SecretSink
+│       ├── ProvisionFile.kt + provision.schema.json         # the .thoryn/provision.yaml model
+│       ├── ProvisionReceipt.kt                              # the secret-free ownership ledger
+│       ├── ProvisionApi.kt                                  # the product-api PORT the engine converges through
+│       ├── AccessRefs.kt, CustomDomain.kt, ProductApiException.kt
+│       └── (no picocli, no TTY, no CLI type — pinned by ProvisionEngineLibraryBoundaryArchTest)
+└── cli/                                                     # io.thoryn:thoryn-cli — the picocli front end (shaded jar + native image)
+    ├── pom.xml
+    └── src/
     ├── main/kotlin/com/devnow/thoryn/cli/
     │   ├── ThorynMain.kt                                    # picocli root
     │   ├── auth/
@@ -1696,7 +1708,8 @@ thoryn-cli/
   classes are picked up automatically; no manual `reflect-config.json`
   changes needed.
 * `java-keyring` + `JNA` reflection lives in
-  `src/main/resources/META-INF/native-image/com.devnow.thoryn.cli/`.
+  `cli/src/main/resources/META-INF/native-image/com.devnow.thoryn.cli/` (the engine library's own
+  entries live in `engine/src/main/resources/META-INF/native-image/io.thoryn/thoryn-provision-engine/`).
 * All subcommands use only `java.net.http.HttpClient` + Jackson 3 + picocli,
   all of which are already native-image-ready.
 * DPoP (SSO-3199) adds no dependency: the proof is signed with the JDK's own
