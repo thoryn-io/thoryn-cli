@@ -385,6 +385,8 @@ internal class RecipeInterpreter(
         err = ctx.err,
         env = { name -> scope[name] ?: provisionEnv(name) },
         cliVersion = runCatching { VersionProvider.readVersion() }.getOrNull(),
+        // SSO-3659 — the ownership marker on the provisioning receipt: the identity this recipe provisions as.
+        subject = com.devnow.thoryn.cli.cmd.provision.ProvisionCommand.subjectOf(ctx.tokens),
     )
 
     // ── param resolution ──────────────────────────────────────────────────────────────────────────

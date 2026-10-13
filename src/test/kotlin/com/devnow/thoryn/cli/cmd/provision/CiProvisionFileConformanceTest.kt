@@ -126,12 +126,14 @@ class CiProvisionFileConformanceTest {
 
     /**
      * The LEAST-PRIVILEGE scope set an identity needs to converge this very file: read + write on every
-     * declared kind's area (the plan reads before the apply writes), plus `tenant:access.*` when any
-     * resource carries a `grants:` block (read to diff the live grants, write to converge them).
+     * declared kind's area (the plan reads before the apply writes), plus `tenant:access.read` ALWAYS —
+     * SSO-3659: ownership is decided by the identity's own reach (`GET /api/v1/access/mine`) before any
+     * write — and `tenant:access.write` when any resource carries a `grants:` block (to converge them).
      */
     private fun scopesToConverge(): Set<String> =
         file.resources.flatMap { listOf("tenant:${area(it.kind)}.read", "tenant:${area(it.kind)}.write") }.toSet() +
-            if (file.resources.any { it.grants != null }) setOf(AccessCommand.SCOPE_READ, AccessCommand.SCOPE_WRITE) else emptySet()
+            AccessCommand.SCOPE_READ +
+            if (file.resources.any { it.grants != null }) setOf(AccessCommand.SCOPE_WRITE) else emptySet()
 
     private fun locate(relative: String): File {
         var dir: File? = File(System.getProperty("user.dir")).absoluteFile

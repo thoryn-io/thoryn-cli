@@ -57,8 +57,10 @@ What confines it:
 
 - **Six scopes** — `tenant:environments.{read,write}` + `tenant:applications.{read,write}` (the kinds
   this file declares) + `tenant:access.{read,write}` (the `grants:` block: read to plan the diff, write
-  to converge it). **No** `tenant:users.*`, **no** `tenant:federation.*` — the file declares no `user`
-  and no `federationMember`, so the identity gets no reach over either.
+  to converge it; SSO-3659 — `read` is needed by every `plan`/`apply` regardless, because ownership is
+  decided by the identity's own reach, `GET /api/v1/access/mine`, before any write). **No**
+  `tenant:users.*`, **no** `tenant:federation.*` — the file declares no `user` and no
+  `federationMember`, so the identity gets no reach over either.
 - **One grant** — `client:cli-ci manager` on the `ci` **environment**. That is its whole declared reach.
   The loopback client inside the sandbox is covered by containment, and a machine client manages its own
   record by creation, so neither is restated as a grant.

@@ -21,6 +21,16 @@ internal data class ProvisionReceipt(
     val cliVersion: String? = null,
     /** The workspace slug the session was bound to at apply time (display/audit only). */
     val workspace: String? = null,
+    /**
+     * SSO-3659 (ADR 2026-10-13 §1, "one owning repository per resource") — the platform subject that applied
+     * this receipt (`client:<clientId>` for a machine identity such as a repository's workload-identity
+     * client, `member:<sub>` for a person), derived from the token exactly as product-api derives the
+     * caller. This is the OWNERSHIP MARKER another repository's `plan` compares against when it is handed
+     * this receipt as a peer (`--peer-receipt`): a resource recorded here as owned is `access_owned_elsewhere`
+     * for every other subject. Absent on a pre-SSO-3659 receipt (the resources it records still count as
+     * owned by that receipt). Not a secret.
+     */
+    val subject: String? = null,
     val resources: List<OwnedResource> = emptyList(),
 ) {
     companion object {

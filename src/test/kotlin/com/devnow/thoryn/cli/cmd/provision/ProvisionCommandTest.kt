@@ -247,6 +247,46 @@ class ProvisionCommandTest : CommandTestBase() {
     }
 
     @Test
+    fun `a resource the identity may only view is a red plan — plan exits non-zero and apply refuses before any write`() {
+        // SSO-3659 — the identity is not a workspace admin: it may view `shared` and manages nothing else.
+        api.callerIsAdmin = false
+        api.caller = "client:repo"
+        api.seedApplication(null, "Shared", listOf("https://shared.example.com/cb"), clientId = "shared")
+        api.seedGrant("client:repo", "viewer", "application:shared")
+        val file = writeFile(
+            "provision.yaml",
+            """
+            apiVersion: thoryn.io/provision/v1
+            resources:
+              - kind: application
+                name: shared
+                spec: { clientId: shared, displayName: "Shared", redirectUris: ["https://shared.example.com/cb"] }
+            """.trimIndent(),
+        )
+        val plan = runCli("provision", "plan", "--file", file.path, "--gateway", baseUrl())
+        assertThat(plan.exit).isEqualTo(com.devnow.thoryn.cli.cmd.CommandSupport.EXIT_HTTP_ERROR)
+        assertThat(plan.out).contains("error").contains("1 ownership error(s).")
+        assertThat(plan.err).contains("failed the ownership check").contains("access_read_only").contains("`readOnly: true`")
+        val structured = runCli("provision", "plan", "--file", file.path, "--gateway", baseUrl(), "--output", "json")
+        assertThat(structured.exit).isEqualTo(com.devnow.thoryn.cli.cmd.CommandSupport.EXIT_HTTP_ERROR)
+        assertThat(structured.out).contains("\"error\" : \"access_read_only\"").contains("\"access\" : \"viewer\"")
+
+        val apply = runCli("provision", "apply", "--file", file.path, "--gateway", baseUrl(), "--yes")
+        assertThat(apply.exit).isEqualTo(com.devnow.thoryn.cli.cmd.CommandSupport.EXIT_HTTP_ERROR)
+        assertThat(apply.err).contains("access_read_only").contains("Nothing was changed.")
+        assertThat(api.writes).isEmpty()
+        assertThat(File(file.parentFile, "provision.receipt.json")).doesNotExist()
+
+        // Declared as the dependency it is, the same file is green and owns nothing.
+        file.writeText(file.readText().replace("    name: shared\n", "    name: shared\n    readOnly: true\n"))
+        val green = runCli("provision", "apply", "--file", file.path, "--gateway", baseUrl(), "--yes")
+        assertThat(green.err).isEmpty()
+        assertThat(green.exit).isEqualTo(0)
+        assertThat(green.out).contains("read-only reference (viewer)").contains("No changes.")
+        assertThat(api.writes).isEmpty()
+    }
+
+    @Test
     fun `an invalid file fails fast with the violations and touches nothing`() {
         val file = writeFile("provision.yaml", "apiVersion: thoryn.io/provision/v1\nresources:\n  - { kind: db, name: x, spec: {} }\n")
         val r = runCli("provision", "apply", "--file", file.path, "--gateway", baseUrl(), "--yes")

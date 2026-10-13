@@ -38,14 +38,22 @@ import java.util.concurrent.Callable
  *    one-time client secret through [SecretIo] (exactly as `clients create`); an undeliverable secret
  *    still records the resource and exits [SecretIo.EXIT_NO_SECRET]. A resource's `grants:` block is
  *    converged with it (`thoryn access` is the imperative twin).
+ *  - SSO-3659 (ADR 2026-10-13 §1/§2): ownership is decided by the signed-in identity's platform reach —
+ *    `plan` and `apply` gate every declared resource (`manager` ⇒ converge; `viewer` ⇒ only a matching
+ *    `readOnly: true` reference; none ⇒ `access_not_owned`); a failed gate is a red plan (exit
+ *    [CommandSupport.EXIT_HTTP_ERROR]) and `apply` refuses before writing. `--peer-receipt` hands over
+ *    other repositories' receipts so a resource one of them owns is refused here (`access_owned_elsewhere`).
+ *    `import [--write]` renders what the identity may reach as `provision.yaml` entries (`manager` ⇒ owned,
+ *    recorded `adopted: true`; `viewer` ⇒ `readOnly: true`); without `--write` it only prints them.
  */
 @Command(
     name = "provision",
-    description = ["Provisioning-as-code: plan / apply / destroy a .thoryn/provision.yaml."],
+    description = ["Provisioning-as-code: plan / apply / import / destroy a .thoryn/provision.yaml."],
     mixinStandardHelpOptions = true,
     subcommands = [
         ProvisionCommand.PlanSubcommand::class,
         ProvisionCommand.ApplySubcommand::class,
+        ProvisionCommand.ImportSubcommand::class,
         ProvisionCommand.DestroySubcommand::class,
     ],
 )
@@ -53,7 +61,7 @@ class ProvisionCommand : Callable<Int> {
 
     override fun call(): Int {
         System.err.println("Usage: thoryn provision <subcommand>")
-        System.err.println("Subcommands: plan, apply, destroy")
+        System.err.println("Subcommands: plan, apply, import, destroy")
         return CommandSupport.EXIT_USAGE
     }
 
@@ -72,6 +80,15 @@ class ProvisionCommand : Callable<Int> {
 
         @Option(names = ["--output"], description = ["Output format: json|yaml|table (default: table)."])
         var outputRaw: String? = null
+
+        @Option(
+            names = ["--peer-receipt"],
+            description = ["SSO-3659 — another repository's committed receipt (a path or an https:// URL; repeatable): a resource it owns is refused here unless declared readOnly."],
+        )
+        var peerReceipts: List<String> = emptyList()
+
+        /** SSO-3659 — the other repositories' receipts the ownership gate compares against (fail closed on an unreadable one). */
+        fun peers(): List<ProvisionReceipt> = PeerReceipts.load(peerReceipts)
 
         /** Resolve + load the file (or fail with a usage error) and locate its receipt. */
         fun open(): Session? {
@@ -110,6 +127,7 @@ class ProvisionCommand : Callable<Int> {
             tokens: com.devnow.thoryn.cli.auth.Tokens,
             secretSink: ProvisionEngine.SecretSink = ProvisionEngine.SecretSink.undeliverable(),
             format: OutputFormat = OutputFormat.TABLE,
+            peers: List<ProvisionReceipt> = emptyList(),
         ): ProvisionEngine = ProvisionEngine(
             clients = { slug -> CommandSupport.gatewayClient(gateway, tokens, applyEnvironment = false, environmentOverride = slug ?: "") },
             // SSO-3414 — with --output json|yaml stdout carries ONE document; the per-resource progress goes to stderr.
@@ -118,9 +136,38 @@ class ProvisionCommand : Callable<Int> {
             secretSink = secretSink,
             // SSO-3413 — the workspace id (`tnt`) names the workspace-level custom domain's access object.
             workspaceId = runCatching { JwtClaims.of(tokens.accessToken)["tnt"]?.asString() }.getOrNull()?.takeIf { it.isNotBlank() },
+            // SSO-3659 — the ownership marker on the receipt, and the other repositories' receipts to refuse against.
+            subject = subjectOf(tokens),
+            peers = peers,
         )
 
+        /**
+         * SSO-3659 — the signed-in identity's PLATFORM SUBJECT, derived from the access token exactly as
+         * product-api's `PlatformSubjects.fromJwt` derives the caller (ADR 2026-09-15 §4): `client:<client_id>`
+         * when the token has no `sub` or its `sub` IS the client (a `client_credentials` / workload-identity
+         * machine identity — Spring AS names the principal after the client), else `member:<sub>`; `azp` is the
+         * fallback spelling of `client_id`. Null for an opaque token — the engine then records no marker.
+         */
+        fun subjectOf(tokens: Tokens): String? {
+            val claims = runCatching { JwtClaims.of(tokens.accessToken) }.getOrNull() ?: return null
+            fun claim(name: String): String? = claims[name]?.takeIf { !it.isNull }?.asString()?.takeIf { it.isNotBlank() }
+            val clientId = claim("client_id") ?: claim("azp") ?: tokens.clientId?.takeIf { tokens.authMode != null }
+            val sub = claim("sub")
+            return when {
+                clientId != null && (sub == null || sub == clientId) -> "client:$clientId"
+                sub != null -> "member:$sub"
+                else -> null
+            }
+        }
+
         fun workspaceSlug(): String? = runCatching { SelectedWorkspaceStore().read()?.slug }.getOrNull()
+
+        /** SSO-3659 — the red half of a plan: one line per resource that failed the ownership gate, on stderr. */
+        fun printPlanErrors(plan: ProvisionPlan) {
+            if (!plan.hasErrors) return
+            System.err.println("${plan.errors.size} resource(s) failed the ownership check — apply would refuse this plan:")
+            plan.errors.forEach { c -> System.err.println("  ! ${c.kind} ${c.name}: ${c.reason}") }
+        }
 
         fun printPlan(plan: ProvisionPlan, file: ProvisionFile) {
             println("Plan — ${file.source} (${file.digest.take(19)}…)")
@@ -151,8 +198,20 @@ class ProvisionCommand : Callable<Int> {
             println(
                 "  ${plan.creates.size} to create, ${plan.updates.size} to update, ${plan.adopts.size} to adopt, " +
                     "${plan.removes.size} to remove, ${plan.changes.count { it.action == ChangeAction.NOOP }} unchanged" +
-                    (if (plan.grantChanges > 0) ", ${plan.grantChanges} grant change(s)." else "."),
+                    (if (plan.grantChanges > 0) ", ${plan.grantChanges} grant change(s)" else "") +
+                    (if (plan.hasErrors) ", ${plan.errors.size} ownership error(s)." else "."),
             )
+        }
+
+        /**
+         * SSO-3659 — render a plan in the requested format and answer the exit code: a plan with an ownership
+         * error is RED ([CommandSupport.EXIT_HTTP_ERROR]) whatever else it says, so a pull-request dry run fails
+         * on a resource the repository does not own.
+         */
+        fun renderPlan(plan: ProvisionPlan, file: ProvisionFile, format: OutputFormat): Int {
+            if (format == OutputFormat.TABLE) printPlan(plan, file) else CommandSupport.emitValue(format, plan.toStructured(), "")
+            printPlanErrors(plan)
+            return if (plan.hasErrors) CommandSupport.EXIT_HTTP_ERROR else CommandSupport.EXIT_OK
         }
 
         /**
@@ -192,9 +251,8 @@ class ProvisionCommand : Callable<Int> {
             val tokens = CommandSupport.readTokens() ?: return CommandSupport.EXIT_NOT_SIGNED_IN
             gateway = CommandSupport.resolveGateway(gateway, tokens)
             return try {
-                val plan = engine(gateway, tokens).plan(s.file, s.receipt, prune)
-                if (format == OutputFormat.TABLE) printPlan(plan, s.file) else CommandSupport.emitValue(format, plan.toStructured(), "")
-                CommandSupport.EXIT_OK
+                val plan = engine(gateway, tokens, format = format, peers = peers()).plan(s.file, s.receipt, prune)
+                renderPlan(plan, s.file, format)
             } catch (ex: Exception) {
                 fail(ex, gateway, format)
             }
@@ -248,13 +306,24 @@ class ProvisionCommand : Callable<Int> {
             waitUsageError(s.file)?.let { System.err.println("Error: $it"); return CommandSupport.EXIT_USAGE }
             val tokens = CommandSupport.readTokens() ?: return CommandSupport.EXIT_NOT_SIGNED_IN
             gateway = CommandSupport.resolveGateway(gateway, tokens)
-            val engine = engine(gateway, tokens, ProvisionEngine.SecretSink.toSecretIo(secretFile, forceStdout), format)
+            val engine = try {
+                engine(gateway, tokens, ProvisionEngine.SecretSink.toSecretIo(secretFile, forceStdout), format, peers())
+            } catch (ex: ProvisionException) {
+                System.err.println("Error: ${ex.message}"); return CommandSupport.EXIT_USAGE
+            }
             val plan = try {
                 engine.plan(s.file, s.receipt, prune)
             } catch (ex: Exception) {
                 return fail(ex, gateway, format)
             }
             if (format == OutputFormat.TABLE) printPlan(plan, s.file)
+            // SSO-3659 — a plan with an ownership error is refused WHOLE, before anything is written or asked.
+            if (plan.hasErrors) {
+                if (format != OutputFormat.TABLE) CommandSupport.emitValue(format, plan.toStructured(), "")
+                printPlanErrors(plan)
+                System.err.println("Nothing was changed.")
+                return CommandSupport.EXIT_HTTP_ERROR
+            }
             if (!plan.hasChanges) {
                 if (wait) return awaitDomain(gateway, tokens, format, plan.toStructured())
                 if (format == OutputFormat.TABLE) println("No changes.") else CommandSupport.emitValue(format, plan.toStructured(), "")
@@ -335,6 +404,116 @@ class ProvisionCommand : Callable<Int> {
                 return DomainCommand.renderWaitOutcome(outcome, format, waitUntil, timeout, emitBody = false)
             }
             return DomainCommand.renderWaitOutcome(outcome, format, waitUntil, timeout)
+        }
+    }
+
+    /**
+     * `thoryn provision import [--file] [--write] [--peer-receipt …]` — SSO-3659 (ADR 2026-10-13 §2): the inverse
+     * of `plan`, bounded by the same relations. Lists what the signed-in identity may reach
+     * (`GET /api/v1/access/mine`, `manager` then `viewer`) and renders each live resource the file does not yet
+     * declare as a `provision.yaml` entry — `manager` objects as OWNED (recorded `adopted: true` in the receipt,
+     * never deleted by destroy), `viewer` objects (and objects another `--peer-receipt` owns) as `readOnly: true`.
+     * Nothing the identity has no relation to is listed, so nothing it has no relation to can be imported — the
+     * hub's rows stay the authority; `import` only writes the file and the receipt. Without `--write` it prints
+     * the entries it would add (stdout; notes and skipped objects on stderr) and changes nothing.
+     */
+    @Command(name = "import", description = ["Render the live resources this identity may reach as provisioning-file entries; --write appends them and records the owned ones in the receipt."], mixinStandardHelpOptions = true)
+    internal class ImportSubcommand : FileOptions(), Callable<Int> {
+        @Option(names = ["--write"], description = ["Append the entries to the provisioning file (created when absent) and record the owned ones in its receipt. Default: print only."])
+        var write: Boolean = false
+
+        override fun call(): Int {
+            val format = CommandSupport.parseFormat(outputRaw) ?: return CommandSupport.EXIT_USAGE
+            val target = file ?: ProvisionFile.resolveDefault() ?: File(ProvisionFile.DEFAULT_DIR, ProvisionFile.DEFAULT_FILES.first())
+            val existing = try {
+                if (target.isFile) ProvisionFile.load(target) else null
+            } catch (ex: ProvisionException) {
+                System.err.println("Error: ${ex.message}"); return CommandSupport.EXIT_USAGE
+            }
+            if (write && target.name.endsWith(".json", ignoreCase = true)) {
+                System.err.println("Error: --write appends YAML; ${target.path} is a JSON file — run without --write and add the entries by hand.")
+                return CommandSupport.EXIT_USAGE
+            }
+            val store = ProvisionReceiptStore()
+            val receiptPath = receipt ?: store.defaultPathFor(target)
+            val tokens = CommandSupport.readTokens() ?: return CommandSupport.EXIT_NOT_SIGNED_IN
+            gateway = CommandSupport.resolveGateway(gateway, tokens)
+            return try {
+                val current = store.read(receiptPath)
+                val engine = engine(gateway, tokens, format = format, peers = peers())
+                val result = engine.import(existing, current)
+                val yaml = renderEntries(result.resources)
+                if (format == OutputFormat.TABLE) {
+                    if (result.resources.isEmpty()) println("Nothing to import — every resource this identity may reach is already declared in ${target.path}.") else print(yaml)
+                } else {
+                    CommandSupport.emitValue(
+                        format,
+                        mapOf("file" to target.path, "written" to (write && result.resources.isNotEmpty()), "resources" to result.resources.map { it.toStructured() }, "skipped" to result.skipped),
+                        "",
+                    )
+                }
+                result.resources.filter { it.note != null }.forEach { System.err.println("  note ${it.resource.kind} ${it.resource.name}: ${it.note}") }
+                result.skipped.forEach { System.err.println("  skipped $it") }
+                if (!write || result.resources.isEmpty()) {
+                    if (!write && result.resources.isNotEmpty()) System.err.println("Printed ${result.resources.size} entry(ies) — nothing was written; re-run with --write to append them to ${target.path}.")
+                    return CommandSupport.EXIT_OK
+                }
+                appendEntries(target, yaml, existing)
+                val owned = result.resources.mapNotNull { it.owned }
+                val reloaded = ProvisionFile.load(target)
+                store.write(
+                    receiptPath,
+                    ProvisionReceipt(
+                        file = ProvisionFileRef(reloaded.source, reloaded.digest),
+                        appliedAt = java.time.Instant.now().toString(),
+                        cliVersion = runCatching { VersionProvider.readVersion() }.getOrNull(),
+                        workspace = workspaceSlug() ?: current?.workspace,
+                        subject = subjectOf(tokens) ?: current?.subject,
+                        resources = current?.resources.orEmpty().filter { o -> owned.none { it.key == o.key } } + owned,
+                    ),
+                )
+                if (format == OutputFormat.TABLE) {
+                    println("Imported ${result.resources.size} entry(ies) into ${target.path}: ${owned.size} owned (adopted — never deleted by destroy), ${result.resources.size - owned.size} read-only. Receipt: ${receiptPath.path}")
+                }
+                CommandSupport.EXIT_OK
+            } catch (ex: Exception) {
+                fail(ex, gateway, format)
+            }
+        }
+
+        /** The entries as a `resources:` list fragment, indented for the file (two spaces, as the schema examples are written). */
+        private fun renderEntries(entries: List<ImportedResource>): String {
+            if (entries.isEmpty()) return ""
+            val node = tools.jackson.databind.json.JsonMapper.builder().build().valueToTree<tools.jackson.databind.JsonNode>(entries.map { it.toEntry() })
+            return com.devnow.thoryn.cli.output.YamlWriter.write(node).lines().filter { it.isNotEmpty() }.joinToString("\n") { "  $it" } + "\n"
+        }
+
+        /**
+         * Append under the file's `resources:` list — only when that list is the LAST top-level key (otherwise the
+         * appended entries would not belong to it); a fresh file is created with the header. The result is re-loaded
+         * through [ProvisionFile] and the original bytes restored when it does not validate, so `--write` can never
+         * leave an invalid file behind.
+         */
+        private fun appendEntries(target: File, fragment: String, existing: ProvisionFile?) {
+            if (existing == null) {
+                target.absoluteFile.parentFile?.mkdirs()
+                target.writeText("apiVersion: ${ProvisionFile.API_VERSION}\nresources:\n$fragment")
+            } else {
+                val original = target.readBytes()
+                val root = tools.jackson.dataformat.yaml.YAMLMapper.builder().build().readTree(original)
+                val lastKey = root.properties().lastOrNull()?.key
+                if (lastKey != "resources") {
+                    throw ProvisionException("${target.path}: 'resources' is not the last top-level key, so entries cannot be appended to it — run without --write and add them by hand")
+                }
+                val text = original.toString(Charsets.UTF_8)
+                target.writeText(text + (if (text.endsWith("\n")) "" else "\n") + fragment)
+                try {
+                    ProvisionFile.load(target)
+                } catch (ex: ProvisionException) {
+                    target.writeBytes(original)
+                    throw ProvisionException("the appended entries did not validate (${ex.message}); ${target.path} was left unchanged")
+                }
+            }
         }
     }
 

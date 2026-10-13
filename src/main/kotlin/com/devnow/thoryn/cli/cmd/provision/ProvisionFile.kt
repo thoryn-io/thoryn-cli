@@ -28,6 +28,13 @@ internal data class ProvisionResource(
      * written); an empty list ⇒ the file declares NONE (every revocable grant on the object is revoked).
      */
     val grants: List<ProvisionGrant>? = null,
+    /**
+     * SSO-3659 (ADR 2026-10-13 §1) — "this repository depends on it and does not own it". A read-only
+     * reference is looked up live and must MATCH: any field difference is the plan error
+     * `access_read_only`, it is never created, adopted, recorded in the receipt, or removed, and it may
+     * be declared with only `viewer` reach (an owned resource needs `manager`).
+     */
+    val readOnly: Boolean = false,
 ) {
     val isSingleton: Boolean get() = kind in ProvisionFile.SINGLETON_KINDS
     val key: String get() = "$kind/$name"
@@ -130,6 +137,9 @@ internal class ProvisionFile private constructor(
         /** SSO-3113 — the relations a `grants:` entry may carry (the SSO-3112 contract; equals the schema enum). */
         val GRANT_RELATIONS: Set<String> = AccessCommand.RELATIONS
 
+        /** SSO-3659 — the resource-level `readOnly` flag (ADR 2026-10-13 §1): a dependency, not an owned resource. */
+        const val READ_ONLY = "readOnly"
+
         private val jsonMapper = JsonMapper.builder().addModule(kotlinModule()).build()
         private val yamlMapper = YAMLMapper.builder().addModule(kotlinModule()).build()
 
@@ -188,6 +198,7 @@ internal class ProvisionFile private constructor(
                     grants = r["grants"]?.takeIf { it.isArray() }?.toList()?.map { g ->
                         ProvisionGrant(subject = g["subject"].asString().trim(), relation = g["relation"].asString().trim())
                     },
+                    readOnly = r[READ_ONLY]?.takeIf { it.isBoolean() }?.asBoolean() ?: false,
                 )
             }
             if (unresolved.isNotEmpty()) {
@@ -245,7 +256,13 @@ internal class ProvisionFile private constructor(
                     v += "$where must be an object"
                     return@forEachIndexed
                 }
-                rejectUnknownKeys(r, setOf("kind", "name", "environment", "spec", "grants"), where, v)
+                rejectUnknownKeys(r, setOf("kind", "name", "environment", "spec", "grants", READ_ONLY), where, v)
+                // SSO-3659 — `readOnly: true` declares a dependency, not ownership: a boolean, and never with `grants`
+                // (a grant is a write on the object; a reference writes nothing).
+                r[READ_ONLY]?.takeIf { !it.isNull }?.let { ro ->
+                    if (!ro.isBoolean()) v += "$where $READ_ONLY must be true or false"
+                    else if (ro.asBoolean() && r["grants"]?.takeIf { !it.isNull } != null) v += "$where a read-only reference cannot carry 'grants' — this repository does not own it"
+                }
                 val kind = r["kind"]?.takeIf { !it.isNull }?.asString()
                 if (kind == null || kind !in KINDS) {
                     v += "$where kind '$kind' not in the allowlist $KINDS"
