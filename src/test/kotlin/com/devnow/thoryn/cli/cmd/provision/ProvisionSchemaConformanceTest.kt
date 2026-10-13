@@ -206,6 +206,44 @@ class ProvisionSchemaConformanceTest {
     }
 
     @Test
+    fun `readOnly is a boolean on every kind, excludes grants, and the schema pins the same two rules`() {
+        // SSO-3659 (ADR 2026-10-13 §1) — a read-only reference is a dependency, not ownership: no grants on it.
+        val ok = yaml.readTree(
+            """
+            apiVersion: thoryn.io/provision/v1
+            resources:
+              - { kind: application, name: shared, readOnly: true, spec: { clientId: shared, displayName: "Shared" } }
+              - { kind: environment, name: ci, readOnly: true, spec: { slug: ci } }
+              - { kind: loginMethods, environment: ci, readOnly: true, spec: { methods: [password] } }
+              - { kind: customDomain, readOnly: true, spec: { host: auth.example.com } }
+              - { kind: user, name: owned, spec: { email: owned@example.com } }
+            """.trimIndent(),
+        )
+        assertThat(ProvisionFile.validate(ok)).isEmpty()
+        val parsed = ProvisionFile.parse(json.writeValueAsBytes(ok), "provision.json", yaml = false)
+        assertThat(parsed.resources.map { it.readOnly }).containsExactly(true, true, true, true, false)
+
+        val bad = yaml.readTree(
+            """
+            apiVersion: thoryn.io/provision/v1
+            resources:
+              - { kind: application, name: a, readOnly: "yes", spec: { displayName: a } }
+              - { kind: environment, name: b, readOnly: true, spec: { slug: b }, grants: [ { subject: "client:x", relation: viewer } ] }
+            """.trimIndent(),
+        )
+        val v = ProvisionFile.validate(bad)
+        assertThat(v).anyMatch { it.contains("resources[0] readOnly must be true or false") }
+        assertThat(v).anyMatch { it.contains("resources[1]") && it.contains("read-only reference cannot carry 'grants'") }
+
+        val readOnly = schema["\$defs"]["resource"]["properties"][ProvisionFile.READ_ONLY]
+        assertThat(readOnly["type"].asString()).isEqualTo("boolean")
+        assertThat(readOnly["default"].asBoolean()).isFalse()
+        val exclusion = schema["\$defs"]["resource"]["allOf"].toList().last()
+        assertThat(exclusion["if"]["properties"][ProvisionFile.READ_ONLY]["const"].asBoolean()).isTrue()
+        assertThat(exclusion["then"]["not"]["required"].toList().map { it.asString() }).containsExactly("grants")
+    }
+
+    @Test
     fun `apiVersion, unknown properties and an empty resource list are rejected`() {
         val bad = yaml.readTree(
             """

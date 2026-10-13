@@ -29,8 +29,18 @@ internal class FakeProductApi : Dispatcher() {
     val loginMethods = mutableMapOf<String?, List<String>>()
     /** SSO-3113 — access grants (`/api/v1/access/grants`, the SSO-3112 contract): `{subject, relation, object, createdAt}`. */
     val grants = mutableListOf<MutableMap<String, Any?>>()
-    /** SSO-3113 — what `/api/v1/access/mine` answers for the caller (object refs). */
-    val mine = mutableListOf<String>()
+    /**
+     * SSO-3659 — the caller's platform subject, the identity `/api/v1/access/mine` reports reach FOR (product-api
+     * derives it from the token; the fake has no token, so a test states it). Reach is COMPUTED from [grants] the
+     * way the platform model does — `manager = this ∪ parent.manager`, `viewer = this ∪ manager ∪ parent.viewer`,
+     * an application's parent being its environment (or the workspace on the production plane), an environment's
+     * and the custom domain's the workspace — so a test seeds grants, not answers.
+     */
+    var caller = "client:repo"
+    /** SSO-3659 — a workspace admin manages everything. The DEFAULT, so a test about something else sees a founder's reach. */
+    var callerIsAdmin = true
+    /** The workspace id (`tnt`) — the object `workspace:<tenantId>` and the custom domain's id. */
+    var tenantId = "t-1"
     /** SSO-3113 — simulate a token WITHOUT `tenant:access.write` / `tenant:access.read` (403 insufficient_scope). */
     var denyGrantWrites = false
     var denyGrantReads = false
@@ -147,6 +157,51 @@ internal class FakeProductApi : Dispatcher() {
     }
 
     fun grantsOn(objectRef: String): List<String> = grants.filter { it["object"] == objectRef }.map { "${it["subject"]} ${it["relation"]}" }
+
+    // ── SSO-3659 — the caller's reach, computed from the grants through the platform model's containment ──
+
+    /** Every platform object of [type] that exists in the fake, as `<type>:<id>` (production-plane singletons by `production`). */
+    private fun objectsOf(type: String): List<String> = when (type) {
+        "workspace" -> listOf("workspace:$tenantId")
+        "environment" -> environments.map { "environment:${it["id"]}" }
+        "application" -> applications.map { "application:${it["clientId"]}" }
+        "user" -> users.map { "user:${it["id"]}" }
+        "federation_member" -> federationMembers.map { "federation_member:${it["id"]}" }
+        "email_provider" -> emailProviders.keys.map { "email_provider:${it ?: "production"}" }
+        "login_theme" -> branding.keys.map { "login_theme:${it ?: "production"}" }
+        "login_methods" -> loginMethods.keys.map { "login_methods:${it ?: "production"}" }
+        "login_flow" -> activeFlow.keys.map { "login_flow:${it ?: "production"}" }
+        "custom_domain" -> if (domainHost != null) listOf("custom_domain:$tenantId") else emptyList()
+        else -> emptyList()
+    }
+
+    /** The object's `parent` edge: an environment by slug (or the workspace for the production plane / env-less kinds). */
+    private fun parentOf(ref: String): String? {
+        val type = ref.substringBefore(':'); val id = ref.substringAfter(':')
+        fun envRef(slug: String?): String = slug?.let { s -> environments.firstOrNull { it["slug"] == s }?.let { "environment:${it["id"]}" } } ?: "workspace:$tenantId"
+        return when (type) {
+            "workspace" -> null
+            "environment", "custom_domain" -> "workspace:$tenantId"
+            "application" -> envRef(applications.firstOrNull { it["clientId"] == id }?.get("_env") as String?)
+            "user" -> envRef(users.firstOrNull { it["id"] == id }?.get("_env") as String?)
+            "federation_member" -> envRef(federationMembers.firstOrNull { it["id"] == id }?.get("_env") as String?)
+            else -> envRef(id.takeIf { it != "production" })
+        }
+    }
+
+    private fun direct(ref: String, relation: String): Boolean = grants.any { it["object"] == ref && it["relation"] == relation && it["subject"] == caller }
+
+    /** `manager = this ∪ parent.manager`; `viewer = this ∪ manager ∪ parent.viewer`; a workspace admin holds both everywhere. */
+    fun holds(ref: String, relation: String): Boolean {
+        if (callerIsAdmin || direct("workspace:$tenantId", "admin")) return true
+        if (direct(ref, relation)) return true
+        if (relation == "viewer" && direct(ref, "manager")) return true
+        val parent = parentOf(ref) ?: return false
+        return holds(parent, relation)
+    }
+
+    /** What `/api/v1/access/mine?type=&relation=` answers: every object of the type the caller holds the relation on. */
+    fun reach(type: String, relation: String): List<String> = objectsOf(type).filter { holds(it, relation) }
 
     private fun query(path: String): Map<String, String> =
         path.substringAfter('?', "").split('&').filter { it.contains('=') }.associate { kv ->
@@ -335,7 +390,9 @@ internal class FakeProductApi : Dispatcher() {
             route == "/api/v1/access/mine" && method == "GET" -> {
                 if (denyGrantReads) return problem(403, "insufficient_scope")
                 val q = query(path)
-                json(200, mapOf("data" to mine.filter { q["type"] == null || it.startsWith(q["type"] + ":") }))
+                // SSO-3659 — the caller's OWN reach, computed from the grants (relation defaults to manager, as product-api's does).
+                val type = q["type"] ?: return problem(400, "invalid_type")
+                json(200, mapOf("data" to reach(type, q["relation"] ?: "manager")))
             }
             // ── custom domain (SSO-3413 / SSO-3414) ──
             route.startsWith("/api/v1/custom-domain") -> customDomain(method, route, b)

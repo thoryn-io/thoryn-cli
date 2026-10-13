@@ -39,6 +39,11 @@
           "type": "object",
           "propertyNames": { "not": { "pattern": "([Pp]assword|[Ss]ecret|[Tt]oken)$" } }
         },
+        "readOnly": {
+          "description": "SSO-3659 (ADR 2026-10-13 §1) — `true` declares that this repository DEPENDS ON the resource and does not own it. `plan` / `apply` look it up live and require it to MATCH the declared spec: any field difference is the plan error `access_read_only` (non-zero exit; `apply` refuses before writing anything). A read-only reference is never created, adopted, recorded in the receipt, or removed, and `viewer` reach on it suffices (an OWNED resource — the default — needs `manager`, held directly or inherited from its environment / workspace; see `thoryn access`). It cannot carry `grants`. `thoryn provision import` renders a resource the repository may only view this way.",
+          "type": "boolean",
+          "default": false
+        },
         "grants": {
           "description": "SSO-3113 (epic SSO-3108) — least-privilege ACCESS GRANTS on this resource, converged with it by `apply`: a listed grant that is missing is created, a grant on this object the file no longer lists is revoked (the workspace admin userset `workspace:<id>#admin` is never revoked; grants on objects the file does not own are never touched). The OBJECT is implicit — it derives from the receipt id (`environment:<id>`, `application:<clientId>`, `user:<id>`, `federation_member:<id>`, `<singleton>:<envSlug>`, `custom_domain:<workspace-id>`). Omit to leave the object's grants unmanaged; `[]` declares none. Needs `tenant:access.write` (a session without it fails closed).",
           "type": "array",
@@ -81,7 +86,9 @@
                       "host": { "description": "The host to claim: a subdomain you control, e.g. `auth.acme.com` (the platform refuses apex domains, IP addresses and Thoryn domains).",
                                 "type": "string", "minLength": 1 },
                       "acceptReSignIn": { "description": "Required `true` when the workspace already has production users: a custom domain changes the workspace's issuer, so every production user signs in again once. Recorded on the claim and in the audit log.",
-                                          "type": "boolean" } } } } } }
+                                          "type": "boolean" } } } } } },
+        { "if": { "properties": { "readOnly": { "const": true } }, "required": ["readOnly"] },
+          "then": { "not": { "required": ["grants"] } } }
       ]
     }
   }

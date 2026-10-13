@@ -23,7 +23,11 @@ class ProvisionCustomDomainTest : CommandTestBase() {
     private val console = ByteArrayOutputStream()
 
     @BeforeEach
-    fun mount() { server.dispatcher = api }
+    fun mount() {
+        server.dispatcher = api
+        // SSO-3659 — the custom domain's parent (and its own id) is the workspace; the fake's graph must name the same one.
+        api.tenantId = WORKSPACE_ID
+    }
 
     private fun engine() = ProvisionEngine(
         clients = { slug -> ProductApiClient(gateway = baseUrl(), tokens = Tokens(accessToken = "AT-test"), environmentSlug = slug) },

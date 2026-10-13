@@ -157,10 +157,16 @@ thoryn examples share    <name> [--output <file>]   # SSO-2876 — export the se
 # SSO-3430: a resource's `environment:` may also be `{{env.NAME}}` (e.g. "{{env.THORYN_ENVIRONMENT}}", how an
 # unrendered starter repository names its sandbox from a CI variable); it is resolved when the file is read,
 # and an unset variable is an error for plan and apply alike.
-thoryn provision plan    [--file <path>] [--prune]                                  # read-only: what apply would create / remove (+ grant changes)
+# SSO-3659 (ADR 2026-10-13 §1/§2): ownership is decided by the signed-in identity's platform reach — plan and apply
+# gate every resource on the relation it holds (`manager` ⇒ converge; `viewer` ⇒ only a matching `readOnly: true`
+# reference; none ⇒ access_not_owned). A failed gate is a RED plan (exit 1) and apply refuses before writing. See
+# "Ownership is decided by your identity's reach" below.
+thoryn provision plan    [--file <path>] [--prune] [--peer-receipt <path|https-url>]...   # read-only: what apply would create / remove (+ grant changes); exit 1 on an ownership error
 thoryn provision apply   [--file <path>] [--prune] [--confirm <ws>] [--yes] \
-                         [--secret-file <path>] [--force-stdout] \
+                         [--secret-file <path>] [--force-stdout] [--peer-receipt <path|https-url>]... \
                          [--wait [--wait-until ACTIVE|VERIFIED] [--wait-timeout 15m] [--wait-interval 20s]]
+thoryn provision import  [--file <path>] [--write] [--peer-receipt <path|https-url>]...  # SSO-3659 — the inverse of plan: render what this identity may reach as
+                                             # provision.yaml entries (manager ⇒ owned, receipt `adopted: true`; viewer ⇒ `readOnly: true`); --write appends them
                                              # converge; environments first, dependants into them.
                                              # SSO-3414 — --wait blocks until the file's customDomain is ACTIVE (or VERIFIED), verifying each round.
                                              # SSO-3113 — a confidential application it CREATES gets a one-time client secret, delivered via
@@ -733,6 +739,63 @@ secret-free by construction. If it cannot be delivered the client is **still cre
 recorded** (it exists), and `apply` exits **65** naming
 `thoryn clients rotate-secret <clientId> --secret-file <path>` to mint a fresh one. `plan` marks
 such a create with `(a client secret will be minted and shown once)`.
+
+### Ownership is decided by your identity's reach (SSO-3659, epic SSO-3087)
+
+Per oauthy ADR `2026-10-13-provisioning-as-code-converge-github-app-and-fga-ownership.md` §1/§2, a
+repository converges **only what it owns**, and "owns" is a relation in the platform authorization
+graph — never a naming prefix, never something the file can claim by being written. The subject is
+the signed-in identity itself (`client:<clientId>` for a workload-identity / client-credentials
+session, `member:<sub>` for a person), derived from the token exactly as product-api derives it.
+
+Before any write, `plan` and `apply` read that identity's **own reach** — `GET /api/v1/access/mine`
+for `manager` and `viewer` per object type (scope `tenant:access.read`; a session without it fails
+closed with the scope named) — and gate every declared resource:
+
+| relation held on the live object | `plan` / `apply` |
+|---|---|
+| `manager` (direct, or inherited through `parent` from its environment / workspace) | the normal converge (create / update / adopt / no-op) |
+| `viewer` only | allowed only as `readOnly: true`; **any field diff** is `access_read_only`; declared without `readOnly` is `access_read_only` naming the fix |
+| none | `access_not_owned` — not visible to this identity; cannot be adopted, imported or converged |
+| does not exist yet | a create needs `manager` on the **parent** (`environment:<id>`, or the workspace for the production plane / an environment / the custom domain); creator-becomes-manager on the platform then makes the identity its manager — no grant step |
+| another repository's receipt owns it (`--peer-receipt`) | `access_owned_elsewhere` unless declared `readOnly: true` |
+
+A failed gate is an `error` row in the plan (`--output json` → `changes[].error`, `changes[].access`),
+the plan exits **1** (a red check on a pull request), and `apply` refuses the **whole** plan before
+writing anything — never a partial apply that owns the half it may touch.
+
+**`readOnly: true`** on any kind means *"this repository depends on it and does not own it"*: the
+resource is looked up live and must match the declared spec; it is never created, adopted, recorded
+in the receipt (a receipt entry from before it was marked read-only is dropped — the resource stays),
+removed, or granted on (`grants:` is refused on a reference).
+
+**One owning repository per resource.** FGA happily holds several `manager`s on one object; the engine
+additionally refuses to converge a resource that **another repository's receipt** records as owned.
+The hub's client row carries no owner tag today, so the marker is the receipt: `apply` records the
+owning identity in the receipt's `subject`, and a repository hands other repositories' committed
+receipts to the gate with `--peer-receipt <path|https://…>` (repeatable). The limit is explicit: the
+guard sees exactly the receipts it is given — a repository nobody names is not checked against. A
+product-side owner marker (free-form metadata on an application, or an `owner` relation) would make
+this authoritative; neither exists yet.
+
+**`thoryn provision import [--write]`** is the inverse of `plan`, bounded by the same relations: it
+lists what the identity may reach (`manager`, then `viewer`) and renders each live resource the file
+does not yet declare as an entry — `manager` objects as owned (recorded `adopted: true` in the receipt,
+so `destroy` never deletes them), `viewer` objects (and objects a `--peer-receipt` owns) as
+`readOnly: true`. Nothing the identity has no relation to is listed, so nothing it has no relation to
+can be imported; the hub's rows stay the authority. Without `--write` it prints the YAML it would add
+(notes and unrenderable objects on stderr); `--write` appends under the file's `resources:` list (the
+file is created when absent), re-validates it, and writes the receipt. A `loginFlow` cannot be
+rendered (its `templateId` is not recoverable from the active flow); write-only secrets
+(`smtpPasswordEnv`, `clientSecretEnv`) must be added by hand before an update is converged.
+
+Two facts worth knowing when reading the ADR against the code: the public `POST /api/v1/fga/check` /
+`list-objects` evaluate the **tenant's own** authorization model over the environment-partitioned
+tenant tuple store, not the platform resource graph — `/api/v1/access/mine` is that graph's
+list-objects and the one customer-plane read of it, so the gate uses it (and `tenant:access.read`,
+not `tenant:fga.*`). And an object the reverse index does not list (a singleton reset out of band, a
+row without its `parent` edge) is still gated by containment — manager on the parent — because the
+platform re-checks every write server-side, so the engine can never admit a write the platform refuses.
 
 ## Secret-safety (SSO-1552)
 

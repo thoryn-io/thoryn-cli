@@ -14,7 +14,15 @@ import java.io.File
 import java.io.PrintStream
 import java.time.Instant
 
-internal enum class ChangeAction { CREATE, UPDATE, ADOPT, NOOP, REMOVE, SKIP }
+/**
+ * [ERROR] (SSO-3659) is a per-resource VERDICT, not a step: the declared resource failed the ownership
+ * gate (`access_read_only` / `access_not_owned` / `access_owned_elsewhere`, see [PlannedChange.error]).
+ * A plan carrying one is red (non-zero exit) and `apply` refuses it before writing anything.
+ */
+internal enum class ChangeAction { CREATE, UPDATE, ADOPT, NOOP, REMOVE, SKIP, ERROR }
+
+/** SSO-3659 — the relation the signed-in identity holds on a live platform object (ADR 2026-10-13 §1). */
+internal enum class Access(val label: String) { MANAGER("manager"), VIEWER("viewer"), NONE("none") }
 
 /** One row of a plan: what `apply` / `destroy` would do to a resource, why, and (for updates) which fields change. */
 internal data class PlannedChange(
@@ -39,6 +47,15 @@ internal data class PlannedChange(
      * the DNS records to publish as `{type, name, value, ttl}` ([com.devnow.thoryn.cli.cmd.DnsRecord]).
      */
     val customDomain: Map<String, Any?>? = null,
+    /**
+     * SSO-3659 — the relation the signed-in identity holds on the live object (`manager` / `viewer` /
+     * `none`), or `manager` for a create whose parent it manages. Null for receipt-only rows (skip / remove).
+     */
+    val access: String? = null,
+    /** SSO-3659 — the file declares this resource `readOnly: true` (a dependency; never owned, never in the receipt). */
+    val readOnly: Boolean = false,
+    /** SSO-3659 — the ownership-gate error code when [action] is [ChangeAction.ERROR] (`access_*`), else null. */
+    val error: String? = null,
 ) {
     val hasGrantChanges: Boolean get() = grantAdds.isNotEmpty() || grantRemoves.isNotEmpty()
 
@@ -49,6 +66,9 @@ internal data class PlannedChange(
         if (adopted) put("adopted", true)
         if (hasGrantChanges) put("grants", mapOf("add" to grantAdds, "remove" to grantRemoves))
         customDomain?.let { put("customDomain", it) }
+        access?.let { put("access", it) }
+        if (readOnly) put("readOnly", true)
+        error?.let { put("error", it) }
     }
 }
 
@@ -60,6 +80,9 @@ internal class ProvisionPlan(val changes: List<PlannedChange>) {
     /** SSO-3113 — resources whose grants differ (a no-op resource can still carry grant changes). */
     val grantChanges: Int get() = changes.sumOf { it.grantAdds.size + it.grantRemoves.size }
     val hasChanges: Boolean get() = creates.isNotEmpty() || updates.isNotEmpty() || adopts.isNotEmpty() || removes.isNotEmpty() || grantChanges > 0
+    /** SSO-3659 — resources that failed the ownership gate; a plan with one is red and `apply` refuses it. */
+    val errors: List<PlannedChange> get() = changes.filter { it.action == ChangeAction.ERROR }
+    val hasErrors: Boolean get() = errors.isNotEmpty()
 
     /** True when any planned removal targets the workspace's PRODUCTION plane (confirmation-gated). */
     val removesOnProductionPlane: Boolean
@@ -75,9 +98,41 @@ internal class ProvisionPlan(val changes: List<PlannedChange>) {
             "noop" to changes.count { it.action == ChangeAction.NOOP },
             "skip" to changes.count { it.action == ChangeAction.SKIP },
             "grants" to grantChanges,
+            "error" to errors.size,
         ),
     )
 }
+
+/**
+ * SSO-3659 (ADR 2026-10-13 §2) — one live resource `import` would add to the provisioning file: the
+ * rendered [resource] (owned, or `readOnly: true` when the identity may only view it or another receipt
+ * owns it), its live id, the [access] the identity holds, the receipt entry it becomes ([owned] —
+ * `adopted: true`, never deleted by destroy; null for a read-only reference), and a [note] for what the
+ * file cannot carry (a write-only secret, an unrecoverable template).
+ */
+internal data class ImportedResource(
+    val resource: ProvisionResource,
+    val liveId: String,
+    val access: Access,
+    val owned: OwnedResource?,
+    val note: String? = null,
+) {
+    /** The `provision.yaml` entry, key order as a human would write it. */
+    fun toEntry(): Map<String, Any?> = buildMap {
+        put("kind", resource.kind)
+        if (!resource.isSingleton || resource.name != resource.kind) put("name", resource.name)
+        resource.environment?.let { put("environment", it) }
+        if (resource.readOnly) put(ProvisionFile.READ_ONLY, true)
+        put("spec", resource.spec)
+    }
+
+    fun toStructured(): Map<String, Any?> = buildMap {
+        putAll(toEntry()); put("id", liveId); put("access", access.label); note?.let { put("note", it) }
+    }
+}
+
+/** The outcome of an import: what would be added, and what was reachable but could not be rendered (with why). */
+internal data class ImportResult(val resources: List<ImportedResource>, val skipped: List<String>)
 
 /** The outcome of a destroy / prune pass: what is still owned, and which removals failed. */
 internal data class RemovalOutcome(val remaining: ProvisionReceipt, val failures: List<String>)
@@ -116,6 +171,23 @@ internal data class RemovalOutcome(val remaining: ProvisionReceipt, val failures
  * under another kind or further down; converging inline would read the file's own kind ordering as a
  * dependency order it never had. A session without `tenant:access.write` fails closed with a clear message.
  *
+ * **Ownership is decided by the identity's platform reach (SSO-3659; ADR 2026-10-13 §1).** Before any
+ * write, every declared resource is gated on the relation the signed-in identity holds on the live
+ * object in the platform authorization graph — `manager` (direct, or inherited through `parent` from its
+ * environment / workspace), `viewer`, or none — read from `GET /api/v1/access/mine?type=…&relation=…`
+ * (the platform reverse index, each candidate confirmed by a forward check; `tenant:access.read`).
+ * `manager` ⇒ the normal converge; `viewer` ⇒ the resource may be declared `readOnly: true` as a
+ * dependency and must MATCH (any diff is `access_read_only`); none ⇒ `access_not_owned` — not visible,
+ * never adopted, imported or converged. A CREATE needs `manager` on the parent (`environment:<id>`, or
+ * the workspace for the production plane / an environment / the custom domain); creator-becomes-manager
+ * on the platform then makes this identity the resource's manager — no grant step, no race. A failed gate
+ * is a [ChangeAction.ERROR] row (red plan, non-zero exit) and [apply] refuses the whole plan before
+ * writing. **One owning repository per resource:** a live resource another receipt ([peers]) records as
+ * owned is `access_owned_elsewhere` unless declared `readOnly: true` here. Note that the public
+ * `POST /api/v1/fga/check` / `list-objects` evaluate the TENANT's own authorization model over the
+ * environment-partitioned tenant tuple store, not the platform resource graph — `/api/v1/access/mine` is
+ * the platform graph's list-objects, and the one customer-plane read of it that exists.
+ *
  * [clients] yields a tenant-scoped [ProductApiClient] bound to an environment slug (`null` ⇒ the
  * production plane); [persist] is invoked after every successful write so the receipt on disk always
  * reflects reality even when a later step fails.
@@ -134,6 +206,20 @@ internal class ProvisionEngine(
      * `customDomain` singleton, and so of its access object `custom_domain:<workspaceId>`.
      */
     private val workspaceId: String? = null,
+    /**
+     * SSO-3659 — the signed-in identity's platform subject (`client:<clientId>` / `member:<sub>`), derived
+     * from the token by the caller exactly as product-api derives it. Recorded on the receipt as the
+     * ownership marker ([ProvisionReceipt.subject]); the gate itself never sends it — `/api/v1/access/mine`
+     * reports the CALLER's own reach, so the subject is always the token's, never the file's.
+     */
+    private val subject: String? = null,
+    /**
+     * SSO-3659 — receipts of OTHER repositories ("one owning repository per resource"): a live resource one
+     * of them records as owned is `access_owned_elsewhere` here unless declared `readOnly: true`. A peer
+     * whose [ProvisionReceipt.subject] equals [subject] is the same identity and is ignored. The hub's
+     * client row carries no owner tag, so this guard only sees the receipts it is handed.
+     */
+    private val peers: List<ProvisionReceipt> = emptyList(),
 ) {
 
     /**
@@ -186,9 +272,14 @@ internal class ProvisionEngine(
         val changes = mutableListOf<PlannedChange>()
         // Environment slugs known so far (owned / live), so dependants can be probed in the right plane.
         val envSlugs = mutableMapOf<String, String>()
+        val reach = Reach()
         orderForApply(file.resources).forEach { r ->
             val owned = ownedByKey[r.key]
-            val change = probe(r, file, owned, envSlugs).let { c -> planGrants(r, c, planSlug(r, file, envSlugs), owned) }
+            val slug = planSlug(r, file, envSlugs)
+            // SSO-3659 — the ownership gate sits between the live lookup and everything that would write:
+            // a resource that fails it plans no grants (its object may not even be visible to this identity).
+            val change = gate(r, probe(r, file, owned, envSlugs), file, envSlugs, slug, reach)
+                .let { c -> if (c.action == ChangeAction.ERROR || c.readOnly) c else planGrants(r, c, slug, owned) }
             changes += change
             if (r.kind == ProvisionFile.KIND_ENVIRONMENT && change.liveId != null) {
                 // The RESOLVED slug (a `{{env.NAME}}` placeholder names a per-run sandbox), never the raw spec.
@@ -272,6 +363,328 @@ internal class ProvisionEngine(
         return change.copy(reason = change.reason + note, grantAdds = adds, grantRemoves = removes)
     }
 
+    // ── ownership gate (SSO-3659; ADR 2026-10-13 §1) ─────────────────────────────────────────────
+
+    /**
+     * The signed-in identity's own platform reach, read lazily per `(type, relation)` from
+     * `GET /api/v1/access/mine` and cached for one plan / import pass. Workspace-level: the environment is
+     * an object in that graph, never a partition, so every read goes through the production-plane client.
+     * A truncated reverse walk on the platform side can only SHORTEN an answer (fail closed), never widen it.
+     */
+    private inner class Reach {
+        private val cache = HashMap<Pair<String, String>, Set<String>>()
+        private var environments: List<JsonNode>? = null
+
+        /** The ids (percent-decoded AND as sent) of every `type` object the identity holds [relation] on. */
+        fun ids(type: String, relation: String): Set<String> = cache.getOrPut(type to relation) {
+            try {
+                listItems(clients(null).listMyAccess(type, relation), "data")
+                    .mapNotNull { n -> n.takeIf { it.isString }?.asString()?.takeIf { it.startsWith("$type:") }?.substringAfter(':') }
+                    .flatMap { listOf(it, decodePlatformId(it)) }
+                    .toSet()
+            } catch (ex: ProductApiException) {
+                throw reachFailure(ex)
+            }
+        }
+
+        /** The relation held on `type:id` — `manager` implies `viewer`, so the stronger one is answered first. */
+        fun on(ref: String): Access {
+            val type = ref.substringBefore(':')
+            val id = ref.substringAfter(':')
+            return when {
+                id in ids(type, RELATION_MANAGER) -> Access.MANAGER
+                id in ids(type, RELATION_VIEWER) -> Access.VIEWER
+                else -> Access.NONE
+            }
+        }
+
+        /**
+         * Whether the identity manages the workspace (`workspace#manager` is the model's alias of `admin`). A
+         * session without a `tnt` cannot name the workspace, but it is signed in to exactly one — so a non-empty
+         * answer is that one.
+         */
+        fun managesWorkspace(): Boolean {
+            val ids = ids(OBJECT_TYPE_WORKSPACE, RELATION_MANAGER)
+            return if (workspaceId != null) workspaceId in ids else ids.isNotEmpty()
+        }
+
+        fun managesParent(parentRef: String): Boolean =
+            if (parentRef.startsWith("$OBJECT_TYPE_WORKSPACE:")) managesWorkspace() else on(parentRef) == Access.MANAGER
+
+        /** The workspace's environments (one list per pass). */
+        fun environments(): List<JsonNode> = environments ?: try {
+            listItems(clients(null).listEnvironments(), "environments").also { environments = it }
+        } catch (ex: ProductApiException) {
+            throw ProvisionException("could not list the workspace's environments to resolve a resource's parent (${ex.message})")
+        }
+
+        fun environmentId(slug: String): String? = environments().firstOrNull { it.str("slug") == slug }?.str("id")
+    }
+
+    /**
+     * Gate one probed resource on the identity's reach. The verdict table of ADR 2026-10-13 §1, plus the
+     * "one owning repository" rule: `manager` ⇒ converge (unless another receipt owns it); `viewer` ⇒ only a
+     * matching `readOnly: true` reference; none ⇒ not visible; a create ⇒ `manager` on the parent.
+     */
+    private fun gate(r: ProvisionResource, change: PlannedChange, file: ProvisionFile, envSlugs: Map<String, String>, slug: String?, reach: Reach): PlannedChange {
+        if (change.action == ChangeAction.ERROR) return change
+        val liveId = change.liveId
+        if (liveId != null) {
+            val ref = objectRef(r.kind, liveId, slug)
+            // Containment is the model's own rule (`manager = this ∪ parent.manager`): an object the reverse index does
+            // not list — a singleton that was reset out of band and so has no tuple yet, a row without its `parent`
+            // edge — is still this identity's to manage when it manages the parent. The platform re-checks every write
+            // server-side, so this can never admit a write the platform would refuse.
+            val access = reach.on(ref).let { direct ->
+                if (direct == Access.NONE && parentRef(r, file, envSlugs, slug, reach)?.let { reach.managesParent(it) } == true) Access.MANAGER else direct
+            }
+            val differs = change.diff.isNotEmpty()
+            return when (access) {
+                Access.NONE -> refuse(
+                    r, change, ERROR_NOT_OWNED, access,
+                    "this identity holds no relation on $ref — the resource is not visible to it and cannot be adopted, imported or converged " +
+                        "(a workspace admin grants reach with `thoryn access grant <subject> manager $ref`)",
+                )
+                Access.VIEWER -> when {
+                    !r.readOnly -> refuse(
+                        r, change, ERROR_READ_ONLY, access,
+                        "this identity may only VIEW $ref — declare the resource `readOnly: true` to depend on it without owning it, " +
+                            "or have a workspace admin grant it `manager`",
+                    )
+                    differs -> refuse(
+                        r, change, ERROR_READ_ONLY, access,
+                        "read-only reference differs from the live resource in ${change.diff.size} field(s) (${change.diff.keys.joinToString(", ")}) — " +
+                            "a repository that does not own a resource cannot change it; align the file with what is live",
+                    )
+                    else -> reference(change, access)
+                }
+                Access.MANAGER -> when {
+                    r.readOnly && differs -> refuse(
+                        r, change, ERROR_READ_ONLY, access,
+                        "declared `readOnly: true` but differs from the live resource in ${change.diff.size} field(s) (${change.diff.keys.joinToString(", ")}) — " +
+                            "a read-only reference is never written; drop `readOnly` to converge it from this file, or align the file with what is live",
+                    )
+                    r.readOnly -> reference(change, access)
+                    else -> ownedElsewhere(ref)?.let { owner ->
+                        refuse(
+                            r, change, ERROR_OWNED_ELSEWHERE, access,
+                            "$ref is owned by another repository's receipt ($owner) — one repository owns a resource; declare it `readOnly: true` here to depend on it",
+                        )
+                    } ?: change.copy(access = access.label)
+                }
+            }
+        }
+        // A create. A read-only reference is a dependency on something that exists — it is never created.
+        if (r.readOnly) {
+            return refuse(r, change, ERROR_READ_ONLY, null, "declared `readOnly: true` but nothing matches it live — a read-only reference is never created; declare it without `readOnly` to own it")
+        }
+        val parent = parentRef(r, file, envSlugs, slug, reach)
+            ?: return change.copy(access = Access.MANAGER.label) // the parent environment is created by this very apply: creator-becomes-manager covers both
+        return if (reach.managesParent(parent)) {
+            change.copy(access = Access.MANAGER.label)
+        } else {
+            refuse(r, change, ERROR_NOT_OWNED, null, "creating a ${r.kind} here requires `manager` on its parent $parent, which this identity does not hold")
+        }
+    }
+
+    private fun refuse(r: ProvisionResource, change: PlannedChange, code: String, access: Access?, why: String): PlannedChange =
+        change.copy(action = ChangeAction.ERROR, reason = "$code — $why", error = code, access = access?.label, readOnly = r.readOnly, owned = change.owned)
+
+    /** A read-only reference that exists and matches: a no-op that is never owned (a stale receipt entry is dropped by `apply`). */
+    private fun reference(change: PlannedChange, access: Access): PlannedChange = change.copy(
+        action = ChangeAction.NOOP,
+        reason = "read-only reference (${access.label}) — exists and matches; this file does not own it" +
+            if (change.owned != null) "; dropped from the receipt" else "",
+        readOnly = true, access = access.label, adopted = false, diff = emptyMap(),
+    )
+
+    /**
+     * The platform object a CREATE needs `manager` on: the workspace for an environment, the custom domain and
+     * any production-plane resource; `environment:<id>` for a resource inside an existing sandbox; `null` when
+     * the sandbox is an `environment` resource of this file that does not exist yet (it is created first).
+     */
+    private fun parentRef(r: ProvisionResource, file: ProvisionFile, envSlugs: Map<String, String>, slug: String?, reach: Reach): String? {
+        val workspace = "$OBJECT_TYPE_WORKSPACE:${workspaceId ?: "(this workspace)"}"
+        if (r.kind == ProvisionFile.KIND_ENVIRONMENT || r.kind in ProvisionFile.WORKSPACE_KINDS) return workspace
+        val envRef = r.environment ?: return workspace
+        if (file.environmentResource(envRef) != null && envSlugs[envRef] == null) return null
+        val envSlug = slug ?: return workspace
+        if (envSlug == ThorynConfig.PRODUCTION_ENV_SLUG) return workspace
+        // An environment the workspace does not list cannot be anyone's but a workspace manager's to fill (the API
+        // refuses the unknown plane either way); never a verdict invented from a slug.
+        val id = reach.environmentId(envSlug) ?: return workspace
+        return objectRef(ProvisionFile.KIND_ENVIRONMENT, id, null)
+    }
+
+    /** The label of the FIRST peer receipt recording [ref] as owned (another identity's), else null. */
+    private fun ownedElsewhere(ref: String): String? = peers.firstNotNullOfOrNull { peer ->
+        if (peer.subject != null && peer.subject == subject) return@firstNotNullOfOrNull null
+        peer.resources.firstOrNull { o -> runCatching { objectRef(o.kind, o.id, o.environment) }.getOrNull() == ref }
+            ?.let { peer.file.path + (peer.subject?.let { s -> " ($s)" } ?: "") }
+    }
+
+    /** Fail closed: the reach read names the scope it needs; every other failure keeps its cause. */
+    private fun reachFailure(ex: ProductApiException): ProvisionException = when {
+        ex.isInsufficientScope -> ProvisionException(
+            "could not read this identity's reach (${ex.message}) — ownership is decided by the relation it holds on each resource, " +
+                "which needs the '${AccessCommand.SCOPE_READ}' scope. Sign in with `thoryn login --scope ${AccessCommand.SCOPE_READ}` " +
+                "(or grant the CI identity that scope) and re-run.",
+        )
+        else -> ProvisionException("could not read this identity's reach (${ex.message}); nothing was planned or written")
+    }
+
+    // ── import (SSO-3659; ADR 2026-10-13 §2) ─────────────────────────────────────────────────────
+
+    /**
+     * The inverse of [plan], bounded by the same relations: every live platform object the identity holds
+     * `manager` on is rendered as an OWNED entry (its receipt row `adopted: true` — never deleted by destroy),
+     * every one it may only `viewer` as `readOnly: true`; an object another receipt ([peers]) owns is rendered
+     * `readOnly: true` as well. Nothing the identity has no relation to is listed by the platform, so nothing
+     * it has no relation to can be imported — the file cannot claim by being written. Resources [existing]
+     * already declares (or [receipt] already owns) are left out; what is reachable but cannot be rendered as a
+     * `provision.yaml` entry lands on [ImportResult.skipped] with the reason. Reads only; writes nothing.
+     */
+    fun import(existing: ProvisionFile?, receipt: ProvisionReceipt?): ImportResult {
+        val reach = Reach()
+        val out = mutableListOf<ImportedResource>()
+        val skipped = mutableListOf<String>()
+        fun skip(why: String) { skipped += why }
+        val declared = existing?.resources.orEmpty()
+        val ownedRefs = receipt?.resources.orEmpty().mapNotNull { o -> runCatching { objectRef(o.kind, o.id, o.environment) }.getOrNull() }.toSet()
+        val names = declared.map { it.key }.toMutableSet()
+        fun uniqueName(kind: String, base: String): String {
+            val root = slugName(base).ifEmpty { kind.lowercase() }
+            var candidate = root
+            var n = 2
+            while (!names.add("$kind/$candidate")) candidate = "$root-${n++}".take(63).trimEnd('-')
+            return candidate
+        }
+        // Every object of a kind the identity holds any relation on, strongest first.
+        fun reachable(type: String): List<Pair<String, Access>> {
+            val managed = reach.ids(type, RELATION_MANAGER)
+            val viewed = reach.ids(type, RELATION_VIEWER)
+            return (managed.map { it to Access.MANAGER } + viewed.filter { it !in managed }.map { it to Access.VIEWER })
+                .filter { (id, _) -> id == decodePlatformId(id) } // the decoded spelling is the product id; the encoded twin duplicates it
+                .sortedBy { it.first }
+        }
+        fun readOnlyFor(ref: String, access: Access): Pair<Boolean, String?> = when {
+            access == Access.VIEWER -> true to null
+            else -> ownedElsewhere(ref)?.let { true to "owned by another repository's receipt ($it) — imported as a read-only reference" } ?: (false to null)
+        }
+        fun add(kind: String, name: String, environment: String?, environmentSlug: String?, id: String, access: Access, spec: Map<String, Any?>, attributes: Map<String, String> = emptyMap(), note: String? = null) {
+            val ref = objectRef(kind, id, environmentSlug)
+            if (ref in ownedRefs) return
+            val (readOnly, ownerNote) = readOnlyFor(ref, access)
+            val resource = ProvisionResource(kind = kind, name = name, environment = environment, spec = spec, readOnly = readOnly)
+            val owned = if (readOnly) null else OwnedResource(kind, name, id, environmentSlug, attributes, adopted = true)
+            out += ImportedResource(resource, id, access, owned, listOfNotNull(ownerNote, note).joinToString("; ").ifEmpty { null })
+        }
+
+        // Environments first: a child rendered below names its sandbox by the resource NAME when the same import adds it.
+        val envName = declared.filter { it.kind == ProvisionFile.KIND_ENVIRONMENT }.associate { it.spec["slug"].toString() to it.name }.toMutableMap()
+        val sandboxSlugs = reach.environments().filter { it.str("kind") != ThorynConfig.PRODUCTION_ENV_SLUG && it.str("slug") != ThorynConfig.PRODUCTION_ENV_SLUG }.mapNotNull { it.str("slug") }
+        reachable(OBJECT_TYPE_ENVIRONMENT).forEach { (id, access) ->
+            val node = reach.environments().firstOrNull { it.str("id") == id } ?: return@forEach skip("environment:$id — listed as reachable but not in the workspace's environment list")
+            val slug = node.str("slug") ?: return@forEach
+            if (slug == ThorynConfig.PRODUCTION_ENV_SLUG || node.str("kind") == ThorynConfig.PRODUCTION_ENV_SLUG) return@forEach // the production plane is not a declarable resource
+            if (declared.any { it.kind == ProvisionFile.KIND_ENVIRONMENT && it.spec["slug"] == slug }) return@forEach
+            val name = uniqueName(ProvisionFile.KIND_ENVIRONMENT, slug)
+            envName[slug] = name
+            add(ProvisionFile.KIND_ENVIRONMENT, name, null, null, id, access, linkedMapOf("slug" to slug, "displayName" to (node.str("name") ?: slug)), mapOf("slug" to slug))
+        }
+        /** The environment a per-environment object lives in: the first plane that answers its GET (production first). */
+        fun locate(read: (ProductApiClient) -> JsonNode): Pair<String?, JsonNode>? =
+            (listOf<String?>(null) + sandboxSlugs).firstNotNullOfOrNull { plane -> fetchOrNull { read(clients(plane)) }?.let { plane to it } }
+        fun environmentField(slug: String?): String? = slug?.let { envName[it] ?: it }
+
+        reachable(OBJECT_TYPE_APPLICATION).forEach { (id, access) ->
+            if (declared.any { it.kind == ProvisionFile.KIND_APPLICATION && it.spec["clientId"] == id }) return@forEach
+            val (plane, n) = locate { it.getApplication(id) } ?: return@forEach skip("application:$id — listed as reachable but not readable in any environment")
+            val spec = linkedMapOf<String, Any?>("clientId" to id, "displayName" to (n.str("displayName") ?: id))
+            n.str("clientType")?.let { spec["clientType"] = it }
+            listOf("grantTypes", "redirectUris", "postLogoutRedirectUris", "scopes").forEach { f -> (plain(n[f] ?: return@forEach) as? List<*>)?.takeIf { it.isNotEmpty() }?.let { spec[f] = it } }
+            val confidential = !n.str("clientType").equals("public", ignoreCase = true)
+            add(
+                ProvisionFile.KIND_APPLICATION, uniqueName(ProvisionFile.KIND_APPLICATION, n.str("displayName") ?: id), environmentField(plane), plane, id, access, spec,
+                buildMap { (spec["redirectUris"] as? List<*>)?.firstOrNull()?.toString()?.let { put("redirectUri", it) } },
+                if (confidential && access == Access.MANAGER) "its existing client secret is not recoverable; `thoryn clients rotate-secret $id --secret-file <path>` mints a new one" else null,
+            )
+        }
+        reachable(OBJECT_TYPE_USER).forEach { (id, access) ->
+            val (plane, n) = locate { it.getUser(id) } ?: return@forEach skip("user:$id — listed as reachable but not readable in any environment")
+            val email = n.str("email") ?: return@forEach skip("user:$id — no email on the live record")
+            if (declared.any { it.kind == ProvisionFile.KIND_USER && it.spec["email"].toString().equals(email, ignoreCase = true) }) return@forEach
+            val spec = linkedMapOf<String, Any?>("email" to email)
+            n["emailVerified"]?.takeIf { it.isBoolean }?.let { spec["emailVerified"] = it.asBoolean() }
+            add(ProvisionFile.KIND_USER, uniqueName(ProvisionFile.KIND_USER, email.substringBefore('@')), environmentField(plane), plane, id, access, spec, mapOf("email" to email))
+        }
+        reachable(OBJECT_TYPE_FEDERATION_MEMBER).forEach { (id, access) ->
+            val (plane, n) = locate { it.getFederationMember(id) } ?: return@forEach skip("federation_member:$id — listed as reachable but not readable in any environment")
+            if (declared.any { it.kind == ProvisionFile.KIND_FEDERATION_MEMBER && it.spec["displayName"] == n.str("displayName") }) return@forEach
+            val spec = linkedMapOf<String, Any?>("providerType" to (n.str("providerType") ?: "oidc"))
+            listOf("displayName", "discoveryUrl", "clientId").forEach { f -> n.str(f)?.let { spec[f] = it } }
+            add(
+                ProvisionFile.KIND_FEDERATION_MEMBER, uniqueName(ProvisionFile.KIND_FEDERATION_MEMBER, n.str("displayName") ?: id), environmentField(plane), plane, id, access, spec,
+                buildMap { spec["providerType"]?.toString()?.let { put("providerType", it) } },
+                if (access == Access.MANAGER) "its upstream client secret is write-only: add `clientSecretEnv: <VAR>` before an update is converged" else null,
+            )
+        }
+        // The per-environment singletons: the object id IS the environment slug (`production` for the plane without one).
+        fun singletonPlane(id: String): String? = if (id == ThorynConfig.PRODUCTION_ENV_SLUG) null else id.takeIf { it in sandboxSlugs }
+        fun singletonDeclared(kind: String, plane: String?): Boolean =
+            declared.any { it.kind == kind && (it.environment == plane || (plane != null && it.environment == envName[plane])) }
+        reachable(OBJECT_TYPE_EMAIL_PROVIDER).forEach { (id, access) ->
+            if (id != ThorynConfig.PRODUCTION_ENV_SLUG && id !in sandboxSlugs) return@forEach skip("email_provider:$id — no environment with that slug")
+            val plane = singletonPlane(id)
+            if (singletonDeclared(ProvisionFile.KIND_EMAIL_PROVIDER, plane)) return@forEach
+            val n = fetchOrNull { clients(plane).getEmailProvider() } ?: return@forEach
+            if (n["configured"]?.asBoolean() == false) return@forEach
+            val spec = linkedMapOf<String, Any?>()
+            listOf("smtpHost", "smtpUsername", "transportSecurity", "fromAddress", "fromName", "replyTo", "providerType").forEach { f -> n.str(f)?.let { spec[f] = it } }
+            n["smtpPort"]?.takeIf { it.isNumber }?.let { spec["smtpPort"] = it.asInt() }
+            n["enabled"]?.takeIf { it.isBoolean }?.let { spec["enabled"] = it.asBoolean() }
+            if (spec["smtpHost"] == null) return@forEach skip("email_provider:$id — configured without an SMTP host; not a declarable emailProvider")
+            add(
+                ProvisionFile.KIND_EMAIL_PROVIDER, ProvisionFile.KIND_EMAIL_PROVIDER, environmentField(plane), plane, n.str("providerType") ?: "email-provider", access, spec,
+                buildMap { n.str("smtpHost")?.let { put("smtpHost", it) }; n.str("fromAddress")?.let { put("fromAddress", it) } },
+                if (access == Access.MANAGER) "the SMTP password is write-only: add `smtpPasswordEnv: <VAR>` before an update is converged" else null,
+            )
+        }
+        reachable(OBJECT_TYPE_LOGIN_THEME).forEach { (id, access) ->
+            if (id != ThorynConfig.PRODUCTION_ENV_SLUG && id !in sandboxSlugs) return@forEach skip("login_theme:$id — no environment with that slug")
+            val plane = singletonPlane(id)
+            if (singletonDeclared(ProvisionFile.KIND_LOGIN_THEME, plane)) return@forEach
+            val stored = fetchOrNull { clients(plane).getLoginBranding() }?.get("stored") ?: return@forEach
+            val fields = listOf("logoUrl", "primaryColor", "backgroundColor", "borderRadiusPx", "theme", "cssVariables")
+            val spec = stored.toMap(fields).filterValues { it != null && !(it is Map<*, *> && it.isEmpty()) }
+            if (spec.isEmpty()) return@forEach // nothing stored ⇒ the platform default ⇒ nothing to declare
+            add(ProvisionFile.KIND_LOGIN_THEME, ProvisionFile.KIND_LOGIN_THEME, environmentField(plane), plane, "login-theme", access, spec)
+        }
+        reachable(OBJECT_TYPE_LOGIN_METHODS).forEach { (id, access) ->
+            if (id != ThorynConfig.PRODUCTION_ENV_SLUG && id !in sandboxSlugs) return@forEach skip("login_methods:$id — no environment with that slug")
+            val plane = singletonPlane(id)
+            if (singletonDeclared(ProvisionFile.KIND_LOGIN_METHODS, plane)) return@forEach
+            val stored = fetchOrNull { clients(plane).getLoginMethods() }?.get("stored")?.takeIf { !it.isNull && it.isArray } ?: return@forEach
+            val methods = stored.toList().map { it.asString() }
+            add(ProvisionFile.KIND_LOGIN_METHODS, ProvisionFile.KIND_LOGIN_METHODS, environmentField(plane), plane, "login-methods", access, linkedMapOf("methods" to methods), mapOf("methods" to methods.joinToString(",")))
+        }
+        reachable(OBJECT_TYPE_LOGIN_FLOW).forEach { (id, _) ->
+            skipped += "login_flow:$id — a loginFlow is declared by its templateId, which the active flow does not record; declare it by hand"
+        }
+        reachable(OBJECT_TYPE_CUSTOM_DOMAIN).forEach { (id, access) ->
+            if (declared.any { it.kind == ProvisionFile.KIND_CUSTOM_DOMAIN }) return@forEach
+            val body = fetchOrNull { clients(null).getCustomDomain() } ?: return@forEach
+            val view = CustomDomainView.of(body)
+            val host = view.domain?.takeIf { it.isNotBlank() } ?: return@forEach
+            if (view.state == CustomDomainView.NONE) return@forEach
+            add(
+                ProvisionFile.KIND_CUSTOM_DOMAIN, ProvisionFile.KIND_CUSTOM_DOMAIN, null, null, id, access, linkedMapOf("host" to host),
+                buildMap { put("host", host); put("state", view.state); view.issuer?.let { put("issuer", it) } },
+            )
+        }
+        return ImportResult(out, skipped)
+    }
+
     // ── apply ────────────────────────────────────────────────────────────────────────────────────
 
     /**
@@ -289,6 +702,15 @@ internal class ProvisionEngine(
         confirmSlug: String?,
         persist: (ProvisionReceipt) -> Unit,
     ): ProvisionReceipt {
+        // SSO-3659 — a plan with an ownership error is refused WHOLE, before the first write: a red plan on a
+        // pull request must mean "nothing would have happened", and a partial apply would silently own the half
+        // this identity may touch.
+        if (plan.hasErrors) {
+            throw ProvisionException(
+                "${plan.errors.size} resource(s) failed the ownership check — nothing was written:\n  " +
+                    plan.errors.joinToString("\n  ") { "${it.kind} ${it.name}: ${it.reason}" },
+            )
+        }
         if (plan.removesOnProductionPlane && confirmSlug.isNullOrBlank()) {
             throw ProvisionException("--prune would remove resources on the PRODUCTION plane; re-run with --confirm <workspace-slug>.")
         }
@@ -298,6 +720,8 @@ internal class ProvisionEngine(
             appliedAt = now().toString(),
             cliVersion = cliVersion,
             workspace = workspace ?: receipt?.workspace,
+            // SSO-3659 — the ownership marker: who applied this receipt (kept from the receipt when unknown here).
+            subject = subject ?: receipt?.subject,
             resources = owned.toList(),
         )
         fun record(o: OwnedResource) {
@@ -333,6 +757,15 @@ internal class ProvisionEngine(
         val pendingGrants = mutableListOf<Pair<ProvisionResource, String>>()
         plan.changes.filter { it.resource != null }.forEach { change ->
             val r = change.resource!!
+            // SSO-3659 — a read-only reference is never written and never owned: a receipt entry from before the
+            // file declared it `readOnly` is dropped (disowned, not deleted) so destroy / --prune cannot reach it.
+            if (r.readOnly) {
+                if (owned.removeIf { it.key == r.key }) {
+                    out.println("  = ${r.kind} ${r.name}: read-only reference — dropped from the receipt, left in place")
+                    persist(current())
+                }
+                return@forEach
+            }
             val resolved: OwnedResource? = when (change.action) {
                 ChangeAction.CREATE -> create(r, file, owned).also { record(it) }
                 ChangeAction.UPDATE -> update(r, file, owned, change).also { record(it) }
@@ -1054,6 +1487,58 @@ internal class ProvisionEngine(
 
         /** SSO-3413 — the customDomain receipt id when the session carries no `tnt` (grants then cannot name it). */
         const val CUSTOM_DOMAIN_FALLBACK_ID = "custom-domain"
+
+        // ── SSO-3659 — the ownership gate's vocabulary (ADR 2026-10-13 §1) ──
+
+        /** The resource may only be viewed (or is declared `readOnly`) and the file would change it. */
+        const val ERROR_READ_ONLY = "access_read_only"
+        /** No relation on the resource, or no `manager` on the parent a create needs. */
+        const val ERROR_NOT_OWNED = "access_not_owned"
+        /** Another repository's receipt records the resource as owned. */
+        const val ERROR_OWNED_ELSEWHERE = "access_owned_elsewhere"
+
+        const val RELATION_MANAGER = "manager"
+        const val RELATION_VIEWER = "viewer"
+
+        /** The platform object types (`GET /api/v1/access/mine?type=…`); the per-kind mapping is [objectRef]. */
+        const val OBJECT_TYPE_WORKSPACE = "workspace"
+        const val OBJECT_TYPE_ENVIRONMENT = "environment"
+        const val OBJECT_TYPE_APPLICATION = "application"
+        const val OBJECT_TYPE_USER = "user"
+        const val OBJECT_TYPE_FEDERATION_MEMBER = "federation_member"
+        const val OBJECT_TYPE_EMAIL_PROVIDER = "email_provider"
+        const val OBJECT_TYPE_LOGIN_THEME = "login_theme"
+        const val OBJECT_TYPE_LOGIN_FLOW = "login_flow"
+        const val OBJECT_TYPE_LOGIN_METHODS = "login_methods"
+        const val OBJECT_TYPE_CUSTOM_DOMAIN = "custom_domain"
+
+        /**
+         * A platform id as `/api/v1/access/mine` renders it is percent-encoded (`@`, `#`, whitespace — the
+         * SSO-3123 `PlatformRefs.encodeId` mapping); the product id the engine compares against is the raw form.
+         */
+        fun decodePlatformId(encoded: String): String {
+            if (!encoded.contains('%')) return encoded
+            val bytes = java.io.ByteArrayOutputStream()
+            var i = 0
+            while (i < encoded.length) {
+                val c = encoded[i]
+                if (c == '%' && i + 2 < encoded.length && encoded[i + 1].isHexDigit() && encoded[i + 2].isHexDigit()) {
+                    bytes.write(encoded.substring(i + 1, i + 3).toInt(16)); i += 3
+                } else {
+                    bytes.write(c.toString().toByteArray(Charsets.UTF_8)); i++
+                }
+            }
+            return bytes.toByteArray().toString(Charsets.UTF_8)
+        }
+
+        private fun Char.isHexDigit(): Boolean = this in '0'..'9' || this in 'a'..'f' || this in 'A'..'F'
+
+        /** A resource name ([ProvisionFile.NAME_PATTERN]) derived from a display name / slug / email local part. */
+        fun slugName(raw: String): String = raw.lowercase()
+            .replace(Regex("[^a-z0-9]+"), "-")
+            .trim('-')
+            .take(63)
+            .trimEnd('-')
         val ENV_PLACEHOLDER = Regex("""\{\{\s*env\.([A-Za-z_][A-Za-z0-9_]*)\s*}}""")
 
         /** Kinds the customer plane can delete; `loginTheme` / `loginFlow` have no delete surface (`loginMethods` resets via DELETE, SSO-3100). */
