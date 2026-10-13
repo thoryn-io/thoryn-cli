@@ -64,6 +64,13 @@ import java.util.concurrent.Callable
  *    (`gh variable set … --env`, the customer's own `gh` login) on every apply. `plan` prints the pending publish
  *    as a line and writes nothing. An unreachable target is `publish_target_unreachable` AFTER the client exists
  *    and is in the receipt: exit [CommandSupport.EXIT_HTTP_ERROR], naming the `gh variable set` to run by hand.
+ *  - **SSO-3659 (ADR 2026-10-13 converge §5)** — a confidential application's `secretSink:` receives its minted
+ *    secret through [CliDeclaredSecretSink] right after `apply` converged and recorded the client: `kubernetesSecret`
+ *    via the operator's own `kubectl` (value on stdin, never argv; the namespace is never created), `file` via the
+ *    owner-only writer (no overwrite unless `--force`). A sink that cannot be reached falls back to `--secret-file` /
+ *    the TTY; when nothing reaches, the client stays recorded and `apply` exits [SecretIo.EXIT_NO_SECRET] with
+ *    `undelivered_secrets`, naming the resource and `thoryn clients rotate-secret <clientId> --secret-file <path>`.
+ *    `plan` prints the intended delivery as a line and mints nothing.
  */
 @Command(
     name = "provision",
@@ -139,6 +146,8 @@ class ProvisionCommand : Callable<Int> {
             format: OutputFormat = OutputFormat.TABLE,
             /** SSO-3668 — `apply` passes the `gh variable set` publisher; the read-only verbs reach nothing. */
             outputSink: ProvisionEngine.OutputSink = ProvisionEngine.OutputSink.unavailable(),
+            /** SSO-3659 — `apply` passes the kubectl / file delivery; the read-only verbs reach nothing. */
+            declaredSecretSink: ProvisionEngine.DeclaredSecretSink = ProvisionEngine.DeclaredSecretSink.unavailable(),
         ): ProvisionEngine = ProvisionEngine(
             clients = { slug -> CommandSupport.gatewayClient(gateway, tokens, applyEnvironment = false, environmentOverride = slug ?: "") },
             // SSO-3414 — with --output json|yaml stdout carries ONE document; the per-resource progress goes to stderr.
@@ -150,14 +159,20 @@ class ProvisionCommand : Callable<Int> {
             // SSO-3659 — who applied, on the receipt (display / audit; SSO-3673: the owner marker is the platform's).
             subject = subjectOf(tokens),
             outputSink = outputSink,
+            declaredSecretSink = declaredSecretSink,
         )
 
         /** SSO-3668 — test seam: how `gh` is run for `publishTo:`. Production spawns the customer's real `gh`. */
         @Volatile
         internal var ghRunner: () -> GhRunner = { ProcessGhRunner() }
 
+        /** SSO-3659 — test seam: how `kubectl` is run for a `kubernetesSecret` sink. Production spawns the operator's real `kubectl`. */
+        @Volatile
+        internal var kubectlRunner: () -> KubectlRunner = { ProcessKubectlRunner() }
+
         internal fun resetForTest() {
             ghRunner = { ProcessGhRunner() }
+            kubectlRunner = { ProcessKubectlRunner() }
         }
 
         /**
@@ -208,6 +223,8 @@ class ProvisionCommand : Callable<Int> {
             plan.changes.filter { it.publishTo.isNotEmpty() }.forEach { c ->
                 c.publishTo.forEach { t -> println("      ${c.kind} ${c.name}: publish clientId → ${t.label}") }
             }
+            // SSO-3659 — where apply will deliver the minted client secret (a line; no secret exists at plan time).
+            plan.changes.forEach { c -> c.secretSink?.let { t -> println("      ${c.kind} ${c.name}: deliver client secret → ${t.label}") } }
             // SSO-3413 / SSO-3414 — a customDomain's state, the issuer in use and the DNS records to publish.
             plan.changes.forEach { c ->
                 val d = c.customDomain ?: return@forEach
@@ -223,6 +240,7 @@ class ProvisionCommand : Callable<Int> {
                     "${plan.removes.size} to remove, ${plan.changes.count { it.action == ChangeAction.NOOP }} unchanged" +
                     (if (plan.grantChanges > 0) ", ${plan.grantChanges} grant change(s)" else "") +
                     (if (plan.publishes > 0) ", ${plan.publishes} output(s) to publish" else "") +
+                    (if (plan.deliveries > 0) ", ${plan.deliveries} client secret(s) to deliver" else "") +
                     (if (plan.hasErrors) ", ${plan.errors.size} ownership error(s)." else "."),
             )
         }
@@ -310,6 +328,9 @@ class ProvisionCommand : Callable<Int> {
         @Option(names = ["--force-stdout"], description = ["Allow printing a minted client secret to a non-interactive stdout (pipe/redirect). Off by default."])
         var forceStdout: Boolean = false
 
+        @Option(names = ["--force"], description = ["SSO-3659 — overwrite an existing file named by a resource's `secretSink: { kind: file, path }`. Off by default."])
+        var force: Boolean = false
+
         @Option(names = ["--wait"], description = ["SSO-3414 — after applying, block until the file's customDomain is --wait-until (default ACTIVE), verifying it each round; bounded by --wait-timeout."])
         var wait: Boolean = false
 
@@ -335,6 +356,8 @@ class ProvisionCommand : Callable<Int> {
                     gateway, tokens, CliSecretSink.toSecretIo(secretFile, forceStdout), format,
                     // SSO-3668 — the only verb that publishes; the publisher touches gh only when a target is reached for.
                     outputSink = GitHubActionsVariablePublisher(ghRunner()),
+                    // SSO-3659 — the only verb that mints; the delivery touches kubectl / a file only when a sink is declared.
+                    declaredSecretSink = CliDeclaredSecretSink(kubectlRunner(), overwriteFiles = force),
                 )
             } catch (ex: ProvisionException) {
                 System.err.println("Error: ${ex.message}"); return CommandSupport.EXIT_USAGE
@@ -373,12 +396,17 @@ class ProvisionCommand : Callable<Int> {
                     CommandSupport.emitValue(format, result, "")
                 }
                 // SSO-3113 — the resources exist and are owned, but a minted client secret was not surfaced.
-                val lost = engine.undeliveredSecrets
+                // SSO-3659 — `undelivered_secrets`: raised AFTER the receipt is written; names each resource and its recovery.
+                val lost = engine.undeliveredSecretDetails
                 if (lost.isNotEmpty()) {
                     System.err.println(
-                        "The client secret of ${lost.size} created application(s) could not be delivered (${lost.joinToString(", ")}). " +
-                            "Re-run with --secret-file <path> (or --force-stdout) next time; for these, mint a new secret now with " +
-                            lost.joinToString("; ") { "`thoryn clients rotate-secret $it --secret-file <path>`" } + ".",
+                        "Error: ${ProvisionEngine.ERROR_UNDELIVERED_SECRETS} — every resource was converged and recorded in the receipt, but " +
+                            "the client secret of ${lost.size} created application(s) could not be delivered:\n  " +
+                            lost.joinToString("\n  ") { u ->
+                                "${u.resourceKey} (clientId ${u.clientId})" +
+                                    (u.target?.let { " → ${it.label}" } ?: "") + ": ${u.reason}\n    mint a new secret by hand: ${u.recovery}"
+                            } + "\n" +
+                            (if (lost.any { it.target == null }) "Re-run with --secret-file <path> (or --force-stdout) next time, or declare a `secretSink:` on the resource." else "Fix the sink and run the recovery command; the next apply mints nothing for an existing client."),
                     )
                     return SecretIo.EXIT_NO_SECRET
                 }

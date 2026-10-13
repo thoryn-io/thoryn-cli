@@ -169,9 +169,14 @@ thoryn examples share    <name> [--output <file>]   # SSO-2876 — export the se
 # plan prints the pending publish as a line; an unreachable target is `publish_target_unreachable` AFTER the client
 # exists and is in the receipt, naming the one `gh variable set` to run by hand. See "Publishing an application's
 # client id to the repository that deploys it" below.
+# SSO-3659 (ADR 2026-10-13 converge §5): a confidential application's `secretSink:` says WHERE its minted client
+# secret is delivered — `kind: kubernetesSecret` (your own `kubectl`, value on stdin, namespace never created) or
+# `kind: file` (owner-only, no overwrite without --force) — right after apply recorded the client. Nothing reaches
+# ⇒ exit 65 `undelivered_secrets` naming `thoryn clients rotate-secret <id> --secret-file <path>`. See "Where a
+# minted secret goes" below.
 thoryn provision plan    [--file <path>] [--prune]                       # read-only: what apply would create / remove (+ grant changes, pending publishes); exit 1 on an ownership error
 thoryn provision apply   [--file <path>] [--prune] [--confirm <ws>] [--yes] \
-                         [--secret-file <path>] [--force-stdout] \
+                         [--secret-file <path>] [--force-stdout] [--force] \
                          [--wait [--wait-until ACTIVE|VERIFIED] [--wait-timeout 15m] [--wait-interval 20s]]
 thoryn provision import  [--file <path>] [--write]                       # SSO-3659 — the inverse of plan: render what this identity may reach as
                                              # provision.yaml entries (manager ⇒ owned, receipt `adopted: true`; viewer or owned by another repository ⇒ `readOnly: true`); --write appends them
@@ -863,6 +868,77 @@ secret-free by construction. If it cannot be delivered the client is **still cre
 recorded** (it exists), and `apply` exits **65** naming
 `thoryn clients rotate-secret <clientId> --secret-file <path>` to mint a fresh one. `plan` marks
 such a create with `(a client secret will be minted and shown once)`.
+
+### Where a minted secret goes — `secretSink:` (SSO-3659)
+
+Per oauthy ADR `2026-10-13-provisioning-as-code-converge-github-app-and-fga-ownership.md` §5, **a secret is
+delivered where it is consumed, never into a CI secret store**: a confidential application declares a
+`secretSink:`, and `apply` hands the one-time client secret to that place the moment the client is
+converged and recorded in the receipt. The `--secret-file` / TTY channel above stays the default when no
+sink is declared, and the fallback when the declared one cannot be reached. The value never enters the
+file, the plan, the receipt, a log, or a `kubectl` argument.
+
+The forge's own login client (`thoryn-cicd/.thoryn/provision.yaml`, the ADR's first consumer), delivered
+into the cluster the job already has a kubeconfig for:
+
+```yaml
+apiVersion: thoryn.io/provision/v1
+resources:
+  - kind: application
+    name: forge-forgejo-login
+    spec:
+      displayName: "Forgejo login"
+      grantTypes: ["authorization_code"]           # no clientType ⇒ confidential ⇒ a secret is minted on create
+      redirectUris: ["https://forge.thoryn.org/user/oauth2/thoryn/callback"]
+    secretSink:
+      kind: kubernetesSecret
+      namespace: forge                             # must already exist — thoryn never creates a namespace
+      name: forgejo-thoryn-login                   # the Secret your Deployment mounts / envFrom's
+      key: client-secret                           # the data key
+```
+
+A local or self-managed shape — an owner-only file next to the deployment that reads it:
+
+```yaml
+    secretSink:
+      kind: file
+      path: .secrets/forgejo-thoryn-login.secret   # 0600; an existing file is NOT overwritten unless `apply --force`
+```
+
+What `thoryn provision` does with it:
+
+- **`plan`** prints the intended delivery as a line (`application forge-forgejo-login: deliver client
+  secret → kubernetesSecret forge/forgejo-thoryn-login key client-secret`; in `--output json`,
+  `changes[].secretSink` and `summary.deliver`) and marks the create `(a client secret will be minted and
+  delivered to …)`. No secret exists at plan time: `plan` mints nothing and runs no `kubectl`.
+- **`apply`** creates the client, **records it in the receipt**, and only then delivers — so a sink that
+  cannot be reached never costs the client its receipt entry. `kubernetesSecret` goes through **your own
+  `kubectl`** (whatever context it is configured with; thoryn handles no cluster credential), the
+  `install-forge` pattern with the value **on stdin, never on argv**:
+  `kubectl version --client` → `kubectl get namespace <ns> -o name` (reachability and existence in one read)
+  → `kubectl -n <ns> create secret generic <name> --from-file=<key>=/dev/stdin --dry-run=client -o yaml` →
+  `kubectl -n <ns> apply -f -`. `file` is the same owner-only (`0600`) writer `--secret-file` uses, refusing
+  to overwrite an existing file unless `apply --force`.
+- **A sink that cannot be reached** (no `kubectl`, a wrong context, a missing namespace, RBAC, an existing
+  file) is a reason, printed with the value redacted; the secret then falls back to `--secret-file` (or an
+  interactive TTY). **When nothing reaches**, the client stays created and recorded and `apply` exits **65**
+  with `undelivered_secrets`, naming the resource, the sink, the reason and the recovery:
+
+  ```
+  Error: undelivered_secrets — every resource was converged and recorded in the receipt, but the client secret of 1 created application(s) could not be delivered:
+    application/forge-forgejo-login (clientId 7f1c…) → kubernetesSecret forge/forgejo-thoryn-login key client-secret: namespace 'forge' is not reachable through the current kubectl context (…); thoryn never creates a namespace
+      mint a new secret by hand: thoryn clients rotate-secret 7f1c… --secret-file <path>
+  ```
+
+  A secret is minted only on create, so the next `apply` of an existing client delivers nothing — the
+  recovery is always `thoryn clients rotate-secret <clientId> --secret-file <path>` (production-clients ADR
+  §3 tier 3), then placing that file's value yourself.
+
+Rules the schema and the loader both enforce: `secretSink` sits on `kind: application` only and only on a
+confidential one (`clientType: public` is minted nothing and is refused); it is refused on a `readOnly: true`
+reference (nothing is minted for a dependency — the owning repository delivers); a `kubernetesSecret` is
+exactly `{ kind, namespace, name, key }` with Kubernetes grammars (namespace: RFC 1123 label; name: RFC 1123
+subdomain; key: `[-._a-zA-Z0-9]+`); a `file` is exactly `{ kind, path }`.
 
 ### Publishing an application's client id to the repository that deploys it (SSO-3668)
 
