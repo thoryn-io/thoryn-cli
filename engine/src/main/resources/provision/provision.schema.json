@@ -44,6 +44,23 @@
           "type": "boolean",
           "default": false
         },
+        "publishTo": {
+          "description": "SSO-3668 (ADR 2026-10-13 production-clients-declared-in-the-config-project §2) — where `apply` PUBLISHES this resource's id once it is converged. `application` only: the clientId is the one output a resource has, and it is public by construction (it appears in every authorization URL) — so a target is always a VARIABLE, never a secret. Published on EVERY apply (an upsert, so a re-created client propagates without a second step), AFTER the resource is converged and recorded in the receipt. A target the signed-in credential cannot reach is the apply error `publish_target_unreachable`: the client exists, the receipt records its id, and the error names the one `gh variable set` a human can run. `plan` prints the pending publish as a line. Refused on a `readOnly` reference (it publishes nothing — the owning repository publishes). The receipt records what was published (kind, repository, environment, name).",
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["kind", "repository", "environment", "name"],
+            "properties": {
+              "kind": { "description": "`githubActionsVariable`: an Actions variable on a GitHub repository's environment, upserted with `gh variable set <name> --body <clientId> --repo <repository> --env <environment>` (the environment is created when absent; an existing environment's protection is never touched).", "enum": ["githubActionsVariable"] },
+              "repository": { "description": "The target repository as `owner/name` (for a production client: the application repository the config project publishes to).", "type": "string", "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?/[A-Za-z0-9._-]{1,100}$" },
+              "environment": { "description": "The target repository's GitHub environment (e.g. `production`); only a job targeting it reads the variable.", "type": "string", "minLength": 1 },
+              "name": { "description": "The Actions variable name, e.g. `THORYN_PRODUCTION_CLIENT_ID`. GitHub reserves the `GITHUB_` prefix.", "type": "string", "pattern": "^(?!GITHUB_)[A-Z_][A-Z0-9_]*$" }
+            }
+          }
+        },
         "grants": {
           "description": "SSO-3113 (epic SSO-3108) — least-privilege ACCESS GRANTS on this resource, converged with it by `apply`: a listed grant that is missing is created, a grant on this object the file no longer lists is revoked (the workspace admin userset `workspace:<id>#admin` is never revoked; grants on objects the file does not own are never touched). The OBJECT is implicit — it derives from the receipt id (`environment:<id>`, `application:<clientId>`, `user:<id>`, `federation_member:<id>`, `<singleton>:<envSlug>`, `custom_domain:<workspace-id>`). Omit to leave the object's grants unmanaged; `[]` declares none. Needs `tenant:access.write` (a session without it fails closed).",
           "type": "array",
@@ -87,6 +104,10 @@
                                 "type": "string", "minLength": 1 },
                       "acceptReSignIn": { "description": "Required `true` when the workspace already has production users: a custom domain changes the workspace's issuer, so every production user signs in again once. Recorded on the claim and in the audit log.",
                                           "type": "boolean" } } } } } },
+        { "if": { "required": ["publishTo"] },
+          "then": { "properties": { "kind": { "const": "application" } } } },
+        { "if": { "properties": { "readOnly": { "const": true } }, "required": ["readOnly"] },
+          "then": { "not": { "required": ["publishTo"] } } },
         { "if": { "properties": { "readOnly": { "const": true } }, "required": ["readOnly"] },
           "then": { "not": { "required": ["grants"] } } }
       ]

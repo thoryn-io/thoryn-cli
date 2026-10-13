@@ -66,8 +66,23 @@ data class OwnedResource(
      * / `--prune` NEVER delete it: the CLI only removes what it created.
      */
     val adopted: Boolean = false,
+    /**
+     * SSO-3668 — the outputs the last `apply` PUBLISHED for this resource (where its id landed), so a reader
+     * of the receipt — a reviewer, `plan`, the human running the fallback — sees which repository /
+     * environment / variable carries the id. Only targets that were actually reached are listed; a target
+     * that could not be reached is the apply error `publish_target_unreachable` and is not recorded. Never a
+     * secret: a published value is a client id, public by construction. Absent on a pre-SSO-3668 receipt.
+     */
+    val published: List<PublishedOutput> = emptyList(),
 ) {
     val key: String get() = "$kind/$name"
+}
+
+/** SSO-3668 — one output a resource's id was published to (the receipt's record of a [PublishTarget]). */
+data class PublishedOutput(val kind: String, val repository: String, val environment: String, val name: String) {
+    companion object {
+        fun of(target: PublishTarget): PublishedOutput = PublishedOutput(target.kind, target.repository, target.environment, target.name)
+    }
 }
 
 /**
