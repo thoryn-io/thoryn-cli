@@ -20,6 +20,8 @@ import com.devnow.thoryn.cli.cmd.DomainWaiter
 import com.devnow.thoryn.cli.cmd.SecretIo
 import com.devnow.thoryn.cli.cmd.SelectedWorkspaceStore
 import com.devnow.thoryn.cli.cmd.examples.Prompt
+import com.devnow.thoryn.cli.cmd.project.GhRunner
+import com.devnow.thoryn.cli.cmd.project.ProcessGhRunner
 import com.devnow.thoryn.cli.config.ThorynConfig
 import com.devnow.thoryn.cli.output.OutputFormat
 import picocli.CommandLine.Command
@@ -54,6 +56,11 @@ import java.util.concurrent.Callable
  *    other repositories' receipts so a resource one of them owns is refused here (`access_owned_elsewhere`).
  *    `import [--write]` renders what the identity may reach as `provision.yaml` entries (`manager` ⇒ owned,
  *    recorded `adopted: true`; `viewer` ⇒ `readOnly: true`); without `--write` it only prints them.
+ *  - SSO-3668 (ADR 2026-10-13 production-clients-declared-in-the-config-project §2): an `application`'s
+ *    `publishTo:` targets receive its clientId after `apply` converged it — through [GitHubActionsVariablePublisher]
+ *    (`gh variable set … --env`, the customer's own `gh` login) on every apply. `plan` prints the pending publish
+ *    as a line and writes nothing. An unreachable target is `publish_target_unreachable` AFTER the client exists
+ *    and is in the receipt: exit [CommandSupport.EXIT_HTTP_ERROR], naming the `gh variable set` to run by hand.
  */
 @Command(
     name = "provision",
@@ -137,6 +144,8 @@ class ProvisionCommand : Callable<Int> {
             secretSink: ProvisionEngine.SecretSink = ProvisionEngine.SecretSink.undeliverable(),
             format: OutputFormat = OutputFormat.TABLE,
             peers: List<ProvisionReceipt> = emptyList(),
+            /** SSO-3668 — `apply` passes the `gh variable set` publisher; the read-only verbs reach nothing. */
+            outputSink: ProvisionEngine.OutputSink = ProvisionEngine.OutputSink.unavailable(),
         ): ProvisionEngine = ProvisionEngine(
             clients = { slug -> CommandSupport.gatewayClient(gateway, tokens, applyEnvironment = false, environmentOverride = slug ?: "") },
             // SSO-3414 — with --output json|yaml stdout carries ONE document; the per-resource progress goes to stderr.
@@ -148,7 +157,16 @@ class ProvisionCommand : Callable<Int> {
             // SSO-3659 — the ownership marker on the receipt, and the other repositories' receipts to refuse against.
             subject = subjectOf(tokens),
             peers = peers,
+            outputSink = outputSink,
         )
+
+        /** SSO-3668 — test seam: how `gh` is run for `publishTo:`. Production spawns the customer's real `gh`. */
+        @Volatile
+        internal var ghRunner: () -> GhRunner = { ProcessGhRunner() }
+
+        internal fun resetForTest() {
+            ghRunner = { ProcessGhRunner() }
+        }
 
         /**
          * SSO-3659 — the signed-in identity's PLATFORM SUBJECT, derived from the access token exactly as
@@ -194,6 +212,10 @@ class ProvisionCommand : Callable<Int> {
                 c.grantAdds.forEach { println("      ${c.kind} ${c.name}: grant + $it") }
                 c.grantRemoves.forEach { println("      ${c.kind} ${c.name}: grant - $it") }
             }
+            // SSO-3668 — where apply will publish the id (a line, never a write: plan reaches no target).
+            plan.changes.filter { it.publishTo.isNotEmpty() }.forEach { c ->
+                c.publishTo.forEach { t -> println("      ${c.kind} ${c.name}: publish clientId → ${t.label}") }
+            }
             // SSO-3413 / SSO-3414 — a customDomain's state, the issuer in use and the DNS records to publish.
             plan.changes.forEach { c ->
                 val d = c.customDomain ?: return@forEach
@@ -208,6 +230,7 @@ class ProvisionCommand : Callable<Int> {
                 "  ${plan.creates.size} to create, ${plan.updates.size} to update, ${plan.adopts.size} to adopt, " +
                     "${plan.removes.size} to remove, ${plan.changes.count { it.action == ChangeAction.NOOP }} unchanged" +
                     (if (plan.grantChanges > 0) ", ${plan.grantChanges} grant change(s)" else "") +
+                    (if (plan.publishes > 0) ", ${plan.publishes} output(s) to publish" else "") +
                     (if (plan.hasErrors) ", ${plan.errors.size} ownership error(s)." else "."),
             )
         }
@@ -316,7 +339,11 @@ class ProvisionCommand : Callable<Int> {
             val tokens = CommandSupport.readTokens() ?: return CommandSupport.EXIT_NOT_SIGNED_IN
             gateway = CommandSupport.resolveGateway(gateway, tokens)
             val engine = try {
-                engine(gateway, tokens, CliSecretSink.toSecretIo(secretFile, forceStdout), format, peers())
+                engine(
+                    gateway, tokens, CliSecretSink.toSecretIo(secretFile, forceStdout), format, peers(),
+                    // SSO-3668 — the only verb that publishes; the publisher touches gh only when a target is reached for.
+                    outputSink = GitHubActionsVariablePublisher(ghRunner()),
+                )
             } catch (ex: ProvisionException) {
                 System.err.println("Error: ${ex.message}"); return CommandSupport.EXIT_USAGE
             }
@@ -364,6 +391,16 @@ class ProvisionCommand : Callable<Int> {
                     return SecretIo.EXIT_NO_SECRET
                 }
                 if (wait) awaitDomain(gateway, tokens, format, result) else CommandSupport.EXIT_OK
+            } catch (ex: ProvisionEngine.PublishTargetUnreachableException) {
+                // SSO-3668 — NOT a stopped apply: every resource was converged and is in the receipt; only the publish
+                // of an id did not land. The receipt is the source of the id for the by-hand command the error names.
+                if (format == OutputFormat.TABLE) {
+                    println("Applied. ${ex.receipt.resources.size} resource(s) owned. Receipt: ${s.receiptPath.path}")
+                } else {
+                    CommandSupport.emitValue(format, ex.receipt, "")
+                }
+                System.err.println("Error: ${ex.message}")
+                CommandSupport.EXIT_HTTP_ERROR
             } catch (ex: Exception) {
                 System.err.println("Apply stopped; the receipt at ${s.receiptPath.path} records what succeeded — fix the cause and re-run.")
                 fail(ex, gateway, format)

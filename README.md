@@ -161,7 +161,13 @@ thoryn examples share    <name> [--output <file>]   # SSO-2876 — export the se
 # gate every resource on the relation it holds (`manager` ⇒ converge; `viewer` ⇒ only a matching `readOnly: true`
 # reference; none ⇒ access_not_owned). A failed gate is a RED plan (exit 1) and apply refuses before writing. See
 # "Ownership is decided by your identity's reach" below.
-thoryn provision plan    [--file <path>] [--prune] [--peer-receipt <path|https-url>]...   # read-only: what apply would create / remove (+ grant changes); exit 1 on an ownership error
+# SSO-3668 (ADR 2026-10-13 production-clients-declared-in-the-config-project §2): an application's `publishTo:` targets
+# receive its clientId AFTER apply converged it, on EVERY apply (an upsert) — `kind: githubActionsVariable` is
+# `gh variable set <NAME> --body <clientId> --repo <owner/name> --env <environment>` through your own `gh` login.
+# plan prints the pending publish as a line; an unreachable target is `publish_target_unreachable` AFTER the client
+# exists and is in the receipt, naming the one `gh variable set` to run by hand. See "Publishing an application's
+# client id to the repository that deploys it" below.
+thoryn provision plan    [--file <path>] [--prune] [--peer-receipt <path|https-url>]...   # read-only: what apply would create / remove (+ grant changes, pending publishes); exit 1 on an ownership error
 thoryn provision apply   [--file <path>] [--prune] [--confirm <ws>] [--yes] \
                          [--secret-file <path>] [--force-stdout] [--peer-receipt <path|https-url>]... \
                          [--wait [--wait-until ACTIVE|VERIFIED] [--wait-timeout 15m] [--wait-interval 20s]]
@@ -787,6 +793,77 @@ secret-free by construction. If it cannot be delivered the client is **still cre
 recorded** (it exists), and `apply` exits **65** naming
 `thoryn clients rotate-secret <clientId> --secret-file <path>` to mint a fresh one. `plan` marks
 such a create with `(a client secret will be minted and shown once)`.
+
+### Publishing an application's client id to the repository that deploys it (SSO-3668)
+
+Per oauthy ADR `2026-10-13-production-clients-declared-in-the-config-project.md` (SSO-3444), an
+application repository stays sandbox-only: its **production** OAuth client is declared in the
+workspace's **config repository**, converged by that repository's reviewer-protected production run,
+and the resulting client id is **published to the application repository as a GitHub Actions
+variable** on its `production` environment. The app's production deploy reads the variable at run
+time; nothing production-related is written into the application repository, and it makes no Thoryn
+call for the id. The declaration is a `publishTo:` block on the `application` resource — the output
+sibling of the secret channel: the value is a client id, public by construction, so it is always a
+**variable**, never a secret.
+
+The config repository's `.thoryn/environments/production/provision.yaml` (no `environment:` means
+the production plane; the example is the Express starter's `billing-web` app):
+
+```yaml
+apiVersion: thoryn.io/provision/v1
+resources:
+  # … the workspace's own production configuration (environments, sign-in methods, branding, …) …
+
+  # Production OAuth client of the application repository acme/billing-web.
+  # Owned by this repository: changing a redirect URI is a reviewed PR here plus an approved production run.
+  - kind: application
+    name: billing-web
+    spec:
+      displayName: "Billing web"
+      clientType: public                 # PKCE proves the client; no secret exists anywhere
+      grantTypes: ["authorization_code"]
+      scopes: ["openid", "profile", "email"]
+      redirectUris:
+        - "https://billing.acme.example/callback"
+      postLogoutRedirectUris:
+        - "https://billing.acme.example/signed-out"
+    publishTo:
+      - kind: githubActionsVariable
+        repository: acme/billing-web        # the app repository, reachable by the gh login that runs apply
+        environment: production             # the app repository's GitHub environment; created if absent
+        name: THORYN_PRODUCTION_CLIENT_ID   # the variable; upserted on every apply
+```
+
+What `thoryn provision` does with it:
+
+- **`plan`** prints the pending publish as a line (`application billing-web: publish clientId →
+  githubActionsVariable acme/billing-web (environment production) THORYN_PRODUCTION_CLIENT_ID`; in
+  `--output json`, `changes[].publishTo`) and reaches no target — a pull-request check shows where the
+  id will land.
+- **`apply`** publishes **after** the resource is converged and recorded in the receipt (the id is
+  known), on **every** apply — an upsert, so a re-created client propagates without a second step and a
+  variable someone changed by hand is repaired. The publisher is your own `gh` login:
+  `gh variable set THORYN_PRODUCTION_CLIENT_ID --body <clientId> --repo acme/billing-web --env production`,
+  creating the environment when it does not exist (bare, with no protection rules) and **never
+  writing an existing environment** — its reviewers and branch policy stay what the app repository's
+  admins set.
+- **The receipt records what was published** (`resources[].published[]`: kind, repository, environment,
+  name) so a reviewer or an `import` reader sees which repository carries the id.
+- **A target the `gh` login cannot reach** (the repository is not visible, `gh` is not signed in, the
+  environment cannot be created) is the apply error `publish_target_unreachable`, raised **after**
+  convergence: the client exists, the receipt records its id, the exit is non-zero, and the error names
+  the one `gh variable set … --body <id from the receipt> …` a human can run.
+
+Rules the schema and the loader both enforce: `publishTo` sits on `kind: application` only (an
+application's clientId is the one output a resource has); it is refused on a `readOnly: true` reference
+(a reference publishes nothing — the owning repository does); each target is exactly
+`{ kind, repository, environment, name }` with `repository` as GitHub `owner/name`, `name` matching
+`[A-Z_][A-Z0-9_]*` outside the reserved `GITHUB_` prefix, and no two targets naming the same variable.
+
+The app's production deploy job then runs in its `production` environment and reads
+`${{ vars.THORYN_PRODUCTION_CLIENT_ID }}`, resolving the issuer from the discovery document as the
+starters already do — see the oauthy guide *Declare an application's production client in the config
+project* for the deploy-job shape.
 
 ### Ownership is decided by your identity's reach (SSO-3659, epic SSO-3087)
 
