@@ -4,7 +4,7 @@
 # a `kubernetes` workload identity trust pins this cluster's OIDC issuer, the namespace and the service
 # account below. The pod's projected ServiceAccount token (`iss` = the cluster, `sub` =
 # system:serviceaccount:forge:forge-oauth2-proxy, `aud` = the trust's audience) IS its credential: the
-# Thoryn init container signs in with it (`thoryn login --connection`), rotates the application's client
+# Thoryn init containers sign in with it (`thoryn login --connection`), rotate the application's client
 # secret (`thoryn clients rotate-secret … --secret-file`) into an in-memory volume, and the application
 # reads the file. No client secret crosses a repository, a CI secret store or a person. Rotation is a pod
 # restart — the previous secret stays valid for 24 hours, so a rolling restart never breaks a replica.
@@ -18,7 +18,7 @@
 #   → prints the clientId (wi_…), the audience, and the connection.json below (step 1 of its output).
 #   thoryn access grant --subject client:wi_… --relation manager --object application:<APP_CLIENT_ID>
 #
-# Then edit the three values marked `# <-` and `kubectl apply -f deployment.yaml`.
+# Then edit the values marked `# <-` (the image digest included) and `kubectl apply -f deployment.yaml`.
 ---
 apiVersion: v1
 kind: ServiceAccount
@@ -67,6 +67,12 @@ spec:
       labels: { app: oauth2-proxy }
     spec:
       serviceAccountName: forge-oauth2-proxy
+      # The secret file is written 0600 by uid 65532 (the thoryn-cli image's user); the application reads
+      # it as the same uid. oauth2-proxy's image already runs as 65532.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
       volumes:
         - name: thoryn-token
           projected:
@@ -75,22 +81,50 @@ spec:
                   path: token
                   audience: https://thoryn.auth.thoryn.io       # the trust's `audience`
                   expirationSeconds: 3600
-        - name: client-secret
-          emptyDir: { medium: Memory }
         - name: thoryn-connection
           configMap: { name: thoryn-connection }
+        # The CLI's session between the two init containers (a 15-minute token + its DPoP key). RAM only, and
+        # never mounted by the application.
+        - name: thoryn-session
+          emptyDir: { medium: Memory }
+        - name: client-secret
+          emptyDir: { medium: Memory }
+      # The image (ghcr.io/thoryn-io/thoryn-cli, SSO-3687) is distroless: no shell to chain
+      # `login && rotate-secret`, so the two steps are two init containers that run in order and share the
+      # session volume. Pin the image by DIGEST — README.md says how to look it up and verify its signature.
       initContainers:
-        - name: thoryn-client-secret
-          image: ghcr.io/thoryn-io/thoryn-cli:latest
+        - name: thoryn-login
+          image: ghcr.io/thoryn-io/thoryn-cli:<version>@sha256:<digest>  # <- a released version, pinned by digest
           # token source: /var/run/secrets/tokens/thoryn/token (what `trusts create --provider kubernetes` prints)
-          command: ["sh", "-c", "thoryn login --connection /etc/thoryn/connection.json &&
-                     thoryn clients rotate-secret $APP_CLIENT_ID --secret-file /shared/client-secret"]
+          args: ["login", "--connection", "/etc/thoryn/connection.json"]
           env:
-            - name: APP_CLIENT_ID
-              value: "7f1c2d3e-4a5b-6c7d-8e9f-0a1b2c3d4e5f"      # <- the application whose secret the pod pulls
+            # No OS keychain in a container: the explicit opt-in to the file store, on the session volume.
+            - { name: THORYN_CI_PLAINTEXT_TOKENS, value: "1" }
+            - { name: THORYN_TOKEN_FILE, value: /thoryn-session/tokens.json }
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
           volumeMounts:
             - { name: thoryn-token, mountPath: /var/run/secrets/tokens/thoryn, readOnly: true }
             - { name: thoryn-connection, mountPath: /etc/thoryn, readOnly: true }
+            - { name: thoryn-session, mountPath: /thoryn-session }
+        - name: thoryn-client-secret
+          image: ghcr.io/thoryn-io/thoryn-cli:<version>@sha256:<digest>  # <- the same image
+          # --confirm: rotating a PRODUCTION application's secret needs the workspace slug (SSO-2413).
+          args: ["clients", "rotate-secret", "$(APP_CLIENT_ID)", "--secret-file", "/shared/client-secret",
+                 "--confirm", "thoryn"]                                 # <- your workspace slug
+          env:
+            - name: APP_CLIENT_ID
+              value: "7f1c2d3e-4a5b-6c7d-8e9f-0a1b2c3d4e5f"      # <- the application whose secret the pod pulls
+            - { name: THORYN_CI_PLAINTEXT_TOKENS, value: "1" }
+            - { name: THORYN_TOKEN_FILE, value: /thoryn-session/tokens.json }
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - { name: thoryn-session, mountPath: /thoryn-session }
             - { name: client-secret, mountPath: /shared }
       containers:
         - name: oauth2-proxy

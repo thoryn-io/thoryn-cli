@@ -14,10 +14,10 @@ hand-offs and a copy of a credential in a CI secret store. Here the **pod pulls 
 the token Kubernetes already gives it. No client secret crosses a repository, a CI secret store or a person.
 
 ```
-projected ServiceAccount token  ──►  thoryn login --connection /etc/thoryn/connection.json
-   (iss = the cluster,                   (exchanged under a `kubernetes` workload identity trust)
-    sub = system:serviceaccount:forge:forge-oauth2-proxy,
-    aud = the trust's audience)     ──►  thoryn clients rotate-secret $APP_CLIENT_ID --secret-file /shared/client-secret
+projected ServiceAccount token  ──►  init container 1: thoryn login --connection /etc/thoryn/connection.json
+   (iss = the cluster,                   (exchanged under a `kubernetes` workload identity trust;
+    sub = system:serviceaccount:forge:forge-oauth2-proxy,   the session goes to the RAM volume /thoryn-session)
+    aud = the trust's audience)     ──►  init container 2: thoryn clients rotate-secret $APP_CLIENT_ID --secret-file /shared/client-secret
                                     ──►  oauth2-proxy --client-secret-file=/shared/client-secret
 ```
 
@@ -25,7 +25,7 @@ projected ServiceAccount token  ──►  thoryn login --connection /etc/thoryn
 
 | File | What it is |
 |---|---|
-| `deployment.yaml` | ServiceAccount + ConfigMap (the connection contract) + Deployment: the projected token volume (`audience` = the trust's audience, `expirationSeconds: 3600`), the Thoryn init container, the in-memory `/shared` volume, oauth2-proxy reading the file. |
+| `deployment.yaml` | ServiceAccount + ConfigMap (the connection contract) + Deployment: the projected token volume (`audience` = the trust's audience, `expirationSeconds: 3600`), the two Thoryn init containers (`thoryn-login`, then `thoryn-client-secret`) sharing the in-memory `/thoryn-session` volume, the in-memory `/shared` volume, oauth2-proxy reading the file. |
 | `connection.json` | The connection contract the init container signs in with — what `thoryn workload-identity trusts create --provider kubernetes` prints. Token source: the projected token FILE. It holds no secret. |
 
 ## Steps
@@ -55,11 +55,25 @@ projected ServiceAccount token  ──►  thoryn login --connection /etc/thoryn
      --object application:7f1c2d3e-4a5b-6c7d-8e9f-0a1b2c3d4e5f
    ```
 
-3. **Edit and apply** `deployment.yaml`: the three `# <-` values (service account name / namespace must
-   equal the trust's pins; `APP_CLIENT_ID` is the application) and the `audience:` of the projected
+3. **Pin the image** — `ghcr.io/thoryn-io/thoryn-cli`, public, multi-arch, published by every `cli-v*`
+   release. There is no `:latest`: use a released `<version>` and its **digest**, which exists only once
+   that release has pushed it. Look it up, verify the signature, then pin `…:<version>@sha256:<digest>`:
+
+   ```bash
+   docker buildx imagetools inspect ghcr.io/thoryn-io/thoryn-cli:<version>     # the "Digest:" line
+   cosign verify ghcr.io/thoryn-io/thoryn-cli@sha256:<digest> \
+     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+     --certificate-identity-regexp '^https://github\.com/thoryn-io/thoryn-cli/\.github/workflows/release\.yml@refs/(tags/cli-v.+|heads/main)$'
+   ```
+
+   (The release run's summary also prints the exact reference it pushed.)
+
+4. **Edit and apply** `deployment.yaml`: the `# <-` values (service account name / namespace must
+   equal the trust's pins; the image digest; `APP_CLIENT_ID` is the application; `--confirm` takes your
+   workspace slug because the application is in production) and the `audience:` of the projected
    volume (the trust's audience, exactly). Then `kubectl apply -f deployment.yaml`.
 
-The init container runs once per pod start. **Rotation is a restart**: `rotate-secret` keeps the previous
+The init containers run once per pod start. **Rotation is a restart**: `rotate-secret` keeps the previous
 secret valid for 24 hours, so a rolling restart never breaks a running replica. If a private cluster
 rotates its signing key, re-create the trust with the new `--jwks-file`.
 
@@ -90,9 +104,13 @@ Differences found locally:
 
 ## Notes
 
-- The init container image is the `thoryn` CLI. `ghcr.io/thoryn-io/thoryn-cli:latest` is the name the
-  Thoryn guide uses; until that image is published from this repository's releases, build one from the
-  Linux native binary of a `cli-v*` release (`thoryn` on `PATH`, plus `sh`).
+- The image is `gcr.io/distroless/cc-debian12:nonroot` plus the `thoryn` binary: no shell, uid/gid
+  `65532`, `ENTRYPOINT ["/usr/local/bin/thoryn"]` — so each step passes the CLI's arguments as `args:`, and
+  `login && rotate-secret` is two init containers rather than one `sh -c`. It has no OS keychain, so both
+  set the explicit file-store opt-in (`THORYN_CI_PLAINTEXT_TOKENS=1`, `THORYN_TOKEN_FILE` on the session
+  volume) and each logs one `WARNING: Using plaintext file token store…` line announcing it.
+- `/thoryn-session` holds the session the two steps share: a 15-minute workload-identity token and its
+  DPoP key, on a RAM volume only the init containers mount. It is gone with the pod.
 - `/shared` is an `emptyDir` with `medium: Memory`: the secret lives in RAM for the pod's lifetime and is
   gone with the pod. Mount it read-only in the application.
 - The trust's scopes need only `tenant:applications.write`; the token the pod obtains lasts 15 minutes and
