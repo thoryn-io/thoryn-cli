@@ -36,8 +36,10 @@ import java.util.concurrent.Callable
  *  - `update`        — PATCH /api/v1/applications/{clientId}
  *  - `rotate-secret` — POST /api/v1/applications/{clientId}/secret/rotate
  *  - `delete`        — DELETE /api/v1/applications/{clientId}
+ *  - `registration-token` — POST /api/v1/applications/registration-tokens (SSO-3683; the
+ *    Initial Access Token emitted via SecretIo — see [RegistrationTokenSubcommand])
  *
- * Scopes: GET → `tenant:applications.read`; create/update/rotate/delete →
+ * Scopes: GET → `tenant:applications.read`; create/update/rotate/delete/registration-token →
  * `tenant:applications.write`.
  */
 @Command(
@@ -51,14 +53,114 @@ import java.util.concurrent.Callable
         ClientsCommand.UpdateSubcommand::class,
         ClientsCommand.RotateSecretSubcommand::class,
         ClientsCommand.DeleteSubcommand::class,
+        ClientsCommand.RegistrationTokenSubcommand::class,
     ],
 )
 class ClientsCommand : Callable<Int> {
 
     override fun call(): Int {
         System.err.println("Usage: thoryn clients <subcommand>")
-        System.err.println("Subcommands: list | get | create | update | rotate-secret | delete")
+        System.err.println("Subcommands: list | get | create | update | rotate-secret | delete | registration-token")
         return CommandSupport.EXIT_USAGE
+    }
+
+    /**
+     * `thoryn clients registration-token [--software-id <id>] [--ttl <seconds>] [--out-file <path>]`
+     *
+     * SSO-3683 (oauthy ADR 2026-10-14 §2(b)) — mints a Dynamic Client Registration (RFC 7591)
+     * **Initial Access Token** for your workspace and the SELECTED environment, to hand to a
+     * third-party vendor whose software registers its own OAuth client at the workspace's
+     * `registration_endpoint`. The token is single-use, pinned to your workspace and environment,
+     * expires after `--ttl` (default and maximum one hour), and may only grant the client scopes you
+     * hold yourself; `--software-id` additionally pins it to one piece of software.
+     *
+     * **Secret-safety.** The token IS a credential (it creates a client). It is emitted through
+     * [SecretIo] exactly like a client secret: written to `--out-file` (owner-only, `0600`) or printed
+     * to an interactive TTY with a WARN; printing to a non-TTY stdout is refused unless
+     * `--force-stdout`. It is stripped from the `--output json|yaml|table` record, which carries the
+     * two values the vendor needs next to it: `registrationEndpoint` and `expiresAt`.
+     */
+    @Command(
+        name = "registration-token",
+        description = [
+            "Mint a single-use Dynamic Client Registration token (RFC 7591) a third party redeems at your " +
+                "workspace's registration_endpoint. The token is shown once.",
+        ],
+        mixinStandardHelpOptions = true,
+    )
+    class RegistrationTokenSubcommand : Callable<Int> {
+
+        @Option(names = ["--software-id"], description = ["Pin the token to one software_id: the registration must carry the same value."])
+        var softwareId: String? = null
+
+        @Option(names = ["--ttl"], description = ["Lifetime in seconds (default and maximum: 3600)."])
+        var ttlSeconds: Long? = null
+
+        @Option(
+            names = ["--out-file", "--secret-file"],
+            description = ["Write the token to this file (owner-only) instead of printing it to a TTY/pipe."],
+        )
+        var outFile: File? = null
+
+        @Option(names = ["--force-stdout"], description = ["Allow printing the token to a non-interactive stdout (pipe/redirect). Off by default to avoid leaking it into a pipeline."])
+        var forceStdout: Boolean = false
+
+        @Option(names = ["--gateway"], defaultValue = ThorynConfig.DEFAULT_GATEWAY)
+        lateinit var gateway: String
+
+        @Option(names = ["--output"])
+        var outputRaw: String? = null
+
+        override fun call(): Int {
+            val format = CommandSupport.parseFormat(outputRaw) ?: return CommandSupport.EXIT_USAGE
+            if (ttlSeconds != null && ttlSeconds!! !in 1..MAX_TTL_SECONDS) {
+                System.err.println("Error: --ttl must be between 1 and $MAX_TTL_SECONDS seconds.")
+                return CommandSupport.EXIT_USAGE
+            }
+            val tokens = CommandSupport.readTokens() ?: return CommandSupport.EXIT_NOT_SIGNED_IN
+            gateway = CommandSupport.resolveGateway(gateway, tokens)
+            val client = CommandSupport.gatewayClient(gateway, tokens)
+
+            val body = linkedMapOf<String, Any?>(
+                "ttlSeconds" to ttlSeconds,
+                "softwareId" to softwareId?.trim()?.takeIf { it.isNotEmpty() },
+            )
+            return try {
+                val response = client.mintRegistrationToken(body)
+                emitMintedToken(response, format)
+            } catch (ex: ProductApiException) {
+                CommandSupport.renderError(format, ex, requiredScope = "tenant:applications.write")
+            } catch (ex: Exception) {
+                CommandSupport.renderRequestFailure(ex, gateway)
+            }
+        }
+
+        /**
+         * The record (`registrationEndpoint`, `expiresAt`) prints normally; the one-shot
+         * `initialAccessToken` goes through [SecretIo] and is stripped from the JSON/YAML/table view
+         * so it cannot leak through `--output json` into a pipeline.
+         */
+        private fun emitMintedToken(response: JsonNode, format: OutputFormat): Int {
+            val token = response["initialAccessToken"]?.asString()
+            val safe = stripRegistrationToken(response)
+            CommandSupport.emitRecord(format, safe, ::registrationTokenRecordFields)
+            if (token.isNullOrEmpty()) {
+                System.err.println("Error: the server returned no initialAccessToken.")
+                return CommandSupport.EXIT_HTTP_ERROR
+            }
+            val emitted = SecretIo.emitSecret(
+                label = "Initial access token",
+                secret = token,
+                secretFile = outFile,
+                forceStdout = forceStdout,
+            )
+            return if (emitted) CommandSupport.EXIT_OK else SecretIo.EXIT_NO_SECRET
+        }
+
+        companion object {
+            /** product-api's cap (`RegistrationTokenService.MAX_TTL_SECONDS`); refused client-side with a usage error. */
+            const val MAX_TTL_SECONDS: Long = 3600
+        }
     }
 
     /** `thoryn clients list` */
@@ -380,6 +482,19 @@ class ClientsCommand : Callable<Int> {
             "status" to node["status"]?.asString(),
             "createdAt" to node["createdAt"]?.asString(),
         )
+
+        /** SSO-3683 — the mint record WITHOUT the token (it rides SecretIo). */
+        internal fun registrationTokenRecordFields(node: JsonNode): List<Pair<String, Any?>> = listOf(
+            "registration_endpoint" to node["registrationEndpoint"]?.asString(),
+            "expires_at" to node["expiresAt"]?.asString(),
+        )
+
+        internal fun stripRegistrationToken(node: JsonNode): JsonNode {
+            if (node is tools.jackson.databind.node.ObjectNode) {
+                return node.deepCopy().apply { remove("initialAccessToken") }
+            }
+            return node
+        }
 
         internal fun rotateRecordFields(node: JsonNode): List<Pair<String, Any?>> = listOf(
             "newSecretId" to node["newSecretId"]?.asString(),
