@@ -73,10 +73,45 @@ class WorkloadIdentityKubernetesCommandTest : CommandTestBase() {
             .contains("serviceAccountName: forge-oauth2-proxy")
             .contains("audience: https://thoryn.auth.stg.thoryn.org")
             .contains("expirationSeconds: 3600")
-            .contains("thoryn login --connection /etc/thoryn/connection.json")
-            .contains("thoryn clients rotate-secret \$APP_CLIENT_ID --secret-file /shared/client-secret")
+            .contains("args: [\"login\", \"--connection\", \"/etc/thoryn/connection.json\"]")
+            .contains("args: [\"clients\", \"rotate-secret\", \"\$(APP_CLIENT_ID)\", \"--secret-file\", \"/shared/client-secret\",")
             .contains("examples/kubernetes/")
             .doesNotContain("id-token: write")
+    }
+
+    /**
+     * SSO-3687 — the snippet must run on the image this repository publishes: ghcr.io/thoryn-io/thoryn-cli is
+     * distroless (no shell, so no `sh -c "login && rotate-secret"`), has no OS keychain (so every step needs
+     * the explicit file-store opt-in, and the two steps share the session on a volume), and has no `:latest`
+     * (a deployment pins by digest). Each of those, printed wrong, is a pod that never starts.
+     */
+    @Test
+    fun `the printed init containers run on the published shell-less image - two steps sharing a session volume, pinned by digest`() {
+        server.enqueue(jsonResponse(201, fixture("trust-created-kubernetes")))
+
+        val (exit, out, _) = create(
+            "--issuer", issuer, "--namespace", "forge", "--service-account", "forge-oauth2-proxy",
+            "--jwks-file", jwksFile().toString(), "--confirm-production",
+        )
+
+        assertThat(exit).isEqualTo(0)
+        assertThat(out)
+            .doesNotContain("\"sh\"")
+            .doesNotContain("&&")
+            .doesNotContain(":latest")
+            .contains("image: ghcr.io/thoryn-io/thoryn-cli:<version>@sha256:<digest>")
+            .contains("- name: thoryn-login")
+            .contains("- name: thoryn-client-secret")
+            .contains("- name: thoryn-connection")
+            .contains("configMap: { name: thoryn-connection }")
+            .contains("- { name: thoryn-connection, mountPath: /etc/thoryn, readOnly: true }")
+            .contains("\"--confirm\", \"thoryn\"]")
+            .contains("- { name: APP_CLIENT_ID, value: <the application whose secret the pod pulls> }")
+        // Both steps carry the file-store opt-in and mount the shared session; the login step runs first.
+        assertThat(Regex("""THORYN_CI_PLAINTEXT_TOKENS, value: "1"""").findAll(out).count()).isEqualTo(2)
+        assertThat(Regex("""THORYN_TOKEN_FILE, value: /thoryn-session/tokens\.json""").findAll(out).count()).isEqualTo(2)
+        assertThat(Regex("""- \{ name: thoryn-session, mountPath: /thoryn-session }""").findAll(out).count()).isEqualTo(2)
+        assertThat(out.indexOf("- name: thoryn-login")).isLessThan(out.indexOf("- name: thoryn-client-secret"))
     }
 
     @Test
