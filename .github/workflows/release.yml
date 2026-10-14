@@ -11,6 +11,10 @@ name: release
 #     Each native leg is best-effort: an unavailable/slow/broken platform runner
 #     (e.g. the retiring Intel-macOS `macos-13`) is tolerated and simply omitted
 #     from the release, rather than failing or blocking it.
+#   * the container image ghcr.io/thoryn-io/thoryn-cli:<version> (+ :<major>.<minor>), linux/amd64 +
+#     linux/arm64, signed (cosign keyless) with SBOM + provenance — the `image` job (SSO-3687). It is
+#     built from the two linux binaries above and fails on its own (never the release) when one is
+#     missing or when the pushed image is not anonymously pullable.
 #   * the fat jar `thoryn.jar` — ALWAYS published; the SAME asset name the
 #     thoryn-examples conformance / example-e2e workflows download
 #     (`gh release download ... --pattern 'thoryn.jar'`). Keep that name stable.
@@ -170,6 +174,12 @@ jobs:
           java-version: "21"
           distribution: graalvm
           github-token: ${{ secrets.GITHUB_TOKEN }}
+      # SSO-3687 — Linux legs link zlib statically (cli/pom.xml `native-static-nolibc-linux`) so the
+      # binary runs on distroless/cc for the container image; that link needs libz.a.
+      - name: Ensure libz.a for the static zlib link (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: dpkg -s zlib1g-dev >/dev/null 2>&1 || { sudo apt-get update -qq && sudo apt-get install -y -qq zlib1g-dev; }
       - name: Build the native image
         shell: bash
         run: |
@@ -271,6 +281,160 @@ jobs:
           name: thoryn.jar
           path: cli/target/thoryn.jar
           if-no-files-found: error
+
+  # ── SSO-3687 — the CLI as a public, signed, multi-arch container image. ─────
+  #
+  #   ghcr.io/thoryn-io/thoryn-cli:<version>        e.g. :0.25.0  (one per release)
+  #   ghcr.io/thoryn-io/thoryn-cli:<major>.<minor>  e.g. :0.25    (moves to the newest patch)
+  #
+  # There is deliberately NO `:latest`: the image is an init container that receives a client secret,
+  # so a deployment pins it by DIGEST (examples/kubernetes/README.md says how to look it up). The
+  # image is the release's own linux native binaries — the `native` legs above — copied onto
+  # distroless; nothing is compiled twice and the Dockerfile has no RUN step, so building the arm64
+  # image needs no emulation (QEMU is only for the arm64 smoke run below).
+  #
+  # Not part of `release`'s needs: a failed image publish must not hold back the binaries and the jar,
+  # and the binaries must not wait for an image. The two fail independently and visibly.
+  #
+  # The one credential is this job's GITHUB_TOKEN (packages: write, to this repository's package
+  # only); cosign signs keyless with the job's OIDC identity (id-token: write). No stored secret.
+  #
+  # The image MUST be anonymously pullable — that is the whole point of an init container a customer
+  # cluster pulls with no registry credential (product-owner decision 2026-10-14: only the CLI's
+  # package is public). A package GitHub creates on the first push is PRIVATE until an org owner flips
+  # it, so the last step proves the pull as an anonymous client and fails the job with the exact
+  # operator fix when it cannot. A published-but-private image never reports green.
+  image:
+    name: container image (ghcr.io/thoryn-io/thoryn-cli)
+    needs: [resolve, verify, native]
+    # `native` is best-effort (continue-on-error), so run once it has settled and check for the two
+    # linux binaries explicitly below — a missing one fails THIS job loudly, never the release.
+    if: ${{ always() && needs.resolve.result == 'success' && needs.verify.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read # check out the tagged tree
+      packages: write # push ghcr.io/thoryn-io/thoryn-cli with this job's GITHUB_TOKEN
+      id-token: write # cosign keyless signing with the job's OIDC identity (Fulcio certificate)
+    env:
+      IMAGE: ghcr.io/thoryn-io/thoryn-cli
+      VERSION: ${{ needs.resolve.outputs.version }}
+      TAG: ${{ needs.resolve.outputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.resolve.outputs.tag }}
+          persist-credentials: false
+
+      - name: Download the linux native binaries this release built
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: thoryn-linux-*
+          path: dist
+          merge-multiple: true
+
+      - name: Both linux binaries must be present
+        run: |
+          set -euo pipefail
+          for arch in amd64 arm64; do
+            if [ ! -f "dist/thoryn-linux-$arch" ]; then
+              echo "::error::dist/thoryn-linux-$arch is missing — its native leg did not produce a binary, so no multi-arch image can be published for $TAG. The GitHub Release is unaffected. Fix the leg, then re-drive: gh workflow run release.yml -f tag=$TAG"
+              exit 1
+            fi
+          done
+          ls -la dist
+
+      - name: Compute the image tags
+        id: tags
+        run: |
+          set -euo pipefail
+          tags="$IMAGE:$VERSION"
+          # A plain X.Y.Z release also moves :X.Y; a pre-release (0.25.0-rc.1) gets only its own tag.
+          if [[ "$VERSION" =~ ^([0-9]+)\.([0-9]+)\.[0-9]+$ ]]; then
+            tags="$tags,$IMAGE:${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"
+          fi
+          echo "tags=$tags" >> "$GITHUB_OUTPUT"
+          echo "Publishing: $tags"
+
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        with:
+          platforms: arm64
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      # Before anything is pushed: each architecture's image runs as the non-root user, reports THIS
+      # release's version, and can instantiate the commands the init container runs (a binary built
+      # without its picocli reflection config answers --version and nothing else — cli-v0.32.0's Linux
+      # binaries did). A binary that needs a library or a glibc the base lacks fails here too, rather
+      # than in a customer's pod.
+      - name: Smoke — each architecture's image, as the init container runs it
+        run: |
+          set -euo pipefail
+          for arch in amd64 arm64; do
+            docker buildx build --platform "linux/$arch" --load -t "thoryn-cli-smoke:$arch" .
+            bash scripts/release/smoke-image.sh "thoryn-cli-smoke:$arch" "$VERSION" "linux/$arch"
+          done
+
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push (linux/amd64 + linux/arm64, SBOM + provenance)
+        id: push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          labels: |
+            org.opencontainers.image.version=${{ needs.resolve.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          sbom: true
+          provenance: mode=max
+
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Sign the pushed index (cosign keyless)
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          cosign sign --yes "$IMAGE@$DIGEST"
+          echo "Signed $IMAGE@$DIGEST"
+
+      # The false-green guard. Everything above can succeed while the package is still PRIVATE (the
+      # default for a package GitHub creates on first push), and a private image is exactly the failure
+      # an init container in a customer cluster hits. So: drop the push credential and prove, as an
+      # anonymous client, that the version tag (and :X.Y) resolves to the digest just pushed, and that
+      # the signature verifies without a credential too.
+      - name: Post-push — an ANONYMOUS client can pull the image and verify its signature
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+          TAGS: ${{ steps.tags.outputs.tags }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          docker logout ghcr.io
+          IFS=',' read -ra refs <<< "$TAGS"
+          for ref in "${refs[@]}"; do
+            bash scripts/release/check-anonymous-pull.sh "$ref" "$DIGEST"
+          done
+          anon="$(mktemp -d)"
+          DOCKER_CONFIG="$anon" cosign verify \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            --certificate-identity-regexp "^https://github\.com/${REPOSITORY}/\.github/workflows/release\.yml@refs/(tags/cli-v.+|heads/main)$" \
+            "$IMAGE@$DIGEST" > /dev/null
+          {
+            echo "### Container image"
+            echo
+            echo "Published, signed and anonymously pullable:"
+            echo
+            echo '```'
+            echo "$IMAGE:$VERSION@$DIGEST"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
   # ── Publish the release + bump the Homebrew formula. ───────────────────────
   #

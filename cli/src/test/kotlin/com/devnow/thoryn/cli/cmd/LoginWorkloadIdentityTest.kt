@@ -131,7 +131,7 @@ class LoginWorkloadIdentityTest : CommandTestBase() {
     fun `--audience outside --workload-identity is a usage error`() {
         val (exit, _, err) = runCli("login", "--client-credentials", "--audience", audience(), "--issuer", baseUrl())
         assertThat(exit).isEqualTo(LoginCommand.EXIT_USAGE)
-        assertThat(err).contains("--audience and --token-endpoint apply to --workload-identity only")
+        assertThat(err).contains("--audience, --token-endpoint and --token-file apply to --workload-identity only")
     }
 
     @Test

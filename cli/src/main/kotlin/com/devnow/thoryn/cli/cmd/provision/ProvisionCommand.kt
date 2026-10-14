@@ -160,7 +160,20 @@ class ProvisionCommand : Callable<Int> {
             subject = subjectOf(tokens),
             outputSink = outputSink,
             declaredSecretSink = declaredSecretSink,
+            // SSO-3689 — the session's scopes: a workloadIdentityTrust may carry only scopes this identity holds (the hub's
+            // ceiling); known here, the plan refuses an overreaching trust up front with the hub's own code.
+            callerScopes = callerScopesOf(tokens),
         )
+
+        /**
+         * SSO-3689 — the scopes the session's token carries: the JWT `scope` claim (space-separated, as the hub mints
+         * it), else what the token response said. Null for an opaque token without a recorded scope — the engine then
+         * states the ceiling and leaves the refusal to the hub.
+         */
+        fun callerScopesOf(tokens: Tokens): Set<String>? {
+            val claim = runCatching { JwtClaims.of(tokens.accessToken)["scope"]?.takeIf { !it.isNull }?.asString() }.getOrNull()
+            return (claim ?: tokens.scope)?.split(' ')?.map { it.trim() }?.filter { it.isNotEmpty() }?.toSet()?.takeIf { it.isNotEmpty() }
+        }
 
         /** SSO-3668 — test seam: how `gh` is run for `publishTo:`. Production spawns the customer's real `gh`. */
         @Volatile
@@ -225,6 +238,8 @@ class ProvisionCommand : Callable<Int> {
             }
             // SSO-3659 — where apply will deliver the minted client secret (a line; no secret exists at plan time).
             plan.changes.forEach { c -> c.secretSink?.let { t -> println("      ${c.kind} ${c.name}: deliver client secret → ${t.label}") } }
+            // SSO-3689 — a live trust's workload client and audience (what its consumer's connection.json names; apply prints that document).
+            plan.changes.forEach { c -> c.trust?.let { t -> println("      ${c.kind} ${c.name}: clientId ${t["clientId"]} audience ${t["audience"]} (connection.json is printed by apply, never written)") } }
             // SSO-3413 / SSO-3414 — a customDomain's state, the issuer in use and the DNS records to publish.
             plan.changes.forEach { c ->
                 val d = c.customDomain ?: return@forEach

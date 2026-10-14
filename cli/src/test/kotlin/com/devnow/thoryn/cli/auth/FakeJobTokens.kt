@@ -53,4 +53,37 @@ object FakeJobTokens {
     }
 
     fun token(audience: String, environment: String? = null): String = token(claims(audience, environment = environment))
+
+    /** SSO-3684 — the public shape of a Kubernetes PROJECTED ServiceAccount token (k3s v1.31, RS256). */
+    fun kubernetesClaims(
+        audience: String,
+        namespace: String = "forge",
+        serviceAccount: String = "forge-oauth2-proxy",
+        issuer: String = KUBERNETES_ISSUER,
+        projected: Boolean = true,
+    ): Map<String, Any?> = buildMap {
+        put("iss", issuer)
+        put("aud", listOf(audience))
+        put("sub", "system:serviceaccount:$namespace:$serviceAccount")
+        put("jti", UUID.randomUUID().toString())
+        if (projected) {
+            put(
+                "kubernetes.io",
+                mapOf(
+                    "namespace" to namespace,
+                    "serviceaccount" to mapOf("name" to serviceAccount, "uid" to "0c3b9e1a-6d2f-4b8e-9a1c-2d3e4f5a6b7c"),
+                    "pod" to mapOf("name" to "$serviceAccount-7d9f8c6b5-xk2lp", "uid" to "9e8d7c6b-5a4f-4e3d-2c1b-0a9f8e7d6c5b"),
+                ),
+            )
+        }
+        val now = System.currentTimeMillis() / 1000
+        put("iat", now)
+        put("nbf", now)
+        put("exp", now + 3600)
+    }
+
+    const val KUBERNETES_ISSUER: String = "https://kubernetes.default.svc.cluster.local"
+
+    fun kubernetesToken(audience: String, namespace: String = "forge", serviceAccount: String = "forge-oauth2-proxy"): String =
+        token(kubernetesClaims(audience, namespace, serviceAccount))
 }

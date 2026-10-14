@@ -76,6 +76,17 @@ interface ProvisionApi {
     fun updateFederationMember(memberId: String, body: Map<String, Any?>): JsonNode
     fun deleteFederationMember(memberId: String, confirmSlug: String? = null): Unit
 
+    // ── Workload identity trusts (`/api/v1/workload-identity/trusts`, environment-scoped; SSO-3689) ──
+    // Scopes `tenant:workload-identity.read` (list / get) and `tenant:workload-identity.write` (create / delete);
+    // environment managers write, viewers read, anyone else is answered 404. There is NO update: the pins are
+    // immutable on the hub, so the engine never asks for one. [createWorkloadIdentityTrust] answers 201 with the
+    // trust's `clientId` (`wi_…`), `audience` and `tokenEndpoint`; a name already in use is `409
+    // workload_identity_trust_name_taken`; a scope the caller does not hold is `403 scope_not_grantable`.
+    fun listWorkloadIdentityTrusts(limit: Int? = null, cursor: String? = null): JsonNode
+    fun getWorkloadIdentityTrust(id: String): JsonNode
+    fun createWorkloadIdentityTrust(body: Map<String, Any?>): JsonNode
+    fun deleteWorkloadIdentityTrust(id: String, confirmSlug: String? = null): Unit
+
     // ── Access grants, reach and the forward check (`/api/v1/access/grants`, `/mine`, `/check`; SSO-3112 / SSO-3659 / SSO-3673; workspace-level) ──
     fun listGrants(objectRef: String? = null, subjectRef: String? = null): JsonNode
     fun createGrant(subjectRef: String, relation: String, objectRef: String): JsonNode

@@ -44,6 +44,108 @@ that release; see the best-effort note above), `chmod +x`, and put it on `PATH`.
 The `thoryn.jar` fat jar is always attached (`java -jar thoryn.jar ...`); it is
 the stable asset name the `thoryn-examples` conformance CI consumes.
 
+**Container image** (SSO-3687) — every `cli-v*` release also publishes the Linux native binaries as
+a public, signed, multi-arch (`linux/amd64`, `linux/arm64`) image:
+
+```
+ghcr.io/thoryn-io/thoryn-cli:<version>        e.g. :0.33.0 — one per release
+ghcr.io/thoryn-io/thoryn-cli:<major>.<minor>  e.g. :0.33   — moves to the newest patch
+```
+
+There is **no `:latest`**. The image's main use is the Thoryn init container (below), which receives
+a client secret — so **pin it by digest**, with the version beside it for the reader:
+
+```
+image: ghcr.io/thoryn-io/thoryn-cli:<version>@sha256:<digest>
+```
+
+A digest exists only once a release has pushed it; look it up (any of these, no credential needed):
+
+```bash
+docker buildx imagetools inspect ghcr.io/thoryn-io/thoryn-cli:<version>   # "Digest:" line (the multi-arch index)
+crane digest ghcr.io/thoryn-io/thoryn-cli:<version>
+```
+
+— or read it from the release run's summary, which prints the exact `…:<version>@sha256:…` reference
+it pushed. Verify the signature (cosign keyless, signed by this repository's release workflow) before
+you pin it:
+
+```bash
+cosign verify ghcr.io/thoryn-io/thoryn-cli@sha256:<digest> \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  --certificate-identity-regexp '^https://github\.com/thoryn-io/thoryn-cli/\.github/workflows/release\.yml@refs/(tags/cli-v.+|heads/main)$'
+```
+
+The image also carries a BuildKit SBOM and SLSA provenance attestation
+(`docker buildx imagetools inspect ghcr.io/thoryn-io/thoryn-cli:<version> --format '{{ json .SBOM }}'`).
+It is `gcr.io/distroless/cc-debian12:nonroot` (pinned by digest) plus the `thoryn` binary: no shell,
+uid/gid `65532`, `ENTRYPOINT ["/usr/local/bin/thoryn"]` — so a manifest passes the CLI's arguments as
+`args:`. It has no OS keychain, so every invocation needs the explicit file-store opt-in
+(`THORYN_CI_PLAINTEXT_TOKENS=1` + `THORYN_TOKEN_FILE=<path on a volume>`; see
+[Token storage](#token-storage)). The `Dockerfile` explains the base-image choice; `release.yml`'s
+`image` job builds, smoke-runs, pushes, signs, and then **fails unless an anonymous client can pull
+what it pushed** (`scripts/release/check-anonymous-pull.sh`).
+
+**The Thoryn init container** — an application in Kubernetes fetches its own client secret with its
+projected ServiceAccount token (oauthy ADR `2026-10-14-kubernetes-workload-identity-and-runtime-credential-pull`;
+the trust is `thoryn workload-identity trusts create --provider kubernetes`). The image has no shell to
+chain `login && rotate-secret`, so it is **two init containers** that share the CLI's session on a RAM
+volume only they mount:
+
+```yaml
+spec:
+  serviceAccountName: forge-oauth2-proxy            # the trust's --service-account
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65532                                # the secret file is written 0600 — the app reads it as the same uid
+    runAsGroup: 65532
+  volumes:
+    - name: thoryn-token                            # the projected ServiceAccount token = the pod's credential
+      projected:
+        sources:
+          - serviceAccountToken: { path: token, audience: <the trust's audience>, expirationSeconds: 3600 }
+    - name: thoryn-connection
+      configMap: { name: thoryn-connection }        # connection.json, as `trusts create` printed it
+    - name: thoryn-session                          # the CLI session between the two steps; never mounted by the app
+      emptyDir: { medium: Memory }
+    - name: client-secret
+      emptyDir: { medium: Memory }
+  initContainers:
+    - name: thoryn-login
+      image: ghcr.io/thoryn-io/thoryn-cli:<version>@sha256:<digest>
+      args: ["login", "--connection", "/etc/thoryn/connection.json"]
+      env: &thoryn-session-env
+        - { name: THORYN_CI_PLAINTEXT_TOKENS, value: "1" }        # no keychain in a container: explicit file-store opt-in
+        - { name: THORYN_TOKEN_FILE, value: /thoryn-session/tokens.json }
+      securityContext: &thoryn-hardening
+        readOnlyRootFilesystem: true
+        allowPrivilegeEscalation: false
+        capabilities: { drop: ["ALL"] }
+      volumeMounts:
+        - { name: thoryn-token, mountPath: /var/run/secrets/tokens/thoryn, readOnly: true }
+        - { name: thoryn-connection, mountPath: /etc/thoryn, readOnly: true }
+        - { name: thoryn-session, mountPath: /thoryn-session }
+    - name: thoryn-client-secret
+      image: ghcr.io/thoryn-io/thoryn-cli:<version>@sha256:<digest>
+      # --confirm: rotating a PRODUCTION application's secret needs the workspace slug (SSO-2413).
+      args: ["clients", "rotate-secret", "<APP_CLIENT_ID>", "--secret-file", "/shared/client-secret", "--confirm", "<workspace-slug>"]
+      env: *thoryn-session-env
+      securityContext: *thoryn-hardening
+      volumeMounts:
+        - { name: thoryn-session, mountPath: /thoryn-session }
+        - { name: client-secret, mountPath: /shared }
+  containers:
+    - name: oauth2-proxy
+      args: ["--client-secret-file=/shared/client-secret", …]
+      volumeMounts:
+        - { name: client-secret, mountPath: /shared, readOnly: true }
+```
+
+The session the two steps share is a 15-minute workload-identity token (and its DPoP key) on a RAM
+volume the application container never mounts; it dies with the pod. Rotation is a pod restart — the
+previous secret stays valid for 24 hours. The image logs one `WARNING: Using plaintext file token
+store…` line per step; that is the explicit opt-in above being announced, not a fault.
+
 ## Command tree
 
 ```
@@ -76,7 +178,7 @@ thoryn federation delete <memberId> [--confirm <workspace-slug>]
 
 thoryn workspace list                        # Workspaces (hub /account/workspaces)
 thoryn workspace create --slug <slug> --display-name <name>
-thoryn workspace switch <slug>               # prints the `thoryn login --issuer <tenant-hub>` line
+thoryn workspace switch <slug>               # select a workspace you belong to; later commands exchange into it per call (your sign-in workspace: base token, no exchange — SSO-3692)
 thoryn workspace archive <slug> --confirm <slug>   # SSO-2831 — archive (reversible); name-confirmed
 thoryn workspace reactivate <slug>           # SSO-2831 — clear the archive flag
 
@@ -177,6 +279,14 @@ thoryn examples share    <name> [--output <file>]   # SSO-2876 — export the se
 # `kind: file` (owner-only, no overwrite without --force) — right after apply recorded the client. Nothing reaches
 # ⇒ exit 65 `undelivered_secrets` naming `thoryn clients rotate-secret <id> --secret-file <path>`. See "Where a
 # minted secret goes" below.
+# SSO-3689 (ADR 2026-10-14 credential ladder; ADR 2026-10-14 federated client authentication): an application declares HOW it
+# authenticates — `clientAuthenticationMethods: [private_key_jwt]` with `jwksUri` or an inline public `jwks` (rung 1), or
+# `[federated_assertion]` with `federatedTrust: <trust name>` (rung 2: the pod's / job's platform token IS the client
+# credential; nothing is minted) — converged on update too; `client_secret_post` is not declarable. New kind
+# `workloadIdentityTrust` (provider github_actions | forgejo | kubernetes + that provider's pins, scopes, confirmProduction):
+# converged by name, adopted on the API's 409, never updated in place (workload_identity_trust_immutable), removed only
+# via --prune/destroy; the receipt records the wi_ client + audience; apply PRINTS the consumer's connection.json, never
+# writes it. See "Secretless clients" and "Declaring a workload-identity trust" below.
 thoryn provision plan    [--file <path>] [--prune]                       # read-only: what apply would create / remove (+ grant changes, pending publishes); exit 1 on an ownership error
 thoryn provision apply   [--file <path>] [--prune] [--confirm <ws>] [--yes] \
                          [--secret-file <path>] [--force-stdout] [--force] \
@@ -231,8 +341,12 @@ thoryn keys retirements get <id> --kind <kind>                                  
 # Workload identity trusts (SSO-3308, epic SSO-3304) — let ONE GitHub repository's Actions jobs sign in
 # to an environment with NO stored secret (`thoryn login --workload-identity`). Environment managers only
 # (others get 404). Scopes: tenant:workload-identity.read (list, get) / tenant:workload-identity.write (create, delete).
+# SSO-3684 — `--provider kubernetes`: the same for the PODS of one Kubernetes service account (their projected
+# ServiceAccount token is the credential; read from a FILE by the Thoryn init container, see examples/kubernetes/).
 thoryn workload-identity trusts create --name <n> --repository <owner/repo> --scope <tenant:…> [--environment e]
     [--owner-id n --repository-id n] [--github-environment <gh-env>] [--ref <ref>] [--github-hosted-runners-only] [--confirm-production]
+thoryn workload-identity trusts create --provider kubernetes --name <n> --issuer <https url> --scope <tenant:…> [--environment e]
+    [--namespace <ns> [--service-account <sa>]] [--jwks-file <cluster-jwks.json>] [--confirm-production]   # production: both pins
 thoryn workload-identity trusts list [--limit n] [--cursor c]         # GET    /api/v1/workload-identity/trusts
 thoryn workload-identity trusts get <id>                              # GET    /api/v1/workload-identity/trusts/{id} (+ the sign-in line)
 thoryn workload-identity trusts delete <id> [--yes] [--confirm <slug>] # DELETE /api/v1/workload-identity/trusts/{id}
@@ -555,6 +669,73 @@ Compare the job above with the trust (`thoryn workload-identity trusts get <id>`
 
 This retargets SSO-2879's `--workload-identity` (an operator-registered token exchange signed with a CI
 key; its `--tenant`, `--wif-*` and `--subject-token` flags are gone).
+
+#### Kubernetes — a pod pulls its own client secret (SSO-3684, parent SSO-3678)
+
+A `--provider kubernetes` trust pins a **cluster's OIDC issuer, a namespace and a service account**
+(oauthy #4095, ADR `2026-10-14-kubernetes-workload-identity-and-runtime-credential-pull`). The pod's
+credential is the **projected ServiceAccount token** Kubernetes already gives it (`iss` = the cluster,
+`sub` = `system:serviceaccount:<namespace>:<serviceAccount>`, `aud` = the trust's audience). The reason to
+want this is software that can only consume a `client_secret` — oauth2-proxy, Forgejo's OIDC login,
+Grafana — in front of Thoryn SSO: the pod's **init container** signs in with the token and rotates the
+application's secret into an in-memory volume the application reads. No client secret crosses a
+repository, a CI secret store or a person.
+
+```bash
+# A PRIVATE cluster (k3s, kind, on-prem: Thoryn cannot reach its issuer) pins its PUBLIC key set; a managed
+# cloud cluster (EKS, GKE, AKS) publishes its issuer — omit --jwks-file and Thoryn discovers the keys once.
+kubectl get --raw /openid/v1/jwks > cluster-jwks.json
+thoryn workload-identity trusts create --provider kubernetes --name forge-oauth2-proxy \
+  --issuer "$(kubectl get --raw /.well-known/openid-configuration | jq -r .issuer)" \
+  --namespace forge --service-account forge-oauth2-proxy --jwks-file cluster-jwks.json \
+  --scope tenant:applications.write --confirm-production
+# → prints the clientId (wi_…), audience, inlineKeyIds (never key material), the connection.json below and
+#   the projected-volume + init-container snippet. A production trust must pin BOTH names: the CLI refuses
+#   --confirm-production without them, as the API refuses `production_requires_service_account`; a sandbox
+#   trust may pin the namespace only. --jwks-file must be a JWK Set of PUBLIC keys — a private parameter
+#   (`d`, `p`, …) is refused before anything is sent.
+```
+
+The connection contract gains a **token source**: the identity token is read from a FILE on every exchange
+(sign-in and renewal — Kubernetes refreshes the projected token in place), not from a GitHub runner:
+
+```json
+{
+  "apiVersion": "thoryn.io/connection/v1",
+  "workspace": { "slug": "thoryn" },
+  "auth": {
+    "method": "workload_identity",
+    "provider": "kubernetes",
+    "clientId": "wi_9a8b7c6d5e4f3a2b1c0d9e8f",
+    "audience": "https://thoryn.auth.thoryn.io",
+    "tokenSource": { "kind": "file", "path": "/var/run/secrets/tokens/thoryn/token" },
+    "scopes": ["tenant:applications.write"],
+    "kubernetes": { "issuer": "https://kubernetes.default.svc.cluster.local", "namespace": "forge", "serviceAccount": "forge-oauth2-proxy" }
+  }
+}
+```
+
+- `auth.provider` is `github_actions` (default) or `kubernetes`. `auth.tokenSource.kind` is
+  `github_actions` (default when absent: `ACTIONS_ID_TOKEN_REQUEST_*`) or `file` (then `path` is
+  required). A `kubernetes` provider REQUIRES a `file` token source; `auth.kubernetes` (the trust's pins,
+  diagnostics only — like `auth.github`) belongs to it alone. The path is public configuration; the file's
+  content is the credential and is never recorded (`tokens.json` keeps the path, never the token).
+- The flag form is `thoryn login --workload-identity --client-id <wi_…> --audience <aud> --token-file <path>`.
+- A missing, unreadable or empty token file fails closed naming the PATH (exit 73, nothing sent); the
+  usual cause is a projected volume mounted elsewhere than the connection says.
+- A refusal prints the **pod's** identity (`iss`, `sub`, `aud`, namespace, service account — never the
+  token) and, with `auth.kubernetes` present, the pin that differs (`namespace: the trust pins 'forge';
+  this pod runs in 'staging'`). The hub's own reasons (`namespace_mismatch`, `service_account_mismatch`,
+  `claim_missing` for a legacy non-projected token, `unknown_signing_key` after a key rotation) are in the
+  workspace audit log.
+- The trust's client needs `manager` on the application whose secret it rotates (`thoryn access grant`).
+  Rotation is a pod restart: the previous secret stays valid for 24 hours.
+
+The complete, applyable manifest — ServiceAccount, the connection ConfigMap, the projected token volume
+(`audience` = the trust's audience, `expirationSeconds: 3600`), the Thoryn init container
+(`thoryn login --connection /etc/thoryn/connection.json && thoryn clients rotate-secret $APP_CLIENT_ID
+--secret-file /shared/client-secret`), the in-memory `/shared` volume and oauth2-proxy reading
+`--client-secret-file=/shared/client-secret` — is [`examples/kubernetes/`](examples/kubernetes/README.md).
 
 ### Project repositories — `thoryn project init` (SSO-3435, epic SSO-3304)
 
@@ -1066,6 +1247,166 @@ The app's production deploy job then runs in its `production` environment and re
 `${{ vars.THORYN_PRODUCTION_CLIENT_ID }}`, resolving the issuer from the discovery document as the
 starters already do — see the oauthy guide *Declare an application's production client in the config
 project* for the deploy-job shape.
+
+### Secretless clients — `clientAuthenticationMethods`, `jwksUri` / `jwks`, `federatedTrust` (SSO-3689)
+
+Per oauthy ADR `2026-10-14-kubernetes-workload-identity-and-runtime-credential-pull.md` (the **credential
+ladder**: secret-less by key, secret-less by platform identity, runtime pull, courier — most preferred first)
+and ADR `2026-10-14-federated-client-authentication-for-login-clients.md` (rung 2), an `application`
+declares **how it authenticates** at the token endpoint instead of being minted a secret by default:
+
+```yaml
+resources:
+  # Rung 1 — the application's own key pair; only its PUBLIC half is declared.
+  - kind: application
+    name: billing-api
+    spec:
+      displayName: "Billing API"
+      grantTypes: [client_credentials]
+      clientAuthenticationMethods: [private_key_jwt]
+      jwksUri: https://billing.acme.example/.well-known/jwks.json   # or an inline `jwks: { keys: [ { kty, kid, n, e } ] }` — exactly one of the two
+
+  # Rung 2 — the workload's platform identity token IS the client assertion (ADR 2026-10-14 §11). Nothing is minted.
+  - kind: workloadIdentityTrust
+    name: billing-pods
+    spec:
+      provider: kubernetes
+      kubernetes: { issuer: "https://oidc.eks.eu-central-1.amazonaws.com/id/EXAMPLE", namespace: billing, serviceAccount: billing-web }
+      scopes: [tenant:applications.read]
+      confirmProduction: true
+  - kind: application
+    name: billing-web
+    spec:
+      displayName: "Billing web"
+      redirectUris: ["https://billing.acme.example/cb"]
+      grantTypes: [authorization_code, refresh_token]
+      clientAuthenticationMethods: [federated_assertion]
+      federatedTrust: billing-pods          # the trust's NAME in the same environment — the engine resolves it to the id the API takes
+```
+
+- **The methods are a closed set:** `private_key_jwt`, `federated_assertion`, `client_secret_basic`, `none`.
+  `client_secret_post` is deliberately **not declarable** (`invalid_client_authentication_method`): a secret in
+  the request body is the courier rung. Omitted ⇒ product-api's default for the `clientType`
+  (`client_secret_basic` for a confidential client, `none` for a public one) — the existing behaviour.
+- **`private_key_jwt` needs the public key:** `jwksUri` (https) **xor** an inline `jwks`
+  (`private_key_jwt_key_required` / `jwks_or_jwks_uri`). An inline set holds **public keys only** — a `d`, `p`,
+  `q`, `dp`, `dq`, `qi`, `oth` or `k` member is `invalid_jwks` (a private key in a repository is a secret in the
+  repository, exactly what the file exists to make impossible).
+- **`federated_assertion` is refused client-side with the hub's own codes** (`FederatedLoginClientBinder` /
+  product-api's `FederatedAssertionBindingValidator` answer the same tokens): it is the ONLY method
+  (`federated_assertion_only_method`, also for `clientType: public` — a public client authenticates with
+  `none`), grants beyond `authorization_code` / `refresh_token` are `federated_assertion_grant_not_allowed`
+  (a workload that needs `client_credentials` uses the trust's own `wi_…` client), `requireProofKey: false`
+  is `federated_assertion_pkce_required`, a `jwks` / `jwksUri` is `federated_assertion_no_secret_or_key`,
+  a missing `federatedTrust` is `federated_trust_required`, and a `federatedTrust` without the method is
+  `federated_trust_without_method`. A trust that is missing, or declared in this file for ANOTHER
+  environment, is the plan error **`federated_trust_not_found`** (a login client binds a trust of its own
+  environment; the hub checks the same); `apply` refuses the plan before writing.
+- **No secret is minted or expected** for a `private_key_jwt` / `federated_assertion` client (the API answers
+  `clientSecret: null`): `plan` prints no "will be minted", nothing reaches `--secret-file` or a sink, and a
+  `secretSink:` next to such methods is `secret_sink_without_secret_method` — a sink is legal only when the
+  declared methods include a secret-bearing one (`client_secret_basic`).
+- **All three converge on UPDATE**, not only at create (the 2026-10-13 ADR's reading note): a changed
+  method set or trust binding is one `PATCH` carrying exactly that field. **The key location is the
+  exception you should know about:** product-api's `ApplicationResponse` does not render `jwksUri` / `jwks`
+  (a product gap, reported on the PR), so the engine records what the file last applied in the receipt
+  (`attributes.jwksUri`, `attributes.jwksKids` — never a key) and diffs against that; an **adopted** client
+  with a declared key location is sent it **once** (`(not readable from the API — sent once to converge)`
+  in the plan) and is a no-op afterwards.
+- **Order:** `apply` converges environments, then every `workloadIdentityTrust`, then everything else — so
+  a client may bind a trust the same file declares; the plan shows the pending binding as
+  `federatedTrust: (unset) → billing-pods (created by this apply)`. Removal is child-first: clients before
+  the trust they bind.
+
+### Declaring a workload-identity trust — `kind: workloadIdentityTrust` (SSO-3689)
+
+The imperative twin is `thoryn workload-identity trusts create` (above). Declared, a trust is a resource
+of its **environment** (no `environment:` ⇒ the production plane) with the provider's **pins**:
+
+```yaml
+resources:
+  - kind: workloadIdentityTrust
+    name: billing-ci                    # the trust's name on the API — the converge key, unique per environment
+    environment: staging
+    spec:
+      provider: github_actions
+      github:
+        repository: acme/billing        # owner/name
+        ownerId: 1234567                # GitHub's immutable ids — both or neither (looked up once for a public repository)
+        repositoryId: 7654321
+        environment: staging            # the GitHub environment the job must run in — REQUIRED for a production trust
+        ref: refs/heads/main            # exact
+        githubHostedRunnersOnly: true
+      scopes: [tenant:applications.read, tenant:applications.write]
+  - kind: workloadIdentityTrust
+    name: forge-main
+    spec:
+      provider: forgejo
+      forgejo: { instanceUrl: "https://forge.example.org", owner: thoryn, ownerId: 7, repository: infra, repositoryId: 42, ref: refs/heads/main }
+      scopes: [tenant:applications.write]
+      confirmProduction: true           # production plane: its jobs act on production (production_confirmation_required otherwise)
+  - kind: workloadIdentityTrust
+    name: billing-pods
+    spec:
+      provider: kubernetes
+      kubernetes:
+        issuer: "https://oidc.eks.eu-central-1.amazonaws.com/id/EXAMPLE"
+        namespace: billing              # namespace + serviceAccount: REQUIRED for a production trust
+        serviceAccount: billing-web
+        jwks: { keys: [ { kty: RSA, kid: t10j6Z4K, use: sig, alg: RS256, n: "…", e: AQAB } ] }   # PUBLIC keys only, for a cluster Thoryn cannot reach
+      scopes: [tenant:applications.read]
+      confirmProduction: true
+```
+
+What `thoryn provision` does with it:
+
+- **Converge by name.** A trust of that name in the plane is **adopted** (every DECLARED field must
+  match: `provider`, `scopes` as a set, the pins; a field the file leaves out is not compared); absent, it
+  is **created** (`POST /api/v1/workload-identity/trusts`, with the file's `repository: owner/name` as the
+  API's `owner` + `repository`); a `409 workload_identity_trust_name_taken` between the lookup and the
+  create adopts the matching trust, as `project init` does. **There is no update:** a trust's pins and
+  scopes are immutable on the hub, so a declared field that differs from the live trust is the plan error
+  **`workload_identity_trust_immutable`**, naming the fix — declare what is live, or
+  `thoryn workload-identity trusts delete <id>` and re-apply to re-create it. Removal is only through
+  `--prune` / `destroy` (the production plane gated by `--confirm <workspace-slug>`), clients first.
+- **The receipt records** the trust id, its **`wi_…` workload client** (`attributes.clientId`), its
+  `audience` and `provider` — nothing secret exists on a trust.
+- **The scope ceiling.** A trust may carry only `tenant:` scopes the **applying identity itself holds**
+  (the hub's `403 scope_not_grantable`): a trust can never widen the reach of the repository that declares
+  it. `plan` states the ceiling on every create; when the session's scopes are known (the token's `scope`
+  claim — the CLI passes them) a trust that overreaches is a red plan with the hub's own code before any
+  write; otherwise the hub refuses at apply and the error names the fix.
+- **`apply` prints the consumer's `connection.json` — and never writes it.** The file belongs to the
+  repository (or the workload) that signs in with the trust, not to the one that declares it:
+
+  ```text
+  + workloadIdentityTrust billing-ci: id=7f1c… clientId=wi_3f0c9a1b2d4e5f6a7b8c9d0e audience=https://acme.auth.thoryn.io/staging env=staging
+      connection.json for the workload that signs in with this trust — not written by apply (it belongs to the consumer repository):
+        { "apiVersion" : "thoryn.io/connection/v1", "workspace" : { "slug" : "acme" }, "auth" : { "method" : "workload_identity", "provider" : "github_actions", "clientId" : "wi_3f0c…", "audience" : "https://acme.auth.thoryn.io/staging", "scopes" : [ … ], "github" : { "owner" : "acme", "repository" : "billing", … } } }
+  ```
+
+  `plan` shows an existing trust's `clientId` and `audience` on its row. A `kubernetes` trust's document is
+  the one `trusts create --provider kubernetes` prints (SSO-3684): `provider: kubernetes`, the file token
+  source (`/var/run/secrets/tokens/thoryn/token`, the projected ServiceAccount token) and the cluster pins.
+  For a `forgejo` trust `provider` is left out (the contract validates `github_actions` and `kubernetes`
+  today; a Forgejo job presents its own Actions token as the `client_assertion`).
+- **Ownership is the environment's.** A trust has no platform object of its own: the API writes for an
+  environment's managers, reads for its viewers and answers 404 to anyone else — so the gate asks about
+  the parent (`environment:<id>`, or the workspace for the production plane): `manager` ⇒ converge,
+  `viewer` ⇒ only a matching `readOnly: true` reference, none ⇒ `access_not_owned`. A trust cannot carry
+  `grants:`, `publishTo:` or `secretSink:`.
+- **`import`** renders every trust of a plane the identity may reach (`github` / `forgejo` /
+  `kubernetes` pins, `scopes`, `confirmProduction` on the production plane) — owned as `adopted: true`,
+  `readOnly: true` for a viewer. Inline Kubernetes keys are not rendered by the API: the entry carries a
+  note to add `spec.kubernetes.jwks` by hand (`kubectl get --raw /openid/v1/jwks`).
+
+**The structural limit — a file cannot declare its OWN bootstrap trust.** The identity that applies a
+provisioning file is, in CI, a trust's `wi_…` client. That trust must exist before the first `apply`
+can sign in (chicken-and-egg), so it is **created once by a person** (`thoryn workload-identity trusts
+create`, or `thoryn project init`) and is never declared by the file it signs in: the engine refuses a
+declared trust whose workload client is the applying identity (`workload_identity_trust_is_self` — a
+file that owned it could `--prune` the identity it runs as), and `import` skips it with a note.
+Everything else — the trusts of the applications, of other repositories, of the pods — is declared.
 
 ### Ownership is decided by your identity's reach (SSO-3659 / SSO-3673, epic SSO-3087)
 
@@ -1955,6 +2296,7 @@ thoryn-cli/
 ├── pom.xml                                                  # reactor parent (SSO-3662): shared versions + plugin config
 ├── README.md                                                # this file
 ├── adrs/                                                    # decisions about this repository
+├── examples/kubernetes/                                     # SSO-3684 the Thoryn init-container manifest (a pod pulls its own client secret)
 ├── engine/                                                  # io.thoryn:thoryn-provision-engine — the provisioning engine as a LIBRARY (SSO-3662)
 │   ├── pom.xml
 │   └── src/main/kotlin/com/devnow/thoryn/provision/
@@ -1979,6 +2321,7 @@ thoryn-cli/
     │   │   ├── DpopSession.kt                               # SSO-3199 proof JWTs + DPoP-Nonce retry
     │   │   ├── DpopCapability.kt                            # SSO-3221 send proofs only where discovery advertises DPoP
     │   │   ├── Tokens.kt
+    │   │   ├── WorkloadIdentityFlow.kt + WorkloadIdentityDiagnostics.kt  # SSO-3308 secret-less sign-in; SSO-3684 file token source (Kubernetes)
     │   │   └── ScopeRegistry.kt                             # SSO-959 scope wildcards
     │   ├── api/
     │   │   ├── ProductApiClient.kt                          # SSO-959 typed HTTP client
@@ -1995,6 +2338,8 @@ thoryn-cli/
     │   │   ├── SelectedWorkspaceStore.kt                    # SSO-1552 records the switched-into workspace
     │   │   ├── AuditCommand.kt                              # SSO-1552 audit query (config + auth events)
     │   │   ├── AuditReplayCommand.kt                        # SSO-940b
+    │   │   ├── WorkloadIdentityCommand.kt                   # SSO-3308 `workload-identity trusts` (github_actions); SSO-3684 --provider kubernetes
+    │   │   ├── connection/Connection.kt                     # SSO-2948 the connection contract (+ examples/connection.schema.json)
     │   │   └── operator/                                    # SSO-3356 `operator login|logout|custom-domain` (operator plane)
     │   ├── config/
     │   │   └── ThorynConfig.kt                              # per-env defaults
@@ -2011,7 +2356,14 @@ thoryn-cli/
 * Reflection metadata for picocli's `@Command`-annotated classes is
   generated by `picocli-codegen` during `process-classes`. New subcommand
   classes are picked up automatically; no manual `reflect-config.json`
-  changes needed.
+  changes needed. **A command's constructor must not open the token store (or
+  any OS resource)** — the generator instantiates every command, and on a Linux
+  build host without a keychain an eager store threw there, the generator wrote
+  no config at all, and the shipped Linux binary could run no subcommand (SSO-3687;
+  `by lazy` is the fix, `NativeReflectionConfigWithoutKeychainTest` the guard).
+* Linux binaries link zlib statically (`-H:+StaticExecutableWithDynamicLibC`, profile
+  `native-static-nolibc-linux`): glibc is their only shared dependency, which is what lets the
+  container image run them on distroless/cc (SSO-3687). The build needs `libz.a` (`zlib1g-dev`).
 * `java-keyring` + `JNA` reflection lives in
   `cli/src/main/resources/META-INF/native-image/com.devnow.thoryn.cli/` (the engine library's own
   entries live in `engine/src/main/resources/META-INF/native-image/io.thoryn/thoryn-provision-engine/`).
