@@ -98,6 +98,10 @@ jobs:
         env:
           FOREIGN_ENVIRONMENT_ID: ${{ inputs.foreign-environment-id }}
           EXPECTED_SANDBOX: ${{ steps.provision.outputs.environment }}
+          # The composite action opts its own steps into the plaintext token store (no OS keychain on a
+          # hosted runner, SSO-794); this step reads the same session, so it needs the same opt-in. Run
+          # 38549515003 failed here with "OS keychain backend is not available" without it.
+          THORYN_CI_PLAINTEXT_TOKENS: "1"
         run: |
           set -euo pipefail
           listed=$(java -jar thoryn.jar env list --output json | jq -r '(.data // .)[] | .slug' | sort)
