@@ -496,6 +496,13 @@ class WorkloadIdentityCommand : Callable<Int> {
         /** SSO-3684 — where the documented manifest (`examples/kubernetes/`) mounts the projected token. */
         const val KUBERNETES_TOKEN_FILE: String = WorkloadIdentityFlow.DEFAULT_KUBERNETES_TOKEN_FILE
 
+        /**
+         * SSO-3687 — the init-container image reference the printed snippet carries. There is no `:latest`: a
+         * deployment pins a released version BY DIGEST, which exists only once that release pushed it, so the
+         * snippet prints the shape and examples/kubernetes/README.md says how to look the digest up.
+         */
+        const val KUBERNETES_IMAGE_PLACEHOLDER: String = "ghcr.io/thoryn-io/thoryn-cli:<version>@sha256:<digest>"
+
         internal val LIST_HEADERS: List<String> = listOf("id", "name", "provider", "clientId", "pins", "scopes")
 
         private val jsonMapper: JsonMapper = JsonMapper.builder().build()
@@ -664,14 +671,14 @@ class WorkloadIdentityCommand : Callable<Int> {
             val k = body["kubernetes"]
             val audience = text(body, "audience") ?: "<audience>"
             val serviceAccount = text(k, "serviceAccount") ?: "<service-account>"
-            out.println("Use it from a pod — there is no secret to store. The pod's init container signs in with the projected")
+            out.println("Use it from a pod — there is no secret to store. The pod's init containers sign in with the projected")
             out.println("ServiceAccount token and pulls the application's client secret itself:")
             out.println()
             out.println("1. Mount this as /etc/thoryn/connection.json (a ConfigMap; it holds no secret):")
             out.println()
             out.println(kubernetesConnectionJson(body, workspaceSlug).prependIndent("  "))
             out.println()
-            out.println("2. Project the token for the trust's audience, and run the Thoryn init container:")
+            out.println("2. Project the token for the trust's audience, and run the Thoryn init containers:")
             out.println()
             out.println("  spec:")
             out.println("    serviceAccountName: $serviceAccount")
@@ -683,16 +690,37 @@ class WorkloadIdentityCommand : Callable<Int> {
             out.println("                path: token")
             out.println("                audience: $audience       # the trust's `audience`")
             out.println("                expirationSeconds: 3600")
+            out.println("      - name: thoryn-connection           # step 1's connection.json, as a ConfigMap")
+            out.println("        configMap: { name: thoryn-connection }")
+            out.println("      - name: thoryn-session              # the CLI session between the two steps; RAM, never the app's")
+            out.println("        emptyDir: { medium: Memory }")
             out.println("      - name: client-secret")
             out.println("        emptyDir: { medium: Memory }")
-            out.println("    initContainers:")
-            out.println("      - name: thoryn-client-secret")
-            out.println("        image: ghcr.io/thoryn-io/thoryn-cli:latest")
+            // SSO-3687 — the published image (ghcr.io/thoryn-io/thoryn-cli) is distroless: there is no shell to
+            // chain `login && rotate-secret`, and no OS keychain, so: two init containers sharing the session on
+            // a RAM volume, each with the explicit file-store opt-in. No `:latest` exists — pin by digest.
+            out.println("    initContainers:          # the image has no shell: two steps, in order, sharing /thoryn-session")
+            out.println("      - name: thoryn-login")
+            out.println("        image: $KUBERNETES_IMAGE_PLACEHOLDER   # pin by digest — see examples/kubernetes/README.md")
             out.println("        # token source: $KUBERNETES_TOKEN_FILE")
-            out.println("        command: [\"sh\", \"-c\", \"thoryn login --connection /etc/thoryn/connection.json &&")
-            out.println("                   thoryn clients rotate-secret \$APP_CLIENT_ID --secret-file /shared/client-secret\"]")
+            out.println("        args: [\"login\", \"--connection\", \"/etc/thoryn/connection.json\"]")
+            out.println("        env:                          # no OS keychain in a container: the explicit file-store opt-in")
+            out.println("          - { name: THORYN_CI_PLAINTEXT_TOKENS, value: \"1\" }")
+            out.println("          - { name: THORYN_TOKEN_FILE, value: /thoryn-session/tokens.json }")
             out.println("        volumeMounts:")
             out.println("          - { name: thoryn-token, mountPath: /var/run/secrets/tokens/thoryn, readOnly: true }")
+            out.println("          - { name: thoryn-connection, mountPath: /etc/thoryn, readOnly: true }")
+            out.println("          - { name: thoryn-session, mountPath: /thoryn-session }")
+            out.println("      - name: thoryn-client-secret")
+            out.println("        image: $KUBERNETES_IMAGE_PLACEHOLDER")
+            out.println("        args: [\"clients\", \"rotate-secret\", \"\$(APP_CLIENT_ID)\", \"--secret-file\", \"/shared/client-secret\",")
+            out.println("               \"--confirm\", \"${workspaceSlug ?: "<workspace-slug>"}\"]   # --confirm: a production application")
+            out.println("        env:")
+            out.println("          - { name: APP_CLIENT_ID, value: <the application whose secret the pod pulls> }")
+            out.println("          - { name: THORYN_CI_PLAINTEXT_TOKENS, value: \"1\" }")
+            out.println("          - { name: THORYN_TOKEN_FILE, value: /thoryn-session/tokens.json }")
+            out.println("        volumeMounts:")
+            out.println("          - { name: thoryn-session, mountPath: /thoryn-session }")
             out.println("          - { name: client-secret, mountPath: /shared }")
             out.println()
             out.println("3. The application reads /shared/client-secret (e.g. oauth2-proxy --client-secret-file=/shared/client-secret).")
