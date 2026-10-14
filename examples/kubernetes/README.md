@@ -1,0 +1,99 @@
+# An application in Kubernetes fetches its own Thoryn client secret
+
+SSO-3684 (parent [SSO-3678](https://thoryn.atlassian.net/browse/SSO-3678), epic SSO-3304). The hub and
+product-api half is oauthy #4095; the design is oauthy ADR
+`adrs/2026-10-14-kubernetes-workload-identity-and-runtime-credential-pull.md`, the user guide the
+Kubernetes section of `docs/content/guides/workload-identity-github-actions.mdx` (published at
+thoryn.org/docs). This directory is that guide's manifest, complete and applyable.
+
+## The problem it removes
+
+Software that can only consume a `client_secret` — oauth2-proxy, Forgejo's OIDC login, Grafana — in front
+of Thoryn SSO used to need a human (or a CI job) to mint the secret and copy it into the cluster: three
+hand-offs and a copy of a credential in a CI secret store. Here the **pod pulls the secret itself** with
+the token Kubernetes already gives it. No client secret crosses a repository, a CI secret store or a person.
+
+```
+projected ServiceAccount token  ──►  thoryn login --connection /etc/thoryn/connection.json
+   (iss = the cluster,                   (exchanged under a `kubernetes` workload identity trust)
+    sub = system:serviceaccount:forge:forge-oauth2-proxy,
+    aud = the trust's audience)     ──►  thoryn clients rotate-secret $APP_CLIENT_ID --secret-file /shared/client-secret
+                                    ──►  oauth2-proxy --client-secret-file=/shared/client-secret
+```
+
+## Files
+
+| File | What it is |
+|---|---|
+| `deployment.yaml` | ServiceAccount + ConfigMap (the connection contract) + Deployment: the projected token volume (`audience` = the trust's audience, `expirationSeconds: 3600`), the Thoryn init container, the in-memory `/shared` volume, oauth2-proxy reading the file. |
+| `connection.json` | The connection contract the init container signs in with — what `thoryn workload-identity trusts create --provider kubernetes` prints. Token source: the projected token FILE. It holds no secret. |
+
+## Steps
+
+1. **Create the trust** (an environment manager; `tenant:workload-identity.write`):
+
+   ```bash
+   # A PRIVATE cluster (k3s, kind, an on-prem cluster whose issuer resolves nowhere outside): pin its
+   # PUBLIC key set. A managed cloud cluster (EKS, GKE, AKS) publishes its issuer — skip this and --jwks-file.
+   kubectl get --raw /openid/v1/jwks > cluster-jwks.json
+
+   thoryn workload-identity trusts create --provider kubernetes --name forge-oauth2-proxy \
+     --issuer "$(kubectl get --raw /.well-known/openid-configuration | jq -r .issuer)" \
+     --namespace forge --service-account forge-oauth2-proxy \
+     --jwks-file cluster-jwks.json \
+     --scope tenant:applications.write --confirm-production
+   ```
+
+   A production trust must pin **both** the namespace and the service account (the CLI refuses
+   `--confirm-production` without them, as the API refuses `production_requires_service_account`). It
+   prints the `clientId` (`wi_…`), the `audience`, and the `connection.json` — paste it into the ConfigMap.
+
+2. **Let the trust's client rotate the application's secret** — `manager` on that one application:
+
+   ```bash
+   thoryn access grant --subject client:wi_9a8b7c6d5e4f3a2b1c0d9e8f --relation manager \
+     --object application:7f1c2d3e-4a5b-6c7d-8e9f-0a1b2c3d4e5f
+   ```
+
+3. **Edit and apply** `deployment.yaml`: the three `# <-` values (service account name / namespace must
+   equal the trust's pins; `APP_CLIENT_ID` is the application) and the `audience:` of the projected
+   volume (the trust's audience, exactly). Then `kubectl apply -f deployment.yaml`.
+
+The init container runs once per pod start. **Rotation is a restart**: `rotate-secret` keeps the previous
+secret valid for 24 hours, so a rolling restart never breaks a running replica. If a private cluster
+rotates its signing key, re-create the trust with the new `--jwks-file`.
+
+## What the hub checks (and how a refusal reads)
+
+The hub accepts the pod's token only when its signature verifies against the cluster's keys, `iss` is the
+pinned issuer, `aud` is the trust's audience, it is unexpired and unused, `sub` is exactly
+`system:serviceaccount:<namespace>:<serviceAccount>` for the pinned names, and the `kubernetes.io` claim
+names the same two (a legacy Secret-based token has no such claim and is refused). Every refusal is the
+same `401 invalid_client`; the exact reason is in the workspace audit log
+(`thoryn audit query --event-type workload_identity.exchange_failed`). The CLI prints what it sent and the
+pod's own identity (the public claims — never the token), and names the difference it can see when the
+connection carries the `auth.kubernetes` pins:
+
+```text
+Sign-in failed: the platform refused the workload identity exchange (HTTP 401: invalid_client).
+…
+This pod (claims of its projected ServiceAccount token; the token itself is not shown):
+  iss                  https://kubernetes.default.svc.cluster.local
+  sub                  system:serviceaccount:staging:forge-oauth2-proxy
+  aud                  https://thoryn.auth.thoryn.io
+  namespace            staging
+  service account      forge-oauth2-proxy
+
+Differences found locally:
+  - namespace: the trust pins 'forge'; this pod runs in 'staging'.
+```
+
+## Notes
+
+- The init container image is the `thoryn` CLI. `ghcr.io/thoryn-io/thoryn-cli:latest` is the name the
+  Thoryn guide uses; until that image is published from this repository's releases, build one from the
+  Linux native binary of a `cli-v*` release (`thoryn` on `PATH`, plus `sh`).
+- `/shared` is an `emptyDir` with `medium: Memory`: the secret lives in RAM for the pod's lifetime and is
+  gone with the pod. Mount it read-only in the application.
+- The trust's scopes need only `tenant:applications.write`; the token the pod obtains lasts 15 minutes and
+  is used once, for the rotation.

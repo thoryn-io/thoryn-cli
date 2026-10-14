@@ -23,6 +23,7 @@ import com.devnow.thoryn.cli.output.OutputFormat
 import com.devnow.thoryn.cli.output.Printers
 import tools.jackson.databind.JsonNode
 import java.io.PrintStream
+import java.nio.file.Path
 import java.time.Duration
 
 /**
@@ -474,20 +475,24 @@ internal object CommandSupport {
     /**
      * SSO-3308 — renew an expired workload identity session: the same trust binding the login stored
      * ([Tokens.clientId], the audience in [Tokens.issuer], [Tokens.tokenEndpoint], the granted
-     * [Tokens.scope]) exchanged again with a FRESH job token from the runner. Works for as long as the job
-     * runs; outside it (no runner variables) it says so once and returns null, so the command surfaces its
-     * 401. The renewed bundle keeps the session fields and is written back to the store.
+     * [Tokens.scope]) exchanged again with a FRESH job token from the runner — or, SSO-3684, re-read from
+     * the token FILE the session recorded ([Tokens.tokenFile]: a pod's projected ServiceAccount token, which
+     * Kubernetes refreshes in place). Works for as long as the job runs / the pod lives; outside it it says
+     * so once and returns null, so the command surfaces its 401. The renewed bundle keeps the session fields
+     * and is written back to the store.
      */
     private fun reMintWorkloadIdentity(current: Tokens, err: PrintStream): Tokens? {
         val audience = current.issuer?.takeIf { it.isNotBlank() } ?: return null
         val clientId = current.clientId?.takeIf { it.isNotBlank() } ?: return null
         val tokenEndpoint = current.tokenEndpoint?.takeIf { it.isNotBlank() } ?: "${audience.trimEnd('/')}/oauth2/token"
+        val tokenFile = current.tokenFile?.takeIf { it.isNotBlank() }
         return try {
             val minted = WorkloadIdentityFlow(
                 clientId = clientId,
                 audience = audience,
                 tokenEndpoint = tokenEndpoint,
                 tokenSender = realHttpSender(),
+                tokenFile = tokenFile?.let(Path::of),
             ).run(current.scope)
                 .copy(
                     issuer = current.issuer,
@@ -497,6 +502,7 @@ internal object CommandSupport {
                     clientId = clientId,
                     workspace = current.workspace,
                     tokenEndpoint = tokenEndpoint,
+                    tokenFile = tokenFile,
                 )
             runCatching { TokenStoreFactory.default().write(minted) }
             minted
@@ -507,7 +513,13 @@ internal object CommandSupport {
             }
             warnOnce(err) {
                 "Could not renew the workload identity session for '$clientId' (${e.oauthError}): ${e.message}. " +
-                    "A workload identity session renews only inside the GitHub Actions job that signed in; " +
+                    (
+                        if (tokenFile != null) {
+                            "A workload identity session renews only where its identity token file is mounted; "
+                        } else {
+                            "A workload identity session renews only inside the GitHub Actions job that signed in; "
+                        }
+                        ) +
                     "run `${LoginCommand.reLoginCommand(current)}` there."
             }
             null

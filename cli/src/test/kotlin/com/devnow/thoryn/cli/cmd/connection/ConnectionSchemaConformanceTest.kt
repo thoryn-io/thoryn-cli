@@ -174,7 +174,7 @@ class ConnectionSchemaConformanceTest {
                 .replace("\"environment\": \"thoryn-staging-wif\"", "\"environment\": \"x\", \"rogue\": 1"),
         )
         val violations = Connection.validate(bad)
-        assertThat(violations).anyMatch { it.contains("auth.provider must be 'github_actions'") }
+        assertThat(violations).anyMatch { it.contains("auth.provider must be one of github_actions | kubernetes") }
         assertThat(violations).anyMatch { it.contains("auth.audience 'not a url' must be an absolute http(s) URL") }
         assertThat(violations).anyMatch { it.contains("auth.github.repositoryId must be a positive integer") }
         assertThat(violations).anyMatch { it.contains("auth.github has unknown property 'rogue'") }

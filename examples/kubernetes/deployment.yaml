@@ -1,0 +1,110 @@
+# SSO-3684 (parent SSO-3678) — an application that fetches its OWN Thoryn client secret.
+#
+# The pattern (ADR oauthy/adrs/2026-10-14-kubernetes-workload-identity-and-runtime-credential-pull.md):
+# a `kubernetes` workload identity trust pins this cluster's OIDC issuer, the namespace and the service
+# account below. The pod's projected ServiceAccount token (`iss` = the cluster, `sub` =
+# system:serviceaccount:forge:forge-oauth2-proxy, `aud` = the trust's audience) IS its credential: the
+# Thoryn init container signs in with it (`thoryn login --connection`), rotates the application's client
+# secret (`thoryn clients rotate-secret … --secret-file`) into an in-memory volume, and the application
+# reads the file. No client secret crosses a repository, a CI secret store or a person. Rotation is a pod
+# restart — the previous secret stays valid for 24 hours, so a rolling restart never breaks a replica.
+#
+# One-time setup (an environment manager, with `thoryn`):
+#   kubectl get --raw /openid/v1/jwks > cluster-jwks.json            # only for a PRIVATE cluster (k3s, …)
+#   thoryn workload-identity trusts create --provider kubernetes --name forge-oauth2-proxy \
+#     --issuer "$(kubectl get --raw /.well-known/openid-configuration | jq -r .issuer)" \
+#     --namespace forge --service-account forge-oauth2-proxy --jwks-file cluster-jwks.json \
+#     --scope tenant:applications.write --confirm-production
+#   → prints the clientId (wi_…), the audience, and the connection.json below (step 1 of its output).
+#   thoryn access grant --subject client:wi_… --relation manager --object application:<APP_CLIENT_ID>
+#
+# Then edit the three values marked `# <-` and `kubectl apply -f deployment.yaml`.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: forge-oauth2-proxy                                     # <- the trust's --service-account
+  namespace: forge                                             # <- the trust's --namespace
+---
+# What `trusts create --provider kubernetes` printed. It holds NO secret (a client id and an audience are
+# public); its token source is the projected volume's mount path below.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: thoryn-connection
+  namespace: forge
+data:
+  connection.json: |
+    {
+      "apiVersion": "thoryn.io/connection/v1",
+      "workspace": { "slug": "thoryn" },
+      "auth": {
+        "method": "workload_identity",
+        "provider": "kubernetes",
+        "clientId": "wi_9a8b7c6d5e4f3a2b1c0d9e8f",
+        "audience": "https://thoryn.auth.thoryn.io",
+        "tokenSource": { "kind": "file", "path": "/var/run/secrets/tokens/thoryn/token" },
+        "scopes": ["tenant:applications.write"],
+        "kubernetes": {
+          "issuer": "https://kubernetes.default.svc.cluster.local",
+          "namespace": "forge",
+          "serviceAccount": "forge-oauth2-proxy"
+        }
+      }
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: oauth2-proxy
+  namespace: forge
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: oauth2-proxy }
+  template:
+    metadata:
+      labels: { app: oauth2-proxy }
+    spec:
+      serviceAccountName: forge-oauth2-proxy
+      volumes:
+        - name: thoryn-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  audience: https://thoryn.auth.thoryn.io       # the trust's `audience`
+                  expirationSeconds: 3600
+        - name: client-secret
+          emptyDir: { medium: Memory }
+        - name: thoryn-connection
+          configMap: { name: thoryn-connection }
+      initContainers:
+        - name: thoryn-client-secret
+          image: ghcr.io/thoryn-io/thoryn-cli:latest
+          # token source: /var/run/secrets/tokens/thoryn/token (what `trusts create --provider kubernetes` prints)
+          command: ["sh", "-c", "thoryn login --connection /etc/thoryn/connection.json &&
+                     thoryn clients rotate-secret $APP_CLIENT_ID --secret-file /shared/client-secret"]
+          env:
+            - name: APP_CLIENT_ID
+              value: "7f1c2d3e-4a5b-6c7d-8e9f-0a1b2c3d4e5f"      # <- the application whose secret the pod pulls
+          volumeMounts:
+            - { name: thoryn-token, mountPath: /var/run/secrets/tokens/thoryn, readOnly: true }
+            - { name: thoryn-connection, mountPath: /etc/thoryn, readOnly: true }
+            - { name: client-secret, mountPath: /shared }
+      containers:
+        - name: oauth2-proxy
+          image: quay.io/oauth2-proxy/oauth2-proxy:v7.7.1
+          args:
+            - --client-secret-file=/shared/client-secret
+            - --client-id=7f1c2d3e-4a5b-6c7d-8e9f-0a1b2c3d4e5f
+            - --provider=oidc
+            - --oidc-issuer-url=https://thoryn.auth.thoryn.io
+            - --redirect-url=https://forge.example.org/oauth2/callback
+            - --cookie-secret-file=/etc/oauth2-proxy/cookie-secret   # oauth2-proxy's own state key, not a Thoryn credential
+            - --email-domain=*
+            - --http-address=0.0.0.0:4180
+          ports:
+            - { name: http, containerPort: 4180 }
+          volumeMounts:
+            - { name: client-secret, mountPath: /shared, readOnly: true }

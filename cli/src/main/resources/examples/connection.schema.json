@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://thoryn.io/examples/connection.schema.json",
   "title": "Thoryn CLI connection contract",
-  "description": "SSO-2948 (epic SSO-2947) — a schema-backed, declarative sign-in configuration for the `thoryn` CLI: HOW a caller (a person for their own use cases, or a CI pipeline dogfooding the same feature) signs the CLI into a given workspace/identity. It is DATA, not code — a sibling of the recipe schema — passed to `thoryn login --connection <file>`. The workspace slug derives the per-tenant issuer (`https://<slug>.<label>.<env>`) and gateway. Two auth methods, one per client: `client_credentials` (an API key — the SECRET is NEVER in this file, only the NAME of the environment variable that carries it, `auth.secretEnv`) and, since SSO-3308, `workload_identity` (a GitHub Actions workload identity trust — no secret at all: the job's own OIDC token is exchanged, so the file names no env var). A client id is public and MAY appear.",
+  "description": "SSO-2948 (epic SSO-2947) — a schema-backed, declarative sign-in configuration for the `thoryn` CLI: HOW a caller (a person for their own use cases, or a CI pipeline dogfooding the same feature) signs the CLI into a given workspace/identity. It is DATA, not code — a sibling of the recipe schema — passed to `thoryn login --connection <file>`. The workspace slug derives the per-tenant issuer (`https://<slug>.<label>.<env>`) and gateway. Two auth methods, one per client: `client_credentials` (an API key — the SECRET is NEVER in this file, only the NAME of the environment variable that carries it, `auth.secretEnv`) and, since SSO-3308, `workload_identity` (a GitHub Actions workload identity trust — no secret at all: the job's own OIDC token is exchanged, so the file names no env var). Since SSO-3684 a `workload_identity` connection may also bind to a `kubernetes` trust (`auth.provider: kubernetes`): the identity token is then a pod's projected ServiceAccount token read from a FILE (`auth.tokenSource: {kind: file, path: …}`) instead of the GitHub Actions runner. A client id is public and MAY appear.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -47,7 +47,7 @@
       ],
       "properties": {
         "method": {
-          "description": "Authentication method: `client_credentials` (an API key, secret named by `secretEnv`) or `workload_identity` (SSO-3308 — a GitHub Actions job exchanges its OIDC token under a workload identity trust; runs only inside a job with `permissions: id-token: write`).",
+          "description": "Authentication method: `client_credentials` (an API key, secret named by `secretEnv`) or `workload_identity` (SSO-3308 — a GitHub Actions job exchanges its OIDC token under a workload identity trust; runs only inside a job with `permissions: id-token: write` — or, with `provider: kubernetes` and a `tokenSource` of kind `file`, inside a pod holding its projected ServiceAccount token).",
           "enum": [
             "client_credentials",
             "workload_identity"
@@ -74,8 +74,66 @@
           }
         },
         "provider": {
-          "description": "`workload_identity` only: the workload identity provider. `github_actions` is the only provider (the default).",
-          "const": "github_actions"
+          "description": "`workload_identity` only: the workload identity provider the trust was created for. `github_actions` (the default) — a GitHub Actions job's OIDC token, requested from the runner; `kubernetes` (SSO-3684, oathy SSO-3678) — a pod's projected ServiceAccount token, which REQUIRES `tokenSource` of kind `file`.",
+          "enum": [
+            "github_actions",
+            "kubernetes"
+          ],
+          "default": "github_actions"
+        },
+        "tokenSource": {
+          "description": "`workload_identity` only: WHERE the CLI obtains the identity token it exchanges. Absent, or `kind: github_actions` — the GitHub Actions runner's job-token endpoint (`ACTIONS_ID_TOKEN_REQUEST_URL` / `_TOKEN`, set for a job with `permissions: id-token: write`). `kind: file` (SSO-3684) — the token is read from `path` on EVERY exchange (sign-in and renewal): a pod's projected ServiceAccount token, which Kubernetes refreshes in place. The path is public configuration; the file's content is the credential and is never recorded.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ],
+          "properties": {
+            "kind": {
+              "description": "`github_actions` — the runner's job-token endpoint (default when `tokenSource` is absent); `file` — read the token from `path`.",
+              "enum": [
+                "github_actions",
+                "file"
+              ]
+            },
+            "path": {
+              "description": "`kind: file` only (required there): the file holding the identity token. For a pod, the projected ServiceAccount token's mount path — `/var/run/secrets/tokens/thoryn/token` in the documented manifest (`examples/kubernetes/`).",
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "kind": {
+                    "const": "file"
+                  }
+                }
+              },
+              "then": {
+                "required": [
+                  "path"
+                ]
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "kind": {
+                    "const": "github_actions"
+                  }
+                }
+              },
+              "then": {
+                "not": {
+                  "required": [
+                    "path"
+                  ]
+                }
+              }
+            }
+          ]
         },
         "audience": {
           "description": "`workload_identity` only: the trust's `audience` EXACTLY (as `thoryn workload-identity trusts create|get` prints it) — the audience the job requests its OIDC token for. When omitted it is derived: the workspace issuer, plus `/<environment>` for a sandbox. Required when the workspace has an active custom domain.",
@@ -93,7 +151,7 @@
           "pattern": "^https?://[^\\s/?#]+(/[^\\s?#]*)?$"
         },
         "github": {
-          "description": "`workload_identity` only, optional: the trust's GitHub pins (same names as the trust API's `github`). Used ONLY to explain a refused sign-in — the platform refuses every mismatch with the same `invalid_client`, so the CLI compares the job's claims with these and names the field that differs. They grant nothing; the trust on the platform decides.",
+          "description": "`workload_identity` with `provider: github_actions` (the default) only, optional: the trust's GitHub pins (same names as the trust API's `github`). Used ONLY to explain a refused sign-in — the platform refuses every mismatch with the same `invalid_client`, so the CLI compares the job's claims with these and names the field that differs. They grant nothing; the trust on the platform decides.",
           "type": "object",
           "additionalProperties": false,
           "properties": {
@@ -130,6 +188,28 @@
             "githubHostedRunnersOnly": {
               "type": "boolean",
               "description": "The trust accepts only GitHub-hosted runners."
+            }
+          }
+        },
+        "kubernetes": {
+          "description": "`workload_identity` with `provider: kubernetes` only, optional: the trust's Kubernetes pins (same names as the trust API's `kubernetes`, never its key set). Used ONLY to explain a refused sign-in — the platform refuses every mismatch with the same `invalid_client`, so the CLI compares the pod's token claims (`iss`, `kubernetes.io.namespace`, `kubernetes.io.serviceaccount.name`) with these and names the field that differs. They grant nothing; the trust on the platform decides.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "issuer": {
+              "type": "string",
+              "pattern": "^https://[^\\s/?#]+(/[^\\s?#]*)?$",
+              "description": "The cluster's OIDC issuer, exactly as its ServiceAccount tokens carry it (`iss`)."
+            },
+            "namespace": {
+              "type": "string",
+              "minLength": 1,
+              "description": "The namespace the pod must run in (`kubernetes.io.namespace`)."
+            },
+            "serviceAccount": {
+              "type": "string",
+              "minLength": 1,
+              "description": "The service account the pod must run as (`kubernetes.io.serviceaccount.name`)."
             }
           }
         }
@@ -173,6 +253,16 @@
                   "required": [
                     "github"
                   ]
+                },
+                {
+                  "required": [
+                    "tokenSource"
+                  ]
+                },
+                {
+                  "required": [
+                    "kubernetes"
+                  ]
                 }
               ]
             }
@@ -190,6 +280,66 @@
             "not": {
               "required": [
                 "secretEnv"
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "method": {
+                "const": "workload_identity"
+              },
+              "provider": {
+                "const": "kubernetes"
+              }
+            },
+            "required": [
+              "provider"
+            ]
+          },
+          "then": {
+            "required": [
+              "tokenSource"
+            ],
+            "properties": {
+              "tokenSource": {
+                "properties": {
+                  "kind": {
+                    "const": "file"
+                  }
+                }
+              }
+            },
+            "not": {
+              "required": [
+                "github"
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "method": {
+                "const": "workload_identity"
+              }
+            },
+            "not": {
+              "properties": {
+                "provider": {
+                  "const": "kubernetes"
+                }
+              },
+              "required": [
+                "provider"
+              ]
+            }
+          },
+          "then": {
+            "not": {
+              "required": [
+                "kubernetes"
               ]
             }
           }
