@@ -429,10 +429,10 @@ class ProductApiClient(
     // CLI's login clients by oathy hub V192). Environment managers write, viewers read; others get 404.
     // Create answers 201 with the trust's clientId, audience and tokenEndpoint — what a workflow needs.
 
-    fun createWorkloadIdentityTrust(body: Map<String, Any?>): JsonNode =
+    override fun createWorkloadIdentityTrust(body: Map<String, Any?>): JsonNode =
         post("/api/v1/workload-identity/trusts", mapper.valueToTree<JsonNode>(body.withoutNulls()))
 
-    fun listWorkloadIdentityTrusts(limit: Int? = null, cursor: String? = null): JsonNode {
+    override fun listWorkloadIdentityTrusts(limit: Int?, cursor: String?): JsonNode {
         val query = buildList {
             limit?.let { add("limit=$it") }
             cursor?.takeIf { it.isNotBlank() }?.let { add("cursor=${encode(it)}") }
@@ -440,10 +440,10 @@ class ProductApiClient(
         return get("/api/v1/workload-identity/trusts$query")
     }
 
-    fun getWorkloadIdentityTrust(id: String): JsonNode =
+    override fun getWorkloadIdentityTrust(id: String): JsonNode =
         get("/api/v1/workload-identity/trusts/${encode(id)}")
 
-    fun deleteWorkloadIdentityTrust(id: String, confirmSlug: String? = null): Unit =
+    override fun deleteWorkloadIdentityTrust(id: String, confirmSlug: String?): Unit =
         deleteNoContent("/api/v1/workload-identity/trusts/${encode(id)}", confirmSlug)
 
     /** Drop null members (recursively through nested maps) so an omitted option is absent, not `null`. */
