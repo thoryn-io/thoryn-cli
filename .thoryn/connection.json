@@ -7,7 +7,7 @@
   "auth": {
     "method": "workload_identity",
     "provider": "github_actions",
-    "clientId": "wi_PASTE_THE_CLIENT_ID_TRUSTS_CREATE_PRINTS",
+    "clientId": "wi_10a7b379c79f7d1353f5798d",
     "audience": "https://thoryn.auth.stg.thoryn.org",
     "scopes": [
       "tenant:environments.read",

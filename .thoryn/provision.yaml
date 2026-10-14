@@ -129,7 +129,7 @@ resources:
       # The subject is the `wi_…` client of the `thoryn-cli-ci` workload identity trust — the SAME value as
       # `auth.clientId` in `.thoryn/connection.json` (CiProvisionFileConformanceTest pins the two equal). It is
       # minted by the founder's one-time `thoryn workload-identity trusts create`; paste it here.
-      - subject: "client:wi_PASTE_THE_CLIENT_ID_TRUSTS_CREATE_PRINTS"
+      - subject: "client:wi_10a7b379c79f7d1353f5798d"
         relation: manager
 
   - kind: application
