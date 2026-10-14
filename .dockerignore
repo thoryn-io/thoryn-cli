@@ -1,0 +1,5 @@
+# The image is the release's prebuilt linux native binaries on distroless (see Dockerfile).
+# Send nothing else to the builder.
+*
+!dist/thoryn-linux-amd64
+!dist/thoryn-linux-arm64

@@ -44,6 +44,108 @@ that release; see the best-effort note above), `chmod +x`, and put it on `PATH`.
 The `thoryn.jar` fat jar is always attached (`java -jar thoryn.jar ...`); it is
 the stable asset name the `thoryn-examples` conformance CI consumes.
 
+**Container image** (SSO-3687) — every `cli-v*` release also publishes the Linux native binaries as
+a public, signed, multi-arch (`linux/amd64`, `linux/arm64`) image:
+
+```
+ghcr.io/thoryn-io/thoryn-cli:<version>        e.g. :0.33.0 — one per release
+ghcr.io/thoryn-io/thoryn-cli:<major>.<minor>  e.g. :0.33   — moves to the newest patch
+```
+
+There is **no `:latest`**. The image's main use is the Thoryn init container (below), which receives
+a client secret — so **pin it by digest**, with the version beside it for the reader:
+
+```
+image: ghcr.io/thoryn-io/thoryn-cli:<version>@sha256:<digest>
+```
+
+A digest exists only once a release has pushed it; look it up (any of these, no credential needed):
+
+```bash
+docker buildx imagetools inspect ghcr.io/thoryn-io/thoryn-cli:<version>   # "Digest:" line (the multi-arch index)
+crane digest ghcr.io/thoryn-io/thoryn-cli:<version>
+```
+
+— or read it from the release run's summary, which prints the exact `…:<version>@sha256:…` reference
+it pushed. Verify the signature (cosign keyless, signed by this repository's release workflow) before
+you pin it:
+
+```bash
+cosign verify ghcr.io/thoryn-io/thoryn-cli@sha256:<digest> \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  --certificate-identity-regexp '^https://github\.com/thoryn-io/thoryn-cli/\.github/workflows/release\.yml@refs/(tags/cli-v.+|heads/main)$'
+```
+
+The image also carries a BuildKit SBOM and SLSA provenance attestation
+(`docker buildx imagetools inspect ghcr.io/thoryn-io/thoryn-cli:<version> --format '{{ json .SBOM }}'`).
+It is `gcr.io/distroless/cc-debian12:nonroot` (pinned by digest) plus the `thoryn` binary: no shell,
+uid/gid `65532`, `ENTRYPOINT ["/usr/local/bin/thoryn"]` — so a manifest passes the CLI's arguments as
+`args:`. It has no OS keychain, so every invocation needs the explicit file-store opt-in
+(`THORYN_CI_PLAINTEXT_TOKENS=1` + `THORYN_TOKEN_FILE=<path on a volume>`; see
+[Token storage](#token-storage)). The `Dockerfile` explains the base-image choice; `release.yml`'s
+`image` job builds, smoke-runs, pushes, signs, and then **fails unless an anonymous client can pull
+what it pushed** (`scripts/release/check-anonymous-pull.sh`).
+
+**The Thoryn init container** — an application in Kubernetes fetches its own client secret with its
+projected ServiceAccount token (oauthy ADR `2026-10-14-kubernetes-workload-identity-and-runtime-credential-pull`;
+the trust is `thoryn workload-identity trusts create --provider kubernetes`). The image has no shell to
+chain `login && rotate-secret`, so it is **two init containers** that share the CLI's session on a RAM
+volume only they mount:
+
+```yaml
+spec:
+  serviceAccountName: forge-oauth2-proxy            # the trust's --service-account
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65532                                # the secret file is written 0600 — the app reads it as the same uid
+    runAsGroup: 65532
+  volumes:
+    - name: thoryn-token                            # the projected ServiceAccount token = the pod's credential
+      projected:
+        sources:
+          - serviceAccountToken: { path: token, audience: <the trust's audience>, expirationSeconds: 3600 }
+    - name: thoryn-connection
+      configMap: { name: thoryn-connection }        # connection.json, as `trusts create` printed it
+    - name: thoryn-session                          # the CLI session between the two steps; never mounted by the app
+      emptyDir: { medium: Memory }
+    - name: client-secret
+      emptyDir: { medium: Memory }
+  initContainers:
+    - name: thoryn-login
+      image: ghcr.io/thoryn-io/thoryn-cli:<version>@sha256:<digest>
+      args: ["login", "--connection", "/etc/thoryn/connection.json"]
+      env: &thoryn-session-env
+        - { name: THORYN_CI_PLAINTEXT_TOKENS, value: "1" }        # no keychain in a container: explicit file-store opt-in
+        - { name: THORYN_TOKEN_FILE, value: /thoryn-session/tokens.json }
+      securityContext: &thoryn-hardening
+        readOnlyRootFilesystem: true
+        allowPrivilegeEscalation: false
+        capabilities: { drop: ["ALL"] }
+      volumeMounts:
+        - { name: thoryn-token, mountPath: /var/run/secrets/tokens/thoryn, readOnly: true }
+        - { name: thoryn-connection, mountPath: /etc/thoryn, readOnly: true }
+        - { name: thoryn-session, mountPath: /thoryn-session }
+    - name: thoryn-client-secret
+      image: ghcr.io/thoryn-io/thoryn-cli:<version>@sha256:<digest>
+      # --confirm: rotating a PRODUCTION application's secret needs the workspace slug (SSO-2413).
+      args: ["clients", "rotate-secret", "<APP_CLIENT_ID>", "--secret-file", "/shared/client-secret", "--confirm", "<workspace-slug>"]
+      env: *thoryn-session-env
+      securityContext: *thoryn-hardening
+      volumeMounts:
+        - { name: thoryn-session, mountPath: /thoryn-session }
+        - { name: client-secret, mountPath: /shared }
+  containers:
+    - name: oauth2-proxy
+      args: ["--client-secret-file=/shared/client-secret", …]
+      volumeMounts:
+        - { name: client-secret, mountPath: /shared, readOnly: true }
+```
+
+The session the two steps share is a 15-minute workload-identity token (and its DPoP key) on a RAM
+volume the application container never mounts; it dies with the pod. Rotation is a pod restart — the
+previous secret stays valid for 24 hours. The image logs one `WARNING: Using plaintext file token
+store…` line per step; that is the explicit opt-in above being announced, not a fault.
+
 ## Command tree
 
 ```
@@ -1997,7 +2099,14 @@ thoryn-cli/
 * Reflection metadata for picocli's `@Command`-annotated classes is
   generated by `picocli-codegen` during `process-classes`. New subcommand
   classes are picked up automatically; no manual `reflect-config.json`
-  changes needed.
+  changes needed. **A command's constructor must not open the token store (or
+  any OS resource)** — the generator instantiates every command, and on a Linux
+  build host without a keychain an eager store threw there, the generator wrote
+  no config at all, and the shipped Linux binary could run no subcommand (SSO-3687;
+  `by lazy` is the fix, `NativeReflectionConfigWithoutKeychainTest` the guard).
+* Linux binaries link zlib statically (`-H:+StaticExecutableWithDynamicLibC`, profile
+  `native-static-nolibc-linux`): glibc is their only shared dependency, which is what lets the
+  container image run them on distroless/cc (SSO-3687). The build needs `libz.a` (`zlib1g-dev`).
 * `java-keyring` + `JNA` reflection lives in
   `cli/src/main/resources/META-INF/native-image/com.devnow.thoryn.cli/` (the engine library's own
   entries live in `engine/src/main/resources/META-INF/native-image/io.thoryn/thoryn-provision-engine/`).

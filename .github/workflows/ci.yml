@@ -136,3 +136,69 @@ jobs:
           # A job token works once: signing in again must request a FRESH one and succeed.
           thoryn login --workload-identity --client-id "$WIF_CLIENT_ID" --audience "$WIF_AUDIENCE" --scope tenant:environments.read
           thoryn logout || true
+
+  # SSO-3687 — the container image ghcr.io/thoryn-io/thoryn-cli, built from THIS commit and run, with
+  # nothing pushed. release.yml publishes it from the linux native binaries; this builds the same
+  # binary the same way on the same runner class (ubuntu-24.04 / ubuntu-24.04-arm, -march as there),
+  # puts it on the same pinned distroless base through the same Dockerfile, and runs it. It catches a
+  # binary that cannot start on the base (a shared library the base lacks — the libz.so.1 trap — or a
+  # newer glibc than Debian 12 carries), a Dockerfile regression, and a lost non-root user — at PR
+  # time, not after a tag. Not a required check (a native build takes minutes); the release re-runs
+  # the same smoke before it pushes.
+  container-image:
+    name: container image (${{ matrix.arch }}) — build + smoke
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+            march: compatibility
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            march: default
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: graalvm/setup-graalvm@27b360dbb857524eaf0b4c4cef364d38e5b4f173 # v1.6.7
+        with:
+          java-version: "21"
+          distribution: graalvm
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Ensure libz.a for the static zlib link
+        run: dpkg -s zlib1g-dev >/dev/null 2>&1 || { sudo apt-get update -qq && sudo apt-get install -y -qq zlib1g-dev; }
+
+      - name: Build the linux native binary (as release.yml does)
+        env:
+          MARCH: ${{ matrix.march }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          if [ "$MARCH" = "compatibility" ]; then
+            ./mvnw -B -ntp -q -Pnative -Dnative-march=compatibility -Drevision=0.0.0-ci -DskipTests package
+          else
+            ./mvnw -B -ntp -q -Pnative -Drevision=0.0.0-ci -DskipTests package
+          fi
+          mkdir -p dist
+          cp cli/target/thoryn "dist/thoryn-linux-$ARCH"
+          # Evidence for the base-image choice, in the log: glibc is the ONLY shared dependency.
+          readelf -d "dist/thoryn-linux-$ARCH" | grep NEEDED
+          if readelf -d "dist/thoryn-linux-$ARCH" | grep NEEDED | grep -qv -e 'libc\.so\.6' -e 'ld-linux'; then
+            echo "::error::the linux binary needs a shared library besides glibc — distroless/cc will not carry it (see cli/pom.xml native-static-nolibc-linux)."
+            exit 1
+          fi
+
+      - name: Build the image (no push) and run it as the init container does
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          docker build --platform "linux/$ARCH" -t "thoryn-cli:ci-$ARCH" .
+          bash scripts/release/smoke-image.sh "thoryn-cli:ci-$ARCH" 0.0.0-ci
