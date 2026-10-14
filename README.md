@@ -279,6 +279,14 @@ thoryn examples share    <name> [--output <file>]   # SSO-2876 — export the se
 # `kind: file` (owner-only, no overwrite without --force) — right after apply recorded the client. Nothing reaches
 # ⇒ exit 65 `undelivered_secrets` naming `thoryn clients rotate-secret <id> --secret-file <path>`. See "Where a
 # minted secret goes" below.
+# SSO-3689 (ADR 2026-10-14 credential ladder; ADR 2026-10-14 federated client authentication): an application declares HOW it
+# authenticates — `clientAuthenticationMethods: [private_key_jwt]` with `jwksUri` or an inline public `jwks` (rung 1), or
+# `[federated_assertion]` with `federatedTrust: <trust name>` (rung 2: the pod's / job's platform token IS the client
+# credential; nothing is minted) — converged on update too; `client_secret_post` is not declarable. New kind
+# `workloadIdentityTrust` (provider github_actions | forgejo | kubernetes + that provider's pins, scopes, confirmProduction):
+# converged by name, adopted on the API's 409, never updated in place (workload_identity_trust_immutable), removed only
+# via --prune/destroy; the receipt records the wi_ client + audience; apply PRINTS the consumer's connection.json, never
+# writes it. See "Secretless clients" and "Declaring a workload-identity trust" below.
 thoryn provision plan    [--file <path>] [--prune]                       # read-only: what apply would create / remove (+ grant changes, pending publishes); exit 1 on an ownership error
 thoryn provision apply   [--file <path>] [--prune] [--confirm <ws>] [--yes] \
                          [--secret-file <path>] [--force-stdout] [--force] \
@@ -1239,6 +1247,166 @@ The app's production deploy job then runs in its `production` environment and re
 `${{ vars.THORYN_PRODUCTION_CLIENT_ID }}`, resolving the issuer from the discovery document as the
 starters already do — see the oauthy guide *Declare an application's production client in the config
 project* for the deploy-job shape.
+
+### Secretless clients — `clientAuthenticationMethods`, `jwksUri` / `jwks`, `federatedTrust` (SSO-3689)
+
+Per oauthy ADR `2026-10-14-kubernetes-workload-identity-and-runtime-credential-pull.md` (the **credential
+ladder**: secret-less by key, secret-less by platform identity, runtime pull, courier — most preferred first)
+and ADR `2026-10-14-federated-client-authentication-for-login-clients.md` (rung 2), an `application`
+declares **how it authenticates** at the token endpoint instead of being minted a secret by default:
+
+```yaml
+resources:
+  # Rung 1 — the application's own key pair; only its PUBLIC half is declared.
+  - kind: application
+    name: billing-api
+    spec:
+      displayName: "Billing API"
+      grantTypes: [client_credentials]
+      clientAuthenticationMethods: [private_key_jwt]
+      jwksUri: https://billing.acme.example/.well-known/jwks.json   # or an inline `jwks: { keys: [ { kty, kid, n, e } ] }` — exactly one of the two
+
+  # Rung 2 — the workload's platform identity token IS the client assertion (ADR 2026-10-14 §11). Nothing is minted.
+  - kind: workloadIdentityTrust
+    name: billing-pods
+    spec:
+      provider: kubernetes
+      kubernetes: { issuer: "https://oidc.eks.eu-central-1.amazonaws.com/id/EXAMPLE", namespace: billing, serviceAccount: billing-web }
+      scopes: [tenant:applications.read]
+      confirmProduction: true
+  - kind: application
+    name: billing-web
+    spec:
+      displayName: "Billing web"
+      redirectUris: ["https://billing.acme.example/cb"]
+      grantTypes: [authorization_code, refresh_token]
+      clientAuthenticationMethods: [federated_assertion]
+      federatedTrust: billing-pods          # the trust's NAME in the same environment — the engine resolves it to the id the API takes
+```
+
+- **The methods are a closed set:** `private_key_jwt`, `federated_assertion`, `client_secret_basic`, `none`.
+  `client_secret_post` is deliberately **not declarable** (`invalid_client_authentication_method`): a secret in
+  the request body is the courier rung. Omitted ⇒ product-api's default for the `clientType`
+  (`client_secret_basic` for a confidential client, `none` for a public one) — the existing behaviour.
+- **`private_key_jwt` needs the public key:** `jwksUri` (https) **xor** an inline `jwks`
+  (`private_key_jwt_key_required` / `jwks_or_jwks_uri`). An inline set holds **public keys only** — a `d`, `p`,
+  `q`, `dp`, `dq`, `qi`, `oth` or `k` member is `invalid_jwks` (a private key in a repository is a secret in the
+  repository, exactly what the file exists to make impossible).
+- **`federated_assertion` is refused client-side with the hub's own codes** (`FederatedLoginClientBinder` /
+  product-api's `FederatedAssertionBindingValidator` answer the same tokens): it is the ONLY method
+  (`federated_assertion_only_method`, also for `clientType: public` — a public client authenticates with
+  `none`), grants beyond `authorization_code` / `refresh_token` are `federated_assertion_grant_not_allowed`
+  (a workload that needs `client_credentials` uses the trust's own `wi_…` client), `requireProofKey: false`
+  is `federated_assertion_pkce_required`, a `jwks` / `jwksUri` is `federated_assertion_no_secret_or_key`,
+  a missing `federatedTrust` is `federated_trust_required`, and a `federatedTrust` without the method is
+  `federated_trust_without_method`. A trust that is missing, or declared in this file for ANOTHER
+  environment, is the plan error **`federated_trust_not_found`** (a login client binds a trust of its own
+  environment; the hub checks the same); `apply` refuses the plan before writing.
+- **No secret is minted or expected** for a `private_key_jwt` / `federated_assertion` client (the API answers
+  `clientSecret: null`): `plan` prints no "will be minted", nothing reaches `--secret-file` or a sink, and a
+  `secretSink:` next to such methods is `secret_sink_without_secret_method` — a sink is legal only when the
+  declared methods include a secret-bearing one (`client_secret_basic`).
+- **All three converge on UPDATE**, not only at create (the 2026-10-13 ADR's reading note): a changed
+  method set or trust binding is one `PATCH` carrying exactly that field. **The key location is the
+  exception you should know about:** product-api's `ApplicationResponse` does not render `jwksUri` / `jwks`
+  (a product gap, reported on the PR), so the engine records what the file last applied in the receipt
+  (`attributes.jwksUri`, `attributes.jwksKids` — never a key) and diffs against that; an **adopted** client
+  with a declared key location is sent it **once** (`(not readable from the API — sent once to converge)`
+  in the plan) and is a no-op afterwards.
+- **Order:** `apply` converges environments, then every `workloadIdentityTrust`, then everything else — so
+  a client may bind a trust the same file declares; the plan shows the pending binding as
+  `federatedTrust: (unset) → billing-pods (created by this apply)`. Removal is child-first: clients before
+  the trust they bind.
+
+### Declaring a workload-identity trust — `kind: workloadIdentityTrust` (SSO-3689)
+
+The imperative twin is `thoryn workload-identity trusts create` (above). Declared, a trust is a resource
+of its **environment** (no `environment:` ⇒ the production plane) with the provider's **pins**:
+
+```yaml
+resources:
+  - kind: workloadIdentityTrust
+    name: billing-ci                    # the trust's name on the API — the converge key, unique per environment
+    environment: staging
+    spec:
+      provider: github_actions
+      github:
+        repository: acme/billing        # owner/name
+        ownerId: 1234567                # GitHub's immutable ids — both or neither (looked up once for a public repository)
+        repositoryId: 7654321
+        environment: staging            # the GitHub environment the job must run in — REQUIRED for a production trust
+        ref: refs/heads/main            # exact
+        githubHostedRunnersOnly: true
+      scopes: [tenant:applications.read, tenant:applications.write]
+  - kind: workloadIdentityTrust
+    name: forge-main
+    spec:
+      provider: forgejo
+      forgejo: { instanceUrl: "https://forge.example.org", owner: thoryn, ownerId: 7, repository: infra, repositoryId: 42, ref: refs/heads/main }
+      scopes: [tenant:applications.write]
+      confirmProduction: true           # production plane: its jobs act on production (production_confirmation_required otherwise)
+  - kind: workloadIdentityTrust
+    name: billing-pods
+    spec:
+      provider: kubernetes
+      kubernetes:
+        issuer: "https://oidc.eks.eu-central-1.amazonaws.com/id/EXAMPLE"
+        namespace: billing              # namespace + serviceAccount: REQUIRED for a production trust
+        serviceAccount: billing-web
+        jwks: { keys: [ { kty: RSA, kid: t10j6Z4K, use: sig, alg: RS256, n: "…", e: AQAB } ] }   # PUBLIC keys only, for a cluster Thoryn cannot reach
+      scopes: [tenant:applications.read]
+      confirmProduction: true
+```
+
+What `thoryn provision` does with it:
+
+- **Converge by name.** A trust of that name in the plane is **adopted** (every DECLARED field must
+  match: `provider`, `scopes` as a set, the pins; a field the file leaves out is not compared); absent, it
+  is **created** (`POST /api/v1/workload-identity/trusts`, with the file's `repository: owner/name` as the
+  API's `owner` + `repository`); a `409 workload_identity_trust_name_taken` between the lookup and the
+  create adopts the matching trust, as `project init` does. **There is no update:** a trust's pins and
+  scopes are immutable on the hub, so a declared field that differs from the live trust is the plan error
+  **`workload_identity_trust_immutable`**, naming the fix — declare what is live, or
+  `thoryn workload-identity trusts delete <id>` and re-apply to re-create it. Removal is only through
+  `--prune` / `destroy` (the production plane gated by `--confirm <workspace-slug>`), clients first.
+- **The receipt records** the trust id, its **`wi_…` workload client** (`attributes.clientId`), its
+  `audience` and `provider` — nothing secret exists on a trust.
+- **The scope ceiling.** A trust may carry only `tenant:` scopes the **applying identity itself holds**
+  (the hub's `403 scope_not_grantable`): a trust can never widen the reach of the repository that declares
+  it. `plan` states the ceiling on every create; when the session's scopes are known (the token's `scope`
+  claim — the CLI passes them) a trust that overreaches is a red plan with the hub's own code before any
+  write; otherwise the hub refuses at apply and the error names the fix.
+- **`apply` prints the consumer's `connection.json` — and never writes it.** The file belongs to the
+  repository (or the workload) that signs in with the trust, not to the one that declares it:
+
+  ```text
+  + workloadIdentityTrust billing-ci: id=7f1c… clientId=wi_3f0c9a1b2d4e5f6a7b8c9d0e audience=https://acme.auth.thoryn.io/staging env=staging
+      connection.json for the workload that signs in with this trust — not written by apply (it belongs to the consumer repository):
+        { "apiVersion" : "thoryn.io/connection/v1", "workspace" : { "slug" : "acme" }, "auth" : { "method" : "workload_identity", "provider" : "github_actions", "clientId" : "wi_3f0c…", "audience" : "https://acme.auth.thoryn.io/staging", "scopes" : [ … ], "github" : { "owner" : "acme", "repository" : "billing", … } } }
+  ```
+
+  `plan` shows an existing trust's `clientId` and `audience` on its row. A `kubernetes` trust's document is
+  the one `trusts create --provider kubernetes` prints (SSO-3684): `provider: kubernetes`, the file token
+  source (`/var/run/secrets/tokens/thoryn/token`, the projected ServiceAccount token) and the cluster pins.
+  For a `forgejo` trust `provider` is left out (the contract validates `github_actions` and `kubernetes`
+  today; a Forgejo job presents its own Actions token as the `client_assertion`).
+- **Ownership is the environment's.** A trust has no platform object of its own: the API writes for an
+  environment's managers, reads for its viewers and answers 404 to anyone else — so the gate asks about
+  the parent (`environment:<id>`, or the workspace for the production plane): `manager` ⇒ converge,
+  `viewer` ⇒ only a matching `readOnly: true` reference, none ⇒ `access_not_owned`. A trust cannot carry
+  `grants:`, `publishTo:` or `secretSink:`.
+- **`import`** renders every trust of a plane the identity may reach (`github` / `forgejo` /
+  `kubernetes` pins, `scopes`, `confirmProduction` on the production plane) — owned as `adopted: true`,
+  `readOnly: true` for a viewer. Inline Kubernetes keys are not rendered by the API: the entry carries a
+  note to add `spec.kubernetes.jwks` by hand (`kubectl get --raw /openid/v1/jwks`).
+
+**The structural limit — a file cannot declare its OWN bootstrap trust.** The identity that applies a
+provisioning file is, in CI, a trust's `wi_…` client. That trust must exist before the first `apply`
+can sign in (chicken-and-egg), so it is **created once by a person** (`thoryn workload-identity trusts
+create`, or `thoryn project init`) and is never declared by the file it signs in: the engine refuses a
+declared trust whose workload client is the applying identity (`workload_identity_trust_is_self` — a
+file that owned it could `--prune` the identity it runs as), and `import` skips it with a note.
+Everything else — the trusts of the applications, of other repositories, of the pods — is declared.
 
 ### Ownership is decided by your identity's reach (SSO-3659 / SSO-3673, epic SSO-3087)
 

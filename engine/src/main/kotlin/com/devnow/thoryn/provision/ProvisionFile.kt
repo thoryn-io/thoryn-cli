@@ -167,11 +167,19 @@ class ProvisionFile private constructor(
          * `environment`), a singleton, converged by claim + verify. See [ProvisionEngine] for the semantics.
          */
         const val KIND_CUSTOM_DOMAIN = "customDomain"
+        /**
+         * SSO-3689 (ADR 2026-10-14 credential ladder, rungs 1–3) — a workload-identity TRUST of the resource's
+         * environment (`/api/v1/workload-identity/trusts`): the platform identity a CI job or a pod presents
+         * instead of a stored secret, by `provider` with that provider's immutable pins. Converged by `name`;
+         * an `application` binds one by NAME through `spec.federatedTrust`. See [ProvisionEngine].
+         */
+        const val KIND_WORKLOAD_IDENTITY_TRUST = "workloadIdentityTrust"
 
         /** The CLOSED kind allowlist — must equal the schema's `kind` enum (asserted by the conformance test). */
         val KINDS: Set<String> = setOf(
             KIND_ENVIRONMENT, KIND_APPLICATION, KIND_EMAIL_PROVIDER, KIND_LOGIN_THEME,
             KIND_LOGIN_FLOW, KIND_LOGIN_METHODS, KIND_FEDERATION_MEMBER, KIND_USER, KIND_CUSTOM_DOMAIN,
+            KIND_WORKLOAD_IDENTITY_TRUST,
         )
 
         /**
@@ -197,7 +205,96 @@ class ProvisionFile private constructor(
             KIND_LOGIN_THEME to emptySet(),
             KIND_LOGIN_METHODS to setOf("methods"),
             KIND_CUSTOM_DOMAIN to setOf("host"),
+            KIND_WORKLOAD_IDENTITY_TRUST to setOf("provider", "scopes"),
         )
+
+        // ── SSO-3689 — secret-less clients: `clientAuthenticationMethods` / `jwksUri` / `jwks` / `federatedTrust` ──
+
+        const val SPEC_CLIENT_AUTHENTICATION_METHODS = "clientAuthenticationMethods"
+        const val SPEC_JWKS_URI = "jwksUri"
+        const val SPEC_JWKS = "jwks"
+        /** The NAME of a [KIND_WORKLOAD_IDENTITY_TRUST] in the same environment; the engine resolves it to the id the API takes. */
+        const val SPEC_FEDERATED_TRUST = "federatedTrust"
+        const val SPEC_CLIENT_TYPE = "clientType"
+        const val SPEC_GRANT_TYPES = "grantTypes"
+        const val SPEC_REQUIRE_PROOF_KEY = "requireProofKey"
+
+        /** Rung 1 — the application's own key pair; its public half at `jwksUri` or inline in `jwks`. */
+        const val METHOD_PRIVATE_KEY_JWT = "private_key_jwt"
+        /** Rung 2 — the workload's platform identity token IS the client assertion (ADR 2026-10-14 federated client authentication). */
+        const val METHOD_FEDERATED_ASSERTION = "federated_assertion"
+        /** A Thoryn-minted secret presented in the `Authorization: Basic` header — the one method a `secretSink:` delivers for. */
+        const val METHOD_CLIENT_SECRET_BASIC = "client_secret_basic"
+        /** A public client (PKCE, no credential). */
+        const val METHOD_NONE = "none"
+        /** NOT declarable: a secret in the request body is the courier rung; product-api accepts it, a provisioning file does not. */
+        const val METHOD_CLIENT_SECRET_POST = "client_secret_post"
+
+        /** The CLOSED method allowlist — must equal the schema's `clientAuthenticationMethods.items.enum`. */
+        val CLIENT_AUTHENTICATION_METHODS: Set<String> = setOf(METHOD_PRIVATE_KEY_JWT, METHOD_FEDERATED_ASSERTION, METHOD_CLIENT_SECRET_BASIC, METHOD_NONE)
+        /** The methods a Thoryn-minted secret exists for: a `secretSink:` is legal only when the declared methods include one. */
+        val SECRET_BEARING_METHODS: Set<String> = setOf(METHOD_CLIENT_SECRET_BASIC)
+        /** The grants a federated login client may register (ADR 2026-10-14 §2) — never `client_credentials`. */
+        val FEDERATED_GRANT_TYPES: Set<String> = setOf("authorization_code", "refresh_token")
+        /** JWK members that carry PRIVATE key material (RFC 7518 §6.2.2 / §6.3.2 / §6.4) — refused in any inline `jwks`. */
+        val JWK_PRIVATE_MEMBERS: Set<String> = setOf("d", "p", "q", "dp", "dq", "qi", "oth", "k")
+        /** The key types an inline JWK Set may carry (what the hub validates assertions with). */
+        val JWK_KEY_TYPES: Set<String> = setOf("RSA", "EC")
+
+        // The codes the hub's `FederatedLoginClientBinder` and product-api's `FederatedAssertionBindingValidator` answer
+        // with — mirrored so a file is refused with the same vocabulary whichever side refuses.
+        const val ERR_FEDERATED_ONLY_METHOD = "federated_assertion_only_method"
+        const val ERR_FEDERATED_GRANT_NOT_ALLOWED = "federated_assertion_grant_not_allowed"
+        const val ERR_FEDERATED_PKCE_REQUIRED = "federated_assertion_pkce_required"
+        const val ERR_FEDERATED_NO_SECRET_OR_KEY = "federated_assertion_no_secret_or_key"
+        const val ERR_FEDERATED_TRUST_REQUIRED = "federated_trust_required"
+        const val ERR_FEDERATED_TRUST_WITHOUT_METHOD = "federated_trust_without_method"
+        /** product-api's code for a method outside its allowlist; here also the file's answer to `client_secret_post`. */
+        const val ERR_INVALID_CLIENT_AUTHENTICATION_METHOD = "invalid_client_authentication_method"
+        const val ERR_INCOHERENT_CLIENT_AUTHENTICATION_METHODS = "incoherent_client_authentication_methods"
+        // The file's own codes (no API counterpart: the API would accept the shape, the ladder does not).
+        const val ERR_PRIVATE_KEY_JWT_KEY_REQUIRED = "private_key_jwt_key_required"
+        const val ERR_JWKS_XOR_JWKS_URI = "jwks_or_jwks_uri"
+        const val ERR_SECRET_SINK_WITHOUT_SECRET = "secret_sink_without_secret_method"
+        const val ERR_INVALID_JWKS = "invalid_jwks"
+
+        // ── SSO-3689 — `workloadIdentityTrust` ──
+
+        const val PROVIDER_GITHUB_ACTIONS = "github_actions"
+        const val PROVIDER_FORGEJO = "forgejo"
+        const val PROVIDER_KUBERNETES = "kubernetes"
+        /** The CLOSED provider allowlist — must equal the schema's `provider` enum; each maps to its pin block. */
+        val TRUST_PIN_BLOCKS: Map<String, String> = linkedMapOf(PROVIDER_GITHUB_ACTIONS to "github", PROVIDER_FORGEJO to "forgejo", PROVIDER_KUBERNETES to "kubernetes")
+        val TRUST_PROVIDERS: Set<String> get() = TRUST_PIN_BLOCKS.keys
+        const val TRUST_SCOPES = "scopes"
+        const val TRUST_CONFIRM_PRODUCTION = "confirmProduction"
+        /** The `spec` members a trust accepts (the schema's `additionalProperties: false`). */
+        val TRUST_SPEC_KEYS: Set<String> = setOf("provider", TRUST_SCOPES, TRUST_CONFIRM_PRODUCTION) + TRUST_PIN_BLOCKS.values
+        val GITHUB_PIN_KEYS: Set<String> = setOf("repository", "ownerId", "repositoryId", "environment", "ref", "githubHostedRunnersOnly")
+        val FORGEJO_PIN_KEYS: Set<String> = setOf("instanceUrl", "owner", "ownerId", "repository", "repositoryId", "ref")
+        val KUBERNETES_PIN_KEYS: Set<String> = setOf("issuer", "namespace", "serviceAccount", "jwks")
+        /** A trust carries workspace (`tenant:<area>.<action>`) scopes only — the hub's `invalid_scope` otherwise. */
+        val TENANT_SCOPE_PATTERN = Regex("^tenant:[a-z-]+\\.[a-z-]+$")
+        /** A Forgejo instance origin: `https`, host (and port), no path. */
+        val FORGEJO_INSTANCE_PATTERN = Regex("^https://[^/?#]+$")
+        val GIT_REF_PATTERN = Regex("^refs/.+")
+        // The trust service's codes (product-api `WorkloadIdentityTrustService`), mirrored for the file's own refusals.
+        const val ERR_UNSUPPORTED_PROVIDER = "unsupported_provider"
+        const val ERR_INVALID_SCOPE = "invalid_scope"
+        const val ERR_PRODUCTION_CONFIRMATION_REQUIRED = "production_confirmation_required"
+        const val ERR_PRODUCTION_REQUIRES_ENVIRONMENT = "production_requires_environment"
+        const val ERR_PRODUCTION_REQUIRES_REF = "production_requires_ref"
+        const val ERR_PRODUCTION_REQUIRES_SERVICE_ACCOUNT = "production_requires_service_account"
+        const val ERR_INVALID_GITHUB_IDS = "invalid_github_ids"
+        const val ERR_INVALID_FORGEJO_IDS = "invalid_forgejo_ids"
+        const val ERR_INVALID_FORGEJO_INSTANCE = "invalid_forgejo_instance"
+        const val ERR_INVALID_KUBERNETES_ISSUER = "invalid_kubernetes_issuer"
+        const val ERR_INVALID_KUBERNETES_NAMESPACE = "invalid_kubernetes_namespace"
+        const val ERR_INVALID_KUBERNETES_SERVICE_ACCOUNT = "invalid_kubernetes_service_account"
+        const val ERR_INVALID_KUBERNETES_JWKS = "invalid_kubernetes_jwks"
+
+        /** The production plane: no `environment`, or the `production` slug (mirrors [ProvisionEngine.PRODUCTION_ENV_SLUG]). */
+        fun isProductionPlane(environment: String?): Boolean = environment == null || environment == ProvisionEngine.PRODUCTION_ENV_SLUG
 
         val NAME_PATTERN = Regex("^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
 
@@ -467,6 +564,10 @@ class ProvisionFile private constructor(
                 if (kind == KIND_LOGIN_METHODS) spec["methods"]?.takeIf { it.isArray() }?.let { methods ->
                     if (methods.toList().any { !it.isTextual() || it.asString().isBlank() }) v += "$where (loginMethods) spec.methods must be a list of non-empty method names"
                 }
+                // SSO-3689 — how an application authenticates: the credential ladder's rungs, mirrored client-side.
+                if (kind == KIND_APPLICATION) validateApplicationAuth(spec, r, where, v)
+                // SSO-3689 — a workload-identity trust: the provider's pins, the scope grammar, the production rules.
+                if (kind == KIND_WORKLOAD_IDENTITY_TRUST) validateWorkloadIdentityTrust(spec, r, where, v)
             }
             keys.groupBy { it }.filterValues { it.size > 1 }.keys.forEach { v += "duplicate resource '$it' — kind + name must be unique" }
             return v
@@ -568,6 +669,184 @@ class ProvisionFile private constructor(
                     if (text("path") == null) v += "$tw path is required (the owner-only file the secret is written to)"
                 }
                 else -> v += "$tw kind '$tKind' must be one of ${SECRET_SINK_KINDS.joinToString(", ")}"
+            }
+        }
+
+        /**
+         * SSO-3689 (ADR 2026-10-14 credential ladder; ADR 2026-10-14 federated client authentication §6 / §11) — the
+         * client-authentication rules the schema also pins, with the HUB's own codes so a file is refused with the
+         * vocabulary the API would answer: the closed method allowlist (`client_secret_post` is not declarable — the
+         * courier rung); `jwksUri` XOR `jwks`, REQUIRED for `private_key_jwt`; a `federated_assertion` client is that
+         * method alone, never `clientType: public`, only `authorization_code` / `refresh_token`, PKCE kept, no key, no
+         * secret, and names its `federatedTrust`; `federatedTrust` without the method is refused; a `secretSink:` is
+         * legal only when a secret-bearing method is among the declared ones. An inline `jwks` holds PUBLIC keys only.
+         */
+        private fun validateApplicationAuth(spec: JsonNode, r: JsonNode, where: String, v: MutableList<String>) {
+            val methodsNode = spec[SPEC_CLIENT_AUTHENTICATION_METHODS]?.takeIf { !it.isNull }
+            var methods: List<String>? = null
+            if (methodsNode != null) {
+                if (!methodsNode.isArray() || methodsNode.isEmpty()) {
+                    v += "$where spec.$SPEC_CLIENT_AUTHENTICATION_METHODS must be a non-empty list of ${CLIENT_AUTHENTICATION_METHODS.joinToString(" | ")}"
+                } else {
+                    val raw = methodsNode.toList().map { if (it.isTextual()) it.asString().trim() else it.toString() }
+                    raw.filter { it !in CLIENT_AUTHENTICATION_METHODS }.distinct().forEach { m ->
+                        v += if (m == METHOD_CLIENT_SECRET_POST) {
+                            "$where spec.$SPEC_CLIENT_AUTHENTICATION_METHODS: $ERR_INVALID_CLIENT_AUTHENTICATION_METHOD — '$METHOD_CLIENT_SECRET_POST' is not declarable: a secret in the request body is the courier rung of the credential ladder; use $METHOD_CLIENT_SECRET_BASIC (or climb to $METHOD_PRIVATE_KEY_JWT / $METHOD_FEDERATED_ASSERTION)"
+                        } else {
+                            "$where spec.$SPEC_CLIENT_AUTHENTICATION_METHODS: $ERR_INVALID_CLIENT_AUTHENTICATION_METHOD — '$m' must be one of ${CLIENT_AUTHENTICATION_METHODS.joinToString(", ")}"
+                        }
+                    }
+                    if (raw.size != raw.distinct().size) v += "$where spec.$SPEC_CLIENT_AUTHENTICATION_METHODS lists a method twice"
+                    methods = raw.filter { it in CLIENT_AUTHENTICATION_METHODS }
+                    if (METHOD_NONE in methods && methods.size > 1) v += "$where spec.$SPEC_CLIENT_AUTHENTICATION_METHODS: $ERR_INCOHERENT_CLIENT_AUTHENTICATION_METHODS — a public client ('$METHOD_NONE') combines with no other method"
+                }
+            }
+            val jwksUri = spec[SPEC_JWKS_URI]?.takeIf { !it.isNull }
+            val jwks = spec[SPEC_JWKS]?.takeIf { !it.isNull }
+            if (jwksUri != null && (!jwksUri.isTextual() || !jwksUri.asString().trim().startsWith("https://"))) {
+                v += "$where spec.$SPEC_JWKS_URI must be an https:// URL (where the client's PUBLIC keys are fetched)"
+            }
+            if (jwks != null) validateJwks(jwks, "$where spec.$SPEC_JWKS", ERR_INVALID_JWKS, v)
+            if (jwksUri != null && jwks != null) v += "$where $ERR_JWKS_XOR_JWKS_URI — give exactly one of spec.$SPEC_JWKS_URI and spec.$SPEC_JWKS"
+            val hasKey = jwksUri != null || jwks != null
+            val trust = spec[SPEC_FEDERATED_TRUST]?.takeIf { !it.isNull }
+            val trustName = trust?.takeIf { it.isTextual() }?.asString()?.trim()
+            if (trust != null && (trustName.isNullOrEmpty() || !NAME_PATTERN.matches(trustName))) {
+                v += "$where spec.$SPEC_FEDERATED_TRUST must be the NAME of a $KIND_WORKLOAD_IDENTITY_TRUST resource (${NAME_PATTERN.pattern}) — the engine resolves it to the trust id"
+            }
+            val federated = methods?.contains(METHOD_FEDERATED_ASSERTION) == true
+            if (methods != null && METHOD_PRIVATE_KEY_JWT in methods && !hasKey) {
+                v += "$where $ERR_PRIVATE_KEY_JWT_KEY_REQUIRED — $METHOD_PRIVATE_KEY_JWT needs the client's PUBLIC key: spec.$SPEC_JWKS_URI or spec.$SPEC_JWKS"
+            }
+            if (trust != null && !federated) {
+                v += "$where $ERR_FEDERATED_TRUST_WITHOUT_METHOD — spec.$SPEC_FEDERATED_TRUST is only valid when spec.$SPEC_CLIENT_AUTHENTICATION_METHODS is ['$METHOD_FEDERATED_ASSERTION']"
+            }
+            val sink = r[SECRET_SINK]?.takeIf { !it.isNull }
+            if (sink != null && methods != null && methods.none { it in SECRET_BEARING_METHODS }) {
+                v += "$where $ERR_SECRET_SINK_WITHOUT_SECRET — a $SECRET_SINK delivers a Thoryn-minted secret, and none exists for ${methods.joinToString(", ")}; drop the sink or declare $METHOD_CLIENT_SECRET_BASIC"
+            }
+            if (!federated) return
+            if (methods!!.size != 1) {
+                v += "$where $ERR_FEDERATED_ONLY_METHOD — spec.$SPEC_CLIENT_AUTHENTICATION_METHODS must be exactly ['$METHOD_FEDERATED_ASSERTION'] for a federated login client"
+            }
+            if (spec[SPEC_CLIENT_TYPE]?.takeIf { it.isTextual() }?.asString()?.trim().equals(CLIENT_TYPE_PUBLIC, ignoreCase = true)) {
+                v += "$where $ERR_FEDERATED_ONLY_METHOD — a public client (clientType: $CLIENT_TYPE_PUBLIC) authenticates with '$METHOD_NONE'; a federated login client is confidential — its platform token is the credential"
+            }
+            spec[SPEC_GRANT_TYPES]?.takeIf { it.isArray() }?.toList()?.map { it.asString().trim() }?.filter { it.isNotEmpty() && it !in FEDERATED_GRANT_TYPES }?.takeIf { it.isNotEmpty() }?.let { bad ->
+                v += "$where $ERR_FEDERATED_GRANT_NOT_ALLOWED — a federated login client may register only ${FEDERATED_GRANT_TYPES.joinToString(", ")} (not ${bad.joinToString(", ")}); for client_credentials use the trust's own wi_ workload client"
+            }
+            if (spec[SPEC_REQUIRE_PROOF_KEY]?.takeIf { it.isBoolean() }?.asBoolean() == false) {
+                v += "$where $ERR_FEDERATED_PKCE_REQUIRED — $SPEC_REQUIRE_PROOF_KEY cannot be false for a federated login client; PKCE (RFC 7636) stays mandatory"
+            }
+            if (hasKey) v += "$where $ERR_FEDERATED_NO_SECRET_OR_KEY — a federated login client registers no $SPEC_JWKS / $SPEC_JWKS_URI; its platform token is the credential"
+            if (trust == null) v += "$where $ERR_FEDERATED_TRUST_REQUIRED — spec.$SPEC_FEDERATED_TRUST (the NAME of a $KIND_WORKLOAD_IDENTITY_TRUST in the same environment) is required for a federated login client"
+        }
+
+        /**
+         * SSO-3689 — an inline JWK Set is PUBLIC key material only: `{ keys: [ … ] }`, each key an RSA / EC public key
+         * with a `kid` and NO private member (`d`, `p`, `q`, `dp`, `dq`, `qi`, `oth`, `k`). A private key in a
+         * provisioning file is a secret in the repository — exactly what the file exists to make impossible.
+         */
+        fun validateJwks(jwks: JsonNode, where: String, code: String, v: MutableList<String>) {
+            val keys = jwks.takeIf { it.isObject() }?.get("keys")
+            if (keys == null || !keys.isArray() || keys.isEmpty()) {
+                v += "$where: $code — must be a JWK Set object { keys: [ … ] } with at least one PUBLIC key"
+                return
+            }
+            keys.toList().forEachIndexed { i, k ->
+                val kw = "$where.keys[$i]"
+                if (!k.isObject()) { v += "$kw: $code — a key must be a JWK object"; return@forEachIndexed }
+                val kty = k["kty"]?.takeIf { it.isTextual() }?.asString()
+                if (kty == null || kty !in JWK_KEY_TYPES) v += "$kw: $code — kty must be one of ${JWK_KEY_TYPES.joinToString(", ")} (was '${kty ?: ""}')"
+                if (k["kid"]?.takeIf { it.isTextual() }?.asString()?.isNotBlank() != true) v += "$kw: $code — every key needs a kid"
+                k.properties().map { it.key }.filter { it in JWK_PRIVATE_MEMBERS }.takeIf { it.isNotEmpty() }?.let { priv ->
+                    v += "$kw: $code — carries PRIVATE key material (${priv.joinToString(", ")}); a provisioning file holds public keys only — strip the private members"
+                }
+                when (kty) {
+                    "RSA" -> if (k["n"]?.isTextual() != true || k["e"]?.isTextual() != true) v += "$kw: $code — an RSA public key needs n and e"
+                    "EC" -> if (k["crv"]?.isTextual() != true || k["x"]?.isTextual() != true || k["y"]?.isTextual() != true) v += "$kw: $code — an EC public key needs crv, x and y"
+                }
+            }
+        }
+
+        /**
+         * SSO-3689 — the trust rules the schema also pins, with the trust service's codes: a closed `provider`, exactly
+         * that provider's pin block, `tenant:` scopes only (a CEILING the hub caps at the applying identity's own —
+         * `scope_not_grantable` at apply), and the production rules (`confirmProduction: true`; GitHub pins an
+         * environment, Forgejo a ref, Kubernetes a namespace + service account). A trust has no access object of its
+         * own (it is the environment's), so it carries no `grants:`.
+         */
+        private fun validateWorkloadIdentityTrust(spec: JsonNode, r: JsonNode, where: String, v: MutableList<String>) {
+            rejectUnknownKeys(spec, TRUST_SPEC_KEYS, "$where spec", v)
+            if (r["grants"]?.takeIf { !it.isNull } != null) v += "$where a $KIND_WORKLOAD_IDENTITY_TRUST has no access object of its own (reach is its environment's) — it cannot carry 'grants'"
+            val provider = spec["provider"]?.takeIf { it.isTextual() }?.asString()?.trim()
+            if (provider != null && provider !in TRUST_PROVIDERS) v += "$where spec.provider: $ERR_UNSUPPORTED_PROVIDER — '$provider' must be one of ${TRUST_PROVIDERS.joinToString(", ")}"
+            spec[TRUST_SCOPES]?.takeIf { it.isArray() }?.toList()?.let { scopes ->
+                val raw = scopes.map { if (it.isTextual()) it.asString().trim() else it.toString() }
+                raw.filter { !TENANT_SCOPE_PATTERN.matches(it) }.distinct().forEach { v += "$where spec.$TRUST_SCOPES: $ERR_INVALID_SCOPE — '$it' is not a workspace scope (tenant:<area>.<action>); a trust can carry only tenant: scopes" }
+                if (raw.size != raw.distinct().size) v += "$where spec.$TRUST_SCOPES lists a scope twice"
+            }
+            spec[TRUST_CONFIRM_PRODUCTION]?.takeIf { !it.isNull && !it.isBoolean() }?.let { v += "$where spec.$TRUST_CONFIRM_PRODUCTION must be true or false" }
+            val production = isProductionPlane(r["environment"]?.takeIf { !it.isNull }?.asString()?.takeIf { it.isNotBlank() })
+            if (production && spec[TRUST_CONFIRM_PRODUCTION]?.takeIf { it.isBoolean() }?.asBoolean() != true) {
+                v += "$where $ERR_PRODUCTION_CONFIRMATION_REQUIRED — this trust is on the PRODUCTION plane (its jobs / pods act on production); declare spec.$TRUST_CONFIRM_PRODUCTION: true"
+            }
+            if (provider == null || provider !in TRUST_PROVIDERS) return
+            val block = TRUST_PIN_BLOCKS.getValue(provider)
+            TRUST_PIN_BLOCKS.values.filter { it != block && spec[it]?.takeIf { n -> !n.isNull } != null }.forEach { other ->
+                v += "$where spec.$other does not belong to provider '$provider' — only spec.$block does"
+            }
+            val pins = spec[block]?.takeIf { !it.isNull }
+            if (pins == null || !pins.isObject()) {
+                v += "$where spec.$block is required for provider '$provider' (the provider's pins)"
+                return
+            }
+            val pw = "$where spec.$block"
+            fun text(field: String): String? = pins[field]?.takeIf { it.isTextual() }?.asString()?.trim()?.takeIf { it.isNotEmpty() }
+            fun integral(field: String): Boolean? = pins[field]?.takeIf { !it.isNull }?.let { it.isIntegralNumber && it.asLong() > 0 }
+            when (provider) {
+                PROVIDER_GITHUB_ACTIONS -> {
+                    rejectUnknownKeys(pins, GITHUB_PIN_KEYS, pw, v)
+                    val repository = text("repository")
+                    when {
+                        repository == null -> v += "$pw.repository is required (owner/name)"
+                        !REPOSITORY_PATTERN.matches(repository) -> v += "$pw.repository '$repository' must be a GitHub owner/name"
+                    }
+                    val ownerId = integral("ownerId"); val repositoryId = integral("repositoryId")
+                    if (ownerId == false || repositoryId == false) v += "$pw: $ERR_INVALID_GITHUB_IDS — ownerId and repositoryId are GitHub's positive integer ids"
+                    if ((ownerId == null) != (repositoryId == null)) v += "$pw: $ERR_INVALID_GITHUB_IDS — ownerId and repositoryId go together: give both (a private repository), or neither (looked up once for a public one)"
+                    pins["environment"]?.takeIf { !it.isNull && (!it.isTextual() || it.asString().isBlank()) }?.let { v += "$pw.environment must be a non-empty GitHub environment name" }
+                    text("ref")?.let { if (!GIT_REF_PATTERN.matches(it)) v += "$pw.ref '$it' must be a full ref, e.g. refs/heads/main" }
+                    pins["githubHostedRunnersOnly"]?.takeIf { !it.isNull && !it.isBoolean() }?.let { v += "$pw.githubHostedRunnersOnly must be true or false" }
+                    if (production && text("environment") == null) v += "$where $ERR_PRODUCTION_REQUIRES_ENVIRONMENT — a production trust must pin a GitHub environment (spec.$block.environment), the one with the reviewers"
+                }
+                PROVIDER_FORGEJO -> {
+                    rejectUnknownKeys(pins, FORGEJO_PIN_KEYS, pw, v)
+                    val instance = text("instanceUrl")
+                    when {
+                        instance == null -> v += "$pw.instanceUrl is required (the Forgejo instance origin, https://host)"
+                        !FORGEJO_INSTANCE_PATTERN.matches(instance) -> v += "$pw: $ERR_INVALID_FORGEJO_INSTANCE — instanceUrl '$instance' must be an https origin with no path"
+                    }
+                    if (text("owner") == null) v += "$pw.owner is required"
+                    if (text("repository") == null) v += "$pw.repository is required"
+                    if (integral("ownerId") != true || integral("repositoryId") != true) v += "$pw: $ERR_INVALID_FORGEJO_IDS — ownerId and repositoryId (the instance's immutable ids, GET /api/v1/repos/{owner}/{repo}) are required positive integers"
+                    text("ref")?.let { if (!GIT_REF_PATTERN.matches(it)) v += "$pw.ref '$it' must be a full ref, e.g. refs/heads/main" }
+                    if (production && text("ref") == null) v += "$where $ERR_PRODUCTION_REQUIRES_REF — a production Forgejo trust must pin a ref (spec.$block.ref); Forgejo has no environments"
+                }
+                PROVIDER_KUBERNETES -> {
+                    rejectUnknownKeys(pins, KUBERNETES_PIN_KEYS, pw, v)
+                    val issuer = text("issuer")
+                    when {
+                        issuer == null -> v += "$pw.issuer is required (the cluster's exact OIDC issuer)"
+                        !issuer.startsWith("https://") -> v += "$pw: $ERR_INVALID_KUBERNETES_ISSUER — issuer '$issuer' must be an https:// URL"
+                    }
+                    val namespace = text("namespace"); val sa = text("serviceAccount")
+                    if (namespace != null && !K8S_NAMESPACE_PATTERN.matches(namespace)) v += "$pw: $ERR_INVALID_KUBERNETES_NAMESPACE — namespace '$namespace' must be an RFC 1123 label"
+                    if (sa != null && !K8S_NAMESPACE_PATTERN.matches(sa)) v += "$pw: $ERR_INVALID_KUBERNETES_SERVICE_ACCOUNT — serviceAccount '$sa' must be an RFC 1123 label"
+                    if (sa != null && namespace == null) v += "$pw.serviceAccount needs namespace"
+                    pins["jwks"]?.takeIf { !it.isNull }?.let { validateJwks(it, "$pw.jwks", ERR_INVALID_KUBERNETES_JWKS, v) }
+                    if (production && (namespace == null || sa == null)) v += "$where $ERR_PRODUCTION_REQUIRES_SERVICE_ACCOUNT — a production Kubernetes trust must pin spec.$block.namespace and spec.$block.serviceAccount"
+                }
             }
         }
 
