@@ -60,10 +60,11 @@ inputs:
     description: >-
       The client SECRET of the machine client named by the connection contract's `auth.clientId`.
       Pass it from a repository secret. NEVER a literal — this repo is public. Supplied to the CLI as
-      the env var named by `secret-env`; never echoed, never an argv flag. See `.thoryn/README.md`
-      for the one-time bootstrap that mints it (`thoryn provision apply --secret-file`, SSO-3113).
+      the env var named by `secret-env`; never echoed, never an argv flag. A confidential client declared
+      in your provisioning file mints it once (`thoryn provision apply --secret-file`, SSO-3113).
       Required for a `client_credentials` contract; leave it empty for a `workload_identity` contract
       (SSO-3308), which uses no secret — the calling job must then grant `permissions: id-token: write`.
+      This repository's own contract is `workload_identity` (SSO-3690): `provision-e2e.yml` passes no secret.
     required: false
     default: ""
   secret-env:
