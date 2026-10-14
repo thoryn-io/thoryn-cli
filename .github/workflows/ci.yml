@@ -189,9 +189,13 @@ jobs:
           mkdir -p dist
           cp cli/target/thoryn "dist/thoryn-linux-$ARCH"
           # Evidence for the base-image choice, in the log: glibc is the ONLY shared dependency.
-          readelf -d "dist/thoryn-linux-$ARCH" | grep NEEDED
-          if readelf -d "dist/thoryn-linux-$ARCH" | grep NEEDED | grep -qv -e 'libc\.so\.6' -e 'ld-linux'; then
-            echo "::error::the linux binary needs a shared library besides glibc — distroless/cc will not carry it (see cli/pom.xml native-static-nolibc-linux)."
+          # (Captured first, not `| grep -q` — under pipefail an early-exiting grep could SIGPIPE
+          # readelf and turn a hit into a silent pass.)
+          needed="$(readelf -d "dist/thoryn-linux-$ARCH" | grep NEEDED)"
+          echo "$needed"
+          extra="$(grep -v -e 'libc\.so\.6' -e 'ld-linux' <<< "$needed" || true)"
+          if [ -n "$extra" ]; then
+            echo "::error::the linux binary needs a shared library besides glibc — distroless/cc will not carry it (see cli/pom.xml native-static-nolibc-linux): $extra"
             exit 1
           fi
 
