@@ -7,7 +7,10 @@ the same two files and the same commands.
 | File | Declares | Schema | Verb |
 |---|---|---|---|
 | `connection.json` | **who I am** — the `thoryn` workspace and the **workload identity trust** CI signs in under: the trust's `wi_…` client id, its audience, its GitHub pins and the exact scope set. No secret, no env var naming one (SSO-3690) | `cli/src/main/resources/examples/connection.schema.json` (SSO-2948) | `thoryn login --connection .thoryn/connection.json` |
-| `provision.yaml` | **what I own** — the desired state: the CLI's own login client `cli` in the `thoryn` workspace (SSO-3104), plus a sandbox environment `cli-ci` — whose one grant makes the trust's client its `manager` — with a public loopback OAuth client inside it | `engine/src/main/resources/provision/provision.schema.json` (SSO-3088) | `thoryn provision plan / apply / destroy --file .thoryn/provision.yaml` |
+| `provision.yaml` | **what I own** — the desired state: the CLI's own login client `cli` in the `thoryn` workspace (SSO-3104; this repository's CI identity is its platform `owner`, SSO-3697), plus a sandbox environment `cli-ci` — whose two grants make the apply and the plan identity its `manager` — with a public loopback OAuth client inside it | `engine/src/main/resources/provision/provision.schema.json` (SSO-3088) | `thoryn provision plan / apply / destroy --file .thoryn/provision.yaml` |
+| `connection.plan.json` | **who I am on a pull request** (SSO-3697) — the READ-ONLY plan identity: the `thoryn-cli-ci-plan` trust's `wi_…` client, pinned to the unprotected GitHub environment `thoryn-provision-e2e-plan`, three `.read` scopes. What the App-dispatched `plan` job signs in with | same schema as `connection.json` | `thoryn login --connection .thoryn/connection.plan.json` |
+| `trusts.provision.yaml` | **the two trusts, declared** (SSO-3689 `kind: workloadIdentityTrust`; SSO-3697) — `thoryn-cli-ci` (adopted) and `thoryn-cli-ci-plan` (created), production plane. Applied by a **founder**, never by CI: a production-plane trust is reached through the workspace, and a file cannot declare its own bootstrap trust | the provision schema | `thoryn provision plan / apply --file .thoryn/trusts.provision.yaml` (founder session) |
+| `provision.receipt.json` | the **ownership ledger** of `provision.yaml` — committed since SSO-3697: the App's apply job opens it as a receipt pull request | written by the engine | — |
 
 The provisioning Action (`.github/actions/provision`) runs, in order:
 
@@ -19,7 +22,8 @@ thoryn provision apply  --file .thoryn/provision.yaml --yes   # converge — twi
 thoryn provision destroy --file .thoryn/provision.yaml --yes  # child-first; sandbox hard-delete cascades
 ```
 
-The receipt (`provision.receipt.json`, written next to the file, git-ignored) is the ownership
+The receipt (`provision.receipt.json`, written next to the file — **committed** since SSO-3697, see
+"Provisioning from code"; every other `*.receipt.json` under `.thoryn/` stays git-ignored) is the ownership
 ledger: `destroy` removes only what it records, and a resource that already existed when `apply`
 ran is **adopted** (converged, never deleted). No secret ever lives in either file — and since
 SSO-3690 none lives in the repository's GitHub settings either: `connection.json` is a
@@ -42,20 +46,20 @@ thoryn provision plan  --file .thoryn/provision.yaml
 thoryn provision apply --file .thoryn/provision.yaml --yes
 ```
 
-Every later `apply` — CI signs in as the trust's client, whose receipt does not own `cli` — **adopts**
-it by its fixed id and converges its non-secret shape; adopted resources are never removed by
-`destroy`, so CI cannot delete the client it depends on. Rotating it is editing this file.
+Every later `apply` — CI signs in as the trust's client — **adopts** it by its fixed id and converges
+its non-secret shape; adopted resources are never removed by `destroy`, so CI cannot delete the client
+it depends on. Rotating it is editing this file.
 
-> **Reading note (SSO-3659 / SSO-3673, not changed by SSO-3690).** Since the engine gates every resource on
-> the signed-in identity's own platform reach (`POST /api/v1/access/check`), an identity that holds *no*
-> relation on `application:cli` plans it as `access-not-owned`. The confined CI identity is `manager` of the
-> `ci` sandbox only. **Decided 2026-10-14 (product owner): `cli` is declared `readOnly: true`** — CI
-> *verifies* the login client and never gains write reach on it. Two consequences the file now carries:
-> a founder grants the CI identity **`viewer`** once, `thoryn access grant client:<wi_…> viewer application:cli`
-> (a `readOnly` resource the identity has *no* relation on is still `access-not-owned`), and any change to
-> the login client is made by a founder with their own session (`thoryn clients update cli …`) — a
-> `readOnly` diff in this file is a red plan, by design. The last green `provision-e2e` run predates the
-> gate (2026-09-16); the first run under the trust proves this path.
+> **This repository OWNS the login client's provisioning (product owner, 2026-10-14; SSO-3697).** The engine
+> gates every resource on the signed-in identity's own platform reach (`POST /api/v1/access/check`,
+> SSO-3659 / SSO-3673). The CI identity `client:wi_10a7b379c79f7d1353f5798d` (the `thoryn-cli-ci` trust) holds
+> the platform **`owner`** relation on `application:cli` — owner ⇒ manager (oauthy ADR
+> `2026-10-13-platform-owner-relation-and-forward-check`) — so `thoryn-provisioning.yml` converges the login
+> client from `main` like every other declared resource, and **a change to the login client is a reviewed pull
+> request to `provision.yaml`, not a founder command**. `owner` is a one-time admin grant from a founder's own
+> session (below); it is deliberately *not* in the file's `grants:` block — the engine refuses
+> `relation: owner` there (SSO-3673), a repository cannot claim ownership by writing YAML. This supersedes
+> SSO-3690's interim `readOnly: true` + founder-granted `viewer` (revoked as redundant once `owner` is set).
 
 ## The CI identity is a workload identity trust (SSO-3690, parent SSO-3659; epic SSO-3108 for the confinement)
 
@@ -82,10 +86,11 @@ What confines the trust's client (unchanged in shape from `cli-ci`):
   no reach over either. The trust is created from exactly this list, so `connection.json`'s `auth.scopes`
   (the only committed statement of what the identity holds) must EQUAL the least-privilege set converging
   `provision.yaml` needs — `CiProvisionFileConformanceTest` and `CiConnectionConfinementTest` both assert it.
-- **One grant** — `client:<wi_…> manager` on the `ci` **environment**, the one `grants:` block of
-  `provision.yaml`. That is its whole declared reach. The loopback client inside the sandbox is covered by
-  containment. `CiProvisionFileConformanceTest` pins that single grant and that its subject is the very
-  client `connection.json` signs in with (both pasted from one `trusts create`).
+- **One declared grant** — `client:<wi_…> manager` on the `ci` **environment**, in the one `grants:` block of
+  `provision.yaml` (beside the plan identity's, SSO-3697). The loopback client inside the sandbox is covered
+  by containment. `CiProvisionFileConformanceTest` pins that grant and that its subject is the very client
+  `connection.json` signs in with (both pasted from one `trusts create`). Plus the one-time **`owner`** on
+  `application:cli` (a platform relation, granted by a founder — never declarable here).
 - **The trust's own pins** (oauthy hub `GithubActionsTrustPolicy`; mirrored in `connection.json`'s
   `auth.github` so the CLI can name the field that differs on a refused sign-in): the repository by its
   **immutable ids** (`ownerId 229451779`, `repositoryId 1361536515` — a rename or transfer does not carry
@@ -97,10 +102,13 @@ What confines the trust's client (unchanged in shape from `cli-ci`):
   which object it may touch. `DELETE /api/v1/environments/<some other sandbox>` answers `404` however
   many scopes the token carries (ADR `2026-09-15-platform-resource-authorization-on-fga.md` §8).
 
-The trust is a real product resource, created once through the product — never seeded — and it is **not
-declared in `provision.yaml`**: the engine has no trust kind yet (SSO-3689 adds `workloadIdentityTrust`; once
-it is on `main`, declare the trust here and adopt it as a follow-up). Until then the trust is only
-*referenced* — by the grant subject in `provision.yaml` and by `connection.json`.
+The trust is a real product resource, created once through the product — never seeded. It is **declared
+in `.thoryn/trusts.provision.yaml`** (SSO-3689's `kind: workloadIdentityTrust`, adopted by name) — a file a
+**founder** applies, not `provision.yaml`, for two structural reasons the engine enforces: a production-plane
+trust is reached through the **workspace** (`ProvisionEngine.gateTrust` — converging or adopting it needs
+`manager` on the workspace, which the confined CI identity must never hold), and a file cannot declare the
+trust its own identity signs in with (`workload_identity_trust_is_self`). In `provision.yaml` the trust is
+only *referenced* — by the grant subject and by `connection.json`.
 
 ### A founder creates the trust once
 
@@ -157,6 +165,95 @@ gh secret delete THORYN_CLI_CI_CLIENT_SECRET -R thoryn-io/thoryn-cli
 
 To stop CI signing in at all: `thoryn workload-identity trusts delete <id> --confirm thoryn` — the client
 stops authenticating at once; no secret to revoke, nothing to rotate.
+
+## Provisioning from code — the App runs plan on pull requests and apply on `main` (SSO-3697)
+
+The repository provisions **itself** from code, the loop proven on thoryn-cicd (oauthy converge ADR
+`2026-10-13-provisioning-as-code-converge-github-app-and-fga-ownership.md` §3 + Amendment 5). The manual
+`provision-e2e` dispatch stays as the manual path (apply, confinement assertions, destroy).
+
+**The developer story.**
+
+1. You open a pull request that changes anything under `.thoryn/`. The Thoryn GitHub App opens a **"Thoryn
+   provisioning plan"** check run and dispatches `.github/workflows/thoryn-provisioning.yml` with `mode=plan`
+   (the PR head as `head_sha`; the run-name carries `check-run:<id>`). The `plan` job runs in the unprotected
+   GitHub environment **`thoryn-provision-e2e-plan`**, signs in as the **read-only plan identity**
+   (`connection.plan.json`, trust `thoryn-cli-ci-plan`: `tenant:environments.read tenant:applications.read
+   tenant:access.read`) and plans `provision.yaml` into the job summary. The check is red when the file
+   declares a resource this repository does not own, or when a dry run would fail — before merge.
+2. The PR is reviewed and merged. The App opens **"Thoryn provisioning apply"** and dispatches `mode=apply`.
+   The `apply` job (`# thoryn-provisioning: apply-job`) runs in the **reviewed** environment
+   **`thoryn-provision-e2e`**: GitHub holds it for a required reviewer *before* any token can be minted. It
+   signs in as `thoryn-cli-ci` through the composite Action (`destroy: "false"` — never `--prune`, never
+   `destroy` from automation), converges the file, and opens a **receipt pull request** (`thoryn/receipt-<sha7>`)
+   carrying `.thoryn/provision.receipt.json`. Merging it keeps the ledger beside the file it records.
+3. A dispatched run executes on `main` in **both** modes (the OIDC `ref` is `refs/heads/main` either way), so
+   the GitHub **environment is the only pin** separating "may read" from "may write": the plan trust carries
+   no write scope whatever the YAML says; the write trust is never minted outside the reviewed environment.
+
+**Operator setup, in order** (a founder: workspace `thoryn`, production plane, own session). Nothing here is
+created by this repository's PR — these are the one-time actions the PR documents.
+
+```bash
+# 1) GitHub App — add thoryn-io/thoryn-cli to the *Thoryn Starters (staging)* installation (today it covers
+#    thoryn-cicd only): GitHub → Settings → Applications → Thoryn Starters (staging) → Repository access.
+#    The App sees .thoryn/ pull requests and pushes only once installed.
+
+# 2) GitHub environments — thoryn-io/thoryn-cli → Settings → Environments:
+#      * create `thoryn-provision-e2e-plan` with NO protection (a plan must run on every pull request);
+#      * on `thoryn-provision-e2e` add REQUIRED REVIEWERS (1–6). Do this BEFORE the first merge: the reviewer
+#        gate is GitHub's, not the App's — unprotected, the apply job starts at once (Amendment 5).
+
+# 3) Declare + create the trusts from code (see .thoryn/trusts.provision.yaml for why a founder, not CI):
+thoryn login --workspace thoryn --issuer https://auth.stg.thoryn.org
+thoryn env use production
+thoryn provision plan  --file .thoryn/trusts.provision.yaml   # thoryn-cli-ci adopted; thoryn-cli-ci-plan: + create
+thoryn provision apply --file .thoryn/trusts.provision.yaml --yes
+#    It prints the plan trust's clientId (wi_…). Hand-run equivalent, if needed (the file then adopts it):
+#      thoryn workload-identity trusts create --name thoryn-cli-ci-plan \
+#        --repository thoryn-io/thoryn-cli --owner-id 229451779 --repository-id 1361536515 \
+#        --github-environment thoryn-provision-e2e-plan --ref refs/heads/main --github-hosted-runners-only \
+#        --scope "tenant:environments.read tenant:applications.read tenant:access.read" --confirm-production
+
+# 4) Paste the plan trust's wi_ into the TWO committed places (CiProvisionFileConformanceTest pins them equal)
+#    and open the pull request:
+#      .thoryn/connection.plan.json  →  auth.clientId
+#      .thoryn/provision.yaml        →  resources[environment/ci].grants[1].subject  ("client:<wi_…>")
+#    The apply identity (manager on environment:ci) converges that grant on the first App apply.
+
+# 5) Ownership of the login client — the apply identity becomes the platform OWNER of application:cli
+#    (owner ⇒ manager); then drop the SSO-3690 viewer grant it made redundant:
+thoryn access grant  client:wi_10a7b379c79f7d1353f5798d owner  application:cli
+thoryn access revoke client:wi_10a7b379c79f7d1353f5798d viewer application:cli
+#    API semantics: `owner` is single — a DIFFERENT current owner answers 409 owner_already_set (DELETE the current
+#    owner first, then POST); a `member:` subject is 400 invalid_owner_subject. Today application:cli has NO owner
+#    (a founder created it; people become manager only), so the grant is a plain 200.
+
+# 6) Merge → the first plan check appears on the next .thoryn/ pull request; the first apply is held for your
+#    review in thoryn-provision-e2e and opens the receipt PR. Run it, do not reason it.
+```
+
+**Two dependencies the first green run has** (recorded, not worked around):
+
+- **`subject_mismatch` until oauthy SSO-3698 is deployed.** The e2e run 38537919648 failed at the exchange:
+  both repositories have GitHub's *immutable subject* enabled, so the job's `sub` is
+  `repo:thoryn-io@229451779/thoryn-cli@1361536515:environment:…`, which the hub's `GithubActionsTrustPolicy`
+  did not yet accept. The fix is in the hub (SSO-3698, oauthy PR in flight); nothing in this repository
+  changes for it — in particular no `sub` customization reset.
+- **The plan check's `application/cli` row is red (`owned_elsewhere`) — an engine gap.** With `cli`
+  declared read-write and the apply identity its `owner`, the gate (`ProvisionEngine.gate`: the live object
+  reports an owner and `/access/check owner` is false for the planning identity) treats the read-only plan
+  twin exactly like a foreign repository, whatever relation it is granted on `application:cli`
+  (`access_not_owned` with none, `owned_elsewhere` with `manager`). `owner` is single, so the plan identity
+  cannot hold it too. The engine needs to recognise a repository's own plan identity (Amendment 5's
+  two-trust shape) before a PR plan of an owned production resource can be green; the sandbox and loopback
+  rows plan correctly meanwhile. Follow-up: **SSO-3699** (under SSO-3659).
+
+> The receipt is committed (`.gitignore` un-ignores `.thoryn/provision.receipt.json`) because the App's receipt
+> step is `git add -- ':(glob).thoryn/**/*.receipt.json'` — an ignored path would fail it. One consequence of
+> two paths sharing one file: `provision-e2e`'s `destroy` removes what its checkout's receipt owns — the
+> loopback client the App's apply created (the sandbox and `cli` are adopted, never removed); the next App
+> apply re-creates it and the receipt PR records the new id. Expected churn, not a defect.
 
 ## Why the scopes are what they are
 

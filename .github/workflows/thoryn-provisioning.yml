@@ -1,0 +1,142 @@
+# Thoryn provisioning — dispatched by the Thoryn GitHub App (oauthy SSO-3660 / SSO-3665), hand-adapted for this
+# repository, which is not a starter-generated project (SSO-3697, parent SSO-3659 — the loop thoryn-cicd proved).
+#
+# The App never holds a credential to the `thoryn` workspace. On a pull request that changes .thoryn/ it opens
+# a "Thoryn provisioning plan" check run and dispatches this workflow with mode=plan; on a push to main it opens
+# "Thoryn provisioning apply" and dispatches mode=apply. Each job signs in as THIS repository's own workload
+# identity (.thoryn/connection*.json — no secret) and the hub enforces the trust's pins. The manual path,
+# provision-e2e.yml (apply + confinement assertions + destroy on a dispatch), stays beside this one.
+#
+# WHY TWO ENVIRONMENTS. .thoryn/provision.yaml declares PRODUCTION-PLANE resources (the CLI's own login client
+# `cli`, the `cli-ci` sandbox whose parent is the workspace), so even the plan needs a production-plane token,
+# and a production trust must be pinned to a GitHub environment. A dispatched run executes on the default
+# branch for BOTH modes (the ref the token carries is refs/heads/main either way), so the GitHub environment is
+# the only thing that separates them (oauthy converge ADR 2026-10-13, Amendment 5):
+#   * `thoryn-provision-e2e-plan` — no reviewers; the `thoryn-cli-ci-plan` trust pinned to it carries READ
+#                                   scopes only (tenant:environments.read tenant:applications.read
+#                                   tenant:access.read). A plan can never write, whatever the YAML says.
+#   * `thoryn-provision-e2e`      — required reviewers; the `thoryn-cli-ci` trust pinned to it carries the write
+#                                   scopes. GitHub holds the apply job for a reviewer before any token can be minted.
+# The App completes its check run from this run's conclusion (the run-name carries the check-run id).
+# Removals are never automated: the apply step is destroy: "false", and nothing here passes --prune.
+#
+# Every `inputs.*` value reaches a shell only through `env:` (the template-injection rule, oauthy SSO-3635).
+name: Thoryn provisioning
+run-name: "Thoryn provisioning ${{ inputs.mode }} ${{ inputs.head_sha }} check-run:${{ inputs.check_run_id }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "plan (pull request, read-only) or apply (default branch, reviewed)"
+        required: true
+        type: choice
+        options: [plan, apply]
+      head_sha:
+        description: "The commit to plan or apply"
+        required: true
+        type: string
+      check_run_id:
+        description: "The Thoryn GitHub App check run this run reports to"
+        required: true
+        type: string
+      pr_number:
+        description: "The pull request (plan only)"
+        required: false
+        type: string
+        default: ""
+
+concurrency:
+  group: thoryn-provisioning-${{ inputs.mode }}
+  cancel-in-progress: false
+
+permissions: {}
+
+env:
+  THORYN_CLI_RELEASE: cli-v0.33.0
+  # The platform base issuer the connection contract derives the thoryn workspace's issuer from.
+  THORYN_ISSUER: https://auth.stg.thoryn.org
+  THORYN_HUB: https://auth.stg.thoryn.org
+  # Headless runner, no OS keychain: the CLI's documented CI token store (an ephemeral file on this runner).
+  THORYN_CI_PLAINTEXT_TOKENS: "1"
+
+jobs:
+  plan:
+    if: inputs.mode == 'plan'
+    runs-on: ubuntu-latest
+    # Read-only production-plane identity (see the header). No reviewers on this environment.
+    environment: thoryn-provision-e2e-plan
+    permissions:
+      id-token: write
+      checks: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.head_sha }}
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Download the released thoryn CLI
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release download "$THORYN_CLI_RELEASE" --repo thoryn-io/thoryn-cli --pattern thoryn.jar --dir .
+      - name: Plan .thoryn/provision.yaml as this repository (production plane, read-only plan identity)
+        run: |
+          set -euo pipefail
+          java -jar thoryn.jar login --connection ".thoryn/connection.plan.json"
+          { echo '## Thoryn provisioning plan: .thoryn/provision.yaml'; echo; echo '<pre>'; } >> "$GITHUB_STEP_SUMMARY"
+          java -jar thoryn.jar provision plan --file ".thoryn/provision.yaml" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo '</pre>' >> "$GITHUB_STEP_SUMMARY"
+
+  # thoryn-provisioning: apply-job
+  apply:
+    if: inputs.mode == 'apply'
+    runs-on: ubuntu-latest
+    # The reviewed environment: a required reviewer approves this run before it starts, and the hub mints the
+    # write-capable production token only for a job in this environment.
+    environment: thoryn-provision-e2e
+    permissions:
+      id-token: write
+      checks: write
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.head_sha }}
+      - name: Apply .thoryn/provision.yaml as this repository (production plane)
+        id: apply-thoryn
+        uses: thoryn-io/thoryn-cli/.github/actions/provision@cli-v0.33.0
+        with:
+          connection: .thoryn/connection.json
+          file: .thoryn/provision.yaml
+          issuer: https://auth.stg.thoryn.org
+          cli-version: cli-v0.33.0
+          destroy: "false"
+      - name: Open the receipt pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+          DEFAULT_BRANCH: main
+        run: |
+          set -euo pipefail
+          short="${HEAD_SHA:0:7}"
+          branch="thoryn/receipt-$short"
+          git config user.name "thoryn-provisioning[bot]"
+          git config user.email "provisioning@thoryn.io"
+          git add -- ':(glob).thoryn/**/*.receipt.json'
+          if git diff --cached --quiet; then
+            echo "The receipt is unchanged: nothing to open." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          git checkout -b "$branch"
+          git commit -m "chore(thoryn): provisioning receipt for $short"
+          git push origin "$branch"
+          gh pr create --head "$branch" --base "$DEFAULT_BRANCH" \
+            --title "Thoryn provisioning receipt for $short" \
+            --body "Applied .thoryn/ as pushed in $short, as this repository's own workload identity in the reviewed thoryn-provision-e2e environment. Merging keeps the receipt beside the file it records. Nothing was removed." \
+            | tee -a "$GITHUB_STEP_SUMMARY"

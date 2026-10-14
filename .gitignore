@@ -10,7 +10,12 @@ HELP.md
 
 # SSO-3088 — provisioning receipts (`thoryn provision apply` writes <name>.receipt.json next to the
 # file; secret-free, but per-account state like Terraform state — not committed by default).
+# SSO-3697 — EXCEPT `.thoryn/provision.receipt.json`: the App-dispatched apply job commits it through the
+# receipt pull request (`git add -- ':(glob).thoryn/**/*.receipt.json'`, the App's contract — an ignored
+# path would fail that step), so it is the committed ownership ledger the next apply builds on. The
+# founder-applied `trusts.provision.receipt.json` stays local to the founder.
 .thoryn/*.receipt.json
+!.thoryn/provision.receipt.json
 
 # SSO-3119 — `--secret-file` output. `provision apply` / `clients create` write a one-time client
 # secret to the path you name, and the natural place to type is the repo you are standing in. A
