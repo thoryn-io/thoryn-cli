@@ -157,6 +157,15 @@ internal object CommandSupport {
         // issuer (including an explicit `--issuer` override at switch time) is used verbatim.
         val targetIssuer = WorkspaceTenantHost.healedSelection(selected, resolvePlatformIssuer(ThorynConfig.DEFAULT_HUB, baseTokens))
 
+        // SSO-3692 — the selection names the workspace this session SIGNED IN AT (since SSO-3104 a
+        // `thoryn login --workspace <slug>` session's issuer IS that workspace's issuer): the base token
+        // already is a token for it, carrying the full login scopes and the refresh ability, so it is
+        // used as-is. No exchange is needed to reach your own home — and the one this used to run was a
+        // SAME-tenant exchange with no scope, which the hub answered with a scope-less token (hub-side
+        // fix in the same story; this makes the CLI not depend on it). A cross-tenant selection exchanges
+        // below exactly as before.
+        if (sameIssuer(baseTokens.issuer, targetIssuer)) return client(gateway, baseTokens, environmentSlug)
+
         var retired = false
         fun mint(): Tokens? {
             val base = ensureFresh(baseTokens, err)
@@ -177,6 +186,10 @@ internal object CommandSupport {
                     // Passing `base.scope` NARROWED the switched token to the login scopes — dropping
                     // clients.write and anything not requested at login — which broke `clients update`
                     // / `env` management in a switched workspace. No-scope is the correct behaviour.
+                    // SSO-3692 — that was true of the CROSS-tenant path only; the hub's SAME-tenant
+                    // exchange answered an empty request with ∅ (now: held ∩ registered). This exchange
+                    // is cross-tenant by construction — a selection equal to the session issuer never
+                    // reaches it (see the `sameIssuer` return above).
                 ).run()
             }.onFailure { e ->
                 // SSO-3377 — the hub refused the exchange because the session's issuer is retired: a
@@ -564,6 +577,32 @@ internal object CommandSupport {
         else tokens?.platformIssuer?.takeIf { it.isNotBlank() }?.trim()?.trimEnd('/')
             ?: tokens?.issuer?.takeIf { it.isNotBlank() }?.let(ThorynConfig::baseHubOf)
             ?: explicit
+
+    /**
+     * SSO-3692 — do two issuer URLs name the SAME issuer? Compared structurally (scheme + host
+     * case-insensitively, port, and the path without a trailing slash), so `https://Acme.auth.example/`
+     * and `https://acme.auth.example` agree while a sandbox issuer (`…/sandbox-alpha`) and its workspace
+     * (`…`) do not — those are distinct issuers with distinct keys, and a session on one is not a
+     * session on the other. Null or unparseable on either side is `false` (never a false "home").
+     */
+    internal fun sameIssuer(a: String?, b: String?): Boolean {
+        val left = canonicalIssuer(a) ?: return false
+        val right = canonicalIssuer(b) ?: return false
+        return left == right
+    }
+
+    private fun canonicalIssuer(issuer: String?): String? {
+        val trimmed = issuer?.trim()?.trimEnd('/')?.takeIf { it.isNotEmpty() } ?: return null
+        return try {
+            val uri = java.net.URI(trimmed)
+            val scheme = uri.scheme?.lowercase() ?: return null
+            val host = uri.host?.lowercase() ?: return null
+            val path = uri.rawPath.orEmpty().trimEnd('/')
+            "$scheme://$host${if (uri.port == -1) "" else ":${uri.port}"}$path"
+        } catch (_: Exception) {
+            null
+        }
+    }
 
     /** SSO-2827 — as [resolveHub], for the gateway base URL ([Tokens.gateway]). */
     fun resolveGateway(explicit: String, tokens: Tokens?): String =

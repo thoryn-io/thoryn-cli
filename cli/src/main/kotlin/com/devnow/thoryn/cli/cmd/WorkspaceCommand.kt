@@ -263,10 +263,17 @@ class WorkspaceCommand : Callable<Int> {
             // refresh token, so it would kill the CLI's refresh ability and die at ~15 minutes.
             // Instead we record the selection (below) and `CommandSupport.gatewayClient` mints a
             // switched token from the refreshable base session on demand.
+            //
+            // SSO-3692 — unless the target IS the workspace this session signed in at. The session token
+            // was issued BY that issuer: the hub has already authenticated this user there, and the list
+            // above (the caller's own workspaces) confirms membership. An exchange would prove nothing
+            // more — and the SAME-tenant exchange it amounted to minted a scope-less token (hub-side fix
+            // in the same story). Record the selection; `gatewayClient` then uses the base token directly.
             val secret = clientSecretFile
                 ?.let { runCatching { Files.readString(Path.of(it)).trim() }.getOrNull()?.takeIf(String::isNotBlank) }
                 ?: System.getenv("THORYN_CLIENT_SECRET")?.takeIf { it.isNotBlank() }
-            try {
+            val home = CommandSupport.sameIssuer(tokens.issuer, tenantHub)
+            if (!home) try {
                 TokenExchangeFlow(
                     issuer = hub,
                     clientId = clientId,
