@@ -5,60 +5,66 @@ import com.devnow.thoryn.provision.ProvisionFile
 import java.io.File
 
 /**
- * SSO-3690 / SSO-3697 (parent SSO-3659) — what the repo-level tests know about THIS repository's own CI identities,
- * shared by [CiProvisionFileConformanceTest] (`.thoryn/provision.yaml`), [CiTrustsFileConformanceTest]
- * (`.thoryn/trusts.provision.yaml`), [CiProvisioningWorkflowConformanceTest] (the App-dispatched workflow),
- * [com.devnow.thoryn.cli.cmd.connection.CiConnectionConfinementTest] (`.thoryn/connection.json`) and
- * [com.devnow.thoryn.cli.cmd.connection.CiPlanConnectionConfinementTest] (`.thoryn/connection.plan.json`).
+ * SSO-3690 / SSO-3697 / SSO-3705 (parent SSO-3659) — what the repo-level tests know about THIS repository's own CI
+ * identity, shared by [CiProvisionFileConformanceTest] (`.thoryn/provision.yaml`), [CiTrustsFileConformanceTest]
+ * (`.thoryn/trusts.provision.yaml`), [CiProvisioningWorkflowConformanceTest] (the App-dispatched workflow) and
+ * [com.devnow.thoryn.cli.cmd.connection.CiConnectionConfinementTest] (`.thoryn/connection.json`).
  *
- * TWO GitHub Actions workload identity trusts on the `thoryn` workspace's production plane (oauthy converge ADR
- * 2026-10-13, Amendment 5 — a dispatched run executes on `main` in both modes, so the GitHub ENVIRONMENT is the only
- * pin separating "may read" from "may write"):
+ * ONE GitHub Actions workload identity trust on the `thoryn` workspace's production plane, [TRUST_NAME]
+ * `thoryn-cli-ci`: pinned to the REVIEWED environment [GITHUB_ENVIRONMENT], the six write-capable scopes
+ * `connection.json` requests; the platform `owner` of `application:cli` (SSO-3697). The SAME identity plans every
+ * pull request (SSO-3705 — SSO-3699 option B): the App's plan job runs in the UNPROTECTED environment
+ * [PLAN_GITHUB_ENVIRONMENT] and the hub's plan profile (SSO-3700; added to the trust by SSO-3704) mints it the
+ * `.read` scopes only there ([scopesToPlan]). There is no second trust and no second `wi_` client — SSO-3697's
+ * `thoryn-cli-ci-plan` was never created, and its placeholder grant stopped provision-e2e run 38547022158.
  *
- *  - [TRUST_NAME] `thoryn-cli-ci` — the APPLY identity: pinned to the REVIEWED environment [GITHUB_ENVIRONMENT],
- *    the six write-capable scopes `connection.json` requests; the platform `owner` of `application:cli` (SSO-3697).
- *  - [PLAN_TRUST_NAME] `thoryn-cli-ci-plan` — the PLAN identity: pinned to the UNPROTECTED environment
- *    [PLAN_GITHUB_ENVIRONMENT], the `.read` scopes only ([scopesToPlan]) — it plans every pull request and can
- *    write nothing whatever the file says.
- *
- * Both are DECLARED (SSO-3689 `kind: workloadIdentityTrust`) in [TRUSTS_PROVISION_PATH], a file a founder applies —
- * never CI: a production-plane trust is reached through the workspace, and a file cannot declare the trust its own
- * identity signs in with. These constants are the pins that file carries; the tests hold every committed file and
- * both workflows to them.
+ * The trust is DECLARED (SSO-3689 `kind: workloadIdentityTrust`) in [TRUSTS_PROVISION_PATH], a file a founder
+ * applies — never CI: a production-plane trust is reached through the workspace, and a file cannot declare the
+ * trust its own identity signs in with. These constants are the pins that file carries; the tests hold every
+ * committed file and both workflows to them.
  */
 internal object CiIdentityFixture {
     const val PROVISION_PATH = ".thoryn/provision.yaml"
     const val CONNECTION_PATH = ".thoryn/connection.json"
     const val E2E_WORKFLOW_PATH = ".github/workflows/provision-e2e.yml"
 
-    /** SSO-3697 — the read-only plan identity's contract, the founder-applied trusts file, the App-dispatched workflow. */
-    const val PLAN_CONNECTION_PATH = ".thoryn/connection.plan.json"
+    /** SSO-3697 — the founder-applied trusts file and the App-dispatched workflow. */
     const val TRUSTS_PROVISION_PATH = ".thoryn/trusts.provision.yaml"
     const val PROVISIONING_WORKFLOW_PATH = ".github/workflows/thoryn-provisioning.yml"
+
+    /**
+     * SSO-3705 — the committed DATA files under `.thoryn/` (prose — the README, YAML comment lines — is not scanned):
+     * none may carry a paste-me placeholder, because there is nothing left to paste. A placeholder is a `wi_` followed
+     * by anything but a hex digit (`wi_PASTE_…`, `wi_…`, `<wi_…>`), or a shouting marker word.
+     */
+    val THORYN_DATA_FILES = listOf(PROVISION_PATH, CONNECTION_PATH, TRUSTS_PROVISION_PATH)
+    val PLACEHOLDER_PATTERN = Regex("wi_[^0-9a-f\\s\"'`]|PASTE|PLACEHOLDER|CHANGE_ME")
+
+    /** The non-comment lines of a YAML/JSON data file (a line whose first non-blank character is `#` is prose). */
+    fun dataLines(file: File): List<String> = file.readLines().filterNot { it.trimStart().startsWith("#") }
 
     /** The trust's client id prefix (oauthy SSO-3307 — a workload client is `wi_…`, `client_credentials` only). */
     const val WORKLOAD_CLIENT_ID_PREFIX = "wi_"
 
-    /** GitHub's immutable ids of thoryn-io/thoryn-cli (`gh api repos/thoryn-io/thoryn-cli`), the D2 pins of both trusts. */
+    /** GitHub's immutable ids of thoryn-io/thoryn-cli (`gh api repos/thoryn-io/thoryn-cli`), the D2 pins of the trust. */
     const val GITHUB_OWNER = "thoryn-io"
     const val GITHUB_REPOSITORY = "thoryn-cli"
     const val GITHUB_OWNER_ID = 229451779L
     const val GITHUB_REPOSITORY_ID = 1361536515L
 
-    /** The apply trust's name on the API (its converge key in [TRUSTS_PROVISION_PATH]). */
+    /** The trust's name on the API (its converge key in [TRUSTS_PROVISION_PATH]). */
     const val TRUST_NAME = "thoryn-cli-ci"
 
     /** A production-plane trust must pin a GitHub environment (D8); the e2e job and the App's apply job declare this REVIEWED one. */
     const val GITHUB_ENVIRONMENT = "thoryn-provision-e2e"
 
-    /** SSO-3697 — the plan trust's name, and the UNPROTECTED environment the App's plan job declares (`<reviewed>-plan`, Amendment 5). */
-    const val PLAN_TRUST_NAME = "thoryn-cli-ci-plan"
+    /** SSO-3697 / SSO-3705 — the UNPROTECTED environment the App's plan job declares (`<reviewed>-plan`, Amendment 5); the plan profile's key. */
     const val PLAN_GITHUB_ENVIRONMENT = "thoryn-provision-e2e-plan"
 
-    /** Only a dispatch on `main` may sign in — a pull request never can (both trusts' `ref` pin). */
+    /** Only a dispatch on `main` may sign in — a pull request never can (the trust's `ref` pin). */
     const val GITHUB_REF = "refs/heads/main"
 
-    /** The production-plane trusts' audience: the `thoryn` workspace's issuer on shared staging (no `/{env}` path). */
+    /** The production-plane trust's audience: the `thoryn` workspace's issuer on shared staging (no `/{env}` path). */
     const val AUDIENCE = "https://thoryn.auth.stg.thoryn.org"
 
     /** The thoryn-cli release the App-dispatched workflow pins — its composite Action and `thoryn.jar`. */
@@ -91,9 +97,10 @@ internal object CiIdentityFixture {
             if (file.resources.any { it.grants != null }) setOf(AccessCommand.SCOPE_WRITE) else emptySet()
 
     /**
-     * SSO-3697 (Amendment 5's rule) — the scope set the read-only PLAN identity needs to plan [file]: the `.read` of
-     * every declared kind's area plus `tenant:access.read` (the ownership gate and the `grants:` diff read it). No
-     * `.write` at all — scopes are the ceiling, so a plan can never write whatever the YAML says.
+     * SSO-3697 / SSO-3705 (Amendment 5's rule) — the scope set a plan of [file] needs, which the hub's plan profile
+     * mints the one identity in the `-plan` environment: the `.read` of every declared kind's area plus
+     * `tenant:access.read` (the ownership gate and the `grants:` diff read it). No `.write` at all — scopes are the
+     * ceiling, so a plan can never write whatever the YAML says. A strict subset of [scopesToConverge].
      */
     fun scopesToPlan(file: ProvisionFile): Set<String> =
         file.resources.map { "tenant:${area(it.kind)}.read" }.toSet() + AccessCommand.SCOPE_READ
@@ -108,4 +115,7 @@ internal object CiIdentityFixture {
         }
         error("could not locate $relative from ${System.getProperty("user.dir")}")
     }
+
+    /** The repository root (the directory holding `.thoryn/`). */
+    fun repositoryRoot(): File = locate(PROVISION_PATH).parentFile.parentFile
 }
