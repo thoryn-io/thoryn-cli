@@ -31,6 +31,7 @@ class CiProvisionFileConformanceTest {
 
     private val file: ProvisionFile = ProvisionFile.load(locate(PROVISION_PATH))
     private val connection: Connection = Connection.load(locate(CONNECTION_PATH))
+    private val planConnection: Connection = Connection.load(locate(CiIdentityFixture.PLAN_CONNECTION_PATH))
 
     @Test
     fun `the committed provisioning file declares the CLI login client on the production plane plus the CI sandbox and its loopback client`() {
@@ -138,10 +139,31 @@ class CiProvisionFileConformanceTest {
         assertThat(reach).containsExactly("environment/ci manager")
         assertThat(file.resources.single { it.key == "application/cli" }.grants).isNull()
         assertThat(file.resources.single { it.key == "application/loopback-rp" }.grants).isNull()
-        // …and the sandbox grants NOBODY else anything (a second subject here would widen CI's blast radius) —
-        // in particular not the retired `client:cli-ci`.
-        assertThat(file.environmentResource("ci")!!.grants!!.map { it.label }).containsExactly("$subject manager")
+        // …and the sandbox grants exactly ONE other subject — the read-only PLAN identity (SSO-3697), `manager` as
+        // well (the gate plans a non-readOnly resource a mere viewer sees as `access_read_only`; its scopes, not
+        // this grant, are what keep a plan from writing). A third subject here would widen CI's blast radius —
+        // in particular never the retired `client:cli-ci`.
+        val planSubject = "client:${planConnection.clientId}"
+        assertThat(planSubject).isNotEqualTo(subject)
+        assertThat(file.environmentResource("ci")!!.grants!!.map { it.label }).containsExactly("$subject manager", "$planSubject manager")
         assertThat(file.resources.flatMap { it.grants.orEmpty() }.map { it.subject }).doesNotContain("client:$RETIRED_CI_CLIENT_ID")
+    }
+
+    /**
+     * SSO-3697 (product owner, 2026-10-14) — THIS repository owns the login client's provisioning: `cli` is declared
+     * read-write (no `readOnly`), so the App-dispatched apply converges it from `main`, and the CI identity holds the
+     * platform `owner` relation on `application:cli` — a one-time admin grant a test cannot observe, so only the
+     * FILE shape is pinned here: no `readOnly`, no `grants:` on it (a `readOnly` would make every change a founder
+     * command again), and `relation: owner` nowhere in the file — the engine refuses it (SSO-3673); a repository
+     * cannot claim ownership by writing YAML.
+     */
+    @Test
+    fun `the login client is declared read-write and owned through the platform — no readOnly, no owner relation in YAML`() {
+        val cli = file.resources.single { it.key == "application/cli" }
+        assertThat(cli.readOnly).withFailMessage("`cli` must not be readOnly — this repository converges the login client from main (SSO-3697)").isFalse()
+        assertThat(cli.environment).isNull() // production plane, adopted by its fixed clientId
+        assertThat(cli.grants).isNull()
+        assertThat(file.resources.flatMap { it.grants.orEmpty() }.map { it.relation }).doesNotContain("owner")
     }
 
     /**

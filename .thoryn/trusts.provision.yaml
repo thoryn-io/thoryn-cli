@@ -1,0 +1,90 @@
+# SSO-3697 (parent SSO-3659) — the TWO workload identity trusts this repository signs in with, DECLARED (SSO-3689's
+# `kind: workloadIdentityTrust`) in a file a FOUNDER applies from their own session. Not CI, and not by accident:
+#
+#  * The ownership gate reaches a trust through its ENVIRONMENT, and both trusts live on the `thoryn` workspace's
+#    PRODUCTION plane (their tokens must address `application:cli` and the `cli-ci` sandbox, whose parent is the
+#    workspace). So converging — or merely ADOPTING — either one needs `manager` on the WORKSPACE
+#    (`ProvisionEngine.gateTrust`): the confined CI identity holds `manager` on `environment:ci` only, and giving it
+#    workspace reach is exactly what epic SSO-3108 forbids. Declared in `.thoryn/provision.yaml`, both trusts would
+#    plan `access_not_owned` for every App-dispatched run — whatever scopes the CI trust carried, including
+#    `tenant:workload-identity.write`.
+#  * A file cannot declare the trust its own identity signs in with (`workload_identity_trust_is_self`): the apply
+#    job IS `thoryn-cli-ci`, so `thoryn-cli-ci` can only ever be declared by a file someone else applies.
+#
+# A founder is `manager` of the workspace and holds `tenant:workload-identity.write` (the `cli` login client's scope
+# set), so this file converges from a founder's laptop — the bootstrap limit of the credential ladder (a trust is
+# created by someone who already holds the scopes it will carry), kept as code:
+#
+#   thoryn login --workspace thoryn --issuer https://auth.stg.thoryn.org
+#   thoryn env use production
+#   thoryn provision plan  --file .thoryn/trusts.provision.yaml       # thoryn-cli-ci: adopted (must match live);
+#                                                                     # thoryn-cli-ci-plan: + create
+#   thoryn provision apply --file .thoryn/trusts.provision.yaml --yes # prints the plan trust's clientId (wi_…)
+#
+# The receipt (`.thoryn/trusts.provision.receipt.json`, git-ignored, local to the founder) owns the plan trust and
+# records thoryn-cli-ci as adopted. A trust's pins and scopes are IMMUTABLE on the hub: a declared field that differs
+# from the live trust is the plan error `workload_identity_trust_immutable` — align the file, or delete and re-apply
+# to re-create (which mints a NEW wi_ client: re-paste it). The App-dispatched workflow never reads this file; it
+# plans and applies `.thoryn/provision.yaml` only. `destroy` of this file would delete both trusts and stop CI
+# signing in at once — a founder's deliberate act, never automation's.
+#
+# The hand-run equivalent of the `thoryn-cli-ci-plan` entry, should the declared form be unavailable:
+#   thoryn workload-identity trusts create --name thoryn-cli-ci-plan \
+#     --repository thoryn-io/thoryn-cli --owner-id 229451779 --repository-id 1361536515 \
+#     --github-environment thoryn-provision-e2e-plan --ref refs/heads/main --github-hosted-runners-only \
+#     --scope "tenant:environments.read tenant:applications.read tenant:access.read" \
+#     --confirm-production
+# (then this file ADOPTS it by name on the founder's next apply — every declared field must match.)
+apiVersion: thoryn.io/provision/v1
+resources:
+  # SSO-3690 — the APPLY identity: created once by the founder on 2026-10-14 (clientId wi_10a7b379c79f7d1353f5798d),
+  # adopted here by name. Pinned to the REVIEWED GitHub environment `thoryn-provision-e2e`: the apply job of
+  # thoryn-provisioning.yml and the manual provision-e2e.yml run in it. Carries the six write-capable scopes
+  # `.thoryn/connection.json` requests (CiTrustsFileConformanceTest pins the two equal).
+  - kind: workloadIdentityTrust
+    name: thoryn-cli-ci
+    spec:
+      provider: github_actions
+      github:
+        repository: thoryn-io/thoryn-cli
+        ownerId: 229451779
+        repositoryId: 1361536515
+        environment: thoryn-provision-e2e
+        ref: refs/heads/main
+        githubHostedRunnersOnly: true
+      scopes:
+        - tenant:environments.read
+        - tenant:environments.write
+        - tenant:applications.read
+        - tenant:applications.write
+        - tenant:access.read
+        - tenant:access.write
+      confirmProduction: true
+
+  # SSO-3697 — the PLAN identity (oauthy converge ADR Amendment 5's two-environment shape): the same repository,
+  # the same ref, but pinned to the UNPROTECTED GitHub environment `thoryn-provision-e2e-plan` and carrying READ
+  # scopes only — the `.read` of every area `.thoryn/provision.yaml` declares plus `tenant:access.read` (ownership
+  # is decided by the identity's own reach before anything is planned). A dispatched run executes on `main` for
+  # both modes, so the environment is the only pin separating "may read" from "may write": this trust cannot write
+  # whatever the YAML says, and the write trust above cannot be minted outside the reviewed environment.
+  # Its reach (scopes are the ceiling, the grant is the gate): `manager` on `environment:ci` (the `grants:` block of
+  # `.thoryn/provision.yaml` — `viewer` would plan the sandbox and its loopback client as `access_read_only`, since
+  # neither is declared readOnly). On `application:cli` the apply identity is the platform `owner` (SSO-3697), and
+  # `owner` is single: whatever this identity is granted there, the gate plans the entry as `owned_elsewhere` — the
+  # recorded gap in `.thoryn/README.md`. `.thoryn/connection.plan.json` is its contract (CiPlanConnectionConfinementTest).
+  - kind: workloadIdentityTrust
+    name: thoryn-cli-ci-plan
+    spec:
+      provider: github_actions
+      github:
+        repository: thoryn-io/thoryn-cli
+        ownerId: 229451779
+        repositoryId: 1361536515
+        environment: thoryn-provision-e2e-plan
+        ref: refs/heads/main
+        githubHostedRunnersOnly: true
+      scopes:
+        - tenant:environments.read
+        - tenant:applications.read
+        - tenant:access.read
+      confirmProduction: true
