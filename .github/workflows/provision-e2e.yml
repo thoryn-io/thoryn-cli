@@ -104,7 +104,7 @@ jobs:
           THORYN_CI_PLAINTEXT_TOKENS: "1"
         run: |
           set -euo pipefail
-          listed=$(java -jar thoryn.jar env list --output json | jq -r '(.data // .)[] | .slug' | sort)
+          listed=$(java -jar thoryn.jar env list --output json | jq -r 'if type == "array" then . else .data end | .[] | .slug' | sort)
           echo "Environments visible to the CI identity:"; echo "$listed" | sed 's/^/  /'
           if [ "$listed" != "$EXPECTED_SANDBOX" ]; then
             echo "::error::confinement broken — expected the CI identity to see only '$EXPECTED_SANDBOX', saw: $(echo "$listed" | tr '\n' ' ')" >&2
