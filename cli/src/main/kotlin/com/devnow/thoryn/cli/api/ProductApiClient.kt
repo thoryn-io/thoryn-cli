@@ -158,6 +158,16 @@ class ProductApiClient(
     fun rotateApplicationSecret(clientId: String, confirmSlug: String? = null): JsonNode =
         post("/api/v1/applications/${encode(clientId)}/secret/rotate", emptyBody(), confirmSlug)
 
+    /**
+     * SSO-3683 — `POST /api/v1/applications/registration-tokens`: mints a Dynamic Client Registration
+     * (RFC 7591) Initial Access Token for the signed-in workspace, pinned to the SELECTED environment
+     * (the `X-Thoryn-Environment` header this client sends). [body] may carry `ttlSeconds` (default and
+     * maximum 3600) and `softwareId`. The response's `initialAccessToken` is returned ONCE — callers
+     * route it through `SecretIo`, never through a printer. Scope: `tenant:applications.write`.
+     */
+    fun mintRegistrationToken(body: Map<String, Any?>): JsonNode =
+        post("/api/v1/applications/registration-tokens", body.withoutNulls())
+
     // ── Tenant users (SSO-2907; product-api SSO-1884 `/api/v1/users`) ──────────
     //
     // The tenant user-management facade, gated by `tenant:users.write`. In the

@@ -64,6 +64,9 @@ thoryn clients create --display-name <n> --redirect-uri <uri> [--scope <s>]... \
 thoryn clients update <clientId> [--display-name <n>] [--redirect-uri <uri>]... [--scope <s>]...
 thoryn clients rotate-secret <clientId> [--secret-file <path>] [--confirm <workspace-slug>]
 thoryn clients delete <clientId> [--confirm <workspace-slug>]
+thoryn clients registration-token [--software-id <id>] [--ttl <seconds>] [--out-file <path>]
+                                             # SSO-3683 — a single-use RFC 7591 token a THIRD PARTY redeems at your
+                                             # registration_endpoint; shown once (SecretIo). See "Register a third-party client".
 
 thoryn federation list                       # Federation members (product-api /federation-members)
 thoryn federation create --provider-type oidc --display-name <n> \
@@ -290,6 +293,59 @@ ungated** — no `--confirm` needed there.
    the gateway); `create` also registers the new tenant in product-api.
  - `audit query` targets product-api's `/audit/events` surface
    (`tenant:audit.read`).
+
+### Register a third-party client (Dynamic Client Registration, SSO-3683)
+
+A vendor integrating Thoryn SSO for your workspace does not need a console session or this CLI:
+RFC 7591 Dynamic Client Registration lets *their* software register its own OAuth client at your
+workspace's `registration_endpoint`. What they need from you is a single-use **Initial Access
+Token** (oauthy ADR `2026-10-14-dynamic-client-registration-for-third-parties`, trust model (b)):
+
+```bash
+thoryn env use staging                       # the token is pinned to the SELECTED environment
+thoryn clients registration-token --software-id com.vendor.crm --ttl 3600 --out-file iat.txt
+# registration_endpoint  https://acme.auth.thoryn.io/staging/oauth2/register
+# expires_at             2026-10-14T12:00:00Z
+# Initial access token written to /…/iat.txt (shown once; not retrievable later).
+```
+
+Hand the vendor the token (out of band — it is a credential) together with the printed
+`registration_endpoint`. Their software redeems it **once**, within the TTL, with no other
+credential:
+
+```bash
+curl -sS -X POST "$REGISTRATION_ENDPOINT" \
+  -H "Authorization: Bearer $(cat iat.txt)" \
+  -H "Content-Type: application/json" \
+  -d '{
+        "client_name": "Vendor CRM",
+        "redirect_uris": ["https://crm.vendor.example/oauth/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "token_endpoint_auth_method": "client_secret_basic",
+        "scope": "openid profile",
+        "software_id": "com.vendor.crm"
+      }'
+```
+
+The `201` response carries `client_id`, the one-time `client_secret`, and a
+`registration_access_token` + `registration_client_uri` for RFC 7592 reads/updates later.
+
+What the token binds (enforced by the hub at redemption, not by this CLI):
+
+ - **your workspace and environment** — a token minted on `staging` cannot create a production
+   client, whichever surface it is presented to (`401 invalid_token` on a mismatch);
+ - **your own scopes** — the registered client may request only `tenant:*` scopes *you* held when
+   you minted (the same transitive-grant rule as `clients create`); `openid`/`profile`/… are not
+   affected;
+ - **`--software-id`**, when given — a registration carrying a different `software_id` is refused
+   (`400 invalid_client_metadata`), so a leaked token cannot register unrelated software;
+ - **one hour at most** (`--ttl` ≤ 3600), **single use**.
+
+Secret-safety is the `SecretIo` contract `clients create` uses: the token goes to `--out-file`
+(owner-only `0600`) or an interactive TTY with a WARN, never to a non-TTY stdout without
+`--force-stdout`, and `--output json` strips it. Scope: `tenant:applications.write` (you must also
+be allowed to create applications in the selected environment — otherwise `404`, exactly as
+`clients create`). The mint is rate-limited per workspace (`429 rate_limited`).
 
 ### Custom domain (SSO-3303, epic SSO-3290)
 
