@@ -55,6 +55,11 @@ data class Tokens(
     // [issuer] is the trust's audience. Kept so a renewal can run the same exchange again with a FRESH job
     // token (a job token works once). Null for every other session. Not a secret.
     val tokenEndpoint: String? = null,
+    // SSO-3684 — the FILE a WORKLOAD IDENTITY session reads its identity token from (a pod's projected
+    // ServiceAccount token under a `kubernetes` trust, `auth.tokenSource.path` of the connection), so a
+    // renewal re-reads the same file instead of asking a GitHub Actions runner that is not there. Null for
+    // a GitHub Actions session and for every other kind. A PATH, never the token: not a secret.
+    val tokenFile: String? = null,
 ) {
     companion object {
         /** SSO-2941 — [authMode] value marking a non-interactive API-key / client-credentials session. */

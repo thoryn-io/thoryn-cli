@@ -1,0 +1,17 @@
+{
+  "apiVersion": "thoryn.io/connection/v1",
+  "workspace": { "slug": "thoryn" },
+  "auth": {
+    "method": "workload_identity",
+    "provider": "kubernetes",
+    "clientId": "wi_9a8b7c6d5e4f3a2b1c0d9e8f",
+    "audience": "https://thoryn.auth.thoryn.io",
+    "tokenSource": { "kind": "file", "path": "/var/run/secrets/tokens/thoryn/token" },
+    "scopes": ["tenant:applications.write"],
+    "kubernetes": {
+      "issuer": "https://kubernetes.default.svc.cluster.local",
+      "namespace": "forge",
+      "serviceAccount": "forge-oauth2-proxy"
+    }
+  }
+}

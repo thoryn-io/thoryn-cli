@@ -1,5 +1,6 @@
 package com.devnow.thoryn.cli.cmd.connection
 
+import com.devnow.thoryn.cli.auth.KubernetesPins
 import com.devnow.thoryn.cli.auth.TrustPins
 import tools.jackson.databind.JsonNode
 import tools.jackson.databind.json.JsonMapper
@@ -22,6 +23,10 @@ import java.io.File
  *    client id and audience (derived from the workspace + `environment` when omitted). No secret at all —
  *    the job's own OIDC token is exchanged, so the file names no env var. Optional `auth.github` pins
  *    mirror the trust's, so a refused sign-in can name the field that differs.
+ *    SSO-3684 — the same method under a `kubernetes` trust (oathy SSO-3678): `auth.provider: kubernetes`,
+ *    and the identity token comes from a FILE — `auth.tokenSource: {kind: file, path: …}`, the pod's
+ *    projected ServiceAccount token — instead of the GitHub Actions runner. Optional `auth.kubernetes`
+ *    pins (issuer, namespace, serviceAccount) play the role `auth.github` plays for GitHub.
  *
  * DATA, not code: the secret is NEVER in the file, only the [secretEnv] name. This class parses and
  * structurally validates against the bundled schema's contract (no third-party JSON-Schema engine —
@@ -53,10 +58,22 @@ internal class Connection private constructor(
     val tokenEndpoint: String? = null,
     /** SSO-3308 — the trust's GitHub pins as the file states them, for local diagnostics only. */
     val github: TrustPins? = null,
+    /** SSO-3684 — the trust's provider (`github_actions` default, or `kubernetes`); `workload_identity` only. */
+    val provider: String? = null,
+    /**
+     * SSO-3684 — the FILE the identity token is read from (`auth.tokenSource.kind: file`), else null: the
+     * GitHub Actions runner variables are the source. A path, never a token.
+     */
+    val tokenFile: String? = null,
+    /** SSO-3684 — a `kubernetes` trust's pins as the file states them, for local diagnostics only. */
+    val kubernetes: KubernetesPins? = null,
 ) {
 
     /** True for a `workload_identity` connection (no secret; the GitHub Actions job token is the credential). */
     val isWorkloadIdentity: Boolean get() = method == AUTH_METHOD_WORKLOAD_IDENTITY
+
+    /** SSO-3684 — the provider a `workload_identity` connection binds to; GitHub Actions when the file names none. */
+    val effectiveProvider: String get() = provider ?: PROVIDER_GITHUB_ACTIONS
 
     /** NAME of the env var holding the client secret — a `client_credentials` connection always has one. */
     val secretEnv: String
@@ -72,14 +89,35 @@ internal class Connection private constructor(
         /** The auth methods a connection may name. */
         val AUTH_METHODS: List<String> = listOf(AUTH_METHOD_CLIENT_CREDENTIALS, AUTH_METHOD_WORKLOAD_IDENTITY)
 
-        /** SSO-3308 — the only workload identity provider in v1 (the trust API's `provider`). */
+        /** SSO-3308 — the default workload identity provider (the trust API's `provider`): a GitHub Actions job. */
         const val PROVIDER_GITHUB_ACTIONS = "github_actions"
 
+        /** SSO-3684 — a pod in a Kubernetes cluster, authenticating with its projected ServiceAccount token. */
+        const val PROVIDER_KUBERNETES = "kubernetes"
+
+        /** The workload identity providers a connection may name. */
+        val PROVIDERS: List<String> = listOf(PROVIDER_GITHUB_ACTIONS, PROVIDER_KUBERNETES)
+
+        /** SSO-3684 — `auth.tokenSource.kind`: the GitHub Actions runner's job-token endpoint (the default when absent). */
+        const val TOKEN_SOURCE_GITHUB_ACTIONS = "github_actions"
+
+        /** SSO-3684 — `auth.tokenSource.kind`: a file on disk, read on every exchange (a projected ServiceAccount token). */
+        const val TOKEN_SOURCE_FILE = "file"
+
+        /** The token-source kinds a connection may name. */
+        val TOKEN_SOURCE_KINDS: List<String> = listOf(TOKEN_SOURCE_GITHUB_ACTIONS, TOKEN_SOURCE_FILE)
+
         /** SSO-3308 — `auth.*` members only a `workload_identity` connection may carry. */
-        private val WORKLOAD_ONLY_KEYS = listOf("provider", "audience", "environment", "tokenEndpoint", "github")
+        private val WORKLOAD_ONLY_KEYS = listOf("provider", "audience", "environment", "tokenEndpoint", "github", "tokenSource", "kubernetes")
 
         /** SSO-3308 — `auth.github` members (the trust API's GitHub pin, same names). */
         private val GITHUB_KEYS = setOf("owner", "repository", "ownerId", "repositoryId", "environment", "ref", "githubHostedRunnersOnly")
+
+        /** SSO-3684 — `auth.kubernetes` members (the trust API's Kubernetes pin, same names; never the key set). */
+        private val KUBERNETES_KEYS = setOf("issuer", "namespace", "serviceAccount")
+
+        /** SSO-3684 — `auth.tokenSource` members. */
+        private val TOKEN_SOURCE_KEYS = setOf("kind", "path")
 
         /**
          * Default env var naming the platform base issuer when `workspace.hubBaseUrlEnv` is omitted.
@@ -147,6 +185,15 @@ internal class Connection private constructor(
                     githubHostedRunnersOnly = g["githubHostedRunnersOnly"]?.takeIf { it.isBoolean() }?.asBoolean(),
                 )
             }
+            val kubernetes = auth["kubernetes"]?.takeIf { it.isObject() }?.let { k ->
+                KubernetesPins(
+                    issuer = text(k, "issuer")?.trimEnd('/'),
+                    namespace = text(k, "namespace"),
+                    serviceAccount = text(k, "serviceAccount"),
+                )
+            }
+            val tokenSource = auth["tokenSource"]?.takeIf { it.isObject() }
+            val tokenFile = tokenSource?.takeIf { text(it, "kind") == TOKEN_SOURCE_FILE }?.let { text(it, "path") }
             return Connection(
                 slug = workspace["slug"].asString(),
                 hubBaseUrlEnv = hubEnv,
@@ -158,6 +205,9 @@ internal class Connection private constructor(
                 environment = text(auth, "environment"),
                 tokenEndpoint = text(auth, "tokenEndpoint"),
                 github = github,
+                provider = text(auth, "provider"),
+                tokenFile = tokenFile,
+                kubernetes = kubernetes,
             )
         }
 
@@ -246,11 +296,29 @@ internal class Connection private constructor(
             return v
         }
 
-        /** SSO-3308 — the `workload_identity`-only members: provider, audience, environment, tokenEndpoint, github. */
+        /**
+         * SSO-3308 — the `workload_identity`-only members: provider, audience, environment, tokenEndpoint, github;
+         * SSO-3684 — tokenSource and kubernetes. A `kubernetes` provider's token can only come from a file
+         * (the projected ServiceAccount token), and a `github_actions` one carries no `kubernetes` pins; each
+         * provider's pin block belongs to it alone.
+         */
         private fun validateWorkloadIdentity(auth: JsonNode, v: MutableList<String>) {
-            auth["provider"]?.takeIf { !it.isNull }?.asString()?.let { p ->
-                if (p != PROVIDER_GITHUB_ACTIONS) v += "auth.provider must be '$PROVIDER_GITHUB_ACTIONS'"
+            val provider = auth["provider"]?.takeIf { !it.isNull }?.asString()
+            provider?.let { p ->
+                if (p !in PROVIDERS) v += "auth.provider must be one of ${PROVIDERS.joinToString(" | ")}"
             }
+            val tokenSourceKind = validateTokenSource(auth, v)
+            if (provider == PROVIDER_KUBERNETES) {
+                if (tokenSourceKind != TOKEN_SOURCE_FILE) {
+                    v += "auth.tokenSource of kind '$TOKEN_SOURCE_FILE' is required for provider '$PROVIDER_KUBERNETES' — a pod's " +
+                        "identity token is its projected ServiceAccount token on disk (e.g. " +
+                        "{\"kind\": \"file\", \"path\": \"/var/run/secrets/tokens/thoryn/token\"})"
+                }
+                if (auth.has("github")) v += "auth.github applies to provider '$PROVIDER_GITHUB_ACTIONS' only"
+            } else {
+                if (auth.has("kubernetes")) v += "auth.kubernetes applies to provider '$PROVIDER_KUBERNETES' only"
+            }
+            validateKubernetesPins(auth, v)
             val audience = auth["audience"]?.takeIf { !it.isNull }?.asString()
             audience?.let { a ->
                 if (!HTTP_URL_PATTERN.matches(a)) v += "auth.audience '$a' must be an absolute http(s) URL"
@@ -277,8 +345,50 @@ internal class Connection private constructor(
             github["githubHostedRunnersOnly"]?.let { n -> if (!n.isBoolean()) v += "auth.github.githubHostedRunnersOnly must be a boolean" }
         }
 
+        /** SSO-3684 — `auth.tokenSource`: `{kind}` with a non-empty `path` for `file`; returns the kind (null when absent). */
+        private fun validateTokenSource(auth: JsonNode, v: MutableList<String>): String? {
+            val source = auth["tokenSource"] ?: return null
+            if (!source.isObject()) {
+                v += "auth.tokenSource must be an object"
+                return null
+            }
+            rejectUnknownKeys(source, TOKEN_SOURCE_KEYS, "auth.tokenSource", v)
+            val kind = source["kind"]?.takeIf { !it.isNull }?.asString()
+            when {
+                kind.isNullOrBlank() -> v += "auth.tokenSource.kind is required (one of ${TOKEN_SOURCE_KINDS.joinToString(" | ")})"
+                kind !in TOKEN_SOURCE_KINDS -> v += "auth.tokenSource.kind must be one of ${TOKEN_SOURCE_KINDS.joinToString(" | ")}"
+            }
+            val path = source["path"]?.takeIf { !it.isNull }
+            when (kind) {
+                TOKEN_SOURCE_FILE -> if (path == null || !path.isString() || path.asString().isBlank()) {
+                    v += "auth.tokenSource.path is required for kind '$TOKEN_SOURCE_FILE' (the file holding the identity token)"
+                }
+                TOKEN_SOURCE_GITHUB_ACTIONS -> if (path != null) v += "auth.tokenSource.path applies to kind '$TOKEN_SOURCE_FILE' only"
+            }
+            return kind
+        }
+
+        /** SSO-3684 — `auth.kubernetes`: the trust's pins, each a non-empty string; the issuer an absolute https URL. */
+        private fun validateKubernetesPins(auth: JsonNode, v: MutableList<String>) {
+            val k = auth["kubernetes"] ?: return
+            if (!k.isObject()) {
+                v += "auth.kubernetes must be an object"
+                return
+            }
+            rejectUnknownKeys(k, KUBERNETES_KEYS, "auth.kubernetes", v)
+            KUBERNETES_KEYS.forEach { key ->
+                k[key]?.let { n -> if (!n.isString() || n.asString().isBlank()) v += "auth.kubernetes.$key must be a non-empty string" }
+            }
+            k["issuer"]?.takeIf { it.isString() }?.asString()?.let { iss ->
+                if (!HTTPS_URL_PATTERN.matches(iss)) v += "auth.kubernetes.issuer '$iss' must be an absolute https URL"
+            }
+        }
+
         /** An absolute http(s) URL (the loader's check; the sign-in re-validates the issuer rules). */
         private val HTTP_URL_PATTERN = Regex("^https?://[^\\s/?#]+(/[^\\s?#]*)?$")
+
+        /** SSO-3684 — an absolute https URL (a cluster's OIDC issuer is always https). */
+        private val HTTPS_URL_PATTERN = Regex("^https://[^\\s/?#]+(/[^\\s?#]*)?$")
 
         private fun rejectUnknownKeys(node: JsonNode, allowed: Set<String>, where: String, into: MutableList<String>) {
             node.properties().forEach { entry ->
