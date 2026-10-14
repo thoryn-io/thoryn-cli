@@ -362,6 +362,47 @@
             </build>
         </profile>
         <!--
+            SSO-3687 — Linux native binaries link everything statically EXCEPT glibc
+            (`-H:+StaticExecutableWithDynamicLibC`, a.k.a. `static-nolibc`).
+
+            A default Linux native image needs `libz.so.1` at run time (readelf
+            NEEDED: libz.so.1, libc.so.6, ld-linux). That is invisible on a desktop,
+            where zlib is always installed, but the container image
+            `ghcr.io/thoryn-io/thoryn-cli` is the release's linux binary on
+            distroless, and distroless/cc ships glibc + libgcc but NO zlib — the
+            binary dies with "libz.so.1: cannot open shared object file". Linking
+            zlib statically leaves glibc as the only shared dependency, so the same
+            binary runs on distroless/cc AND on any glibc host the downloadable
+            binary already supported (it needs no newer glibc: the symbol set is
+            unchanged). Needs `libz.a` at build time (Debian/Ubuntu: zlib1g-dev).
+
+            Activated on Linux only: macOS and Windows have no such mode and no
+            such problem. The profile adds a buildArg to the plugin configured by
+            `native`; without `-Pnative` it has no execution and does nothing.
+        -->
+        <profile>
+            <id>native-static-nolibc-linux</id>
+            <activation>
+                <os>
+                    <name>Linux</name>
+                </os>
+            </activation>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.graalvm.buildtools</groupId>
+                        <artifactId>native-maven-plugin</artifactId>
+                        <version>${native-maven-plugin.version}</version>
+                        <configuration>
+                            <buildArgs combine.children="append">
+                                <buildArg>-H:+StaticExecutableWithDynamicLibC</buildArg>
+                            </buildArgs>
+                        </configuration>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+        <!--
             arm64 (macOS arm64, Linux arm64): GraalVM does not support
             `-march=compatibility` here, so we leave it at the default.
             No additional buildArgs needed — the base `native` profile is enough.

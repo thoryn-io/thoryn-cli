@@ -291,7 +291,13 @@ class LoginCommand : Callable<Int> {
     )
     var deviceName: String? = null
 
-    private val tokenStore: TokenStore = TokenStoreFactory.default()
+    /**
+     * SSO-3687 — opened on first use, never in the constructor. picocli instantiates every command to
+     * build the native image's reflection config; on a Linux build host with no OS keychain an eager
+     * store threw there, the generator wrote no config, and the shipped Linux binary could run no
+     * subcommand (see NativeReflectionConfigWithoutKeychainTest).
+     */
+    private val tokenStore: TokenStore by lazy { TokenStoreFactory.default() }
 
     /**
      * SSO-3228 — persist a freshly-minted session, registering this machine's DPoP key as a named
