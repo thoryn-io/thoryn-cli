@@ -59,6 +59,13 @@ resources:
   # SSO-3104 — the `thoryn` CLI's login client, in the `thoryn` workspace (production plane).
   - kind: application
     name: cli
+    # SSO-3690 — READ-ONLY for the identity that converges this file in CI (the `thoryn-cli-ci` trust).
+    # The ownership gate (SSO-3659/3673) refuses a declared resource the applying identity has no relation
+    # on; CI holds no relation on the login client and must never gain write reach on it. A founder grants
+    # the CI identity `viewer` ONCE (`thoryn access grant client:<wi_…> viewer application:cli`) so the file
+    # can VERIFY the client; any change to the login client itself is made by a founder with their own
+    # session (`thoryn clients update cli …`) — with `readOnly: true` a diff here is a red plan, by design.
+    readOnly: true
     spec:
       clientId: cli                       # fixed id: ThorynConfig.DEFAULT_CLIENT_ID signs in with it
       displayName: "Thoryn CLI"

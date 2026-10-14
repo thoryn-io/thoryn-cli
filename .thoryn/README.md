@@ -49,11 +49,13 @@ it by its fixed id and converges its non-secret shape; adopted resources are nev
 > **Reading note (SSO-3659 / SSO-3673, not changed by SSO-3690).** Since the engine gates every resource on
 > the signed-in identity's own platform reach (`POST /api/v1/access/check`), an identity that holds *no*
 > relation on `application:cli` plans it as `access-not-owned`. The confined CI identity is `manager` of the
-> `ci` sandbox only, so for CI to keep adopting `cli` a workspace admin must grant it reach on that one
-> object — the same as for `cli-ci` before it. The last green `provision-e2e` run predates the gate
-> (2026-09-16); confirm this on the first run under the trust and grant
-> `thoryn access grant client:<wi_…> manager application:cli` (or declare `cli` `readOnly: true` for CI
-> and keep converging it from a founder's session) as the product owner decides.
+> `ci` sandbox only. **Decided 2026-10-14 (product owner): `cli` is declared `readOnly: true`** — CI
+> *verifies* the login client and never gains write reach on it. Two consequences the file now carries:
+> a founder grants the CI identity **`viewer`** once, `thoryn access grant client:<wi_…> viewer application:cli`
+> (a `readOnly` resource the identity has *no* relation on is still `access-not-owned`), and any change to
+> the login client is made by a founder with their own session (`thoryn clients update cli …`) — a
+> `readOnly` diff in this file is a red plan, by design. The last green `provision-e2e` run predates the
+> gate (2026-09-16); the first run under the trust proves this path.
 
 ## The CI identity is a workload identity trust (SSO-3690, parent SSO-3659; epic SSO-3108 for the confinement)
 
