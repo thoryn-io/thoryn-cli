@@ -28,21 +28,27 @@
 #  name, with SSO-3689's `kind: workloadIdentityTrust` — in `.thoryn/trusts.provision.yaml`, a file a FOUNDER
 #  applies, never this one: a production-plane trust is reached through the WORKSPACE (ownership gate), which
 #  the confined CI identity must never hold, and a file cannot declare the trust its own identity signs in
-#  with (`workload_identity_trust_is_self`). Declared here, both trusts would turn every App plan red.
+#  with (`workload_identity_trust_is_self`). Declared here, the trust would turn every App plan red.
 #
 # HOW THIS FILE IS CONVERGED — from code, by the Thoryn GitHub App (SSO-3697, parent SSO-3659; the loop proven on
 # thoryn-cicd, oauthy converge ADR 2026-10-13 §3 + Amendment 5). `.github/workflows/thoryn-provisioning.yml`:
 #  * a pull request that changes anything under .thoryn/ gets a "Thoryn provisioning plan" check run — the App
-#    dispatches `mode=plan`, which signs in as the READ-ONLY plan identity `thoryn-cli-ci-plan`
-#    (`.thoryn/connection.plan.json`; GitHub environment `thoryn-provision-e2e-plan`, no reviewers; scopes
-#    tenant:environments.read tenant:applications.read tenant:access.read) and plans this file. Red when the
-#    file declares a resource the repository does not own, or a `readOnly` resource that differs live.
+#    dispatches `mode=plan`, whose job runs in the UNPROTECTED GitHub environment `thoryn-provision-e2e-plan`
+#    and plans this file. ONE identity for plan and apply (SSO-3705; SSO-3699 option B, product owner
+#    2026-10-14): the plan job signs in with the SAME `.thoryn/connection.json` as the apply job — the
+#    `thoryn-cli-ci` trust's `wi_…` client. What keeps a plan from writing is the trust's PLAN PROFILE on the
+#    hub (SSO-3700; added to `thoryn-cli-ci` by SSO-3704): a job in the `-plan` environment is minted the
+#    READ-ONLY scopes (tenant:environments.read tenant:applications.read tenant:access.read), a job in the
+#    reviewed environment the write scopes. No second trust, no second `wi_` client, nothing to paste.
+#    Until that profile exists the plan job fails at sign-in with `environment_mismatch` (the trust pins the
+#    reviewed environment only) — stated, not worked around. Red when the file declares a resource the
+#    repository does not own, or a `readOnly` resource that differs live.
 #  * a push to `main` dispatches `mode=apply`: the job runs in the REVIEWED environment `thoryn-provision-e2e`
 #    (required reviewers hold it before any token is minted), signs in as `thoryn-cli-ci`, applies with
 #    `destroy: "false"` — never `--prune`, never `destroy` — and opens a follow-up pull request carrying
 #    `.thoryn/provision.receipt.json` (committed since SSO-3697: it is the ownership ledger the next apply
 #    builds on). A dispatched run executes on `main` in BOTH modes, so the GitHub environment is the only pin
-#    that separates "may read" from "may write" — the plan trust cannot write whatever this file says.
+#    that separates "may read" from "may write" — the plan profile cannot write whatever this file says.
 #  `provision-e2e.yml` (dispatch: apply + confinement assertions + destroy) stays as the manual path. Its
 #  `destroy` removes what ITS checkout's receipt owns — with the receipt now committed, that is the loopback
 #  client the App's apply created (the sandbox is adopted, never removed); the next App apply re-creates it and
@@ -92,9 +98,8 @@ resources:
     # The fixed `clientId` keeps the adopt-by-id behaviour: the client exists (a founder created it once), so the
     # first apply from CI ADOPTS it (`adopted: true` in the receipt) and converges its non-secret shape; adopted
     # resources are never deleted by `destroy`, so CI cannot remove the client it depends on.
-    # KNOWN GAP (recorded in the README): the read-only PLAN identity is not the owner, so the ownership gate
-    # plans this entry as `owned_elsewhere` (the engine cannot tell a repository's plan twin from a foreign
-    # repository) — the `cli` row of a PR's plan check is red until the engine learns the difference (SSO-3699).
+    # The plan identity IS this owner (SSO-3705 — SSO-3699 option B: one trust with a plan profile), so a PR's
+    # plan check sees the owner planning its own resource; SSO-3697's `owned_elsewhere` gap is gone by design.
     spec:
       clientId: cli                       # fixed id: ThorynConfig.DEFAULT_CLIENT_ID signs in with it
       displayName: "Thoryn CLI"
@@ -152,22 +157,18 @@ resources:
       slug: cli-ci
       displayName: "thoryn-cli CI sandbox"
     grants:
-      # SSO-3113 / SSO-3690 — the ONLY grants in this file: the two CI identities manage this sandbox, and by
-      # containment everything inside it (the loopback client below). This is the whole of their reach — neither
-      # is a workspace admin, and nothing here grants the `cli` login client anything wider.
-      # The APPLY identity: the `wi_…` client of the `thoryn-cli-ci` workload identity trust — the SAME value as
-      # `auth.clientId` in `.thoryn/connection.json` (CiProvisionFileConformanceTest pins the two equal). It is
-      # minted by the founder's one-time `thoryn workload-identity trusts create`; paste it here.
+      # SSO-3113 / SSO-3690 — the ONLY grant in this file: the CI identity manages this sandbox, and by
+      # containment everything inside it (the loopback client below). This is the whole of its reach — it is
+      # NOT a workspace admin, and nothing here grants the `cli` login client anything wider.
+      # The subject is the `wi_…` client of the `thoryn-cli-ci` workload identity trust — the SAME value as
+      # `auth.clientId` in `.thoryn/connection.json` (CiProvisionFileConformanceTest pins the two equal, and that
+      # it is the ONLY subject here). ONE identity for plan and apply (SSO-3705; SSO-3699 option B): the plan job
+      # signs in as this same client and the hub's plan profile (SSO-3700/SSO-3704) mints it read-only scopes in
+      # the `-plan` environment — `manager` reach lets it plan the sandbox and its loopback client, the scopes keep
+      # it from writing. SSO-3697's second grant, for a never-created plan trust's placeholder client, is what
+      # stopped provision-e2e run 38547022158 with `404 not_found — No such access-grant target`; there is no
+      # second `wi_` to paste, so a placeholder must never return here.
       - subject: "client:wi_10a7b379c79f7d1353f5798d"
-        relation: manager
-      # SSO-3697 — the PLAN identity: the `wi_…` client of the `thoryn-cli-ci-plan` trust — the SAME value as
-      # `auth.clientId` in `.thoryn/connection.plan.json` (pinned equal by the same test). `manager`, not `viewer`:
-      # the ownership gate plans a non-`readOnly` resource the identity may only VIEW as `access_read_only`, and
-      # this sandbox and its loopback client are owned here. Scopes are the ceiling, the grant is the gate — the
-      # plan trust carries READ scopes only, so `manager` reach lets it plan and still cannot write. The apply
-      # identity (manager here) converges this grant on the first apply after the id is pasted; a founder's
-      # `thoryn provision apply --file .thoryn/trusts.provision.yaml` prints the id.
-      - subject: "client:wi_PASTE_THE_PLAN_CLIENT_ID_TRUSTS_CREATE_PRINTS"
         relation: manager
 
   - kind: application

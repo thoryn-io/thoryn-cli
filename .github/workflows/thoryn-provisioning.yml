@@ -4,19 +4,25 @@
 # The App never holds a credential to the `thoryn` workspace. On a pull request that changes .thoryn/ it opens
 # a "Thoryn provisioning plan" check run and dispatches this workflow with mode=plan; on a push to main it opens
 # "Thoryn provisioning apply" and dispatches mode=apply. Each job signs in as THIS repository's own workload
-# identity (.thoryn/connection*.json — no secret) and the hub enforces the trust's pins. The manual path,
+# identity (.thoryn/connection.json — no secret) and the hub enforces the trust's pins. The manual path,
 # provision-e2e.yml (apply + confinement assertions + destroy on a dispatch), stays beside this one.
 #
-# WHY TWO ENVIRONMENTS. .thoryn/provision.yaml declares PRODUCTION-PLANE resources (the CLI's own login client
-# `cli`, the `cli-ci` sandbox whose parent is the workspace), so even the plan needs a production-plane token,
-# and a production trust must be pinned to a GitHub environment. A dispatched run executes on the default
+# WHY TWO ENVIRONMENTS, ONE IDENTITY. .thoryn/provision.yaml declares PRODUCTION-PLANE resources (the CLI's own
+# login client `cli`, the `cli-ci` sandbox whose parent is the workspace), so even the plan needs a production-plane
+# token, and a production trust must be pinned to a GitHub environment. A dispatched run executes on the default
 # branch for BOTH modes (the ref the token carries is refs/heads/main either way), so the GitHub environment is
 # the only thing that separates them (oauthy converge ADR 2026-10-13, Amendment 5):
-#   * `thoryn-provision-e2e-plan` — no reviewers; the `thoryn-cli-ci-plan` trust pinned to it carries READ
-#                                   scopes only (tenant:environments.read tenant:applications.read
-#                                   tenant:access.read). A plan can never write, whatever the YAML says.
-#   * `thoryn-provision-e2e`      — required reviewers; the `thoryn-cli-ci` trust pinned to it carries the write
-#                                   scopes. GitHub holds the apply job for a reviewer before any token can be minted.
+#   * `thoryn-provision-e2e-plan` — no reviewers. The plan job runs here.
+#   * `thoryn-provision-e2e`      — required reviewers; the `thoryn-cli-ci` trust is pinned to it. GitHub holds the
+#                                   apply job for a reviewer before any token can be minted.
+# BOTH jobs sign in with the SAME connection.json — the ONE trust `thoryn-cli-ci` (SSO-3705; SSO-3699 option B,
+# product owner 2026-10-14). What makes the plan read-only is the trust's PLAN PROFILE on the hub (SSO-3700): a job
+# whose OIDC token carries the `-plan` environment is minted READ scopes only (tenant:environments.read
+# tenant:applications.read tenant:access.read); a job in the reviewed environment gets the write scopes. No second
+# trust, no second wi_ client, nothing to paste. UNTIL SSO-3700 is deployed and SSO-3704 adds the profile to
+# thoryn-cli-ci, the plan job FAILS AT SIGN-IN with `environment_mismatch` — the trust pins the reviewed environment
+# only. Stated here and in .thoryn/README.md, not worked around; the App is not installed on this repository yet,
+# so nothing dispatches this workflow until then.
 # The App completes its check run from this run's conclusion (the run-name carries the check-run id).
 # Removals are never automated: the apply step is destroy: "false", and nothing here passes --prune.
 #
@@ -64,7 +70,8 @@ jobs:
   plan:
     if: inputs.mode == 'plan'
     runs-on: ubuntu-latest
-    # Read-only production-plane identity (see the header). No reviewers on this environment.
+    # The UNPROTECTED plan environment (see the header): the hub's plan profile mints read-only scopes for a job
+    # here. No reviewers. Refused with environment_mismatch until thoryn-cli-ci carries the profile (SSO-3700/3704).
     environment: thoryn-provision-e2e-plan
     permissions:
       id-token: write
@@ -84,10 +91,10 @@ jobs:
         run: |
           set -euo pipefail
           gh release download "$THORYN_CLI_RELEASE" --repo thoryn-io/thoryn-cli --pattern thoryn.jar --dir .
-      - name: Plan .thoryn/provision.yaml as this repository (production plane, read-only plan identity)
+      - name: Plan .thoryn/provision.yaml as this repository (production plane, the one identity's plan profile)
         run: |
           set -euo pipefail
-          java -jar thoryn.jar login --connection ".thoryn/connection.plan.json"
+          java -jar thoryn.jar login --connection ".thoryn/connection.json"
           { echo '## Thoryn provisioning plan: .thoryn/provision.yaml'; echo; echo '<pre>'; } >> "$GITHUB_STEP_SUMMARY"
           java -jar thoryn.jar provision plan --file ".thoryn/provision.yaml" | tee -a "$GITHUB_STEP_SUMMARY"
           echo '</pre>' >> "$GITHUB_STEP_SUMMARY"

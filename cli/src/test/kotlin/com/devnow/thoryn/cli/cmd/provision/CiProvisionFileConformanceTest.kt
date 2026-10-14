@@ -31,7 +31,6 @@ class CiProvisionFileConformanceTest {
 
     private val file: ProvisionFile = ProvisionFile.load(locate(PROVISION_PATH))
     private val connection: Connection = Connection.load(locate(CONNECTION_PATH))
-    private val planConnection: Connection = Connection.load(locate(CiIdentityFixture.PLAN_CONNECTION_PATH))
 
     @Test
     fun `the committed provisioning file declares the CLI login client on the production plane plus the CI sandbox and its loopback client`() {
@@ -139,14 +138,38 @@ class CiProvisionFileConformanceTest {
         assertThat(reach).containsExactly("environment/ci manager")
         assertThat(file.resources.single { it.key == "application/cli" }.grants).isNull()
         assertThat(file.resources.single { it.key == "application/loopback-rp" }.grants).isNull()
-        // …and the sandbox grants exactly ONE other subject — the read-only PLAN identity (SSO-3697), `manager` as
-        // well (the gate plans a non-readOnly resource a mere viewer sees as `access_read_only`; its scopes, not
-        // this grant, are what keep a plan from writing). A third subject here would widen CI's blast radius —
-        // in particular never the retired `client:cli-ci`.
-        val planSubject = "client:${planConnection.clientId}"
-        assertThat(planSubject).isNotEqualTo(subject)
-        assertThat(file.environmentResource("ci")!!.grants!!.map { it.label }).containsExactly("$subject manager", "$planSubject manager")
+        // …and the sandbox grants NOBODY else anything (a second subject here would widen CI's blast radius) —
+        // in particular not the retired `client:cli-ci`. SSO-3705: ONE identity plans and applies (SSO-3699
+        // option B), so there is exactly one grant subject in the whole file, and it is the connection's client.
+        assertThat(file.environmentResource("ci")!!.grants!!.map { it.label }).containsExactly("$subject manager")
+        assertThat(file.resources.flatMap { it.grants.orEmpty() }.map { it.subject }.toSet()).containsExactly(subject)
         assertThat(file.resources.flatMap { it.grants.orEmpty() }.map { it.subject }).doesNotContain("client:$RETIRED_CI_CLIENT_ID")
+    }
+
+    /**
+     * SSO-3705 — a placeholder subject is a grant the hub answers `404 not_found — No such access-grant target`
+     * (provision-e2e run 38547022158, on SSO-3697's `client:wi_PASTE_…` for a plan trust that was never created).
+     * Under one-identity (SSO-3699 option B) there is nothing left to paste, so no committed file under `.thoryn/`
+     * may carry a paste-me marker, and every grant subject must be a real `wi_` client of hex digits.
+     */
+    @Test
+    fun `nothing under thoryn carries a placeholder — every grant subject is a real workload client id`() {
+        val root = CiIdentityFixture.repositoryRoot()
+        // Every committed data file under .thoryn/ is one of these three: a fourth (a second connection, say) is a
+        // second identity coming back.
+        val committed = java.io.File(root, ".thoryn").listFiles { f -> f.isFile && f.name != "README.md" && !f.name.endsWith(".receipt.json") }!!.map { it.name }
+        assertThat(committed).containsExactlyInAnyOrderElementsOf(CiIdentityFixture.THORYN_DATA_FILES.map { it.substringAfterLast('/') })
+        CiIdentityFixture.THORYN_DATA_FILES.map(::locate).forEach { f ->
+            CiIdentityFixture.dataLines(f).forEach { line ->
+                val hit = CiIdentityFixture.PLACEHOLDER_PATTERN.find(line)
+                assertThat(hit).withFailMessage("%s carries a placeholder (%s) in `%s` — there is nothing to paste under one-identity (SSO-3705)", f.name, hit?.value, line.trim()).isNull()
+            }
+        }
+        val realClient = Regex("^client:wi_[0-9a-f]{16,}$")
+        file.resources.flatMap { it.grants.orEmpty() }.forEach { g ->
+            assertThat(g.subject).withFailMessage("grant subject %s is not a real wi_ client id", g.subject).matches(realClient.pattern)
+        }
+        assertThat(connection.clientId).matches("^wi_[0-9a-f]{16,}$")
     }
 
     /**
