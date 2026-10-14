@@ -5,6 +5,9 @@ import tools.jackson.module.kotlin.jacksonObjectMapper
 import tools.jackson.module.kotlin.readValue
 import java.io.IOException
 import java.net.URI
+import java.nio.file.Files
+import java.nio.file.NoSuchFileException
+import java.nio.file.Path
 import java.net.URLEncoder
 import java.net.http.HttpClient
 import java.net.http.HttpRequest
@@ -37,6 +40,12 @@ import java.time.Duration
  * [run] asks the runner for a FRESH job token — including the renewal of an expired session
  * ([com.devnow.thoryn.cli.cmd.CommandSupport.forceRefresh]). Nothing here caches a job token.
  *
+ * **SSO-3684 — a token FILE instead of the runner.** A pod under a `kubernetes` trust (oathy SSO-3678) holds
+ * its credential as a projected ServiceAccount token on disk (`/var/run/secrets/tokens/thoryn/token`, the
+ * path the connection's `auth.tokenSource` names). With [tokenFile] set, step 1 is a read of that file —
+ * Kubernetes refreshes it in place, so every [run] re-reads it — and the exchange in step 2 is byte-identical.
+ * The file's content is the credential: it is never logged, never persisted, never put on an exception.
+ *
  * **Every refusal is `401 invalid_client`**, by design: the platform tells a caller nothing about which
  * check failed (the reason is in the workspace audit log only, `workload_identity.exchange_failed`). A
  * refusal therefore carries the job's own [JobIdentity] — public job metadata read from the token the
@@ -57,6 +66,11 @@ class WorkloadIdentityFlow(
     /** Environment lookup; `-D` system properties first, so tests (and `java -D…`) can supply the runner vars. */
     private val env: (String) -> String? = ::runnerEnv,
     private val mapper: ObjectMapper = jacksonObjectMapper(),
+    /**
+     * SSO-3684 — read the identity token from this file (a projected ServiceAccount token) instead of asking
+     * the GitHub Actions runner. Null ⇒ the runner variables are the source.
+     */
+    private val tokenFile: Path? = null,
 ) {
 
     /**
@@ -122,10 +136,12 @@ class WorkloadIdentityFlow(
     }
 
     /**
-     * A FRESH GitHub Actions job token for [audience] — one request per call, never cached (a job token
-     * works once).
+     * A FRESH identity token for [audience] — one request per call, never cached (a job token works
+     * once). From [tokenFile] when set (SSO-3684: Kubernetes rewrites the projected token in place, so a
+     * re-read is a fresh token), else from the GitHub Actions runner.
      */
     internal fun requestJobToken(): String {
+        tokenFile?.let { return readTokenFile(it) }
         val requestUrl = env(REQUEST_URL_ENV)
         val requestToken = env(REQUEST_TOKEN_ENV)
         if (requestUrl == null || requestToken == null) {
@@ -167,6 +183,34 @@ class WorkloadIdentityFlow(
             )
     }
 
+    /**
+     * SSO-3684 — the token at [file], whitespace-trimmed. A missing, unreadable or empty file is
+     * [ERROR_TOKEN_FILE_UNREADABLE] naming the PATH (never any content): the usual causes are a projected
+     * volume mounted elsewhere than the connection says, or no `serviceAccountToken` source at all.
+     */
+    internal fun readTokenFile(file: Path): String {
+        val raw = try {
+            Files.readString(file, Charsets.UTF_8)
+        } catch (e: NoSuchFileException) {
+            throw WorkloadIdentityException(
+                "no identity token at '$file': the file does not exist. Mount the projected ServiceAccount token " +
+                    "there (a `projected` volume with a `serviceAccountToken` source whose `audience` is the trust's " +
+                    "audience), or point the connection's auth.tokenSource.path at where it is mounted.",
+                oauthError = ERROR_TOKEN_FILE_UNREADABLE,
+            )
+        } catch (e: IOException) {
+            throw WorkloadIdentityException(
+                "could not read the identity token at '$file' (${e.javaClass.simpleName}${e.message?.let { ": $it" } ?: ""}).",
+                oauthError = ERROR_TOKEN_FILE_UNREADABLE,
+            )
+        }
+        return raw.trim().takeIf { it.isNotEmpty() }
+            ?: throw WorkloadIdentityException(
+                "the identity token file '$file' is empty.",
+                oauthError = ERROR_TOKEN_FILE_UNREADABLE,
+            )
+    }
+
     /** The exchange form: client_credentials, the workload client, the job token as its assertion. No secret. */
     internal fun buildForm(jobToken: String, scope: String?): String {
         val pairs = buildList {
@@ -203,10 +247,16 @@ class WorkloadIdentityFlow(
         /** The only job-token issuer a trust accepts (operator config on the platform; D4). */
         const val GITHUB_ACTIONS_ISSUER = "https://token.actions.githubusercontent.com"
 
+        /** SSO-3684 — where a pod's projected ServiceAccount token is mounted in the documented manifest. */
+        const val DEFAULT_KUBERNETES_TOKEN_FILE = "/var/run/secrets/tokens/thoryn/token"
+
         /** CLI-side failure codes (never sent by the platform). */
         const val ERROR_NOT_ON_GITHUB_ACTIONS = "not_on_github_actions"
         const val ERROR_JOB_TOKEN_REQUEST_FAILED = "job_token_request_failed"
         const val ERROR_TRANSPORT = "token_endpoint_unreachable"
+
+        /** SSO-3684 — the token file named by `--token-file` / `auth.tokenSource.path` is missing, unreadable or empty. */
+        const val ERROR_TOKEN_FILE_UNREADABLE = "token_file_unreadable"
 
         /** A runner variable: `-D` property first (tests, `java -D…`), then the environment; blank ⇒ null. */
         fun runnerEnv(name: String): String? =
@@ -280,8 +330,17 @@ data class JobIdentity(
     val environment: String?,
     val eventName: String?,
     val runnerEnvironment: String?,
+    /** SSO-3684 — a projected ServiceAccount token's `kubernetes.io.namespace`; null for a CI job token. */
+    val kubernetesNamespace: String? = null,
+    /** SSO-3684 — a projected ServiceAccount token's `kubernetes.io.serviceaccount.name`. */
+    val kubernetesServiceAccount: String? = null,
 ) {
+    /** SSO-3684 — true when the token is a Kubernetes ServiceAccount token (`sub` = `system:serviceaccount:…`). */
+    val isKubernetes: Boolean get() = subject?.startsWith(KUBERNETES_SUBJECT_PREFIX) == true || kubernetesNamespace != null
+
     companion object {
+        const val KUBERNETES_SUBJECT_PREFIX: String = "system:serviceaccount:"
+
         fun of(jobToken: String): JobIdentity {
             val c = JwtClaims.of(jobToken)
             fun text(name: String): String? = c[name]?.takeUnless { it.isNull }?.asString()?.takeIf { it.isNotBlank() }
@@ -303,6 +362,8 @@ data class JobIdentity(
                 environment = text("environment"),
                 eventName = text("event_name"),
                 runnerEnvironment = text("runner_environment"),
+                kubernetesNamespace = c["kubernetes.io"]?.get("namespace")?.takeUnless { it.isNull }?.asString()?.takeIf { it.isNotBlank() },
+                kubernetesServiceAccount = c["kubernetes.io"]?.get("serviceaccount")?.get("name")?.takeUnless { it.isNull }?.asString()?.takeIf { it.isNotBlank() },
             )
         }
     }

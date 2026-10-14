@@ -23,6 +23,7 @@ import com.devnow.thoryn.cli.auth.ScopeRegistry
 import com.devnow.thoryn.cli.auth.TokenStore
 import com.devnow.thoryn.cli.auth.TokenStoreFactory
 import com.devnow.thoryn.cli.auth.Tokens
+import com.devnow.thoryn.cli.auth.KubernetesPins
 import com.devnow.thoryn.cli.auth.TrustPins
 import com.devnow.thoryn.cli.auth.WorkloadIdentityBinding
 import com.devnow.thoryn.cli.auth.WorkloadIdentityDiagnostics
@@ -227,6 +228,21 @@ class LoginCommand : Callable<Int> {
     )
     var wifTokenEndpoint: String? = null
 
+    /**
+     * SSO-3684 — read the identity token from a FILE instead of the GitHub Actions runner: a pod's projected
+     * ServiceAccount token under a `kubernetes` trust (`/var/run/secrets/tokens/thoryn/token` in the documented
+     * manifest). Re-read on every renewal — Kubernetes refreshes it in place. A path, never a token.
+     */
+    @Option(
+        names = ["--token-file"],
+        paramLabel = "<path>",
+        description = [
+            "With --workload-identity: read the identity token from this file instead of the GitHub Actions runner — " +
+                "a pod's projected ServiceAccount token under a kubernetes trust (see `thoryn workload-identity trusts create --provider kubernetes`).",
+        ],
+    )
+    var wifTokenFile: File? = null
+
     @Option(
         names = ["--status"],
         description = ["Print sign-in status and exit. Does not initiate a new flow."],
@@ -246,7 +262,7 @@ class LoginCommand : Callable<Int> {
      */
     @Option(
         names = ["--connection"],
-        description = ["Sign in from a connection contract (connection.schema.json). Derives issuer/gateway from workspace.slug; auth.method client_credentials reads the client secret from the env var named by auth.secretEnv, workload_identity exchanges the GitHub Actions job's OIDC token (no secret); requests exactly auth.scopes. Mutually exclusive with --issuer/--gateway/--scope/--client-id and the other modes."],
+        description = ["Sign in from a connection contract (connection.schema.json). Derives issuer/gateway from workspace.slug; auth.method client_credentials reads the client secret from the env var named by auth.secretEnv, workload_identity exchanges the GitHub Actions job's OIDC token — or, with auth.tokenSource {kind: file}, the identity token in that file (a pod's projected ServiceAccount token) — no secret; requests exactly auth.scopes. Mutually exclusive with --issuer/--gateway/--scope/--client-id and the other modes."],
     )
     var connectionFile: File? = null
 
@@ -484,8 +500,8 @@ class LoginCommand : Callable<Int> {
             }
             return runWorkloadIdentityFlow()
         }
-        if (wifAudience != null || wifTokenEndpoint != null) {
-            System.err.println("Error: --audience and --token-endpoint apply to --workload-identity only.")
+        if (wifAudience != null || wifTokenEndpoint != null || wifTokenFile != null) {
+            System.err.println("Error: --audience, --token-endpoint and --token-file apply to --workload-identity only.")
             return EXIT_USAGE
         }
         // SSO-3182 — no localhost default: resolve the platform's hub or fail fast with guidance.
@@ -644,6 +660,7 @@ class LoginCommand : Callable<Int> {
             if (useWorkloadIdentity) add("--workload-identity")
             if (wifAudience != null) add("--audience")
             if (wifTokenEndpoint != null) add("--token-endpoint")
+            if (wifTokenFile != null) add("--token-file")
         }
         if (conflicting.isNotEmpty()) {
             System.err.println(
@@ -791,6 +808,7 @@ class LoginCommand : Callable<Int> {
         }
         // An explicit --scope narrows the request; the interactive default set is not a workload scope set.
         val requested = scope.takeIf { it != ThorynConfig.DEFAULT_SCOPE }?.let(ScopeRegistry::expand)?.takeIf { it.isNotBlank() }
+        val tokenFile = wifTokenFile?.path?.trim()?.takeIf { it.isNotEmpty() }
         return signInWithWorkloadIdentity(
             clientIdValue = workloadClient,
             audience = audience,
@@ -799,7 +817,9 @@ class LoginCommand : Callable<Int> {
             platformBase = issuerOption?.trim()?.trimEnd('/')?.takeIf { it.isNotEmpty() }?.let(ThorynConfig::baseHubOf),
             workspaceSlug = workspace?.trim()?.takeIf { it.isNotEmpty() },
             pins = null,
-            reLogin = "thoryn login --workload-identity --client-id $workloadClient --audience <the trust's audience>",
+            reLogin = "thoryn login --workload-identity --client-id $workloadClient --audience <the trust's audience>" +
+                (tokenFile?.let { " --token-file $it" } ?: ""),
+            tokenFile = tokenFile,
         )
     }
 
@@ -856,6 +876,10 @@ class LoginCommand : Callable<Int> {
             workspaceSlug = connection.slug,
             pins = connection.github,
             reLogin = "thoryn login --connection ${file.path}",
+            // SSO-3684 — a `kubernetes` connection: the projected ServiceAccount token file, and the cluster pins.
+            tokenFile = connection.tokenFile,
+            provider = connection.effectiveProvider,
+            kubernetesPins = connection.kubernetes,
             retiredFix = if (connection.audience == null) {
                 { suggestion -> customDomainAudienceFix(suggestion, connection, file) }
             } else {
@@ -911,6 +935,12 @@ class LoginCommand : Callable<Int> {
         retiredFix: ((RetiredIssuer.Suggestion?) -> String)? = null,
         /** SSO-3415 — the caller already resolved [audience] through [followRetiredIssuer]. */
         alreadyProbed: Boolean = false,
+        /** SSO-3684 — read the identity token from this file (a projected ServiceAccount token) instead of the runner. */
+        tokenFile: String? = null,
+        /** SSO-3684 — the trust's provider when known, for the refusal diagnostics. */
+        provider: String? = null,
+        /** SSO-3684 — a `kubernetes` trust's pins, for the refusal diagnostics. */
+        kubernetesPins: KubernetesPins? = null,
     ): Int {
         try {
             IssuerUrlValidator.validate(audience, devMode)
@@ -947,12 +977,13 @@ class LoginCommand : Callable<Int> {
             }?.let { return it }
         }
 
-        val binding = WorkloadIdentityBinding(clientIdValue, audience, tokenEndpoint, requestedScope, pins)
+        val binding = WorkloadIdentityBinding(clientIdValue, audience, tokenEndpoint, requestedScope, pins, provider, kubernetesPins)
         val flow = WorkloadIdentityFlow(
             clientId = clientIdValue,
             audience = audience,
             tokenEndpoint = tokenEndpoint,
             tokenSender = realHttpSender(),
+            tokenFile = tokenFile?.let { java.nio.file.Path.of(it) },
         )
         return try {
             val tokens = flow.run(requestedScope)
@@ -965,6 +996,7 @@ class LoginCommand : Callable<Int> {
                     clientId = clientIdValue,
                     workspace = workspaceSlug ?: ThorynConfig.workspaceOfIssuer(audience),
                     tokenEndpoint = tokenEndpoint,
+                    tokenFile = tokenFile,
                 ),
             )
             // SSO-2863 — a fresh login resets the base tenant; drop any stale workspace selection.
@@ -974,8 +1006,13 @@ class LoginCommand : Callable<Int> {
             tokens.scope?.let { println("Scopes: $it") }
             val minutes = tokens.expiresAtEpochSecond?.let { (it - System.currentTimeMillis() / 1000) / 60 }
             println(
-                "The token lasts ${minutes?.let { "about ${it}m" } ?: "a few minutes"}; later commands in this job renew it " +
-                    "with a fresh job token (re-run `$reLogin` outside the job's lifetime).",
+                if (tokenFile != null) {
+                    "The token lasts ${minutes?.let { "about ${it}m" } ?: "a few minutes"}; later commands renew it by re-reading " +
+                        "the identity token at $tokenFile (re-run `$reLogin` where that file is mounted)."
+                } else {
+                    "The token lasts ${minutes?.let { "about ${it}m" } ?: "a few minutes"}; later commands in this job renew it " +
+                        "with a fresh job token (re-run `$reLogin` outside the job's lifetime)."
+                },
             )
             EXIT_OK
         } catch (e: WorkloadIdentityException) {
@@ -1348,7 +1385,8 @@ class LoginCommand : Callable<Int> {
         internal fun reLoginCommand(tokens: Tokens?): String {
             // SSO-3308 — a workload identity session re-signs-in with the same trust binding, inside a job.
             if (tokens?.authMode == Tokens.AUTH_MODE_WORKLOAD_IDENTITY) {
-                return "thoryn login --workload-identity --client-id ${tokens.clientId ?: "<wi_…>"} --audience ${tokens.issuer ?: "<audience>"}"
+                return "thoryn login --workload-identity --client-id ${tokens.clientId ?: "<wi_…>"} --audience ${tokens.issuer ?: "<audience>"}" +
+                    (tokens.tokenFile?.takeIf { it.isNotBlank() }?.let { " --token-file $it" } ?: "") // SSO-3684
             }
             val slug = tokens?.workspace?.takeIf { it.isNotBlank() } ?: ThorynConfig.workspaceOfIssuer(tokens?.issuer)
             return if (slug != null) "thoryn login --workspace $slug" else "thoryn login"
