@@ -49,7 +49,13 @@ class LogoutCommand : Callable<Int> {
     /** Test seam — where the command writes its confirmation lines. */
     internal var out: PrintStream = System.out
 
-    private val tokenStore: TokenStore = TokenStoreFactory.default()
+    /**
+     * SSO-3687 — opened on first use, never in the constructor. picocli instantiates every command to
+     * build the native image's reflection config; on a Linux build host with no OS keychain an eager
+     * store threw there, the generator wrote no config, and the shipped Linux binary could run no
+     * subcommand (see NativeReflectionConfigWithoutKeychainTest).
+     */
+    private val tokenStore: TokenStore by lazy { TokenStoreFactory.default() }
 
     override fun call(): Int {
         // SSO-3270 — revoke, THEN discard the key, THEN clear the session. The revoke needs both of
