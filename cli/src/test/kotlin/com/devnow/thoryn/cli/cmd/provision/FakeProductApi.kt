@@ -55,6 +55,18 @@ internal class FakeProductApi : Dispatcher() {
     var denyGrantReads = false
     /** SSO-3113 — the one-shot client secrets the fake minted for confidential applications, by clientId (test-side ledger only). */
     val mintedSecrets = mutableMapOf<String, String>()
+    // ── SSO-3689 — workload-identity trusts (product-api /api/v1/workload-identity/trusts) ──
+    /** The trusts, with `_env` (null ⇒ production). Rendered as `WorkloadIdentityTrustResponse` — never key material. */
+    val trusts = mutableListOf<MutableMap<String, Any?>>()
+    /**
+     * The scopes the CALLER's token carries — the hub's scope ceiling (D6): a trust may carry only scopes among them
+     * (`403 scope_not_grantable` otherwise). Null ⇒ the caller holds everything (a founder's session).
+     */
+    var callerScopes: Set<String>? = null
+    /** Race fixture: the first trust POST finds its name taken meanwhile — the fake seeds the trust from the body and answers 409. */
+    var trustNameTakenOnce = false
+    /** The page size the trusts list uses (cursor = the offset), so a test can exercise the engine's paging. */
+    var trustPageSize = 50
     // ── SSO-3413 / SSO-3414 — the workspace's ONE custom domain (product-api /api/v1/custom-domain) ──
     /** Custom domains enabled for the workspace (the operator entitlement). */
     var domainEntitled = true
@@ -161,6 +173,103 @@ internal class FakeProductApi : Dispatcher() {
     ): String =
         (clientId ?: "app-${++seq}").also { applications += mutableMapOf("clientId" to it, "displayName" to displayName, "redirectUris" to redirectUris, "status" to "active", "_env" to env) }
 
+    /**
+     * SSO-3689 — a live trust as product-api renders it: the `wi_` workload client, the environment issuer as audience,
+     * the provider's pin block (GitHub: owner / repository / ids / environment / ref / runner rule; Kubernetes: issuer /
+     * namespace / serviceAccount and `inlineKeyIds` or a discovered `jwksUri` — never the keys themselves).
+     */
+    fun seedTrust(env: String?, name: String, provider: String = "github_actions", scopes: List<String> = listOf("tenant:applications.read"), pins: Map<String, Any?> = mapOf("owner" to "acme", "repository" to "billing"), clientId: String? = null): String {
+        val id = "trust-${++seq}"
+        val audience = "https://acme.auth.thoryn.io" + (env?.let { "/$it" } ?: "")
+        val rec = mutableMapOf<String, Any?>(
+            "id" to id, "name" to name, "provider" to provider, "scopes" to scopes, "enabled" to true,
+            "clientId" to (clientId ?: "wi_${"%024x".format(seq)}"), "audience" to audience, "tokenEndpoint" to "$audience/oauth2/token",
+            "environment" to (env ?: "production"), "createdAt" to "2026-10-14T00:00:00Z", "_env" to env,
+            "issuer" to when (provider) { "forgejo" -> "${pins["instanceUrl"]}/api/actions"; "kubernetes" -> pins["issuer"]; else -> "https://token.actions.githubusercontent.com" },
+        )
+        val block = pins.filterKeys { it != "jwks" }.toMutableMap()
+        when (provider) {
+            "github_actions" -> { block.putIfAbsent("githubHostedRunnersOnly", false); listOf("ownerId", "repositoryId", "environment", "ref").forEach { block.putIfAbsent(it, null) } }
+            "kubernetes" -> {
+                val kids = ((pins["jwks"] as? Map<*, *>)?.get("keys") as? List<*>).orEmpty().mapNotNull { (it as? Map<*, *>)?.get("kid")?.toString() }
+                block["inlineKeyIds"] = kids
+                block["jwksUri"] = if (kids.isEmpty()) "${pins["issuer"]}/openid/v1/jwks" else null
+                listOf("namespace", "serviceAccount").forEach { block.putIfAbsent(it, null) }
+            }
+        }
+        rec[when (provider) { "forgejo" -> "forgejo"; "kubernetes" -> "kubernetes"; else -> "github" }] = block
+        trusts += rec
+        return id
+    }
+
+    /** The plane's parent object in the model: the environment by slug, or the workspace for production. */
+    private fun planeRef(env: String?): String =
+        env?.let { s -> environments.firstOrNull { it["slug"] == s }?.let { "environment:${it["id"]}" } } ?: "workspace:$tenantId"
+
+    private fun workloadIdentity(method: String, route: String, env: String?, confirm: String?, b: Map<String, Any?>, path: String): MockResponse {
+        val seg = route.removePrefix("/api/v1/workload-identity/trusts").trim('/')
+        // Environment managers write, viewers read; anyone else (and an unknown plane) is answered 404.
+        if (env != null && environments.none { it["slug"] == env }) return problem(404, "environment_not_found")
+        if (!holds(planeRef(env), if (method == "GET") "viewer" else "manager")) return problem(404, "environment_not_found")
+        val visible = trusts.filter { it["_env"] == env }
+        return when {
+            seg.isEmpty() && method == "GET" -> {
+                val q = query(path)
+                val offset = q["cursor"]?.toIntOrNull() ?: 0
+                val size = q["limit"]?.toIntOrNull() ?: trustPageSize
+                val page = visible.drop(offset).take(size)
+                val next = (offset + size).takeIf { it < visible.size }?.toString()
+                json(200, mapOf("data" to page.map { public(it) }, "pagination" to mapOf("cursor" to next, "hasMore" to (next != null), "total" to visible.size)))
+            }
+            seg.isEmpty() && method == "POST" -> createTrust(env, b)
+            method == "GET" -> visible.firstOrNull { it["id"] == seg }?.let { json(200, public(it)) } ?: problem(404, "workload_identity_trust_not_found")
+            method == "DELETE" -> {
+                val t = visible.firstOrNull { it["id"] == seg } ?: return problem(404, "workload_identity_trust_not_found")
+                // The production plane's destructive-action guard (SSO-2413): the workspace slug in X-Thoryn-Confirm.
+                if (env == null && confirm.isNullOrBlank()) return problem(428, "production_confirmation_required")
+                trusts.remove(t); MockResponse().setResponseCode(204)
+            }
+            else -> problem(405, "method")
+        }
+    }
+
+    /** product-api's `WorkloadIdentityTrustService.create` in miniature: name, scope ceiling, production rules, the provider's pin block. */
+    private fun createTrust(env: String?, b: Map<String, Any?>): MockResponse {
+        val name = (b["name"] as? String)?.takeIf { it.isNotBlank() } ?: return problem(400, "invalid_request")
+        val provider = b["provider"] as? String ?: "github_actions"
+        if (provider !in setOf("github_actions", "forgejo", "kubernetes")) return problem(400, "unsupported_provider")
+        val scopes = (b["scopes"] as? List<*>).orEmpty().map { it.toString() }
+        if (scopes.isEmpty() || scopes.any { !it.startsWith("tenant:") }) return problem(400, "invalid_scope")
+        callerScopes?.let { held -> if (scopes.any { it !in held }) return problem(403, "scope_not_grantable") }
+        if (trusts.any { it["_env"] == env && it["name"] == name }) return problem(409, "workload_identity_trust_name_taken")
+        if (env == null && b["confirmProduction"] != true) return problem(400, "production_confirmation_required")
+        @Suppress("UNCHECKED_CAST")
+        val pins = (b[when (provider) { "forgejo" -> "forgejo"; "kubernetes" -> "kubernetes"; else -> "github" }] as? Map<String, Any?>) ?: return problem(400, "invalid_$provider")
+        when (provider) {
+            "github_actions" -> {
+                if ((pins["owner"] as? String).isNullOrBlank() || (pins["repository"] as? String).isNullOrBlank()) return problem(400, "invalid_github")
+                if ((pins["ownerId"] == null) != (pins["repositoryId"] == null)) return problem(400, "invalid_github_ids")
+                if (env == null && (pins["environment"] as? String).isNullOrBlank()) return problem(400, "production_requires_environment")
+            }
+            "forgejo" -> {
+                if ((pins["instanceUrl"] as? String)?.startsWith("https://") != true) return problem(400, "invalid_forgejo_instance")
+                if (pins["ownerId"] == null || pins["repositoryId"] == null) return problem(400, "invalid_forgejo_ids")
+                if (env == null && (pins["ref"] as? String).isNullOrBlank()) return problem(400, "production_requires_ref")
+            }
+            "kubernetes" -> {
+                if ((pins["issuer"] as? String)?.startsWith("https://") != true) return problem(400, "invalid_kubernetes_issuer")
+                if (env == null && ((pins["namespace"] as? String).isNullOrBlank() || (pins["serviceAccount"] as? String).isNullOrBlank())) return problem(400, "production_requires_service_account")
+            }
+        }
+        val id = seedTrust(env, name, provider, scopes, pins)
+        if (trustNameTakenOnce) {
+            // The race: another writer took the name between the engine's lookup and its POST — the trust now exists, the POST is refused.
+            trustNameTakenOnce = false
+            return problem(409, "workload_identity_trust_name_taken")
+        }
+        return json(201, public(trusts.first { it["id"] == id }))
+    }
+
     fun seedGrant(subject: String, relation: String, objectRef: String) {
         grants += mutableMapOf("subject" to subject, "relation" to relation, "object" to objectRef, "createdAt" to "2026-09-15T00:00:00Z")
     }
@@ -263,7 +372,28 @@ internal class FakeProductApi : Dispatcher() {
 
     private fun visible(rec: Map<String, Any?>, env: String?) = rec["_env"] == env
 
-    private fun public(rec: Map<String, Any?>) = rec.filterKeys { !it.startsWith("_") }
+    /** SSO-3689 — like product-api's `ApplicationResponse`, the fake does NOT render `jwks` / `jwksUri` (the key location is write-only today). */
+    private fun public(rec: Map<String, Any?>) = rec.filterKeys { !it.startsWith("_") && it !in KEY_LOCATION_FIELDS }
+
+    private val KEY_LOCATION_FIELDS = setOf("jwks", "jwksUri")
+
+    /** SSO-3689 — `FederatedAssertionBindingValidator` in miniature: a `federatedTrust` must be the id of a trust of THIS plane (`400 federated_trust_not_found`); the method needs the binding and refuses a key. */
+    private fun federatedBindingProblem(b: Map<String, Any?>, env: String?): MockResponse? {
+        val methods = (b["clientAuthenticationMethods"] as? List<*>)?.map { it.toString() }
+        val federated = methods?.contains("federated_assertion") == true
+        val trust = b["federatedTrust"] as? String
+        if (!federated) return if (trust != null && methods != null) problem(400, "federated_trust_without_method") else null
+        if (methods!!.size != 1) return problem(400, "federated_assertion_only_method")
+        if (b["jwks"] != null || b["jwksUri"] != null) return problem(400, "federated_assertion_no_secret_or_key")
+        if (trust == null) return problem(400, "federated_trust_required")
+        if (trusts.none { it["id"] == trust && it["_env"] == env }) return problem(400, "federated_trust_not_found")
+        return null
+    }
+
+    private fun mintsSecret(b: Map<String, Any?>): Boolean {
+        val methods = (b["clientAuthenticationMethods"] as? List<*>)?.map { it.toString() } ?: return true
+        return "client_secret_basic" in methods || "client_secret_post" in methods
+    }
 
     override fun dispatch(req: RecordedRequest): MockResponse {
         val method = req.method ?: "GET"
@@ -302,13 +432,15 @@ internal class FakeProductApi : Dispatcher() {
                 // names it as a subject.
                 val id = (b["clientId"] as? String)?.takeIf { it.isNotBlank() } ?: "app-${++seq}"
                 if (applications.any { it["clientId"] == id }) return problem(409, "client_id_taken")
+                federatedBindingProblem(b, env)?.let { return it }
                 applications += (b + mapOf("clientId" to id, "status" to "active", "_env" to env)).toMutableMap()
                 // SSO-3667 — a `client:` creator becomes the application's owner (rendered on the create response).
                 creatorBecomesOwner("application:$id")
                 // SSO-3113 — a CONFIDENTIAL client's one-shot secret rides ONLY on the create response (never on a later
                 // GET). product-api's `clientType` defaults to confidential, so only an explicit `public` is secret-less.
                 val response = withOwner(applications.last(), "application:$id").toMutableMap()
-                if (b["clientType"] != "public") {
+                // SSO-3689 — a secret is minted only for a secret-bearing method (product-api defaults to client_secret_basic).
+                if (b["clientType"] != "public" && mintsSecret(b)) {
                     val secret = "minted-secret-$id"
                     mintedSecrets[id] = secret
                     response["clientSecret"] = secret
@@ -319,7 +451,7 @@ internal class FakeProductApi : Dispatcher() {
                 val a = applications.firstOrNull { it["clientId"] == seg[1] && visible(it, env) } ?: return problem(404, "not_found")
                 when (method) {
                     "GET" -> json(200, withOwner(a, "application:${seg[1]}"))
-                    "PATCH" -> { a.putAll(b); json(200, withOwner(a, "application:${seg[1]}")) }
+                    "PATCH" -> { federatedBindingProblem(b, env)?.let { return it }; a.putAll(b); json(200, withOwner(a, "application:${seg[1]}")) }
                     "DELETE" -> { applications.remove(a); MockResponse().setResponseCode(204) }
                     else -> problem(405, "method")
                 }
@@ -458,6 +590,8 @@ internal class FakeProductApi : Dispatcher() {
             }
             // ── custom domain (SSO-3413 / SSO-3414) ──
             route.startsWith("/api/v1/custom-domain") -> customDomain(method, route, b)
+            // ── workload-identity trusts (SSO-3689) ──
+            route.startsWith("/api/v1/workload-identity/trusts") -> workloadIdentity(method, route, env, confirm, b, path)
             // ── receipt attestation (SSO-2878; the recipe interpreter's best-effort signed layer) ──
             route == "/api/v1/attestations" && method == "POST" ->
                 json(200, mapOf("kid" to "receipt-attestation-fake-v1", "signature" to "sig", "canonicalPayload" to "e30", "attestedAt" to "2026-01-01T00:00:00Z"))

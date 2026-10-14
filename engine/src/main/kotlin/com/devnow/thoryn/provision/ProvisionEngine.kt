@@ -64,6 +64,12 @@ data class PlannedChange(
      * will land); nothing is minted by `plan`. Only on a CREATE of a confidential application with a `secretSink:`.
      */
     val secretSink: SecretTarget? = null,
+    /**
+     * SSO-3689 — a `workloadIdentityTrust`'s live view when it exists (`id`, `clientId` — the `wi_…` workload client,
+     * `audience`, `tokenEndpoint`, `provider`, `scopes`, the provider's pins): what a plan shows and what `apply`
+     * renders the consumer's `connection.json` from. Null for a trust that does not exist yet.
+     */
+    val trust: Map<String, Any?>? = null,
 ) {
     val hasGrantChanges: Boolean get() = grantAdds.isNotEmpty() || grantRemoves.isNotEmpty()
 
@@ -82,6 +88,7 @@ data class PlannedChange(
             put("publishTo", publishTo.map { mapOf("kind" to it.kind, "repository" to it.repository, "environment" to it.environment, "name" to it.name) })
         }
         secretSink?.let { put("secretSink", it.toStructured()) }
+        trust?.let { put("trust", it) }
     }
 }
 
@@ -285,6 +292,13 @@ class ProvisionEngine(
      * [secretSink] and then to `undelivered_secrets` — never a silent skip.
      */
     private val declaredSecretSink: DeclaredSecretSink = DeclaredSecretSink.unavailable(),
+    /**
+     * SSO-3689 — the scopes the signed-in identity's token carries (its `scope` claim), when the host knows them. A
+     * `workloadIdentityTrust` may carry only scopes the APPLYING identity itself holds (the hub's scope ceiling,
+     * `403 scope_not_grantable`); with the set known, `plan` refuses a trust that overreaches before any write, with
+     * the hub's own code. Null ⇒ unknown here — the plan states the ceiling and the hub enforces it at apply.
+     */
+    private val callerScopes: Set<String>? = null,
 ) {
 
     /**
@@ -376,6 +390,7 @@ class ProvisionEngine(
     // ── plan ─────────────────────────────────────────────────────────────────────────────────────
 
     fun plan(file: ProvisionFile, receipt: ProvisionReceipt?, prune: Boolean): ProvisionPlan {
+        trustLists.clear()
         val ownedByKey = receipt?.resources.orEmpty().associateBy { it.key }
         val changes = mutableListOf<PlannedChange>()
         // Environment slugs known so far (owned / live), so dependants can be probed in the right plane.
@@ -391,7 +406,7 @@ class ProvisionEngine(
                 // SSO-3668 — a resource that will be converged publishes its id afterwards (every apply); shown, never done, by plan.
                 .let { c -> if (c.action == ChangeAction.ERROR || c.readOnly || r.publishTo.isEmpty()) c else c.copy(publishTo = r.publishTo, reason = c.reason + "; publishes its id to ${r.publishTo.size} target(s)") }
                 // SSO-3659 — a CREATE of a confidential application mints a secret; where it will be delivered is shown, never done, by plan.
-                .let { c -> if (c.action == ChangeAction.CREATE && !c.readOnly && r.secretSink != null && isConfidential(r.spec)) c.copy(secretSink = r.secretSink) else c }
+                .let { c -> if (c.action == ChangeAction.CREATE && !c.readOnly && r.secretSink != null && mintsSecret(r.spec)) c.copy(secretSink = r.secretSink) else c }
             changes += change
             if (r.kind == ProvisionFile.KIND_ENVIRONMENT && change.liveId != null) {
                 // The RESOLVED slug (a `{{env.NAME}}` placeholder names a per-run sandbox), never the raw spec.
@@ -432,7 +447,16 @@ class ProvisionEngine(
             else -> envSlugs[r.environment]
                 ?: return PlannedChange(r.kind, r.name, ChangeAction.CREATE, "environment '${r.environment}' will be created first${mintNote(r)}", resource = r)
         }
-        val desired = resolveSpec(r, strict = false)
+        var desired = resolveSpec(r, strict = false)
+        // SSO-3689 — a trust converges by its name and is never updated in place (its pins are immutable on the hub).
+        if (r.kind == ProvisionFile.KIND_WORKLOAD_IDENTITY_TRUST) return probeTrust(r, owned, slug, desired)
+        // SSO-3689 — `federatedTrust` names a trust; the API takes its id, so the name is resolved (same environment) first.
+        if (r.kind == ProvisionFile.KIND_APPLICATION) {
+            federatedTrustRef(r, file, slug, atApply = false)?.let { ref ->
+                ref.error?.let { why -> return PlannedChange(r.kind, r.name, ChangeAction.ERROR, "$ERROR_FEDERATED_TRUST_NOT_FOUND — $why", resource = r, owned = owned, error = ERROR_FEDERATED_TRUST_NOT_FOUND) }
+                desired = desired + (ProvisionFile.SPEC_FEDERATED_TRUST to (ref.id ?: "${ref.name} $PENDING_TRUST_MARKER"))
+            }
+        }
         val live = try {
             lookup(r, owned, slug, desired)
         } catch (ex: ProductApiException) {
@@ -453,7 +477,7 @@ class ProvisionEngine(
 
     /** SSO-3113 — the plan marker for a confidential application about to be created (its secret is shown once). */
     private fun mintNote(r: ProvisionResource): String = when {
-        r.kind != ProvisionFile.KIND_APPLICATION || !isConfidential(r.spec) -> ""
+        r.kind != ProvisionFile.KIND_APPLICATION || !mintsSecret(r.spec) -> ""
         // SSO-3659 — with a declared sink the secret is delivered, not shown.
         r.secretSink != null -> " (a client secret will be minted and delivered to ${r.secretSink.label})"
         else -> " (a client secret will be minted and shown once)"
@@ -462,6 +486,17 @@ class ProvisionEngine(
     /** product-api's `clientType` defaults to `confidential`; only an explicit `public` client is secret-less. */
     private fun isConfidential(spec: Map<String, Any?>): Boolean =
         !spec["clientType"]?.toString()?.trim().equals("public", ignoreCase = true)
+
+    /**
+     * SSO-3689 — whether the create MINTS a client secret: a confidential client whose declared methods include a
+     * secret-bearing one (or declare none — product-api then defaults to `client_secret_basic`). A `private_key_jwt`
+     * or `federated_assertion` client is confidential and minted nothing (`clientSecret: null` on the response).
+     */
+    private fun mintsSecret(spec: Map<String, Any?>): Boolean {
+        if (!isConfidential(spec)) return false
+        val methods = (spec[ProvisionFile.SPEC_CLIENT_AUTHENTICATION_METHODS] as? List<*>)?.map { it.toString().trim() } ?: return true
+        return methods.any { it in ProvisionFile.SECRET_BEARING_METHODS }
+    }
 
     /**
      * SSO-3113 — attach the grant diff to a planned change: for a CREATE every declared grant is an add
@@ -561,6 +596,9 @@ class ProvisionEngine(
      */
     private fun gate(r: ProvisionResource, change: PlannedChange, file: ProvisionFile, envSlugs: Map<String, String>, slug: String?, reach: Reach): PlannedChange {
         if (change.action == ChangeAction.ERROR) return change
+        // SSO-3689 — a trust has no platform object of its own: its reach IS its environment's (the API writes for
+        // environment managers, reads for viewers, answers 404 to anyone else), so the gate asks about the parent.
+        if (r.kind == ProvisionFile.KIND_WORKLOAD_IDENTITY_TRUST) return gateTrust(r, change, file, envSlugs, slug, reach)
         val liveId = change.liveId
         if (liveId != null) {
             val ref = objectRef(r.kind, liveId, slug)
@@ -620,6 +658,46 @@ class ProvisionEngine(
             change.copy(access = Access.MANAGER.label)
         } else {
             refuse(r, change, ERROR_NOT_OWNED, null, "creating a ${r.kind} here requires `manager` on its parent $parent, which this identity does not hold")
+        }
+    }
+
+    /**
+     * SSO-3689 — the ownership gate for a `workloadIdentityTrust`: the relation this identity holds on the trust's
+     * ENVIRONMENT (the workspace for the production plane) — `manager` ⇒ converge, `viewer` ⇒ only a matching
+     * `readOnly: true` reference, none ⇒ `access_not_owned`; a create needs `manager` on that parent. The platform
+     * re-checks every write, so this can never admit a write the API would refuse.
+     */
+    private fun gateTrust(r: ProvisionResource, change: PlannedChange, file: ProvisionFile, envSlugs: Map<String, String>, slug: String?, reach: Reach): PlannedChange {
+        val parent = parentRef(r, file, envSlugs, slug, reach)
+        val access = when {
+            parent == null -> Access.MANAGER // the environment is created by this very apply: creator-becomes-manager covers both
+            reach.managesParent(parent) -> Access.MANAGER
+            reach.holds(parent, RELATION_VIEWER) -> Access.VIEWER
+            else -> Access.NONE
+        }
+        val where = parent ?: "its environment (created by this apply)"
+        if (change.liveId != null) {
+            return when (access) {
+                Access.NONE -> refuse(
+                    r, change, ERROR_NOT_OWNED, access,
+                    "this identity holds no relation on $where — a trust is reached through its environment, so it is not visible to it " +
+                        "(a workspace admin grants reach with `thoryn access grant <subject> manager $where`)",
+                )
+                Access.VIEWER -> if (!r.readOnly) {
+                    refuse(r, change, ERROR_READ_ONLY, access, "this identity may only VIEW $where — declare the trust `readOnly: true` to depend on it without owning it, or have a workspace admin grant it `manager`")
+                } else {
+                    reference(change, access)
+                }
+                Access.MANAGER -> if (r.readOnly) reference(change, access) else change.copy(access = access.label)
+            }
+        }
+        if (r.readOnly) {
+            return refuse(r, change, ERROR_READ_ONLY, null, "declared `readOnly: true` but nothing matches it live — a read-only reference is never created; declare it without `readOnly` to own it")
+        }
+        return if (access == Access.MANAGER) {
+            change.copy(access = access.label)
+        } else {
+            refuse(r, change, ERROR_NOT_OWNED, null, "creating a ${r.kind} here requires `manager` on its environment $where, which this identity does not hold")
         }
     }
 
@@ -814,6 +892,41 @@ class ProvisionEngine(
                 buildMap { put("host", host); put("state", view.state); view.issuer?.let { put("issuer", it) } },
             )
         }
+        // SSO-3689 — workload-identity trusts: no access object of their own, so reach is the PLANE's (the workspace
+        // for production, the environment for a sandbox); the API lists them only for a viewer or better.
+        fun planeAccess(plane: String?): Access = when {
+            plane == null && reach.managesWorkspace() -> Access.MANAGER
+            plane == null -> if (workspaceId != null && reach.holds("$OBJECT_TYPE_WORKSPACE:$workspaceId", RELATION_VIEWER)) Access.VIEWER else Access.NONE
+            else -> reach.environmentId(plane)?.let { reach.on(objectRef(ProvisionFile.KIND_ENVIRONMENT, it, null)) } ?: Access.NONE
+        }
+        val ownedTrustIds = receipt?.resources.orEmpty().filter { it.kind == ProvisionFile.KIND_WORKLOAD_IDENTITY_TRUST }.map { it.id }.toSet()
+        val ownClientId = subject?.takeIf { it.startsWith("client:") }?.substringAfter(':')
+        (listOf<String?>(null) + sandboxSlugs).forEach { plane ->
+            val access = planeAccess(plane)
+            if (access == Access.NONE) return@forEach
+            val trusts = fetchOrNull { trustsOf(plane) } ?: return@forEach
+            trusts.forEach { n ->
+                val name = n.str("name") ?: return@forEach
+                val id = n.str("id") ?: return@forEach
+                if (id in ownedTrustIds) return@forEach
+                val envField = environmentField(plane)
+                if (declared.any { it.kind == ProvisionFile.KIND_WORKLOAD_IDENTITY_TRUST && it.name == name && (it.environment == envField || it.environment == plane) }) return@forEach
+                // The structural limit: the identity applying a file cannot declare its OWN bootstrap trust.
+                if (ownClientId != null && n.str("clientId") == ownClientId) {
+                    skipped += "workloadIdentityTrust:$name — the trust this identity itself signs in with (its own bootstrap trust); it was created once by a person and is never declared by the file it applies"
+                    return@forEach
+                }
+                // The trust's NAME is its converge key on the API, so it cannot be renamed to stay unique in the file.
+                if (!names.add("${ProvisionFile.KIND_WORKLOAD_IDENTITY_TRUST}/$name")) {
+                    skipped += "workloadIdentityTrust:$name (${planeLabel(plane)}) — a trust of the same name is already in the file; a trust converges by its API name, so declare it by hand under a second file"
+                    return@forEach
+                }
+                val (spec, note) = trustSpecOf(n, production = plane == null)
+                val resource = ProvisionResource(ProvisionFile.KIND_WORKLOAD_IDENTITY_TRUST, name, envField, spec, readOnly = access == Access.VIEWER)
+                val owned = if (access == Access.VIEWER) null else OwnedResource(ProvisionFile.KIND_WORKLOAD_IDENTITY_TRUST, name, id, plane, trustAttributes(trustView(n)), adopted = true)
+                out += ImportedResource(resource, id, access, owned, note)
+            }
+        }
         return ImportResult(out, skipped)
     }
 
@@ -846,6 +959,8 @@ class ProvisionEngine(
         if (plan.removesOnProductionPlane && confirmSlug.isNullOrBlank()) {
             throw ProvisionException("--prune would remove resources on the PRODUCTION plane; re-run with --confirm <workspace-slug>.")
         }
+        trustLists.clear()
+        applyWorkspace = workspace ?: receipt?.workspace
         val owned = receipt?.resources.orEmpty().toMutableList()
         fun current() = ProvisionReceipt(
             file = ProvisionFileRef(file.source, file.digest),
@@ -1036,8 +1151,19 @@ class ProvisionEngine(
                 ?: fixedId?.let { fetchOrNull { client.getApplication(it) } }
                 ?: listItems(client.listApplications(), "data").filter { it.str("displayName") == desired["displayName"] }.singleOrNull()
             node?.let { n ->
-                val fields = listOf("displayName", "redirectUris", "postLogoutRedirectUris", "scopes", "grantTypes")
-                Live(n.str("clientId") ?: n.str("client_id") ?: "", diffOf(desired.filterKeys { it in fields }, n.toMap(fields)), owner = ProvisionApi.ownerOf(n))
+                // SSO-3689 — the client-authentication fields converge on UPDATE too (ADR 2026-10-14 §11): the methods and
+                // the bound trust are read from the response; the key location is NOT rendered by the API (product gap,
+                // see the PR), so the receipt holds what this file last applied and a change converges from that.
+                val fields = listOf("displayName", "redirectUris", "postLogoutRedirectUris", "scopes", "grantTypes", ProvisionFile.SPEC_CLIENT_AUTHENTICATION_METHODS, ProvisionFile.SPEC_FEDERATED_TRUST)
+                val live = n.toMap(fields).toMutableMap()
+                live[ProvisionFile.SPEC_JWKS_URI] = owned?.attributes?.get(ATTR_JWKS_URI)
+                live[ProvisionFile.SPEC_JWKS] = owned?.attributes?.get(ATTR_JWKS_KIDS)?.split(',')?.filter { it.isNotEmpty() }
+                val want = desired.filterKeys { it in fields || it == ProvisionFile.SPEC_JWKS_URI || it == ProvisionFile.SPEC_JWKS }.toMutableMap()
+                want[ProvisionFile.SPEC_JWKS]?.let { want[ProvisionFile.SPEC_JWKS] = jwkKids(it) }
+                val diff = diffOf(want, live).mapValues { (field, change) ->
+                    if (owned == null && field in KEY_LOCATION_FIELDS && live[field] == null) change.replaceFirst("(unset)", "(not readable from the API — sent once to converge)") else change
+                }
+                Live(n.str("clientId") ?: n.str("client_id") ?: "", diff, owner = ProvisionApi.ownerOf(n))
             }
         }
         ProvisionFile.KIND_USER -> {
@@ -1132,13 +1258,14 @@ class ProvisionEngine(
             ProvisionFile.KIND_LOGIN_FLOW -> applyLoginFlow(r, targetSlug(r, file, owned), spec, "+")
             ProvisionFile.KIND_LOGIN_METHODS -> putLoginMethods(r, targetSlug(r, file, owned), spec, "+")
             ProvisionFile.KIND_CUSTOM_DOMAIN -> claimCustomDomain(r, spec)
+            ProvisionFile.KIND_WORKLOAD_IDENTITY_TRUST -> createTrust(r, file, owned, spec)
             else -> throw ProvisionException("${r.key}: unsupported kind '${r.kind}'")
         })
     }
 
     private fun createApplication(r: ProvisionResource, file: ProvisionFile, owned: List<OwnedResource>, spec: Map<String, Any?>): Created {
         val slug = targetSlug(r, file, owned)
-        val resp = clients(slug).createApplication(spec)
+        val resp = clients(slug).createApplication(applicationBody(r, spec, slug))
         val id = resp.str("clientId") ?: resp.str("client_id") ?: throw ProvisionException("${r.key}: the application create returned no clientId")
         // SSO-3113 — the ONE server-minted secret goes to a sink and NOWHERE else: never a field, the receipt, the
         // plan, the console, or a log. The response node is not retained. SSO-3659 — it is handed back to [apply],
@@ -1151,9 +1278,7 @@ class ProvisionEngine(
         }
         out.println("  + application ${r.name}: clientId=$id${slug?.let { " env=$it" } ?: ""}$note")
         // SSO-3673 — the owner the create established (creator-becomes-owner for a `client:` caller), as reported.
-        val created = OwnedResource(r.kind, r.name, id, slug, buildMap {
-            (spec["redirectUris"] as? List<*>)?.firstOrNull()?.toString()?.let { put("redirectUri", it) }
-        }, owner = ProvisionApi.ownerOf(resp))
+        val created = OwnedResource(r.kind, r.name, id, slug, applicationAttributes(spec), owner = ProvisionApi.ownerOf(resp))
         return Created(created, secret)
     }
 
@@ -1207,10 +1332,12 @@ class ProvisionEngine(
                 base.copy(attributes = mapOf("slug" to spec["slug"].toString()))
             }
             ProvisionFile.KIND_APPLICATION -> {
-                clients(slug).updateApplication(id, changed)
+                clients(slug).updateApplication(id, applicationBody(r, changed, slug))
                 out.println("  ~ application ${r.name}: updated ${change.diff.keys} (clientId $id)")
-                base.copy(attributes = buildMap { (spec["redirectUris"] as? List<*>)?.firstOrNull()?.toString()?.let { put("redirectUri", it) } })
+                base.copy(attributes = applicationAttributes(spec))
             }
+            // SSO-3689 — never planned: a differing trust is the plan error `workload_identity_trust_immutable`.
+            ProvisionFile.KIND_WORKLOAD_IDENTITY_TRUST -> throw ProvisionException("${r.key}: $ERROR_TRUST_IMMUTABLE — a trust's pins and scopes cannot be changed in place; delete it and re-apply, or declare what is live")
             ProvisionFile.KIND_USER -> {
                 clients(slug).updateUser(id, changed)
                 out.println("  ~ user ${r.name}: updated ${change.diff.keys} (id $id)")
@@ -1242,6 +1369,8 @@ class ProvisionEngine(
             ProvisionFile.KIND_ENVIRONMENT -> mapOf("slug" to resolved["slug"].toString())
             ProvisionFile.KIND_USER -> mapOf("email" to resolved["email"].toString())
             ProvisionFile.KIND_CUSTOM_DOMAIN -> mapOf("host" to hostOf(resolved))
+            // SSO-3689 — the receipt records the trust's `wi_` client and audience; the consumer's connection.json is shown.
+            ProvisionFile.KIND_WORKLOAD_IDENTITY_TRUST -> change.trust?.let { view -> printTrustConnection(view); trustAttributes(view) } ?: emptyMap()
             else -> emptyMap()
         }
         return OwnedResource(r.kind, r.name, id, slug, attributes, adopted = true, owner = change.owner)
@@ -1577,19 +1706,313 @@ class ProvisionEngine(
                 clients(null).deleteCustomDomain()
                 out.println("  - customDomain: released ${o.attributes["host"] ?: ""} — the workspace issues on its platform host again")
             }
+            ProvisionFile.KIND_WORKLOAD_IDENTITY_TRUST -> {
+                // SSO-3689 — only through `--prune` / `destroy`; the trust's workload client stops authenticating at once.
+                clients(o.environment).deleteWorkloadIdentityTrust(o.id, confirmSlug)
+                trustLists.remove(o.environment)
+                out.println("  - workloadIdentityTrust ${o.name}: deleted (id ${o.id}; its workload client ${o.attributes[ATTR_CLIENT_ID] ?: "wi_…"} stops authenticating at once)")
+            }
             else -> throw ProvisionException("${o.key}: no delete API for kind '${o.kind}'")
         }
     }
 
+    // ── workload-identity trusts and secret-less clients (SSO-3689) ─────────────────────────────
+
+    /** The workspace slug `apply` is bound to — what the consumer's `connection.json` names. */
+    private var applyWorkspace: String? = null
+
+    /** Every trust of one plane, listed once per pass (cleared by [plan] / [apply], and after a write to that plane). */
+    private val trustLists = HashMap<String?, List<JsonNode>>()
+
+    /** `GET /api/v1/workload-identity/trusts` of one plane, every page. A plane this identity cannot read answers 404 — the caller treats that as "none visible". */
+    private fun trustsOf(slug: String?, fresh: Boolean = false): List<JsonNode> {
+        if (!fresh) trustLists[slug]?.let { return it }
+        val client = clients(slug)
+        val items = mutableListOf<JsonNode>()
+        var cursor: String? = null
+        for (page in 0 until MAX_TRUST_PAGES) {
+            val body = client.listWorkloadIdentityTrusts(null, cursor)
+            items += listItems(body, "data")
+            cursor = body["pagination"]?.get("cursor")?.takeUnless { it.isNull }?.asString()?.takeIf { it.isNotBlank() }
+            if (cursor == null || body["pagination"]?.get("hasMore")?.asBoolean(true) == false) break
+        }
+        return items.also { trustLists[slug] = it }
+    }
+
+    private fun planeLabel(slug: String?): String = slug?.let { "environment '$it'" } ?: "the production plane"
+
+    /**
+     * Live lookup of a trust by its NAME in its plane (or by the owned id): absent ⇒ create (refused up front with the
+     * hub's `scope_not_grantable` when the host knows the caller's scopes and a declared one is not among them);
+     * present and every DECLARED field equal ⇒ adopt / no-op; present and different ⇒ `workload_identity_trust_immutable`
+     * (the hub has no update; the pins are immutable by design). A trust whose workload client IS the applying identity is
+     * refused: a file cannot declare the bootstrap trust it signs in with.
+     */
+    private fun probeTrust(r: ProvisionResource, owned: OwnedResource?, slug: String?, desired: Map<String, Any?>): PlannedChange {
+        val node = try {
+            owned?.let { fetchOrNull { clients(slug).getWorkloadIdentityTrust(it.id) } }
+                ?: fetchOrNull { trustsOf(slug) }?.firstOrNull { it.str("name") == r.name }
+        } catch (ex: ProductApiException) {
+            throw ProvisionException("${r.key}: could not read live state (${ex.message})")
+        }
+        if (node == null) {
+            val notHeld = scopesNotHeld(desired)
+            if (notHeld.isNotEmpty()) {
+                return PlannedChange(
+                    r.kind, r.name, ChangeAction.ERROR,
+                    "$ERROR_SCOPE_NOT_GRANTABLE — a trust can carry only tenant: scopes the applying identity itself holds, and this one does not hold ${notHeld.joinToString(", ")}: " +
+                        "drop the scope from spec.scopes, or sign in with it (grant the CI identity that scope) first",
+                    resource = r, owned = owned, error = ERROR_SCOPE_NOT_GRANTABLE,
+                )
+            }
+            val why = if (owned != null) "owned id ${owned.id} no longer exists — will be re-created" else "not found by its name in ${planeLabel(slug)}"
+            return PlannedChange(r.kind, r.name, ChangeAction.CREATE, "$why — mints its wi_ workload client$SCOPE_CEILING_NOTE", resource = r, owned = owned)
+        }
+        val id = node.str("id") ?: ""
+        val view = trustView(node)
+        val clientId = node.str("clientId")
+        if (clientId != null && subject == "client:$clientId") {
+            return PlannedChange(
+                r.kind, r.name, ChangeAction.ERROR,
+                "$ERROR_TRUST_IS_SELF — this trust's workload client $clientId is the identity applying this file: a repository cannot declare its OWN bootstrap trust " +
+                    "(it was created once by a person, and a file that owned it could remove the identity it signs in with); drop the resource",
+                resource = r, owned = owned, liveId = id, error = ERROR_TRUST_IS_SELF, trust = view,
+            )
+        }
+        val diff = diffOf(trustDesired(desired), trustLive(node))
+        return when {
+            diff.isNotEmpty() -> PlannedChange(
+                r.kind, r.name, ChangeAction.ERROR,
+                "$ERROR_TRUST_IMMUTABLE — ${diff.size} declared field(s) differ from the live trust (${diff.keys.joinToString(", ")}); a trust's pins and scopes are immutable on the hub: " +
+                    "declare what is live, or delete it (`thoryn workload-identity trusts delete $id${slug?.let { " --environment $it" } ?: ""}`) and re-apply to re-create it",
+                resource = r, owned = owned, liveId = id, diff = diff, adopted = owned?.adopted ?: true, error = ERROR_TRUST_IMMUTABLE, trust = view,
+            )
+            owned == null -> PlannedChange(r.kind, r.name, ChangeAction.ADOPT, "exists and matches — adopted under management (never deleted by destroy)", resource = r, liveId = id, adopted = true, trust = view)
+            else -> PlannedChange(r.kind, r.name, ChangeAction.NOOP, "owned (id $id) and matches", resource = r, owned = owned, liveId = id, adopted = owned.adopted, trust = view)
+        }
+    }
+
+    /** The declared scopes the caller's token does not carry (empty when the host did not say what it carries). */
+    private fun scopesNotHeld(spec: Map<String, Any?>): List<String> {
+        val held = callerScopes ?: return emptyList()
+        return (spec[ProvisionFile.TRUST_SCOPES] as? List<*>).orEmpty().map { it.toString().trim() }.filter { it !in held }
+    }
+
+    /** The trust's declared fields as the flat map the live record is compared against (the pins prefixed with their block; an inline JWKS as its kids). */
+    private fun trustDesired(spec: Map<String, Any?>): Map<String, Any?> {
+        val provider = spec["provider"].toString()
+        val out = linkedMapOf<String, Any?>("provider" to provider, ProvisionFile.TRUST_SCOPES to spec[ProvisionFile.TRUST_SCOPES])
+        val block = ProvisionFile.TRUST_PIN_BLOCKS[provider] ?: return out
+        (spec[block] as? Map<*, *>)?.forEach { (k, v) -> out["$block.$k"] = if (k == "jwks") jwkKids(v) else v }
+        return out
+    }
+
+    /** The live trust in the same flat shape (GitHub's `owner` + `repository` as the file's `owner/name`; inline keys as their kids). */
+    private fun trustLive(n: JsonNode): Map<String, Any?> {
+        val provider = n.str("provider")
+        val out = linkedMapOf<String, Any?>("provider" to provider, ProvisionFile.TRUST_SCOPES to n["scopes"]?.let { plain(it) })
+        fun pins(block: String, fields: List<String>) = n[block]?.takeIf { it.isObject }?.let { b -> fields.forEach { f -> out["$block.$f"] = b[f]?.let { plain(it) } } }
+        when (provider) {
+            ProvisionFile.PROVIDER_GITHUB_ACTIONS -> {
+                pins("github", listOf("ownerId", "repositoryId", "environment", "ref", "githubHostedRunnersOnly"))
+                n["github"]?.takeIf { it.isObject }?.let { g -> out["github.repository"] = listOfNotNull(g.str("owner"), g.str("repository")).joinToString("/") }
+                // An unpinned runner rule renders as `false`; a file that leaves it out declares nothing about it.
+                if (out["github.githubHostedRunnersOnly"] == false) out["github.githubHostedRunnersOnly"] = null
+            }
+            ProvisionFile.PROVIDER_FORGEJO -> pins("forgejo", listOf("instanceUrl", "owner", "ownerId", "repository", "repositoryId", "ref"))
+            ProvisionFile.PROVIDER_KUBERNETES -> {
+                pins("kubernetes", listOf("issuer", "namespace", "serviceAccount"))
+                out["kubernetes.jwks"] = n["kubernetes"]?.get("inlineKeyIds")?.takeIf { it.isArray }?.toList()?.map { it.asString() }?.sorted()
+            }
+        }
+        return out
+    }
+
+    /** The `kid`s of an inline JWK Set, sorted — the comparable, never-secret form of a public key set. */
+    private fun jwkKids(jwks: Any?): List<String> =
+        ((jwks as? Map<*, *>)?.get("keys") as? List<*>).orEmpty().mapNotNull { (it as? Map<*, *>)?.get("kid")?.toString() }.sorted()
+
+    /** The live trust as a plan / receipt view: never key material, never anything secret (a trust has none). */
+    private fun trustView(n: JsonNode): Map<String, Any?> = buildMap {
+        listOf("id", "name", "clientId", "audience", "tokenEndpoint", "provider", "environment").forEach { f -> n.str(f)?.let { put(f, it) } }
+        n["scopes"]?.takeIf { it.isArray }?.let { put("scopes", it.toList().map { s -> s.asString() }) }
+        n["github"]?.takeIf { it.isObject }?.let { g -> put("github", plain(g)) }
+        n["kubernetes"]?.takeIf { it.isObject }?.let { k -> put("kubernetes", listOf("issuer", "namespace", "serviceAccount").mapNotNull { f -> k.str(f)?.let { f to it } }.toMap()) }
+    }
+
+    /** The receipt attributes of a trust: its `wi_` workload client, its audience and provider (what a reader needs; nothing secret). */
+    private fun trustAttributes(view: Map<String, Any?>): Map<String, String> = buildMap {
+        view["clientId"]?.toString()?.let { put(ATTR_CLIENT_ID, it) }
+        view["audience"]?.toString()?.let { put("audience", it) }
+        view["provider"]?.toString()?.let { put("provider", it) }
+    }
+
+    /** The `provision.yaml` spec of a live trust (`import`), and a note for what the file cannot carry (inline keys are not rendered by the API). */
+    private fun trustSpecOf(n: JsonNode, production: Boolean): Pair<Map<String, Any?>, String?> {
+        val provider = n.str("provider") ?: ProvisionFile.PROVIDER_GITHUB_ACTIONS
+        val spec = linkedMapOf<String, Any?>("provider" to provider)
+        var note: String? = null
+        fun copy(block: String, fields: List<String>) = n[block]?.takeIf { it.isObject }?.let { b ->
+            val pins = linkedMapOf<String, Any?>()
+            fields.forEach { f -> b[f]?.takeIf { !it.isNull }?.let { pins[f] = plain(it) } }
+            pins
+        }
+        when (provider) {
+            ProvisionFile.PROVIDER_GITHUB_ACTIONS -> n["github"]?.takeIf { it.isObject }?.let { g ->
+                val pins = linkedMapOf<String, Any?>("repository" to listOfNotNull(g.str("owner"), g.str("repository")).joinToString("/"))
+                listOf("ownerId", "repositoryId", "environment", "ref").forEach { f -> g[f]?.takeIf { !it.isNull }?.let { pins[f] = plain(it) } }
+                if (g["githubHostedRunnersOnly"]?.asBoolean() == true) pins["githubHostedRunnersOnly"] = true
+                spec["github"] = pins
+            }
+            ProvisionFile.PROVIDER_FORGEJO -> copy("forgejo", listOf("instanceUrl", "owner", "ownerId", "repository", "repositoryId", "ref"))?.let { spec["forgejo"] = it }
+            ProvisionFile.PROVIDER_KUBERNETES -> copy("kubernetes", listOf("issuer", "namespace", "serviceAccount"))?.let { pins ->
+                spec["kubernetes"] = pins
+                n["kubernetes"]?.get("inlineKeyIds")?.takeIf { it.isArray && !it.isEmpty }?.let { kids ->
+                    note = "pins inline public keys (kid ${kids.toList().joinToString(", ") { it.asString() }}) that the API does not render; add spec.kubernetes.jwks by hand (`kubectl get --raw /openid/v1/jwks`) before a re-create is planned"
+                }
+            }
+        }
+        spec[ProvisionFile.TRUST_SCOPES] = n["scopes"]?.takeIf { it.isArray }?.toList()?.map { it.asString() }.orEmpty()
+        if (production) spec[ProvisionFile.TRUST_CONFIRM_PRODUCTION] = true
+        return spec to note
+    }
+
+    /** `POST /api/v1/workload-identity/trusts` body: the file's `repository: owner/name` becomes the API's `owner` + `repository`. */
+    private fun trustBody(name: String, spec: Map<String, Any?>): Map<String, Any?> {
+        val provider = spec["provider"].toString()
+        val block = ProvisionFile.TRUST_PIN_BLOCKS.getValue(provider)
+        val pins = (spec[block] as? Map<*, *>).orEmpty().entries.associate { (k, v) -> k.toString() to v }.toMutableMap()
+        if (provider == ProvisionFile.PROVIDER_GITHUB_ACTIONS) {
+            val repository = pins.remove("repository").toString()
+            pins["owner"] = repository.substringBefore('/')
+            pins["repository"] = repository.substringAfter('/')
+        }
+        return linkedMapOf("name" to name, "provider" to provider, block to pins, ProvisionFile.TRUST_SCOPES to spec[ProvisionFile.TRUST_SCOPES], ProvisionFile.TRUST_CONFIRM_PRODUCTION to spec[ProvisionFile.TRUST_CONFIRM_PRODUCTION])
+    }
+
+    /**
+     * Create the trust; a `409 workload_identity_trust_name_taken` (a race with another writer) adopts the matching trust
+     * of that name — exactly as `project init` does — or refuses when it differs. Prints the `wi_` client, the audience
+     * and the consumer's `connection.json`; never writes that file (it belongs to the consumer repository).
+     */
+    private fun createTrust(r: ProvisionResource, file: ProvisionFile, owned: List<OwnedResource>, spec: Map<String, Any?>): OwnedResource {
+        val slug = targetSlug(r, file, owned)
+        val resp = try {
+            clients(slug).createWorkloadIdentityTrust(trustBody(r.name, spec))
+        } catch (ex: ProductApiException) {
+            if (ex.errorCode == "workload_identity_trust_name_taken") {
+                val live = fetchOrNull { trustsOf(slug, fresh = true) }?.firstOrNull { it.str("name") == r.name }
+                if (live != null && diffOf(trustDesired(spec), trustLive(live)).isEmpty()) {
+                    val view = trustView(live)
+                    out.println("  = workloadIdentityTrust ${r.name}: the name was taken by a matching trust meanwhile — adopted (id ${view["id"]}, clientId ${view["clientId"]})")
+                    printTrustConnection(view)
+                    return OwnedResource(r.kind, r.name, view["id"].toString(), slug, trustAttributes(view), adopted = true)
+                }
+                throw ProvisionException("${r.key}: $ERROR_TRUST_IMMUTABLE — a trust named '${r.name}' already exists in ${planeLabel(slug)} with other pins or scopes; declare what is live, or delete it and re-apply")
+            }
+            throw trustFailure(r, ex)
+        }
+        trustLists.remove(slug)
+        val view = trustView(resp)
+        val id = view["id"]?.toString() ?: throw ProvisionException("${r.key}: the trust create returned no id")
+        out.println("  + workloadIdentityTrust ${r.name}: id=$id clientId=${view["clientId"]} audience=${view["audience"]}${slug?.let { " env=$it" } ?: ""}")
+        printTrustConnection(view)
+        return OwnedResource(r.kind, r.name, id, slug, trustAttributes(view))
+    }
+
+    /** The trust service's refusals, each with what to do next (the same guidance `thoryn workload-identity trusts create` gives). */
+    private fun trustFailure(r: ProvisionResource, ex: ProductApiException): ProvisionException = ProvisionException(
+        "${r.key}: ${ex.errorCode ?: "the workload-identity API refused the request"} — " + when (ex.errorCode) {
+            ERROR_SCOPE_NOT_GRANTABLE -> "a trust can carry only tenant: scopes the applying identity itself holds (${ex.errorDescription ?: "scope ceiling"}); drop the scope from spec.scopes, or sign in with it (grant the CI identity that scope) first"
+            ProvisionFile.ERR_INVALID_SCOPE -> "a trust can carry only workspace (tenant:) scopes"
+            ProvisionFile.ERR_PRODUCTION_CONFIRMATION_REQUIRED -> "this is the production plane: jobs / pods using the trust act on production; declare spec.confirmProduction: true"
+            ProvisionFile.ERR_PRODUCTION_REQUIRES_ENVIRONMENT -> "a production GitHub trust must pin a GitHub environment (spec.github.environment)"
+            ProvisionFile.ERR_PRODUCTION_REQUIRES_REF -> "a production Forgejo trust must pin a ref (spec.forgejo.ref)"
+            ProvisionFile.ERR_PRODUCTION_REQUIRES_SERVICE_ACCOUNT -> "a production Kubernetes trust must pin spec.kubernetes.namespace and spec.kubernetes.serviceAccount"
+            "github_repository_not_found" -> "GitHub has no public repository by that name; for a private repository declare spec.github.ownerId and spec.github.repositoryId"
+            "github_unavailable" -> "GitHub could not be reached to look up the repository ids; retry, or declare spec.github.ownerId and spec.github.repositoryId"
+            ProvisionFile.ERR_INVALID_GITHUB_IDS -> "spec.github.ownerId and spec.github.repositoryId go together: declare both, or neither"
+            "environment_not_found" -> "no such environment, or this identity cannot reach it"
+            else -> if (ex.isInsufficientScope) "this session lacks the '$SCOPE_TRUST_WRITE' scope (${ex.message}); sign in with `thoryn login --scope $SCOPE_TRUST_WRITE` (or grant the CI identity that scope) and re-run" else (ex.errorDescription ?: ex.message ?: "refused")
+        },
+    )
+
+    /**
+     * Print the consumer's `connection.json` for a trust `apply` created or adopted (ADR 2026-09-09 connection
+     * contract) — NEVER written by apply: it belongs to the repository / workload that signs in with the trust.
+     */
+    private fun printTrustConnection(view: Map<String, Any?>) {
+        out.println("    connection.json for the workload that signs in with this trust — not written by apply (it belongs to the consumer repository):")
+        json.writerWithDefaultPrettyPrinter().writeValueAsString(connectionDocument(view, applyWorkspace)).lines().forEach { out.println("      $it") }
+        if (view["provider"] == ProvisionFile.PROVIDER_FORGEJO) {
+            out.println("    (the connection contract knows github_actions and kubernetes today; a forgejo job presents its own Actions token as the client_assertion — `provider` is left out so the document validates.)")
+        }
+    }
+
+    // ── secret-less clients (SSO-3689): the application's `federatedTrust` NAME → id, inline `jwks` → the API's string ──
+
+    /** How a declared `federatedTrust` name resolved: to a live [id], to a trust this apply creates first ([pending]), or to an [error]. */
+    private class TrustRef(val name: String, val id: String?, val pending: Boolean, val error: String?)
+
+    /**
+     * Resolve `spec.federatedTrust` (a NAME) in the application's OWN plane: a trust of that name declared in this file
+     * for another environment is refused (a login client binds a trust of its own environment — the hub checks the
+     * same); a live trust gives its id; one declared here but not live yet is pending at plan time (created first by
+     * `apply`); anything else is `federated_trust_not_found`.
+     */
+    private fun federatedTrustRef(r: ProvisionResource, file: ProvisionFile?, slug: String?, atApply: Boolean): TrustRef? {
+        val name = r.spec[ProvisionFile.SPEC_FEDERATED_TRUST]?.toString()?.trim()?.takeIf { it.isNotEmpty() } ?: return null
+        val declared = file?.resources?.firstOrNull { it.kind == ProvisionFile.KIND_WORKLOAD_IDENTITY_TRUST && it.name == name }
+        if (declared != null && declared.environment != r.environment) {
+            return TrustRef(name, null, false, "trust '$name' is declared in this file for ${declared.environment?.let { "environment '$it'" } ?: "the production plane"} while the application lives in ${r.environment?.let { "environment '$it'" } ?: "the production plane"} — a login client binds a trust of its OWN environment")
+        }
+        val live = try {
+            fetchOrNull { trustsOf(slug, fresh = atApply) }?.firstOrNull { it.str("name") == name }
+        } catch (ex: ProductApiException) {
+            throw ProvisionException("${r.key}: could not list the trusts of ${planeLabel(slug)} to resolve spec.federatedTrust '$name' (${ex.message})")
+        }
+        return when {
+            live != null -> TrustRef(name, live.str("id"), false, null)
+            declared != null && !atApply -> TrustRef(name, null, true, null)
+            else -> TrustRef(name, null, false, "no workloadIdentityTrust named '$name' in ${planeLabel(slug)} — declare it in this file (same environment) or create it first; the trust must exist before the client is written")
+        }
+    }
+
+    /** The application body the API takes: `federatedTrust` as the trust id, an inline `jwks` as its JSON text. */
+    private fun applicationBody(r: ProvisionResource, spec: Map<String, Any?>, slug: String?): Map<String, Any?> {
+        val body = LinkedHashMap(spec)
+        if (spec.containsKey(ProvisionFile.SPEC_FEDERATED_TRUST)) {
+            // At apply the trust must be LIVE (this apply created it first, or it existed): the file is not consulted again.
+            val ref = federatedTrustRef(r, file = null, slug = slug, atApply = true)
+            body[ProvisionFile.SPEC_FEDERATED_TRUST] = ref?.id ?: throw ProvisionException("${r.key}: $ERROR_FEDERATED_TRUST_NOT_FOUND — ${ref?.error ?: "spec.federatedTrust could not be resolved"}")
+        }
+        (spec[ProvisionFile.SPEC_JWKS] as? Map<*, *>)?.let { body[ProvisionFile.SPEC_JWKS] = json.writeValueAsString(it) }
+        return body
+    }
+
+    /** The receipt attributes of an application: its first redirect URI and (SSO-3689) the key location this file last applied — never a key. */
+    private fun applicationAttributes(spec: Map<String, Any?>): Map<String, String> = buildMap {
+        (spec["redirectUris"] as? List<*>)?.firstOrNull()?.toString()?.let { put("redirectUri", it) }
+        spec[ProvisionFile.SPEC_JWKS_URI]?.toString()?.trim()?.takeIf { it.isNotEmpty() }?.let { put(ATTR_JWKS_URI, it) }
+        (spec[ProvisionFile.SPEC_JWKS] as? Map<*, *>)?.let { put(ATTR_JWKS_KIDS, jwkKids(it).joinToString(",")) }
+    }
+
     // ── helpers ──────────────────────────────────────────────────────────────────────────────────
 
-    /** Environments first (file order), then everything else (file order): dependants after their env. */
+    /**
+     * Environments first (file order), then (SSO-3689) workload-identity trusts — an application's `federatedTrust`
+     * names one, so it must exist before the client is written — then everything else (file order).
+     */
     private fun orderForApply(resources: List<ProvisionResource>): List<ProvisionResource> =
-        resources.filter { it.kind == ProvisionFile.KIND_ENVIRONMENT } + resources.filter { it.kind != ProvisionFile.KIND_ENVIRONMENT }
+        resources.filter { it.kind == ProvisionFile.KIND_ENVIRONMENT } +
+            resources.filter { it.kind == ProvisionFile.KIND_WORKLOAD_IDENTITY_TRUST } +
+            resources.filter { it.kind != ProvisionFile.KIND_ENVIRONMENT && it.kind != ProvisionFile.KIND_WORKLOAD_IDENTITY_TRUST }
 
-    /** Child-first: everything in reverse order, environments last (their hard-delete cascades). */
+    /** Child-first: everything in reverse order, then the trusts the clients were bound to, environments last (their hard-delete cascades). */
     private fun orderForRemove(owned: List<OwnedResource>): List<OwnedResource> =
-        owned.filter { it.kind != ProvisionFile.KIND_ENVIRONMENT }.reversed() + owned.filter { it.kind == ProvisionFile.KIND_ENVIRONMENT }.reversed()
+        owned.filter { it.kind != ProvisionFile.KIND_ENVIRONMENT && it.kind != ProvisionFile.KIND_WORKLOAD_IDENTITY_TRUST }.reversed() +
+            owned.filter { it.kind == ProvisionFile.KIND_WORKLOAD_IDENTITY_TRUST }.reversed() +
+            owned.filter { it.kind == ProvisionFile.KIND_ENVIRONMENT }.reversed()
 
     /** The slug a resource targets: an env resource of this file (must already be owned), an existing slug, or null. */
     private fun targetSlug(r: ProvisionResource, file: ProvisionFile, owned: List<OwnedResource>): String? {
@@ -1679,7 +2102,7 @@ class ProvisionEngine(
     }
 
     /** A GET that treats 404 (deleted out of band / cross-tenant) as "absent". */
-    private fun fetchOrNull(call: () -> JsonNode): JsonNode? = try {
+    private fun <T> fetchOrNull(call: () -> T): T? = try {
         call()
     } catch (ex: ProductApiException) {
         if (ex.httpStatus == 404) null else throw ex
@@ -1735,6 +2158,59 @@ class ProvisionEngine(
 
         /** The one command a human runs for a client whose secret was not delivered (ADR production-clients §3 tier 3). */
         fun recoverSecret(clientId: String): String = "thoryn clients rotate-secret $clientId --secret-file <path>"
+
+        // ── SSO-3689 — workload-identity trusts and secret-less clients ──
+
+        /** A declared trust field differs from the live trust: the hub has no update (its pins are immutable) — delete + re-create, or declare what is live. */
+        const val ERROR_TRUST_IMMUTABLE = "workload_identity_trust_immutable"
+        /** The hub's scope ceiling: a trust may carry only tenant: scopes the applying identity itself holds. */
+        const val ERROR_SCOPE_NOT_GRANTABLE = "scope_not_grantable"
+        /** `spec.federatedTrust` names no trust of the application's environment (missing, or declared for another one). */
+        const val ERROR_FEDERATED_TRUST_NOT_FOUND = "federated_trust_not_found"
+        /** The declared trust's workload client IS the applying identity: a file cannot declare its own bootstrap trust. */
+        const val ERROR_TRUST_IS_SELF = "workload_identity_trust_is_self"
+        /** The plan's wording of the ceiling the hub enforces on every trust create. */
+        const val SCOPE_CEILING_NOTE = " (scope ceiling: the hub grants a trust only tenant: scopes the applying identity itself holds — scope_not_grantable otherwise)"
+        /** The diff value of a `federatedTrust` whose trust this same apply creates first. */
+        const val PENDING_TRUST_MARKER = "(created by this apply)"
+        const val SCOPE_TRUST_WRITE = "tenant:workload-identity.write"
+        /** Receipt attribute keys (never a key or a secret: a URI, kids, a public client id). */
+        const val ATTR_JWKS_URI = "jwksUri"
+        const val ATTR_JWKS_KIDS = "jwksKids"
+        const val ATTR_CLIENT_ID = "clientId"
+        private val KEY_LOCATION_FIELDS = setOf(ProvisionFile.SPEC_JWKS_URI, ProvisionFile.SPEC_JWKS)
+        private const val MAX_TRUST_PAGES = 50
+        private val json = tools.jackson.databind.json.JsonMapper.builder().build()
+
+        /**
+         * The consumer's `connection.json` (ADR 2026-09-09 connection contract) for a trust: `workload_identity` with the
+         * trust's `wi_` client, audience, scopes and the provider's pins — exactly what `thoryn workload-identity trusts
+         * create` prints: for `github_actions` the GitHub pins; for `kubernetes` (SSO-3684) the file token source (the
+         * projected ServiceAccount token at [KUBERNETES_TOKEN_FILE]) and the cluster pins. The contract validates those
+         * two providers today, so a `forgejo` document carries no `provider` (its job presents its own Actions token).
+         * Rendered, never written, by `apply`; nothing in it is secret.
+         */
+        fun connectionDocument(view: Map<String, Any?>, workspace: String?): Map<String, Any?> {
+            val audience = view["audience"]?.toString()?.trimEnd('/')
+            val provider = view["provider"]?.toString()
+            val auth = linkedMapOf<String, Any?>("method" to "workload_identity")
+            if (provider == ProvisionFile.PROVIDER_GITHUB_ACTIONS || provider == ProvisionFile.PROVIDER_KUBERNETES) auth["provider"] = provider
+            auth["clientId"] = view["clientId"]
+            if (audience != null) auth["audience"] = audience
+            view["tokenEndpoint"]?.toString()?.takeIf { audience == null || it != "$audience/oauth2/token" }?.let { auth["tokenEndpoint"] = it }
+            if (provider == ProvisionFile.PROVIDER_KUBERNETES) auth["tokenSource"] = linkedMapOf("kind" to "file", "path" to KUBERNETES_TOKEN_FILE)
+            auth["scopes"] = (view["scopes"] as? List<*>).orEmpty().map { it.toString() }
+            (view["github"] as? Map<*, *>)?.let { g ->
+                val pins = linkedMapOf<String, Any?>()
+                listOf("owner", "repository", "ownerId", "repositoryId", "environment", "ref").forEach { f -> g[f]?.let { v -> if (!(v is Number && v.toLong() <= 0) && v.toString().isNotBlank()) pins[f] = v } }
+                if (pins.isNotEmpty()) auth["github"] = pins
+            }
+            (view["kubernetes"] as? Map<*, *>)?.takeIf { provider == ProvisionFile.PROVIDER_KUBERNETES && it.isNotEmpty() }?.let { k -> auth["kubernetes"] = k.entries.associate { (f, v) -> f.toString() to v } }
+            return linkedMapOf("apiVersion" to "thoryn.io/connection/v1", "workspace" to linkedMapOf("slug" to (workspace ?: "<your-workspace>")), "auth" to auth)
+        }
+
+        /** SSO-3684 — where a pod's projected ServiceAccount token is mounted (the CLI's `WorkloadIdentityFlow.DEFAULT_KUBERNETES_TOKEN_FILE`). */
+        const val KUBERNETES_TOKEN_FILE = "/var/run/secrets/tokens/thoryn/token"
 
         const val RELATION_MANAGER = AccessRefs.RELATION_MANAGER
         const val RELATION_VIEWER = AccessRefs.RELATION_VIEWER
