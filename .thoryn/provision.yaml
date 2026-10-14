@@ -37,12 +37,11 @@
 #    and plans this file. ONE identity for plan and apply (SSO-3705; SSO-3699 option B, product owner
 #    2026-10-14): the plan job signs in with the SAME `.thoryn/connection.json` as the apply job — the
 #    `thoryn-cli-ci` trust's `wi_…` client. What keeps a plan from writing is the trust's PLAN PROFILE on the
-#    hub (SSO-3700; added to `thoryn-cli-ci` by SSO-3704): a job in the `-plan` environment is minted the
-#    READ-ONLY scopes (tenant:environments.read tenant:applications.read tenant:access.read), a job in the
-#    reviewed environment the write scopes. No second trust, no second `wi_` client, nothing to paste.
-#    Until that profile exists the plan job fails at sign-in with `environment_mismatch` (the trust pins the
-#    reviewed environment only) — stated, not worked around. Red when the file declares a resource the
-#    repository does not own, or a `readOnly` resource that differs live.
+#    hub (SSO-3700; declared on `thoryn-cli-ci` as `spec.plan` in `.thoryn/trusts.provision.yaml`, SSO-3704): the
+#    hub reads the job token's `environment` claim — a job in the `-plan` environment is minted the READ-ONLY
+#    scopes (tenant:environments.read tenant:applications.read tenant:access.read), a job in the reviewed
+#    environment the write scopes. No second trust, no second `wi_` client, nothing to paste. Red when the file
+#    declares a resource the repository does not own, or a dry run would fail — before merge.
 #  * a push to `main` dispatches `mode=apply`: the job runs in the REVIEWED environment `thoryn-provision-e2e`
 #    (required reviewers hold it before any token is minted), signs in as `thoryn-cli-ci`, applies with
 #    `destroy: "false"` — never `--prune`, never `destroy` — and opens a follow-up pull request carrying
@@ -163,9 +162,9 @@ resources:
       # The subject is the `wi_…` client of the `thoryn-cli-ci` workload identity trust — the SAME value as
       # `auth.clientId` in `.thoryn/connection.json` (CiProvisionFileConformanceTest pins the two equal, and that
       # it is the ONLY subject here). ONE identity for plan and apply (SSO-3705; SSO-3699 option B): the plan job
-      # signs in as this same client and the hub's plan profile (SSO-3700/SSO-3704) mints it read-only scopes in
-      # the `-plan` environment — `manager` reach lets it plan the sandbox and its loopback client, the scopes keep
-      # it from writing. SSO-3697's second grant, for a never-created plan trust's placeholder client, is what
+      # signs in as this same client and the trust's plan profile (SSO-3700; `spec.plan` in
+      # `.thoryn/trusts.provision.yaml`, SSO-3704) mints it read-only scopes in the `-plan` environment — `manager`
+      # reach lets it plan the sandbox and its loopback client, the scopes keep it from writing. SSO-3697's second grant, for a never-created plan trust's placeholder client, is what
       # stopped provision-e2e run 38547022158 with `404 not_found — No such access-grant target`; there is no
       # second `wi_` to paste, so a placeholder must never return here.
       - subject: "client:wi_10a7b379c79f7d1353f5798d"

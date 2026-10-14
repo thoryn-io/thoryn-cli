@@ -16,13 +16,15 @@
 #   * `thoryn-provision-e2e`      — required reviewers; the `thoryn-cli-ci` trust is pinned to it. GitHub holds the
 #                                   apply job for a reviewer before any token can be minted.
 # BOTH jobs sign in with the SAME connection.json — the ONE trust `thoryn-cli-ci` (SSO-3705; SSO-3699 option B,
-# product owner 2026-10-14). What makes the plan read-only is the trust's PLAN PROFILE on the hub (SSO-3700): a job
-# whose OIDC token carries the `-plan` environment is minted READ scopes only (tenant:environments.read
-# tenant:applications.read tenant:access.read); a job in the reviewed environment gets the write scopes. No second
-# trust, no second wi_ client, nothing to paste. UNTIL SSO-3700 is deployed and SSO-3704 adds the profile to
-# thoryn-cli-ci, the plan job FAILS AT SIGN-IN with `environment_mismatch` — the trust pins the reviewed environment
-# only. Stated here and in .thoryn/README.md, not worked around; the App is not installed on this repository yet,
-# so nothing dispatches this workflow until then.
+# product owner 2026-10-14; oauthy ADR 2026-10-14-plan-identity-and-resource-ownership). What makes the plan read-only
+# is the trust's PLAN PROFILE on the hub (SSO-3700/SSO-3701, deployed; declared on the trust by SSO-3704 in
+# .thoryn/trusts.provision.yaml): the hub reads the `environment` claim of the job's own OIDC token — a job in the
+# `-plan` environment is minted the READ scopes only (tenant:environments.read tenant:applications.read
+# tenant:access.read), a job in the reviewed environment the write scopes, a job in neither is refused at the
+# exchange. `thoryn login --connection` (cli-v0.34.0, SSO-3702) requests no scope outside the apply environment, so
+# the plan job never asks for a write. No second trust, no second wi_ client, no second connection file, nothing to
+# paste. Until the Thoryn GitHub App is installed on this repository nothing dispatches this workflow (operator
+# steps in .thoryn/README.md).
 # The App completes its check run from this run's conclusion (the run-name carries the check-run id).
 # Removals are never automated: the apply step is destroy: "false", and nothing here passes --prune.
 #
@@ -59,7 +61,7 @@ concurrency:
 permissions: {}
 
 env:
-  THORYN_CLI_RELEASE: cli-v0.33.0
+  THORYN_CLI_RELEASE: cli-v0.34.0
   # The platform base issuer the connection contract derives the thoryn workspace's issuer from.
   THORYN_ISSUER: https://auth.stg.thoryn.org
   THORYN_HUB: https://auth.stg.thoryn.org
@@ -70,8 +72,8 @@ jobs:
   plan:
     if: inputs.mode == 'plan'
     runs-on: ubuntu-latest
-    # The UNPROTECTED plan environment (see the header): the hub's plan profile mints read-only scopes for a job
-    # here. No reviewers. Refused with environment_mismatch until thoryn-cli-ci carries the profile (SSO-3700/3704).
+    # The UNPROTECTED plan environment (see the header): the trust's plan profile is keyed on it, so the hub mints a
+    # job here the read-only scopes from the OIDC token's environment claim. No reviewers — a plan runs on every PR.
     environment: thoryn-provision-e2e-plan
     permissions:
       id-token: write
@@ -117,12 +119,12 @@ jobs:
           ref: ${{ inputs.head_sha }}
       - name: Apply .thoryn/provision.yaml as this repository (production plane)
         id: apply-thoryn
-        uses: thoryn-io/thoryn-cli/.github/actions/provision@cli-v0.33.0
+        uses: thoryn-io/thoryn-cli/.github/actions/provision@cli-v0.34.0
         with:
           connection: .thoryn/connection.json
           file: .thoryn/provision.yaml
           issuer: https://auth.stg.thoryn.org
-          cli-version: cli-v0.33.0
+          cli-version: cli-v0.34.0
           destroy: "false"
       - name: Open the receipt pull request
         env:
