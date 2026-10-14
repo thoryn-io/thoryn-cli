@@ -14,9 +14,10 @@ import java.io.File
  * `thoryn-cli-ci`: pinned to the REVIEWED environment [GITHUB_ENVIRONMENT], the six write-capable scopes
  * `connection.json` requests; the platform `owner` of `application:cli` (SSO-3697). The SAME identity plans every
  * pull request (SSO-3705 — SSO-3699 option B): the App's plan job runs in the UNPROTECTED environment
- * [PLAN_GITHUB_ENVIRONMENT] and the hub's plan profile (SSO-3700; added to the trust by SSO-3704) mints it the
- * `.read` scopes only there ([scopesToPlan]). There is no second trust and no second `wi_` client — SSO-3697's
- * `thoryn-cli-ci-plan` was never created, and its placeholder grant stopped provision-e2e run 38547022158.
+ * [PLAN_GITHUB_ENVIRONMENT] and the trust's plan profile (SSO-3700; declared as `spec.plan` in [TRUSTS_PROVISION_PATH]
+ * by SSO-3704, scopes derived) mints it the `.read` scopes only there ([scopesToPlan]). There is no second trust and no
+ * second `wi_` client — SSO-3697's second trust was never created, and its placeholder grant stopped provision-e2e run
+ * 38547022158; [TWO_TRUST_RESIDUE] is what none of the committed files may mention again.
  *
  * The trust is DECLARED (SSO-3689 `kind: workloadIdentityTrust`) in [TRUSTS_PROVISION_PATH], a file a founder
  * applies — never CI: a production-plane trust is reached through the workspace, and a file cannot declare the
@@ -31,6 +32,15 @@ internal object CiIdentityFixture {
     /** SSO-3697 — the founder-applied trusts file and the App-dispatched workflow. */
     const val TRUSTS_PROVISION_PATH = ".thoryn/trusts.provision.yaml"
     const val PROVISIONING_WORKFLOW_PATH = ".github/workflows/thoryn-provisioning.yml"
+    const val PROVISION_ACTION_PATH = ".github/actions/provision/action.yml"
+
+    /**
+     * SSO-3704 — the two-trust shape's residue (SSO-3699 option B retired it): a second connection file, the second trust's
+     * name, and the sign-in failure a plan job hit while the trust pinned only the reviewed environment. Once the one trust
+     * carries its plan profile none of these is a current fact, and a committed file that still states one would send an
+     * operator down the retired path — so no file under `.thoryn/` (prose included) and no workflow may mention them.
+     */
+    val TWO_TRUST_RESIDUE = listOf("connection.plan.json", "thoryn-cli-ci-plan", "environment_mismatch")
 
     /**
      * SSO-3705 — the committed DATA files under `.thoryn/` (prose — the README, YAML comment lines — is not scanned):
@@ -67,8 +77,13 @@ internal object CiIdentityFixture {
     /** The production-plane trust's audience: the `thoryn` workspace's issuer on shared staging (no `/{env}` path). */
     const val AUDIENCE = "https://thoryn.auth.stg.thoryn.org"
 
-    /** The thoryn-cli release the App-dispatched workflow pins — its composite Action and `thoryn.jar`. */
-    const val CLI_RELEASE = "cli-v0.33.0"
+    /**
+     * The thoryn-cli release the App-dispatched workflow pins — its composite Action and `thoryn.jar`. SSO-3704: at least
+     * cli-v0.34.0, the first release whose `thoryn login --connection` picks the profile from the job's own OIDC
+     * `environment` claim (SSO-3702) — an older CLI in the `-plan` environment would request the six write scopes and
+     * be refused by the plan profile's ceiling.
+     */
+    const val CLI_RELEASE = "cli-v0.34.0"
 
     /** The platform base issuer the workflow provisions against (the connection derives the workspace issuer from it). */
     const val PLATFORM_ISSUER = "https://auth.stg.thoryn.org"

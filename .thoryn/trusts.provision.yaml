@@ -1,6 +1,6 @@
-# SSO-3697 / SSO-3705 (parent SSO-3659) — the ONE workload identity trust this repository signs in with, DECLARED
-# (SSO-3689's `kind: workloadIdentityTrust`) in a file a FOUNDER applies from their own session. Not CI, and not by
-# accident:
+# SSO-3697 / SSO-3705 / SSO-3704 (parent SSO-3659) — the ONE workload identity trust this repository signs in with,
+# DECLARED (SSO-3689's `kind: workloadIdentityTrust`) in a file a FOUNDER applies from their own session. Not CI, and
+# not by accident:
 #
 #  * The ownership gate reaches a trust through its ENVIRONMENT, and this trust lives on the `thoryn` workspace's
 #    PRODUCTION plane (its token must address `application:cli` and the `cli-ci` sandbox, whose parent is the
@@ -24,18 +24,28 @@
 # The receipt (`.thoryn/trusts.provision.receipt.json`, git-ignored, local to the founder) records thoryn-cli-ci as
 # adopted. A trust's pins and scopes are IMMUTABLE on the hub: a declared field that differs from the live trust is
 # the plan error `workload_identity_trust_immutable` — align the file, or delete and re-apply to re-create (which
-# mints a NEW wi_ client: re-paste it into connection.json and provision.yaml). The App-dispatched workflow never
-# reads this file; it plans and applies `.thoryn/provision.yaml` only. `destroy` of this file would delete the trust
-# and stop CI signing in at once — a founder's deliberate act, never automation's.
+# mints a NEW wi_ client: re-paste it into connection.json and provision.yaml). The ONE additive exception is the
+# plan profile below. The App-dispatched workflow never reads this file; it plans and applies `.thoryn/provision.yaml`
+# only. `destroy` of this file would delete the trust and stop CI signing in at once — a founder's deliberate act,
+# never automation's.
 #
-# ONE trust for plan AND apply (SSO-3705 — SSO-3699 option B, product owner 2026-10-14). SSO-3697 declared a second
-# trust here, `thoryn-cli-ci-plan`, pinned to the unprotected `thoryn-provision-e2e-plan` environment with read-only
-# scopes; it was never created, and its placeholder client in `provision.yaml`'s grants stopped provision-e2e run
-# 38547022158. Under option B the hub gives a trust a PLAN PROFILE (SSO-3700): the same `wi_` client, minted the
-# read-only scopes when the job runs in the `-plan` environment and the write scopes in the reviewed one. The
-# profile is NOT a field of this declaration yet — SSO-3704 adds it to `thoryn-cli-ci` once the hub ships it (the
-# CLI verb and its flags are SSO-3702's to settle; see `.thoryn/README.md`). Until then a plan job in the `-plan`
-# environment is refused at sign-in with `environment_mismatch`: this trust pins the reviewed environment only.
+# ONE TRUST, TWO PROFILES (SSO-3699 option B, product owner 2026-10-14; oauthy ADR
+# 2026-10-14-plan-identity-and-resource-ownership). The same `wi_` client signs in for plan AND apply; what differs is
+# the GitHub environment the job runs in, and the hub mints only the matched profile's scopes:
+#   * `github.environment` — the APPLY profile: the reviewed environment `thoryn-provision-e2e`, the six `scopes`.
+#   * `plan.environment`   — the PLAN profile: the unprotected environment `thoryn-provision-e2e-plan`, read-only.
+# A job in neither environment is refused at the exchange. A plan job is read-only by CONSTRUCTION — the profile can
+# only carry `.read` scopes (`plan_scope_not_read_only`) — not because a second trust was configured correctly: there
+# is no second trust, no second `wi_` client, and `connection.json` is the one contract both jobs sign in with
+# (`thoryn login --connection` picks the profile from the job's own OIDC `environment` claim and requests no scope
+# outside the apply environment). SSO-3704 is the dogfood migration that gave `thoryn-cli-ci` this profile.
+#
+# HOW THE PROFILE REACHES THE LIVE TRUST. The trust was created (SSO-3690, 2026-10-14) WITHOUT a plan profile. Declaring
+# `plan:` here on a live trust that has none is the one field the engine converges ADDITIVELY (SSO-3702): a founder's
+# `thoryn provision apply --file .thoryn/trusts.provision.yaml` issues the single `POST …/trusts/{id}/plan-profile`
+# — the wi_ client, its `owner` relation on `application:cli`, its `manager` grant on the sandbox and the committed
+# `connection.json` all stay; nothing is re-created or re-pasted. Once set, a profile is immutable like every other
+# pin: a live profile that differs from the declared one is `workload_identity_trust_immutable` (re-create the trust).
 apiVersion: thoryn.io/provision/v1
 resources:
   # SSO-3690 — the CI identity: created once by the founder on 2026-10-14 (clientId wi_10a7b379c79f7d1353f5798d),
@@ -60,4 +70,12 @@ resources:
         - tenant:applications.write
         - tenant:access.read
         - tenant:access.write
+      # SSO-3704 — the PLAN profile (SSO-3699 option B): the plan job of thoryn-provisioning.yml runs in this
+      # UNPROTECTED GitHub environment and is minted read-only scopes there. `scopes` is deliberately OMITTED: the hub
+      # DERIVES the plan scopes as every `.read` member of `scopes` above — tenant:environments.read
+      # tenant:applications.read tenant:access.read — which is exactly the set planning `provision.yaml` needs
+      # (CiIdentityFixture.scopesToPlan). Listing them would pin what the hub already derives; a listed scope that is
+      # not `.read` is `plan_scope_not_read_only`, one not in `scopes` is `plan_scope_not_subset`.
+      plan:
+        environment: thoryn-provision-e2e-plan
       confirmProduction: true
