@@ -1336,8 +1336,14 @@ class ProvisionEngine(
                 out.println("  ~ application ${r.name}: updated ${change.diff.keys} (clientId $id)")
                 base.copy(attributes = applicationAttributes(spec))
             }
-            // SSO-3689 — never planned: a differing trust is the plan error `workload_identity_trust_immutable`.
-            ProvisionFile.KIND_WORKLOAD_IDENTITY_TRUST -> throw ProvisionException("${r.key}: $ERROR_TRUST_IMMUTABLE — a trust's pins and scopes cannot be changed in place; delete it and re-apply, or declare what is live")
+            // SSO-3689 — a differing pin or scope set is never planned (`workload_identity_trust_immutable`); SSO-3702 — the ONE
+            // update a plan can carry is the additive plan profile on a trust that has none.
+            ProvisionFile.KIND_WORKLOAD_IDENTITY_TRUST -> {
+                if (change.diff.keys.any { !it.startsWith(PLAN_FIELD_PREFIX) }) {
+                    throw ProvisionException("${r.key}: $ERROR_TRUST_IMMUTABLE — a trust's pins and scopes cannot be changed in place; delete it and re-apply, or declare what is live")
+                }
+                setTrustPlanProfile(r, change, slug, spec)
+            }
             ProvisionFile.KIND_USER -> {
                 clients(slug).updateUser(id, changed)
                 out.println("  ~ user ${r.name}: updated ${change.diff.keys} (id $id)")
@@ -1780,7 +1786,24 @@ class ProvisionEngine(
             )
         }
         val diff = diffOf(trustDesired(desired), trustLive(node))
+        // SSO-3702 — the ONE additive exception to immutability: a declared plan profile on a live trust that has none is
+        // converged by `set plan profile` (the wi_ client stays). Anything else that differs — a pin, the scopes, a live
+        // profile that is not the declared one — is still the immutable error.
+        val planOnly = diff.isNotEmpty() && diff.keys.all { it.startsWith(PLAN_FIELD_PREFIX) }
+        val liveHasPlan = node[ProvisionFile.TRUST_PLAN]?.takeIf { it.isObject && it.str("environment") != null } != null
         return when {
+            planOnly && !liveHasPlan -> PlannedChange(
+                r.kind, r.name, ChangeAction.UPDATE,
+                (if (owned == null) "exists (adopting) — " else "") + "adds the plan profile (GitHub environment '${(desired[ProvisionFile.TRUST_PLAN] as? Map<*, *>)?.get("environment")}', read-only scopes) " +
+                    "through the one additive set-plan-profile call; the wi_ workload client ${clientId ?: ""} stays".replace("  ", " "),
+                resource = r, owned = owned, liveId = id, diff = diff, adopted = owned?.adopted ?: true, trust = view,
+            )
+            planOnly -> PlannedChange(
+                r.kind, r.name, ChangeAction.ERROR,
+                "$ERROR_TRUST_IMMUTABLE — the live trust already carries a plan profile that differs from the declared one (${diff.keys.joinToString(", ")}); a plan profile is set once: " +
+                    "declare what is live, or re-create the trust (`thoryn workload-identity trusts delete $id${slug?.let { " --environment $it" } ?: ""}`, then re-apply — a new wi_ client, re-paste it)",
+                resource = r, owned = owned, liveId = id, diff = diff, adopted = owned?.adopted ?: true, error = ERROR_TRUST_IMMUTABLE, trust = view,
+            )
             diff.isNotEmpty() -> PlannedChange(
                 r.kind, r.name, ChangeAction.ERROR,
                 "$ERROR_TRUST_IMMUTABLE — ${diff.size} declared field(s) differ from the live trust (${diff.keys.joinToString(", ")}); a trust's pins and scopes are immutable on the hub: " +
@@ -1804,6 +1827,12 @@ class ProvisionEngine(
         val out = linkedMapOf<String, Any?>("provider" to provider, ProvisionFile.TRUST_SCOPES to spec[ProvisionFile.TRUST_SCOPES])
         val block = ProvisionFile.TRUST_PIN_BLOCKS[provider] ?: return out
         (spec[block] as? Map<*, *>)?.forEach { (k, v) -> out["$block.$k"] = if (k == "jwks") jwkKids(v) else v }
+        // SSO-3702 — the plan profile: its environment always; its scopes only when the file lists them (omitted ⇒ derived
+        // by the hub, so whatever the hub derived is not a difference).
+        (spec[ProvisionFile.TRUST_PLAN] as? Map<*, *>)?.let { plan ->
+            out["${PLAN_FIELD_PREFIX}environment"] = plan["environment"]
+            plan[ProvisionFile.TRUST_SCOPES]?.let { out["$PLAN_FIELD_PREFIX${ProvisionFile.TRUST_SCOPES}"] = it }
+        }
         return out
     }
 
@@ -1818,6 +1847,11 @@ class ProvisionEngine(
                 n["github"]?.takeIf { it.isObject }?.let { g -> out["github.repository"] = listOfNotNull(g.str("owner"), g.str("repository")).joinToString("/") }
                 // An unpinned runner rule renders as `false`; a file that leaves it out declares nothing about it.
                 if (out["github.githubHostedRunnersOnly"] == false) out["github.githubHostedRunnersOnly"] = null
+                // SSO-3702 — the live plan profile (`plan: null` on a trust without one — both keys then absent).
+                n[ProvisionFile.TRUST_PLAN]?.takeIf { it.isObject }?.let { p ->
+                    out["${PLAN_FIELD_PREFIX}environment"] = p.str("environment")
+                    out["$PLAN_FIELD_PREFIX${ProvisionFile.TRUST_SCOPES}"] = p["scopes"]?.let { plain(it) }
+                }
             }
             ProvisionFile.PROVIDER_FORGEJO -> pins("forgejo", listOf("instanceUrl", "owner", "ownerId", "repository", "repositoryId", "ref"))
             ProvisionFile.PROVIDER_KUBERNETES -> {
@@ -1837,6 +1871,9 @@ class ProvisionEngine(
         listOf("id", "name", "clientId", "audience", "tokenEndpoint", "provider", "environment").forEach { f -> n.str(f)?.let { put(f, it) } }
         n["scopes"]?.takeIf { it.isArray }?.let { put("scopes", it.toList().map { s -> s.asString() }) }
         n["github"]?.takeIf { it.isObject }?.let { g -> put("github", plain(g)) }
+        // SSO-3702 — the plan profile and the per-profile subject patterns (apply, plan), as the API renders them.
+        n[ProvisionFile.TRUST_PLAN]?.takeIf { it.isObject }?.let { p -> put(ProvisionFile.TRUST_PLAN, plain(p)) }
+        n["subjectPatterns"]?.takeIf { it.isArray }?.let { put("subjectPatterns", it.toList().map { s -> s.asString() }) }
         n["kubernetes"]?.takeIf { it.isObject }?.let { k -> put("kubernetes", listOf("issuer", "namespace", "serviceAccount").mapNotNull { f -> k.str(f)?.let { f to it } }.toMap()) }
     }
 
@@ -1863,6 +1900,12 @@ class ProvisionEngine(
                 listOf("ownerId", "repositoryId", "environment", "ref").forEach { f -> g[f]?.takeIf { !it.isNull }?.let { pins[f] = plain(it) } }
                 if (g["githubHostedRunnersOnly"]?.asBoolean() == true) pins["githubHostedRunnersOnly"] = true
                 spec["github"] = pins
+                // SSO-3702 — a live plan profile is rendered with its (possibly derived) scopes made explicit, so the file pins what is live.
+                n[ProvisionFile.TRUST_PLAN]?.takeIf { it.isObject && it.str("environment") != null }?.let { p ->
+                    spec[ProvisionFile.TRUST_PLAN] = linkedMapOf<String, Any?>("environment" to p.str("environment")).also { plan ->
+                        p["scopes"]?.takeIf { it.isArray && !it.isEmpty }?.let { plan[ProvisionFile.TRUST_SCOPES] = it.toList().map { s -> s.asString() } }
+                    }
+                }
             }
             ProvisionFile.PROVIDER_FORGEJO -> copy("forgejo", listOf("instanceUrl", "owner", "ownerId", "repository", "repositoryId", "ref"))?.let { spec["forgejo"] = it }
             ProvisionFile.PROVIDER_KUBERNETES -> copy("kubernetes", listOf("issuer", "namespace", "serviceAccount"))?.let { pins ->
@@ -1887,7 +1930,39 @@ class ProvisionEngine(
             pins["owner"] = repository.substringBefore('/')
             pins["repository"] = repository.substringAfter('/')
         }
-        return linkedMapOf("name" to name, "provider" to provider, block to pins, ProvisionFile.TRUST_SCOPES to spec[ProvisionFile.TRUST_SCOPES], ProvisionFile.TRUST_CONFIRM_PRODUCTION to spec[ProvisionFile.TRUST_CONFIRM_PRODUCTION])
+        return linkedMapOf(
+            "name" to name, "provider" to provider, block to pins, ProvisionFile.TRUST_SCOPES to spec[ProvisionFile.TRUST_SCOPES],
+            ProvisionFile.TRUST_CONFIRM_PRODUCTION to spec[ProvisionFile.TRUST_CONFIRM_PRODUCTION],
+            // SSO-3702 — the plan profile rides on the create when declared (absent otherwise; the client drops nulls).
+            ProvisionFile.TRUST_PLAN to planProfileBody(spec),
+        )
+    }
+
+    /** SSO-3702 — the declared plan profile as the API's `{ environment, scopes? }` (scopes only when the file lists them), or null. */
+    private fun planProfileBody(spec: Map<String, Any?>): Map<String, Any?>? {
+        val plan = spec[ProvisionFile.TRUST_PLAN] as? Map<*, *> ?: return null
+        val environment = plan["environment"]?.toString()?.trim()?.takeIf { it.isNotEmpty() } ?: return null
+        return linkedMapOf("environment" to environment, ProvisionFile.TRUST_SCOPES to (plan[ProvisionFile.TRUST_SCOPES] as? List<*>)?.map { it.toString().trim() }?.takeIf { it.isNotEmpty() })
+    }
+
+    /**
+     * SSO-3702 — the ONE additive mutation of a live trust (SSO-3699 decision (b)): `POST …/{id}/plan-profile` with the
+     * declared profile. The `wi_` client, its `owner` relation and the consumer's `connection.json` all stay; the
+     * receipt keeps the same id and attributes. Only reached for a plan whose diff is the plan profile on a trust
+     * without one ([probeTrust]).
+     */
+    private fun setTrustPlanProfile(r: ProvisionResource, change: PlannedChange, slug: String?, spec: Map<String, Any?>): OwnedResource {
+        val id = change.liveId ?: throw ProvisionException("${r.key}: plan-profile update planned without a live id")
+        val body = planProfileBody(spec) ?: throw ProvisionException("${r.key}: plan-profile update planned without a declared spec.${ProvisionFile.TRUST_PLAN}")
+        val resp = try {
+            clients(slug).setWorkloadIdentityTrustPlanProfile(id, body)
+        } catch (ex: ProductApiException) {
+            throw trustFailure(r, ex)
+        }
+        trustLists.remove(slug)
+        val view = trustView(resp)
+        out.println("  ~ workloadIdentityTrust ${r.name}: plan profile added — GitHub environment '${body["environment"]}' is minted read-only scopes ${((view[ProvisionFile.TRUST_PLAN] as? Map<*, *>)?.get("scopes") as? List<*>)?.joinToString(" ") ?: "(derived by the hub)"}; wi_ client ${view["clientId"] ?: change.trust?.get("clientId") ?: ""} unchanged (id $id)")
+        return OwnedResource(r.kind, r.name, id, slug, trustAttributes(view.ifEmpty { change.trust.orEmpty() }), adopted = change.adopted, owner = change.owner)
     }
 
     /**
@@ -1902,11 +1977,21 @@ class ProvisionEngine(
         } catch (ex: ProductApiException) {
             if (ex.errorCode == "workload_identity_trust_name_taken") {
                 val live = fetchOrNull { trustsOf(slug, fresh = true) }?.firstOrNull { it.str("name") == r.name }
-                if (live != null && diffOf(trustDesired(spec), trustLive(live)).isEmpty()) {
+                val diff = live?.let { diffOf(trustDesired(spec), trustLive(it)) }
+                if (live != null && diff!!.isEmpty()) {
                     val view = trustView(live)
                     out.println("  = workloadIdentityTrust ${r.name}: the name was taken by a matching trust meanwhile — adopted (id ${view["id"]}, clientId ${view["clientId"]})")
                     printTrustConnection(view)
                     return OwnedResource(r.kind, r.name, view["id"].toString(), slug, trustAttributes(view), adopted = true)
+                }
+                // SSO-3702 — the racing writer created it WITHOUT the declared plan profile: the additive mutation still applies.
+                if (live != null && diff!!.keys.all { it.startsWith(PLAN_FIELD_PREFIX) } && live[ProvisionFile.TRUST_PLAN]?.takeIf { it.isObject && it.str("environment") != null } == null) {
+                    val view = trustView(live)
+                    out.println("  = workloadIdentityTrust ${r.name}: the name was taken by a matching trust meanwhile — adopted (id ${view["id"]}, clientId ${view["clientId"]})")
+                    val adopted = PlannedChange(r.kind, r.name, ChangeAction.UPDATE, "adds the plan profile", resource = r, liveId = view["id"].toString(), diff = diff, adopted = true, trust = view)
+                    val owned = setTrustPlanProfile(r, adopted, slug, spec)
+                    printTrustConnection(view)
+                    return owned
                 }
                 throw ProvisionException("${r.key}: $ERROR_TRUST_IMMUTABLE — a trust named '${r.name}' already exists in ${planeLabel(slug)} with other pins or scopes; declare what is live, or delete it and re-apply")
             }
@@ -1933,6 +2018,15 @@ class ProvisionEngine(
             "github_unavailable" -> "GitHub could not be reached to look up the repository ids; retry, or declare spec.github.ownerId and spec.github.repositoryId"
             ProvisionFile.ERR_INVALID_GITHUB_IDS -> "spec.github.ownerId and spec.github.repositoryId go together: declare both, or neither"
             "environment_not_found" -> "no such environment, or this identity cannot reach it"
+            // SSO-3702 — the plan profile's refusals (product-api SSO-3701 / hub SSO-3700).
+            "plan_profile_already_set" -> "the live trust already carries a plan profile; a profile is set once — declare what is live, or re-create the trust (delete and re-apply; a new wi_ client)"
+            ProvisionFile.ERR_PLAN_ENVIRONMENT_EQUALS_APPLY -> "spec.plan.environment must differ from spec.github.environment — the GitHub environment is what separates \"may read\" from \"may write\""
+            ProvisionFile.ERR_PLAN_SCOPE_NOT_READ_ONLY -> "every spec.plan.scopes entry must be a tenant:<area>.read scope — a plan profile is read-only by construction"
+            ProvisionFile.ERR_PLAN_SCOPE_NOT_SUBSET -> "every spec.plan.scopes entry must be among spec.scopes"
+            ProvisionFile.ERR_PLAN_PROFILE_REQUIRES_ENVIRONMENT -> "spec.plan.environment is required (the GitHub environment the plan jobs run in)"
+            ProvisionFile.ERR_PLAN_SCOPES_EMPTY -> "the plan profile would carry no scope: spec.scopes has no .read member to derive from — list spec.plan.scopes, or add a .read scope"
+            ProvisionFile.ERR_PLAN_PROFILE_UNSUPPORTED -> "only a github_actions trust carries a plan profile"
+            ProvisionFile.ERR_INVALID_PLAN_ENVIRONMENT -> "spec.plan.environment must be a GitHub environment name, exactly as the plan job declares it"
             else -> if (ex.isInsufficientScope) "this session lacks the '$SCOPE_TRUST_WRITE' scope (${ex.message}); sign in with `thoryn login --scope $SCOPE_TRUST_WRITE` (or grant the CI identity that scope) and re-run" else (ex.errorDescription ?: ex.message ?: "refused")
         },
     )
@@ -2163,6 +2257,8 @@ class ProvisionEngine(
 
         /** A declared trust field differs from the live trust: the hub has no update (its pins are immutable) — delete + re-create, or declare what is live. */
         const val ERROR_TRUST_IMMUTABLE = "workload_identity_trust_immutable"
+        /** SSO-3702 — the flat-diff key prefix of a trust's plan profile (`plan.environment`, `plan.scopes`): the one additive exception to immutability. */
+        const val PLAN_FIELD_PREFIX = "plan."
         /** The hub's scope ceiling: a trust may carry only tenant: scopes the applying identity itself holds. */
         const val ERROR_SCOPE_NOT_GRANTABLE = "scope_not_grantable"
         /** `spec.federatedTrust` names no trust of the application's environment (missing, or declared for another one). */

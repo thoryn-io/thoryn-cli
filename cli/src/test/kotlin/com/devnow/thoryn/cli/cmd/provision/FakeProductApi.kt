@@ -178,14 +178,30 @@ internal class FakeProductApi : Dispatcher() {
      * the provider's pin block (GitHub: owner / repository / ids / environment / ref / runner rule; Kubernetes: issuer /
      * namespace / serviceAccount and `inlineKeyIds` or a discovered `jwksUri` — never the keys themselves).
      */
-    fun seedTrust(env: String?, name: String, provider: String = "github_actions", scopes: List<String> = listOf("tenant:applications.read"), pins: Map<String, Any?> = mapOf("owner" to "acme", "repository" to "billing"), clientId: String? = null): String {
+    fun seedTrust(
+        env: String?,
+        name: String,
+        provider: String = "github_actions",
+        scopes: List<String> = listOf("tenant:applications.read"),
+        pins: Map<String, Any?> = mapOf("owner" to "acme", "repository" to "billing"),
+        clientId: String? = null,
+        /** SSO-3702 — the trust's plan profile `{environment, scopes}` (scopes already derived), or null: rendered as `plan: null`. */
+        plan: Map<String, Any?>? = null,
+    ): String {
         val id = "trust-${++seq}"
         val audience = "https://acme.auth.thoryn.io" + (env?.let { "/$it" } ?: "")
+        val repo = "${pins["owner"]}/${pins["repository"]}"
         val rec = mutableMapOf<String, Any?>(
             "id" to id, "name" to name, "provider" to provider, "scopes" to scopes, "enabled" to true,
             "clientId" to (clientId ?: "wi_${"%024x".format(seq)}"), "audience" to audience, "tokenEndpoint" to "$audience/oauth2/token",
             "environment" to (env ?: "production"), "createdAt" to "2026-10-14T00:00:00Z", "_env" to env,
             "issuer" to when (provider) { "forgejo" -> "${pins["instanceUrl"]}/api/actions"; "kubernetes" -> pins["issuer"]; else -> "https://token.actions.githubusercontent.com" },
+            // SSO-3702 — product-api SSO-3701's shape: `plan` (null without a profile) and one anchored `sub` pattern per profile.
+            "plan" to plan,
+            "subjectPatterns" to if (provider == "github_actions") listOfNotNull(
+                "^repo:\\Q$repo\\E:${pins["environment"]?.let { "environment:\\Q$it\\E" } ?: ".*"}$",
+                plan?.let { "^repo:\\Q$repo\\E:environment:\\Q${it["environment"]}\\E$" },
+            ) else emptyList(),
         )
         val block = pins.filterKeys { it != "jwks" }.toMutableMap()
         when (provider) {
@@ -222,6 +238,19 @@ internal class FakeProductApi : Dispatcher() {
                 json(200, mapOf("data" to page.map { public(it) }, "pagination" to mapOf("cursor" to next, "hasMore" to (next != null), "total" to visible.size)))
             }
             seg.isEmpty() && method == "POST" -> createTrust(env, b)
+            // SSO-3702 (product-api SSO-3701) — the ONE additive mutation: `POST …/{id}/plan-profile`.
+            seg.endsWith("/plan-profile") && method == "POST" -> {
+                val t = visible.firstOrNull { it["id"] == seg.removeSuffix("/plan-profile") } ?: return problem(404, "workload_identity_trust_not_found")
+                if (t["plan"] != null) return problem(409, "plan_profile_already_set")
+                @Suppress("UNCHECKED_CAST")
+                val github = t["github"] as? Map<String, Any?>
+                val plan = planProfileOf(t["provider"] as String, github?.get("environment") as? String, (t["scopes"] as List<*>).map { it.toString() }, b)
+                if (plan is MockResponse) return plan
+                @Suppress("UNCHECKED_CAST")
+                t["plan"] = plan as Map<String, Any?>
+                t["subjectPatterns"] = listOfNotNull((t["subjectPatterns"] as? List<*>)?.firstOrNull()?.toString(), "^repo:\\Q${github?.get("owner")}/${github?.get("repository")}\\E:environment:\\Q${plan["environment"]}\\E$")
+                json(200, public(t))
+            }
             method == "GET" -> visible.firstOrNull { it["id"] == seg }?.let { json(200, public(it)) } ?: problem(404, "workload_identity_trust_not_found")
             method == "DELETE" -> {
                 val t = visible.firstOrNull { it["id"] == seg } ?: return problem(404, "workload_identity_trust_not_found")
@@ -261,13 +290,49 @@ internal class FakeProductApi : Dispatcher() {
                 if (env == null && ((pins["namespace"] as? String).isNullOrBlank() || (pins["serviceAccount"] as? String).isNullOrBlank())) return problem(400, "production_requires_service_account")
             }
         }
-        val id = seedTrust(env, name, provider, scopes, pins)
+        // SSO-3702 — the plan profile declared at create (product-api SSO-3701 validates it exactly as the mutation does).
+        var plan: Map<String, Any?>? = null
+        @Suppress("UNCHECKED_CAST")
+        (b["plan"] as? Map<String, Any?>)?.let { declared ->
+            val outcome = planProfileOf(provider, pins["environment"] as? String, scopes, declared)
+            if (outcome is MockResponse) return outcome
+            @Suppress("UNCHECKED_CAST")
+            plan = outcome as Map<String, Any?>
+        }
+        // The race fixture creates the trust WITHOUT the profile the engine declared (another writer's shape), then refuses.
+        val id = seedTrust(env, name, provider, scopes, pins, plan = if (trustNameTakenOnce) null else plan)
         if (trustNameTakenOnce) {
             // The race: another writer took the name between the engine's lookup and its POST — the trust now exists, the POST is refused.
             trustNameTakenOnce = false
             return problem(409, "workload_identity_trust_name_taken")
         }
         return json(201, public(trusts.first { it["id"] == id }))
+    }
+
+    /**
+     * SSO-3702 — product-api's plan-profile validation in miniature (the same for create and the mutation): github_actions
+     * only (`plan_profile_unsupported`); a non-empty environment (`plan_profile_requires_environment` /
+     * `invalid_plan_environment`) that differs from the apply one (`plan_environment_equals_apply`); scopes each
+     * `tenant:<area>.read` (`plan_scope_not_read_only`) and among the trust's (`plan_scope_not_subset`), held by the caller
+     * (`scope_not_grantable`); omitted scopes DERIVED as the `.read` members of the trust's — none ⇒ `plan_scopes_empty`.
+     * Answers the stored profile, or the refusing [MockResponse].
+     */
+    private fun planProfileOf(provider: String, applyEnvironment: String?, trustScopes: List<String>, declared: Map<String, Any?>): Any {
+        if (provider != "github_actions") return problem(400, "plan_profile_unsupported")
+        val environment = declared["environment"] ?: return problem(400, "plan_profile_requires_environment")
+        if (environment !is String || environment.isBlank()) return problem(400, "invalid_plan_environment")
+        if (environment == applyEnvironment) return problem(400, "plan_environment_equals_apply")
+        val explicit = (declared["scopes"] as? List<*>)?.map { it.toString() }
+        val scopes = when {
+            explicit == null -> trustScopes.filter { it.endsWith(".read") }
+            explicit.isEmpty() -> return problem(400, "plan_scopes_empty")
+            explicit.any { !it.endsWith(".read") } -> return problem(400, "plan_scope_not_read_only")
+            explicit.any { it !in trustScopes } -> return problem(400, "plan_scope_not_subset")
+            else -> explicit
+        }
+        if (scopes.isEmpty()) return problem(400, "plan_scopes_empty")
+        callerScopes?.let { held -> if (scopes.any { it !in held }) return problem(403, "scope_not_grantable") }
+        return linkedMapOf<String, Any?>("environment" to environment, "scopes" to scopes)
     }
 
     fun seedGrant(subject: String, relation: String, objectRef: String) {

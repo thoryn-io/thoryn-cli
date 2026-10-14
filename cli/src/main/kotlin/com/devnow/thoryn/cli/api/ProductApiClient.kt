@@ -446,6 +446,10 @@ class ProductApiClient(
     override fun deleteWorkloadIdentityTrust(id: String, confirmSlug: String?): Unit =
         deleteNoContent("/api/v1/workload-identity/trusts/${encode(id)}", confirmSlug)
 
+    // SSO-3702 (product-api SSO-3701) — the ONE additive trust mutation: add the plan profile, keep the wi_ client.
+    override fun setWorkloadIdentityTrustPlanProfile(id: String, body: Map<String, Any?>): JsonNode =
+        post("/api/v1/workload-identity/trusts/${encode(id)}/plan-profile", mapper.valueToTree<JsonNode>(body.withoutNulls()))
+
     /** Drop null members (recursively through nested maps) so an omitted option is absent, not `null`. */
     private fun Map<String, Any?>.withoutNulls(): Map<String, Any?> =
         filterValues { it != null }.mapValues { (_, v) ->

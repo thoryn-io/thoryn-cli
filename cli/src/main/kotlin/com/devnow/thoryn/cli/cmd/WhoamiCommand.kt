@@ -100,6 +100,9 @@ class WhoamiCommand : Callable<Int> {
             put("issuer", tokens.issuer)
             put("gateway", tokens.gateway)
             put("scopes", tokens.scope ?: claims["scope"]?.asString())
+            // SSO-3702 — a workload identity session's trust PROFILE (apply / plan): which GitHub environment the job
+            // ran in decided which scope set the hub minted; a plan session is read-only by the hub's construction.
+            tokens.profile?.takeIf { it.isNotBlank() }?.let { put("profile", LoginCommand.profileLine(it)) }
             put("tokenExpiresAt", expiresAtIso)
             put("tokenStatus", status)
             // SSO-3199 — RFC 9449. `dpopKeyThumbprint` is this installation's `jkt`; `dpopBound` says
@@ -154,6 +157,7 @@ class WhoamiCommand : Callable<Int> {
                 "issuer" to n["issuer"]?.asString(),
                 "gateway" to n["gateway"]?.asString(),
                 "scopes" to n["scopes"]?.asString(),
+                "profile" to n["profile"]?.asString(),
                 "tokenExpiresAt" to n["tokenExpiresAt"]?.asString(),
                 "tokenStatus" to n["tokenStatus"]?.asString(),
                 "dpopKeyThumbprint" to n["dpopKeyThumbprint"]?.asString(),

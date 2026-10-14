@@ -345,8 +345,12 @@ thoryn keys retirements get <id> --kind <kind>                                  
 # ServiceAccount token is the credential; read from a FILE by the Thoryn init container, see examples/kubernetes/).
 thoryn workload-identity trusts create --name <n> --repository <owner/repo> --scope <tenant:…> [--environment e]
     [--owner-id n --repository-id n] [--github-environment <gh-env>] [--ref <ref>] [--github-hosted-runners-only] [--confirm-production]
+    [--plan-environment <gh-env> [--plan-scope <tenant:…read>…]]   # SSO-3702: the PLAN profile — a second GitHub environment minted
+                                                                   # read-only scopes (derived: the .read members of --scope) — one trust, one wi_
 thoryn workload-identity trusts create --provider kubernetes --name <n> --issuer <https url> --scope <tenant:…> [--environment e]
     [--namespace <ns> [--service-account <sa>]] [--jwks-file <cluster-jwks.json>] [--confirm-production]   # production: both pins
+thoryn workload-identity trusts set-plan-profile <id> --plan-environment <gh-env> [--plan-scope <tenant:…read>…]   # POST …/{id}/plan-profile
+                                                                   # the ONE additive mutation: adds the plan profile, keeps the wi_ client (409 once set)
 thoryn workload-identity trusts list [--limit n] [--cursor c]         # GET    /api/v1/workload-identity/trusts
 thoryn workload-identity trusts get <id>                              # GET    /api/v1/workload-identity/trusts/{id} (+ the sign-in line)
 thoryn workload-identity trusts delete <id> [--yes] [--confirm <slug>] # DELETE /api/v1/workload-identity/trusts/{id}
@@ -666,6 +670,66 @@ Compare the job above with the trust (`thoryn workload-identity trusts get <id>`
   deliberately.
 - The `tenant:workload-identity.*` scopes are part of the default `thoryn login` set. They are granted to
   the `cli` client by oathy hub V192, which must be deployed before a CLI release that requests them.
+
+#### One trust, two profiles — the plan job (SSO-3702; SSO-3699 option B)
+
+A repository that provisions **production** from code runs two kinds of job on the **same `main`**: a
+read-only **plan** on every pull request and a reviewed **apply** on merge (oauthy converge ADR Amendment 5).
+A dispatched run executes on the default branch either way, so the GitHub **environment** is the only
+thing that separates "may read" from "may write" — and until SSO-3702 that meant two trusts, two `wi_`
+clients, two connection files and a plan identity the ownership gate could not tell from a foreign
+repository (`owned_elsewhere` on the repository's own plan). Oauthy ADR
+`2026-10-14-plan-identity-and-resource-ownership` (accepted, option B) collapses that into **ONE trust with
+two scope profiles**:
+
+- the **apply profile** — `--github-environment` (the reviewed environment) with the trust's `--scope` set;
+- an optional **plan profile** — `--plan-environment` (a second, **unprotected** GitHub environment, e.g.
+  `<apply>-plan`, so it runs on every pull request) whose jobs the hub mints **read-only scopes only**: the
+  `.read` members of `--scope`, derived by the hub, or an explicit `--plan-scope` subset (each a
+  `tenant:<area>.read`, each among `--scope`).
+
+```bash
+# At create — one trust, both profiles:
+thoryn workload-identity trusts create --name thoryn-cli-ci --repository thoryn-io/thoryn-cli \
+  --owner-id 229451779 --repository-id 1361536515 --github-environment thoryn-provision-e2e \
+  --ref refs/heads/main --github-hosted-runners-only --confirm-production \
+  --scope "tenant:environments.read tenant:environments.write tenant:applications.read tenant:applications.write tenant:access.read tenant:access.write" \
+  --plan-environment thoryn-provision-e2e-plan            # plan scopes derived: the three .read members
+
+# Or later, on an EXISTING trust — the ONE additive mutation; the wi_ client, its owner relation and the
+# committed connection.json all stay (nothing to re-paste). Set once: 409 plan_profile_already_set after that.
+thoryn workload-identity trusts set-plan-profile <trust-id> --plan-environment thoryn-provision-e2e-plan \
+  [--plan-scope "tenant:environments.read tenant:access.read"]
+```
+
+**The hub decides by the job token's `environment` claim** and mints only the matched profile's scopes: a
+plan job asking for a write scope is refused at sign-in with `invalid_scope` and
+`error_description: scope_outside_plan_profile` (an apply job asking beyond the trust's scopes:
+`scope_outside_apply_profile`); a job in neither environment is `environment_mismatch`. Least privilege is
+structural — no second trust has to be configured correctly for a plan token to be unable to write.
+
+**One `connection.json`, no `auth.plan`, no `connection.plan.json`.** `thoryn login --connection` reads the
+job's own OIDC `environment` claim: in the connection's `auth.github.environment` (the apply environment)
+it requests `auth.scopes` exactly, as always; in any **other** environment it sends **no `scope`**, so the
+hub mints the matched plan profile — a plan job never asks for a write scope. The contract does not
+declare the plan scopes because it could add nothing the hub does not already enforce (at best it would ask
+for less, at worst for a write the hub refuses). The sign-in line names the profile:
+
+```text
+Signed in (workload identity / client 'wi_10a7…' at https://thoryn.auth.stg.thoryn.org, as …).
+Profile: plan (read-only) — this job runs in GitHub environment 'thoryn-provision-e2e-plan', not the trust's apply environment 'thoryn-provision-e2e', so no scope was requested and the hub minted the trust's plan profile. Writes are refused by design.
+Scopes: tenant:environments.read tenant:applications.read tenant:access.read
+```
+
+`thoryn login --status` and `thoryn whoami` print the same `profile`, and a write refused in a plan session
+says it is the plan profile at work rather than suggesting a login with more scopes. `trusts get` / `list`
+render `planEnvironment`, `planScopes` and both `subjectPatterns` (apply, then plan). Since the plan runs as the
+repository's **one** identity — the `owner` of what it provisions — the engine's ownership gate is green for
+its own resources and stays `owned_elsewhere` for anyone else's (SSO-3659 / SSO-3673, unchanged).
+
+GitHub only for now: a Forgejo job token has no `environment` claim (its selector is the forge-side App
+story's), a Kubernetes trust has no plan jobs (`plan_profile_unsupported`). Needs oauthy SSO-3700 (hub) and
+SSO-3701 (product-api) deployed; the dogfood migration of this repository's own trust is SSO-3704.
 
 This retargets SSO-2879's `--workload-identity` (an operator-registered token exchange signed with a CI
 key; its `--tenant`, `--wif-*` and `--subject-token` flags are gone).
@@ -1338,6 +1402,9 @@ resources:
         ref: refs/heads/main            # exact
         githubHostedRunnersOnly: true
       scopes: [tenant:applications.read, tenant:applications.write]
+      plan:                             # SSO-3702 — the PLAN profile (github_actions only): a second GitHub environment whose
+        environment: staging-plan       # jobs are minted read-only scopes only; must differ from github.environment
+        # scopes: [tenant:applications.read]   # optional explicit .read subset of `scopes`; omitted ⇒ derived by the hub
   - kind: workloadIdentityTrust
     name: forge-main
     spec:
@@ -1369,6 +1436,18 @@ What `thoryn provision` does with it:
   **`workload_identity_trust_immutable`**, naming the fix — declare what is live, or
   `thoryn workload-identity trusts delete <id>` and re-apply to re-create it. Removal is only through
   `--prune` / `destroy` (the production plane gated by `--confirm <workspace-slug>`), clients first.
+- **The one additive exception — `plan:` (SSO-3702).** A `github_actions` trust's plan profile is compared
+  like a pin (`plan.environment`; `plan.scopes` only when the file lists them — a derived declaration
+  matches whatever the hub derived), with one exception: a **declared profile on a live trust that has
+  none** is a plain `update` that calls the additive `POST …/{id}/plan-profile` (`~ workloadIdentityTrust
+  …: plan profile added`) — the `wi_` client, its `owner` relation and the consumer's `connection.json` stay,
+  and the receipt keeps the same id. A live profile that **differs** from the declared one is the red plan
+  `workload_identity_trust_immutable` ("re-create the trust"). The file refuses what the API refuses, with
+  its codes: `plan_profile_unsupported` (not `github_actions`), `plan_profile_requires_environment`,
+  `plan_environment_equals_apply`, `plan_scope_not_read_only`, `plan_scope_not_subset`, `plan_scopes_empty`.
+  The printed `connection.json` is unchanged — one file serves both profiles (the hub decides by the job's
+  `environment` claim); `plan` shows `plan-profile <env> [<scopes>]` on the trust's row and `import`
+  renders a live profile with its scopes made explicit.
 - **The receipt records** the trust id, its **`wi_…` workload client** (`attributes.clientId`), its
   `audience` and `provider` — nothing secret exists on a trust.
 - **The scope ceiling.** A trust may carry only `tenant:` scopes the **applying identity itself holds**
@@ -2195,6 +2274,12 @@ thoryn workload-identity trusts create --name thoryn-cli-ci \
   --scope "tenant:environments.read tenant:environments.write tenant:applications.read tenant:applications.write tenant:access.read tenant:access.write" \
   --confirm-production
 
+# 1b) The plan profile (SSO-3702; SSO-3699 option B) — the App's read-only plan job runs in the UNPROTECTED
+#     GitHub environment thoryn-provision-e2e-plan as this SAME trust. Add it at create (--plan-environment
+#     thoryn-provision-e2e-plan, plan scopes derived) or later, additively, on the existing trust:
+thoryn workload-identity trusts set-plan-profile <trust-id> --plan-environment thoryn-provision-e2e-plan
+#     Nothing to re-paste: the wi_ client stays. (The dogfood migration of this repository's trust is SSO-3704.)
+
 # 2) Paste the printed clientId (wi_…) into .thoryn/connection.json (auth.clientId) and into the sandbox's
 #    grants: subject in .thoryn/provision.yaml; open a pull request. Then converge the grant and remove the
 #    retired client in ONE reviewed apply: `thoryn provision apply --file .thoryn/provision.yaml --prune
@@ -2338,7 +2423,7 @@ thoryn-cli/
     │   │   ├── SelectedWorkspaceStore.kt                    # SSO-1552 records the switched-into workspace
     │   │   ├── AuditCommand.kt                              # SSO-1552 audit query (config + auth events)
     │   │   ├── AuditReplayCommand.kt                        # SSO-940b
-    │   │   ├── WorkloadIdentityCommand.kt                   # SSO-3308 `workload-identity trusts` (github_actions); SSO-3684 --provider kubernetes
+    │   │   ├── WorkloadIdentityCommand.kt                   # SSO-3308 `workload-identity trusts` (github_actions); SSO-3684 --provider kubernetes; SSO-3702 --plan-environment / set-plan-profile
     │   │   ├── connection/Connection.kt                     # SSO-2948 the connection contract (+ examples/connection.schema.json)
     │   │   └── operator/                                    # SSO-3356 `operator login|logout|custom-domain` (operator plane)
     │   ├── config/

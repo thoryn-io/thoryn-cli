@@ -223,10 +223,17 @@ thoryn access revoke client:wi_10a7b379c79f7d1353f5798d viewer application:cli
 #    (The trust itself already exists — SSO-3690 — and .thoryn/trusts.provision.yaml adopts it by name; applying
 #    that file from this session is optional reproducibility, not a step the loop needs.)
 
-# 4) PLANNED — after oauthy SSO-3700 ships the plan profile (SSO-3704 is the dogfood migration): give the ONE
-#    trust its plan profile, keyed on the unprotected environment, so the plan job's sign-in is minted the
-#    read-only scopes. The verb and its flags are SSO-3702's to settle; the intended shape is
-#      thoryn workload-identity trusts set-plan-profile thoryn-cli-ci --plan-environment thoryn-provision-e2e-plan
+# 4) PLANNED — after oauthy SSO-3700 (hub) + SSO-3701 (product-api) ship the plan profile (SSO-3704 is the
+#    dogfood migration): give the ONE trust its plan profile, keyed on the unprotected environment, so the plan
+#    job's sign-in is minted the read-only scopes. The verb and its flags shipped with SSO-3702 (this CLI):
+#      thoryn workload-identity trusts set-plan-profile <trust-id> --plan-environment thoryn-provision-e2e-plan
+#    (the id from `thoryn workload-identity trusts list`; plan scopes DERIVED — the three .read members —
+#    or pinned with --plan-scope "tenant:environments.read tenant:applications.read tenant:access.read").
+#    It is ADDITIVE: the wi_ client, its `owner` on application:cli and connection.json stay as they are —
+#    nothing to re-paste. Declaratively the same is `plan: { environment: thoryn-provision-e2e-plan }` under
+#    the trust in .thoryn/trusts.provision.yaml (a founder's `provision apply` of that file converges it through
+#    the same additive call). connection.json needs NO change: `thoryn login --connection` reads the job's own
+#    OIDC environment claim and requests no scope outside thoryn-provision-e2e, so the hub mints the plan profile.
 #    Until then the plan job fails at sign-in with environment_mismatch (see the dependency below).
 
 # 5) Merge → the first plan check appears on the next .thoryn/ pull request (once the App is installed and the

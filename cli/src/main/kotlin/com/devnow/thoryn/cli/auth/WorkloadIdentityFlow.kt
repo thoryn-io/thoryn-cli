@@ -81,9 +81,20 @@ class WorkloadIdentityFlow(
      * @param scope space-separated scopes to request (a subset of the trust's), or null/blank to request
      *   none and receive the trust's full set.
      */
-    fun run(scope: String? = null): Tokens {
+    fun run(scope: String? = null): Tokens = run { _ -> scope }
+
+    /**
+     * SSO-3702 (SSO-3699 option B) — like [run], with the scope decided AFTER the job's own identity token is in
+     * hand: [scopeFor] receives the token's public [JobIdentity] and answers the space-separated scopes to request,
+     * or null to request none. This is how `login --connection` picks the trust's PROFILE from the job's
+     * `environment` claim ([WorkloadProfile.select]): a job in the trust's apply environment requests the
+     * connection's scopes; a job in any other environment omits `scope`, so the hub mints exactly the matched
+     * (plan) profile's read-only set — never a write scope from a plan job.
+     */
+    fun run(scopeFor: (JobIdentity) -> String?): Tokens {
         val jobToken = requestJobToken()
         val identity = JobIdentity.of(jobToken)
+        val scope = scopeFor(identity)
         val request = HttpRequest.newBuilder()
             .uri(URI.create(tokenEndpoint))
             .timeout(Duration.ofSeconds(15))
@@ -366,6 +377,37 @@ data class JobIdentity(
                 kubernetesServiceAccount = c["kubernetes.io"]?.get("serviceaccount")?.get("name")?.takeUnless { it.isNull }?.asString()?.takeIf { it.isNotBlank() },
             )
         }
+    }
+}
+
+/**
+ * SSO-3702 (SSO-3699 option B; oauthy ADR `2026-10-14-plan-identity-and-resource-ownership`) — the two scope
+ * PROFILES of ONE `github_actions` trust, selected by the hub from the job token's `environment` claim: the
+ * **apply** profile (the trust's GitHub environment — the reviewed one — and its full scope set) and the
+ * optional **plan** profile (another GitHub environment, a read-only subset). One trust, one `wi_` client,
+ * one `connection.json`; the environment is the only thing that separates "may read" from "may write".
+ */
+enum class WorkloadProfile(val wire: String) {
+    APPLY(Tokens.PROFILE_APPLY),
+    PLAN(Tokens.PROFILE_PLAN);
+
+    companion object {
+        /**
+         * Which profile the hub will match for [identity], as far as the CLI can tell from the connection's
+         * `auth.github.environment` ([applyEnvironment]): the job's `environment` claim equal to it ⇒ [APPLY];
+         * any OTHER declared environment ⇒ [PLAN]; null when the CLI cannot tell — no apply environment known
+         * (no pin in the connection, or a sandbox trust that pins none), a job declaring no environment at all
+         * (a production trust refuses it anyway, `environment_mismatch`), or a Kubernetes token (no profiles).
+         * The hub decides; this only chooses whether to send `scope`. A `null` answer keeps today's behaviour.
+         */
+        fun select(identity: JobIdentity, applyEnvironment: String?): WorkloadProfile? {
+            val apply = applyEnvironment?.trim()?.takeIf { it.isNotEmpty() } ?: return null
+            if (identity.isKubernetes) return null
+            val claimed = identity.environment ?: return null
+            return if (claimed == apply) APPLY else PLAN
+        }
+
+        fun of(wire: String?): WorkloadProfile? = entries.firstOrNull { it.wire == wire }
     }
 }
 

@@ -239,7 +239,13 @@ class ProvisionCommand : Callable<Int> {
             // SSO-3659 — where apply will deliver the minted client secret (a line; no secret exists at plan time).
             plan.changes.forEach { c -> c.secretSink?.let { t -> println("      ${c.kind} ${c.name}: deliver client secret → ${t.label}") } }
             // SSO-3689 — a live trust's workload client and audience (what its consumer's connection.json names; apply prints that document).
-            plan.changes.forEach { c -> c.trust?.let { t -> println("      ${c.kind} ${c.name}: clientId ${t["clientId"]} audience ${t["audience"]} (connection.json is printed by apply, never written)") } }
+            plan.changes.forEach { c ->
+                c.trust?.let { t ->
+                    // SSO-3702 — a trust's plan profile, when it carries one (the same connection.json serves both profiles).
+                    val planProfile = (t["plan"] as? Map<*, *>)?.let { p -> " plan-profile ${p["environment"]} [${(p["scopes"] as? List<*>)?.joinToString(" ") ?: ""}]" } ?: ""
+                    println("      ${c.kind} ${c.name}: clientId ${t["clientId"]} audience ${t["audience"]}$planProfile (connection.json is printed by apply, never written)")
+                }
+            }
             // SSO-3413 / SSO-3414 — a customDomain's state, the issuer in use and the DNS records to publish.
             plan.changes.forEach { c ->
                 val d = c.customDomain ?: return@forEach

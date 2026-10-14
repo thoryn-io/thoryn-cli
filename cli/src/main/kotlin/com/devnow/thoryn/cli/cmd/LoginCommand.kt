@@ -29,6 +29,7 @@ import com.devnow.thoryn.cli.auth.WorkloadIdentityBinding
 import com.devnow.thoryn.cli.auth.WorkloadIdentityDiagnostics
 import com.devnow.thoryn.cli.auth.WorkloadIdentityException
 import com.devnow.thoryn.cli.auth.WorkloadIdentityFlow
+import com.devnow.thoryn.cli.auth.WorkloadProfile
 import com.devnow.thoryn.cli.cmd.connection.Connection
 import com.devnow.thoryn.cli.cmd.connection.ConnectionException
 import com.devnow.thoryn.cli.config.ThorynConfig
@@ -887,6 +888,9 @@ class LoginCommand : Callable<Int> {
             },
             // SSO-3415 — a derived audience was already probed (and, if it moved, its successor too).
             alreadyProbed = connection.audience == null,
+            // SSO-3702 — the trust's APPLY environment, as the contract mirrors it: the job's own `environment` claim
+            // against it decides whether the connection's scopes are requested (apply) or none (plan).
+            applyEnvironment = connection.github?.environment?.takeIf { connection.effectiveProvider == Connection.PROVIDER_GITHUB_ACTIONS },
         )
     }
 
@@ -941,6 +945,14 @@ class LoginCommand : Callable<Int> {
         provider: String? = null,
         /** SSO-3684 — a `kubernetes` trust's pins, for the refusal diagnostics. */
         kubernetesPins: KubernetesPins? = null,
+        /**
+         * SSO-3702 (SSO-3699 option B) — the trust's APPLY GitHub environment when the caller knows it (a connection's
+         * `auth.github.environment`). With it, the scope decision is made per job token: a job whose `environment`
+         * claim equals it requests [requestedScope] as today; a job in any OTHER environment requests NO scope, so
+         * the hub mints exactly the matched (plan) profile's read-only scopes — a plan job never asks for a write
+         * scope. Null ⇒ today's behaviour (the flag form, a Kubernetes token, a connection without the pin).
+         */
+        applyEnvironment: String? = null,
     ): Int {
         try {
             IssuerUrlValidator.validate(audience, devMode)
@@ -977,7 +989,12 @@ class LoginCommand : Callable<Int> {
             }?.let { return it }
         }
 
-        val binding = WorkloadIdentityBinding(clientIdValue, audience, tokenEndpoint, requestedScope, pins, provider, kubernetesPins)
+        // SSO-3702 — the profile the job's own token selects (known only once the token is in hand), and the scope
+        // actually sent: the connection's scopes in the apply environment, NONE in any other (the plan profile).
+        var selected: WorkloadProfile? = null
+        var jobEnvironment: String? = null
+        fun scopeSent(): String? = if (selected == WorkloadProfile.PLAN) null else requestedScope
+        fun binding() = WorkloadIdentityBinding(clientIdValue, audience, tokenEndpoint, scopeSent(), pins, provider, kubernetesPins, selected)
         val flow = WorkloadIdentityFlow(
             clientId = clientIdValue,
             audience = audience,
@@ -986,7 +1003,11 @@ class LoginCommand : Callable<Int> {
             tokenFile = tokenFile?.let { java.nio.file.Path.of(it) },
         )
         return try {
-            val tokens = flow.run(requestedScope)
+            val tokens = flow.run { identity ->
+                jobEnvironment = identity.environment
+                selected = WorkloadProfile.select(identity, applyEnvironment)
+                scopeSent()
+            }
             persistSession(
                 tokens.copy(
                     issuer = audience,
@@ -997,12 +1018,21 @@ class LoginCommand : Callable<Int> {
                     workspace = workspaceSlug ?: ThorynConfig.workspaceOfIssuer(audience),
                     tokenEndpoint = tokenEndpoint,
                     tokenFile = tokenFile,
+                    profile = selected?.wire,
                 ),
             )
             // SSO-2863 — a fresh login resets the base tenant; drop any stale workspace selection.
             SelectedWorkspaceStore().clear()
             val who = com.devnow.thoryn.cli.auth.JwtClaims.of(tokens.accessToken)["sub"]?.asString() ?: clientIdValue
             println("Signed in (workload identity / client '$clientIdValue' at $audience, as $who).")
+            when (selected) {
+                WorkloadProfile.PLAN -> println(
+                    "Profile: plan (read-only) — this job runs in GitHub environment '${jobEnvironment ?: "(none)"}', not the trust's apply " +
+                        "environment '$applyEnvironment', so no scope was requested and the hub minted the trust's plan profile. Writes are refused by design.",
+                )
+                WorkloadProfile.APPLY -> println("Profile: apply (GitHub environment '$applyEnvironment' — the trust's scopes).")
+                null -> {}
+            }
             tokens.scope?.let { println("Scopes: $it") }
             val minutes = tokens.expiresAtEpochSecond?.let { (it - System.currentTimeMillis() / 1000) / 60 }
             println(
@@ -1016,7 +1046,7 @@ class LoginCommand : Callable<Int> {
             )
             EXIT_OK
         } catch (e: WorkloadIdentityException) {
-            System.err.println(WorkloadIdentityDiagnostics.render(e, binding))
+            System.err.println(WorkloadIdentityDiagnostics.render(e, binding()))
             EXIT_WORKLOAD_IDENTITY_FAILED
         }
     }
@@ -1240,6 +1270,8 @@ class LoginCommand : Callable<Int> {
                 println("Signed in — access token valid for ${mins}m$suffix.")
             }
         }
+        // SSO-3702 — a workload identity session names the trust profile it signed in with.
+        tokens.profile?.let { println("Profile: ${profileLine(it)}") }
         tokens.scope?.let { println("Scopes: $it") }
         return 0
     }
@@ -1382,6 +1414,16 @@ class LoginCommand : Callable<Int> {
          * SSO-3182 — the exact re-login line for a session: `thoryn login --workspace <slug>` when the
          * session recorded (or its tenant issuer names) a workspace, else plain `thoryn login`.
          */
+        /**
+         * SSO-3702 — the one-line description of a workload identity session's trust PROFILE for `login --status` /
+         * `whoami`: `plan` is read-only by the hub's construction, `apply` holds the trust's scopes.
+         */
+        internal fun profileLine(profile: String): String = when (WorkloadProfile.of(profile)) {
+            WorkloadProfile.PLAN -> "plan (read-only — the trust's plan profile; the hub refuses every write scope in this GitHub environment)"
+            WorkloadProfile.APPLY -> "apply (the trust's reviewed GitHub environment; the trust's scopes)"
+            null -> profile
+        }
+
         internal fun reLoginCommand(tokens: Tokens?): String {
             // SSO-3308 — a workload identity session re-signs-in with the same trust binding, inside a job.
             if (tokens?.authMode == Tokens.AUTH_MODE_WORKLOAD_IDENTITY) {

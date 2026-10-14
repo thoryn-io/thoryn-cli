@@ -516,6 +516,8 @@ internal object CommandSupport {
                     workspace = current.workspace,
                     tokenEndpoint = tokenEndpoint,
                     tokenFile = tokenFile,
+                    // SSO-3702 — the same job, the same environment claim: the profile the login matched still holds.
+                    profile = current.profile,
                 )
             runCatching { TokenStoreFactory.default().write(minted) }
             minted
@@ -753,13 +755,18 @@ internal object CommandSupport {
             structured["requiredScope"] = requiredScope
             structured["loginHint"] = ScopeRegistry.loginHintForScope(requiredScope)
         }
+        // SSO-3702 — a write refused in a PLAN-profile workload session is the hub's ceiling at work, not a login
+        // to re-run with more scopes: say so, so the operator looks at the job's GitHub environment instead.
+        val planSession = ex.isInsufficientScope && planProfileSession()
+        if (planSession) structured["profile"] = Tokens.PROFILE_PLAN
         when (format) {
             OutputFormat.JSON -> Printers.json(structured, out)
             OutputFormat.YAML -> Printers.yaml(structured, out)
             OutputFormat.TABLE -> {
                 val description = ex.errorDescription?.let { " — $it" } ?: ""
                 err.println("Error: ${ex.errorCode ?: "HTTP ${ex.httpStatus}"}$description")
-                if (requiredScope != null && ex.isInsufficientScope) {
+                if (planSession) err.println(PLAN_PROFILE_WRITE_REFUSED)
+                if (requiredScope != null && ex.isInsufficientScope && !planSession) {
                     err.println("Required scope: $requiredScope")
                     err.println("Run: ${ScopeRegistry.loginHintForScope(requiredScope)}")
                 }
@@ -767,6 +774,16 @@ internal object CommandSupport {
         }
         return EXIT_HTTP_ERROR
     }
+
+    /** SSO-3702 — the line every write refusal of a plan-profile session carries. */
+    const val PLAN_PROFILE_WRITE_REFUSED: String =
+        "This session signed in with the trust's PLAN profile (read-only): the hub mints no write scope to a job outside the " +
+            "trust's apply GitHub environment, whatever is requested. Writes belong to the apply job in the reviewed environment."
+
+    /** SSO-3702 — true when the stored session is a workload identity session the login stamped as the plan profile. */
+    private fun planProfileSession(): Boolean =
+        runCatching { TokenStoreFactory.default().read() }.getOrNull()
+            ?.takeIf { it.authMode == Tokens.AUTH_MODE_WORKLOAD_IDENTITY }?.profile == Tokens.PROFILE_PLAN
 
     /**
      * SSO-2413 — render the production-confirmation guard response. TABLE prints the
