@@ -268,8 +268,16 @@ class ProvisionFile private constructor(
         val TRUST_PROVIDERS: Set<String> get() = TRUST_PIN_BLOCKS.keys
         const val TRUST_SCOPES = "scopes"
         const val TRUST_CONFIRM_PRODUCTION = "confirmProduction"
+        /**
+         * SSO-3702 (SSO-3699 option B) — a `github_actions` trust's optional PLAN profile `{ environment, scopes? }`: a
+         * second GitHub environment whose jobs the hub mints read-only scopes only (the `.read` members of `spec.scopes`
+         * when `scopes` is omitted — derived by the hub). Sent on create; on a live trust WITHOUT a profile it is converged
+         * by the one additive `set plan profile` call; a live profile that differs is `workload_identity_trust_immutable`.
+         */
+        const val TRUST_PLAN = "plan"
+        val TRUST_PLAN_KEYS: Set<String> = setOf("environment", TRUST_SCOPES)
         /** The `spec` members a trust accepts (the schema's `additionalProperties: false`). */
-        val TRUST_SPEC_KEYS: Set<String> = setOf("provider", TRUST_SCOPES, TRUST_CONFIRM_PRODUCTION) + TRUST_PIN_BLOCKS.values
+        val TRUST_SPEC_KEYS: Set<String> = setOf("provider", TRUST_SCOPES, TRUST_CONFIRM_PRODUCTION, TRUST_PLAN) + TRUST_PIN_BLOCKS.values
         val GITHUB_PIN_KEYS: Set<String> = setOf("repository", "ownerId", "repositoryId", "environment", "ref", "githubHostedRunnersOnly")
         val FORGEJO_PIN_KEYS: Set<String> = setOf("instanceUrl", "owner", "ownerId", "repository", "repositoryId", "ref")
         val KUBERNETES_PIN_KEYS: Set<String> = setOf("issuer", "namespace", "serviceAccount", "jwks")
@@ -292,6 +300,17 @@ class ProvisionFile private constructor(
         const val ERR_INVALID_KUBERNETES_NAMESPACE = "invalid_kubernetes_namespace"
         const val ERR_INVALID_KUBERNETES_SERVICE_ACCOUNT = "invalid_kubernetes_service_account"
         const val ERR_INVALID_KUBERNETES_JWKS = "invalid_kubernetes_jwks"
+        // SSO-3702 — the plan profile's codes (product-api SSO-3701 / hub SSO-3700), mirrored for the file's own refusals.
+        const val ERR_PLAN_PROFILE_UNSUPPORTED = "plan_profile_unsupported"
+        const val ERR_PLAN_PROFILE_REQUIRES_ENVIRONMENT = "plan_profile_requires_environment"
+        const val ERR_INVALID_PLAN_ENVIRONMENT = "invalid_plan_environment"
+        const val ERR_PLAN_ENVIRONMENT_EQUALS_APPLY = "plan_environment_equals_apply"
+        const val ERR_PLAN_SCOPES_EMPTY = "plan_scopes_empty"
+        const val ERR_PLAN_SCOPE_NOT_READ_ONLY = "plan_scope_not_read_only"
+        const val ERR_PLAN_SCOPE_NOT_SUBSET = "plan_scope_not_subset"
+
+        /** SSO-3702 — a read-only workspace scope (`tenant:<area>.read`), the only kind a plan profile may carry. */
+        val READ_SCOPE_PATTERN = Regex("^tenant:[a-z-]+\\.read$")
 
         /** The production plane: no `environment`, or the `production` slug (mirrors [ProvisionEngine.PRODUCTION_ENV_SLUG]). */
         fun isProductionPlane(environment: String?): Boolean = environment == null || environment == ProvisionEngine.PRODUCTION_ENV_SLUG
@@ -795,6 +814,39 @@ class ProvisionFile private constructor(
             val block = TRUST_PIN_BLOCKS.getValue(provider)
             TRUST_PIN_BLOCKS.values.filter { it != block && spec[it]?.takeIf { n -> !n.isNull } != null }.forEach { other ->
                 v += "$where spec.$other does not belong to provider '$provider' — only spec.$block does"
+            }
+            // SSO-3702 — the plan profile: github_actions only, keyed on a DIFFERENT GitHub environment, read-only scopes
+            // that are a subset of spec.scopes (omitted ⇒ derived by the hub from the .read members of spec.scopes).
+            spec[TRUST_PLAN]?.takeIf { !it.isNull }?.let { plan ->
+                val pw = "$where spec.$TRUST_PLAN"
+                if (provider != PROVIDER_GITHUB_ACTIONS) {
+                    v += "$where $ERR_PLAN_PROFILE_UNSUPPORTED — only a github_actions trust carries a plan profile (the job's GitHub environment claim selects it); a '$provider' trust has none"
+                    return@let
+                }
+                if (!plan.isObject()) {
+                    v += "$pw must be an object { environment, scopes? }"
+                    return@let
+                }
+                rejectUnknownKeys(plan, TRUST_PLAN_KEYS, pw, v)
+                val environment = plan["environment"]?.takeIf { !it.isNull }
+                when {
+                    environment == null -> v += "$where $ERR_PLAN_PROFILE_REQUIRES_ENVIRONMENT — spec.$TRUST_PLAN.environment (the GitHub environment the plan jobs run in) is required"
+                    !environment.isTextual() || environment.asString().isBlank() -> v += "$where $ERR_INVALID_PLAN_ENVIRONMENT — spec.$TRUST_PLAN.environment must be a non-empty GitHub environment name"
+                    environment.asString().trim() == spec[block]?.get("environment")?.takeIf { it.isTextual() }?.asString()?.trim() ->
+                        v += "$where $ERR_PLAN_ENVIRONMENT_EQUALS_APPLY — spec.$TRUST_PLAN.environment '${environment.asString().trim()}' must differ from spec.$block.environment: the GitHub environment is what separates \"may read\" from \"may write\""
+                }
+                plan[TRUST_SCOPES]?.takeIf { !it.isNull }?.let { scopes ->
+                    if (!scopes.isArray()) {
+                        v += "$pw.$TRUST_SCOPES must be an array of tenant:<area>.read scopes"
+                        return@let
+                    }
+                    val raw = scopes.toList().map { if (it.isTextual()) it.asString().trim() else it.toString() }
+                    if (raw.isEmpty()) v += "$where $ERR_PLAN_SCOPES_EMPTY — spec.$TRUST_PLAN.$TRUST_SCOPES must list at least one scope, or be omitted to derive the .read members of spec.$TRUST_SCOPES"
+                    raw.filter { !READ_SCOPE_PATTERN.matches(it) }.distinct().forEach { v += "$where $ERR_PLAN_SCOPE_NOT_READ_ONLY — '$it' is not a tenant:<area>.read scope; a plan profile is read-only by construction" }
+                    val apply = spec[TRUST_SCOPES]?.takeIf { it.isArray() }?.toList()?.map { if (it.isTextual()) it.asString().trim() else it.toString() }.orEmpty()
+                    raw.filter { READ_SCOPE_PATTERN.matches(it) && it !in apply }.distinct().forEach { v += "$where $ERR_PLAN_SCOPE_NOT_SUBSET — plan scope '$it' is not among spec.$TRUST_SCOPES" }
+                    if (raw.size != raw.distinct().size) v += "$pw.$TRUST_SCOPES lists a scope twice"
+                }
             }
             val pins = spec[block]?.takeIf { !it.isNull }
             if (pins == null || !pins.isObject()) {

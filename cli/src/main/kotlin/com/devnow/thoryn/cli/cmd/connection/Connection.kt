@@ -28,6 +28,16 @@ import java.io.File
  *    projected ServiceAccount token — instead of the GitHub Actions runner. Optional `auth.kubernetes`
  *    pins (issuer, namespace, serviceAccount) play the role `auth.github` plays for GitHub.
  *
+ * **SSO-3702 — ONE connection per repository, no `auth.plan`, no `connection.plan.json`** (SSO-3699 option B,
+ * oauthy ADR `2026-10-14-plan-identity-and-resource-ownership`). A `github_actions` trust is ONE `wi_` client with
+ * two scope PROFILES — apply (its `github.environment`, the trust's scopes) and an optional plan (a second GitHub
+ * environment, read-only scopes) — and the HUB selects the profile from the job token's `environment` claim. The
+ * CLI only has to decide whether to send `scope`: in the apply environment ([github]`.environment`) it requests
+ * [scopes] exactly, as always; in any other environment it sends none, so the hub mints the matched plan profile.
+ * A declared `auth.plan` could add nothing the hub does not already enforce (it would at best ask for less, at
+ * worst ask for a write scope the hub refuses with `invalid_scope` / `scope_outside_plan_profile`), so the
+ * contract deliberately has no such member — `additionalProperties: false` keeps it out.
+ *
  * DATA, not code: the secret is NEVER in the file, only the [secretEnv] name. This class parses and
  * structurally validates against the bundled schema's contract (no third-party JSON-Schema engine —
  * the same hand-rolled, message-bearing approach the recipe suite uses); [load]/[parse] throw

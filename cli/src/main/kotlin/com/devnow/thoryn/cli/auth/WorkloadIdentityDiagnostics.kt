@@ -39,6 +39,12 @@ data class WorkloadIdentityBinding(
     val provider: String? = null,
     /** SSO-3684 — a `kubernetes` trust's pins, when the connection names them. */
     val kubernetesPins: KubernetesPins? = null,
+    /**
+     * SSO-3702 — the trust PROFILE the sign-in expected the hub to match, judged from the job's `environment`
+     * claim against [TrustPins.environment] ([WorkloadProfile.select]); null when the CLI could not tell. Decides
+     * whether [scope] was sent at all (a plan job sends none) and is named on a refusal.
+     */
+    val profile: WorkloadProfile? = null,
 )
 
 /**
@@ -190,8 +196,30 @@ object WorkloadIdentityDiagnostics {
                     appendLine("    $AUDIT_COMMAND")
                 }
                 "invalid_scope" -> {
-                    appendLine("Sign-in failed: the requested scope is not within the trust's scopes (HTTP ${e.status ?: 400}: invalid_scope).")
-                    appendLine("Request a subset of the trust's scopes, or no --scope at all to receive the trust's full set.")
+                    // SSO-3702 — the hub names the PROFILE whose ceiling refused the request (SSO-3700).
+                    val outside = profileOutside(e.errorDescription)
+                    when (outside) {
+                        WorkloadProfile.PLAN -> {
+                            appendLine("Sign-in failed: the requested scope is outside the trust's PLAN profile (HTTP ${e.status ?: 400}: invalid_scope, $REASON_OUTSIDE_PLAN).")
+                            appendLine(
+                                "This job runs in GitHub environment '${identity.environment ?: "(none)"}'" +
+                                    (binding.pins?.environment?.let { " — not the trust's apply environment '$it'" } ?: "") +
+                                    ", so the hub matched the trust's plan profile and mints only its read-only (.read) scopes there.",
+                            )
+                            appendLine("Fix: request no scope at all (the hub then mints the plan profile's scopes) — `thoryn login --connection` does this when")
+                            appendLine("auth.github.environment names the apply environment — or request only .read scopes. Never request a write scope from a plan job.")
+                        }
+                        WorkloadProfile.APPLY -> {
+                            appendLine("Sign-in failed: the requested scope is outside the trust's APPLY profile (HTTP ${e.status ?: 400}: invalid_scope, $REASON_OUTSIDE_APPLY).")
+                            appendLine("The trust's scopes are the ceiling for a job in its apply environment '${identity.environment ?: "(none)"}'. Request a subset of them")
+                            appendLine("(`thoryn workload-identity trusts get <id>` lists them), or no --scope at all to receive the trust's full set.")
+                        }
+                        null -> {
+                            appendLine("Sign-in failed: the requested scope is not within the trust's scopes (HTTP ${e.status ?: 400}: invalid_scope).")
+                            e.errorDescription?.let { appendLine("  platform said: ${sanitize(it)}") }
+                            appendLine("Request a subset of the trust's scopes, or no --scope at all to receive the trust's full set.")
+                        }
+                    }
                 }
                 else -> {
                     appendLine("Sign-in failed: ${e.message}.")
@@ -203,7 +231,25 @@ object WorkloadIdentityDiagnostics {
             appendLine(field("client id", binding.clientId))
             appendLine(field("audience", binding.audience))
             appendLine(field("token endpoint", binding.tokenEndpoint))
-            appendLine(field("scope", binding.scope ?: "(none requested — the trust's full set)"))
+            appendLine(
+                field(
+                    "scope",
+                    binding.scope ?: when (binding.profile) {
+                        WorkloadProfile.PLAN -> "(none requested — the hub mints the matched plan profile's read-only scopes)"
+                        else -> "(none requested — the trust's full set)"
+                    },
+                ),
+            )
+            // SSO-3702 — which profile the CLI expected the hub to match, and why.
+            binding.profile?.let { p ->
+                appendLine(
+                    field(
+                        "profile",
+                        "${p.wire} (job environment '${identity.environment ?: "(none)"}' " +
+                            (if (p == WorkloadProfile.APPLY) "= " else "≠ ") + "apply environment '${binding.pins?.environment}')",
+                    ),
+                )
+            }
             appendLine()
             val kubernetes = binding.provider == PROVIDER_KUBERNETES || (binding.provider == null && identity.isKubernetes)
             if (kubernetes) {
@@ -254,6 +300,20 @@ object WorkloadIdentityDiagnostics {
                 },
             )
         }
+    }
+
+    /** SSO-3702 / SSO-3700 — the hub's `error_description` when a plan-profile job asks for a scope outside the plan profile. */
+    const val REASON_OUTSIDE_PLAN: String = "scope_outside_plan_profile"
+
+    /** SSO-3702 / SSO-3700 — the hub's `error_description` when an apply-profile job asks for a scope outside the trust's scopes. */
+    const val REASON_OUTSIDE_APPLY: String = "scope_outside_apply_profile"
+
+    /** SSO-3702 — the profile an `invalid_scope` description names (`scope_outside_<profile>_profile`), or null. */
+    internal fun profileOutside(description: String?): WorkloadProfile? = when {
+        description == null -> null
+        description.contains(REASON_OUTSIDE_PLAN) -> WorkloadProfile.PLAN
+        description.contains(REASON_OUTSIDE_APPLY) -> WorkloadProfile.APPLY
+        else -> null
     }
 
     private fun field(name: String, value: String?): String = "  ${name.padEnd(20)} ${value ?: "(none)"}"

@@ -37,16 +37,31 @@ import java.util.concurrent.Callable
  * `kubectl get --raw /openid/v1/jwks`); a production trust pins both the namespace and the service account.
  * The documented manifest is `examples/kubernetes/` in this repository.
  *
+ * SSO-3702 (SSO-3699 **option B**, oauthy ADR `2026-10-14-plan-identity-and-resource-ownership`; hub SSO-3700,
+ * product-api SSO-3701) — **one trust, one `wi_` client, two scope PROFILES.** A `github_actions` trust pins
+ * its APPLY GitHub environment (the reviewed one) with its scopes, and may carry a **plan profile**
+ * `{ environment, scopes }`: a second GitHub environment (unprotected — a plan must run on every pull request)
+ * with a READ-ONLY subset of the scopes. The hub matches the job token's `environment` claim to either profile
+ * and mints only the matched profile's scopes — a plan job cannot obtain a write scope whatever it requests
+ * (`invalid_scope`, `scope_outside_plan_profile`). Plan scopes are DERIVED by default (the `.read` members of
+ * the apply scopes) and overridable with `--plan-scope` (a read-only subset). An existing trust gains the
+ * profile through ONE additive mutation, `set-plan-profile`, that keeps the `wi_` client — so the platform
+ * `owner` relation, the grants and the committed `connection.json` all stay. There is no second connection
+ * file: `thoryn login --connection` reads the job's own `environment` claim and requests the connection's
+ * scopes in the apply environment, none elsewhere.
+ *
  * Subcommands (all under `trusts`):
- *  - `create --name <n> --repository <owner/repo> --scope <s>… [pins] [--confirm-production]` — POST
+ *  - `create --name <n> --repository <owner/repo> --scope <s>… [pins] [--plan-environment <gh-env>
+ *     [--plan-scope <s>…]] [--confirm-production]`                                            — POST
  *  - `create --provider kubernetes --name <n> --issuer <https url> [--namespace <ns> --service-account <sa>]
  *     [--jwks-file <path>] --scope <s>… [--confirm-production]`                               — POST
+ *  - `set-plan-profile <id> --plan-environment <gh-env> [--plan-scope <s>…]`                 — POST …/{id}/plan-profile
  *  - `list [--limit n] [--cursor c]`                                                         — GET
  *  - `get <id>`                                                                              — GET …/{id}
  *  - `delete <id> [--yes] [--confirm <workspace-slug>]`                                      — DELETE …/{id}
  *
  * The environment is the one `--environment <slug>` names, else the one `env use` selected (production
- * otherwise). Scopes: create/delete → `tenant:workload-identity.write`, list/get →
+ * otherwise). Scopes: create/set-plan-profile/delete → `tenant:workload-identity.write`, list/get →
  * `tenant:workload-identity.read` (granted to the CLI's login clients by oathy hub V192; part of the
  * default `thoryn login` set). Writing needs the environment's `manager` relation, reading its `viewer`;
  * for anyone else the API answers 404. A trust can carry only `tenant:` scopes your own session holds.
@@ -64,7 +79,7 @@ class WorkloadIdentityCommand : Callable<Int> {
 
     override fun call(): Int {
         System.err.println("Usage: thoryn workload-identity trusts <subcommand>")
-        System.err.println("Subcommands: trusts create | list | get <id> | delete <id>")
+        System.err.println("Subcommands: trusts create | set-plan-profile <id> | list | get <id> | delete <id>")
         return CommandSupport.EXIT_USAGE
     }
 
@@ -73,12 +88,12 @@ class WorkloadIdentityCommand : Callable<Int> {
         name = "trusts",
         description = ["Manage the environment's workload identity trusts (one GitHub repository, or one Kubernetes service account, each)."],
         mixinStandardHelpOptions = true,
-        subcommands = [CreateSubcommand::class, ListSubcommand::class, GetSubcommand::class, DeleteSubcommand::class],
+        subcommands = [CreateSubcommand::class, SetPlanProfileSubcommand::class, ListSubcommand::class, GetSubcommand::class, DeleteSubcommand::class],
     )
     class TrustsCommand : Callable<Int> {
         override fun call(): Int {
             System.err.println("Usage: thoryn workload-identity trusts <subcommand>")
-            System.err.println("Subcommands: create | list | get <id> | delete <id>")
+            System.err.println("Subcommands: create | set-plan-profile <id> | list | get <id> | delete <id>")
             return CommandSupport.EXIT_USAGE
         }
     }
@@ -234,6 +249,28 @@ class WorkloadIdentityCommand : Callable<Int> {
         )
         var confirmProduction: Boolean = false
 
+        @Option(
+            names = ["--plan-environment"],
+            paramLabel = "<gh-env>",
+            description = [
+                "github_actions: the trust's PLAN profile — a second GitHub environment (unprotected, e.g. <apply>-plan) whose jobs the",
+                "hub mints READ-ONLY scopes only: the .read members of --scope, derived by the hub unless --plan-scope lists them. Must",
+                "differ from --github-environment. One trust, one wi_ client: `thoryn login --connection` picks the profile from the",
+                "job's own OIDC environment claim (SSO-3702). Omit it to add the profile later with `trusts set-plan-profile`.",
+            ],
+        )
+        var planEnvironment: String? = null
+
+        @Option(
+            names = ["--plan-scope"],
+            paramLabel = "<scope>",
+            description = [
+                "Only with --plan-environment: an explicit plan scope (repeatable, or space/comma-separated) — a .read scope among",
+                "--scope. Omitted: the hub DERIVES the plan scopes (every .read member of --scope).",
+            ],
+        )
+        var planScopeArgs: List<String> = emptyList()
+
         override val requiredScope: String = SCOPE_WRITE
 
         private val owner: String get() = repository.orEmpty().trim().substringBefore('/')
@@ -243,7 +280,11 @@ class WorkloadIdentityCommand : Callable<Int> {
 
         /** The requested scopes, split and de-duplicated in order. */
         internal val scopes: List<String>
-            get() = scopeArgs.flatMap { it.split(' ', ',') }.map { it.trim() }.filter { it.isNotEmpty() }.distinct()
+            get() = splitScopes(scopeArgs)
+
+        /** SSO-3702 — the explicit plan scopes (empty ⇒ derived by the hub). */
+        internal val planScopes: List<String>
+            get() = splitScopes(planScopeArgs)
 
         /** SSO-3684 — the parsed `--jwks-file`, set by [precheck] so the file is read (and judged) once, before any call. */
         private var jwks: Map<String, Any?>? = null
@@ -267,6 +308,13 @@ class WorkloadIdentityCommand : Callable<Int> {
                     "Error: a trust can carry only workspace (tenant:) scopes — not ${foreign.joinToString()}.",
                 )
                 return CommandSupport.EXIT_USAGE
+            }
+            // SSO-3702 — the plan profile's own rules, refused here before any call with the API's codes.
+            if (planEnvironment != null || planScopeArgs.isNotEmpty()) {
+                planProfileProblem(githubEnvironment, scopes, planEnvironment, planScopes)?.let {
+                    System.err.println("Error: $it")
+                    return CommandSupport.EXIT_USAGE
+                }
             }
             return null
         }
@@ -313,6 +361,9 @@ class WorkloadIdentityCommand : Callable<Int> {
                 "--github-environment".takeIf { githubEnvironment != null },
                 "--ref".takeIf { ref != null },
                 "--github-hosted-runners-only".takeIf { githubHostedRunnersOnly },
+                // SSO-3702 — a pod has no PR plan and no GitHub environment: no profiles (plan_profile_unsupported on the API).
+                "--plan-environment".takeIf { planEnvironment != null },
+                "--plan-scope".takeIf { planScopeArgs.isNotEmpty() },
             )
             if (githubOnly.isNotEmpty()) {
                 System.err.println("Error: ${githubOnly.joinToString(", ")} apply to --provider $PROVIDER_GITHUB_ACTIONS only.")
@@ -375,6 +426,8 @@ class WorkloadIdentityCommand : Callable<Int> {
                     pin,
                     "scopes" to scopes,
                     "confirmProduction" to confirmProduction.takeIf { it },
+                    // SSO-3702 — the plan profile, when declared at create (absent otherwise, never null).
+                    "plan" to planEnvironment?.let { planProfileBody(it, planScopes) },
                 ),
             )
             when (format) {
@@ -399,6 +452,78 @@ class WorkloadIdentityCommand : Callable<Int> {
         private fun workspaceSlugHint(body: JsonNode): String? =
             ThorynConfig.workspaceOfIssuer(text(body, "audience"))
                 ?: runCatching { TokenStoreFactory.default().read() }.getOrNull()?.workspace
+    }
+
+    /**
+     * SSO-3702 — `thoryn workload-identity trusts set-plan-profile <id> --plan-environment <gh-env> [--plan-scope …]`:
+     * the ONE additive mutation of a trust (SSO-3699 option B, decision (b)) — give an existing `github_actions`
+     * trust its plan profile and keep its `wi_` client, so nothing is re-created, re-pasted or re-owned. A profile
+     * is set once: to change it, re-create the trust (`409 plan_profile_already_set`).
+     */
+    @Command(
+        name = "set-plan-profile",
+        description = [
+            "Give an existing GitHub Actions trust its PLAN profile: a second GitHub environment whose jobs are minted read-only",
+            "scopes only (the .read members of the trust's scopes, or --plan-scope). Additive — the wi_ client, its owner relation",
+            "and the committed connection.json stay. Set once; to change it, re-create the trust.",
+        ],
+        mixinStandardHelpOptions = true,
+    )
+    class SetPlanProfileSubcommand : Base() {
+        @Parameters(index = "0", paramLabel = "<id>", description = ["The trust id (from `trusts create` or `trusts list`)."])
+        lateinit var id: String
+
+        @Option(
+            names = ["--plan-environment"],
+            paramLabel = "<gh-env>",
+            required = true,
+            description = ["The GitHub environment of the plan jobs (unprotected, e.g. <apply>-plan). Must differ from the trust's apply environment."],
+        )
+        lateinit var planEnvironment: String
+
+        @Option(
+            names = ["--plan-scope"],
+            paramLabel = "<scope>",
+            description = [
+                "An explicit plan scope (repeatable, or space/comma-separated): a .read scope among the trust's scopes.",
+                "Omitted: the hub DERIVES them — every .read member of the trust's scopes.",
+            ],
+        )
+        var planScopeArgs: List<String> = emptyList()
+
+        override val requiredScope: String = SCOPE_WRITE
+
+        internal val planScopes: List<String> get() = splitScopes(planScopeArgs)
+
+        override fun precheck(): Int? {
+            // The apply environment and the trust's scopes are only known to the API here; the local rules are the plan side's.
+            planProfileProblem(applyEnvironment = null, applyScopes = null, planEnvironment, planScopes)?.let {
+                System.err.println("Error: $it")
+                return CommandSupport.EXIT_USAGE
+            }
+            return null
+        }
+
+        override fun run(client: ProductApiClient, format: OutputFormat): Int {
+            val body = client.setWorkloadIdentityTrustPlanProfile(id.trim(), planProfileBody(planEnvironment, planScopes))
+            when (format) {
+                OutputFormat.TABLE -> {
+                    val out = System.out
+                    val plan = body["plan"]
+                    out.println(
+                        "Workload identity trust '${text(body, "name")}' (id ${text(body, "id")}) now carries a plan profile: GitHub environment " +
+                            "'${text(plan, "environment") ?: planEnvironment.trim()}' is minted ${planScopesOf(body).joinToString(" ").ifEmpty { "its read-only scopes" }} only.",
+                    )
+                    out.println("The wi_ client ${text(body, "clientId") ?: ""} is unchanged: nothing to re-paste, no owner or grant moves.".replace("  ", " "))
+                    out.println()
+                    Printers.record(trustFields(body), out)
+                    out.println()
+                    printPlanUsage(body, out)
+                }
+                else -> CommandSupport.emitRecord(format, body, ::trustFields)
+            }
+            return CommandSupport.EXIT_OK
+        }
     }
 
     /** `thoryn workload-identity trusts list` */
@@ -446,6 +571,11 @@ class WorkloadIdentityCommand : Callable<Int> {
                     System.out.println()
                     System.out.println("Sign in from the workflow with:")
                     System.out.println("    ${loginLine(body)}")
+                    // SSO-3702 — a trust with a plan profile: the plan job's sign-in requests NO scope.
+                    if (planOf(body) != null) {
+                        System.out.println()
+                        printPlanUsage(body, System.out)
+                    }
                 }
                 else -> CommandSupport.emitRecord(format, body, ::trustFields)
             }
@@ -513,6 +643,61 @@ class WorkloadIdentityCommand : Callable<Int> {
         private fun scopesOf(body: JsonNode): List<String> =
             body["scopes"]?.takeIf { it.isArray }?.toList()?.mapNotNull { it.asString() }.orEmpty()
 
+        /** Scope arguments split on space / comma, trimmed, de-duplicated in order. */
+        internal fun splitScopes(args: List<String>): List<String> =
+            args.flatMap { it.split(' ', ',') }.map { it.trim() }.filter { it.isNotEmpty() }.distinct()
+
+        /** SSO-3702 — the trust's `plan` profile object as the API renders it (`{environment, scopes}`), or null. */
+        internal fun planOf(body: JsonNode): JsonNode? = body["plan"]?.takeIf { it.isObject && !it.isNull }
+
+        /** SSO-3702 — the plan profile's scopes as rendered (empty when the trust has none). */
+        internal fun planScopesOf(body: JsonNode): List<String> =
+            planOf(body)?.get("scopes")?.takeIf { it.isArray }?.toList()?.mapNotNull { it.asString() }.orEmpty()
+
+        /** SSO-3702 — the trust's `subjectPatterns` (apply, then plan), falling back to the single `subjectPattern`. */
+        internal fun subjectPatternsOf(body: JsonNode): List<String> =
+            body["subjectPatterns"]?.takeIf { it.isArray }?.toList()?.mapNotNull { it.asString() }?.takeIf { it.isNotEmpty() }
+                ?: listOfNotNull(text(body, "subjectPattern"))
+
+        /** SSO-3702 — the `plan` request member: the environment, plus the explicit scopes only when given (derived otherwise). */
+        internal fun planProfileBody(environment: String, scopes: List<String>): Map<String, Any?> =
+            mapOf("environment" to environment.trim(), "scopes" to scopes.takeIf { it.isNotEmpty() })
+
+        /**
+         * SSO-3702 — what the API would refuse about a plan profile, refused first with the API's own codes: no plan scopes
+         * without a plan environment (`plan_profile_requires_environment`), a blank environment (`invalid_plan_environment`),
+         * the same environment as the apply one (`plan_environment_equals_apply`), a plan scope that is not a `.read`
+         * scope (`plan_scope_not_read_only`) or not among the apply scopes (`plan_scope_not_subset`). [applyEnvironment]
+         * and [applyScopes] are null when only the API knows them (`set-plan-profile`). Null ⇒ nothing to refuse here.
+         */
+        internal fun planProfileProblem(applyEnvironment: String?, applyScopes: List<String>?, planEnvironment: String?, planScopes: List<String>): String? {
+            val plan = planEnvironment?.trim()
+            if (plan.isNullOrEmpty()) {
+                return if (planScopes.isNotEmpty()) {
+                    "plan_profile_requires_environment — --plan-scope only goes with --plan-environment <gh-env>: the plan profile is keyed on the GitHub environment the plan jobs run in."
+                } else if (planEnvironment != null) {
+                    "invalid_plan_environment — --plan-environment must be a non-empty GitHub environment name."
+                } else {
+                    null
+                }
+            }
+            if (applyEnvironment != null && applyEnvironment.trim() == plan) {
+                return "plan_environment_equals_apply — the plan environment '$plan' must differ from the apply environment (--github-environment): " +
+                    "the GitHub environment is what separates \"may read\" from \"may write\"."
+            }
+            val notReadOnly = planScopes.filterNot { it.startsWith("tenant:") && it.endsWith(".read") }
+            if (notReadOnly.isNotEmpty()) {
+                return "plan_scope_not_read_only — a plan profile is read-only by construction: every --plan-scope must be a tenant:<area>.read scope, not ${notReadOnly.joinToString()}."
+            }
+            if (applyScopes != null) {
+                val notSubset = planScopes.filterNot { it in applyScopes }
+                if (notSubset.isNotEmpty()) {
+                    return "plan_scope_not_subset — every --plan-scope must be among the trust's --scope list; not ${notSubset.joinToString()}."
+                }
+            }
+            return null
+        }
+
         /** SSO-3684 — true for a `kubernetes` trust (by `provider`, else by the pin block present). */
         internal fun isKubernetesTrust(body: JsonNode): Boolean =
             text(body, "provider") == PROVIDER_KUBERNETES || (text(body, "provider") == null && body["kubernetes"]?.isObject == true)
@@ -531,6 +716,8 @@ class WorkloadIdentityCommand : Callable<Int> {
             return listOfNotNull(
                 listOfNotNull(text(github, "owner"), text(github, "repository")).joinToString("/").ifEmpty { null },
                 text(github, "environment")?.let { "env=$it" },
+                // SSO-3702 — the plan profile's environment, when the trust carries one.
+                text(planOf(node), "environment")?.let { "plan=$it" },
             ).joinToString(" ").ifEmpty { null }
         }
 
@@ -608,8 +795,12 @@ class WorkloadIdentityCommand : Callable<Int> {
                 "serviceAccount" to text(kubernetes, "serviceAccount"),
                 "jwksUri" to text(kubernetes, "jwksUri"),
                 "inlineKeyIds" to inlineKeyIds.takeIf { it.isNotEmpty() }?.joinToString(" "),
-                "subjectPattern" to text(body, "subjectPattern"),
+                // SSO-3702 — one anchored `sub` pattern per profile (apply, then plan); older APIs render the single one.
+                "subjectPatterns" to subjectPatternsOf(body).takeIf { it.isNotEmpty() }?.joinToString(" | "),
                 "scopes" to scopesOf(body).joinToString(" ").ifEmpty { null },
+                // SSO-3702 — the plan profile: its GitHub environment and its read-only scopes.
+                "planEnvironment" to text(planOf(body), "environment"),
+                "planScopes" to planScopesOf(body).joinToString(" ").ifEmpty { null },
                 "enabled" to body["enabled"]?.takeUnless { it.isNull }?.asBoolean(),
                 "createdBy" to text(body, "createdBy"),
                 "createdAt" to text(body, "createdAt"),
@@ -769,6 +960,39 @@ class WorkloadIdentityCommand : Callable<Int> {
             )
             out.println()
             out.println("Each job token works once and the token lasts at most 15 minutes; the CLI requests a fresh one as needed.")
+            // SSO-3702 — the plan profile: the same connection.json, a second job in the plan environment, no scope requested.
+            if (planOf(body) != null) {
+                out.println()
+                printPlanUsage(body, out)
+            }
+        }
+
+        /**
+         * SSO-3702 — how a trust's PLAN profile is used: the SAME `connection.json` (one trust, one `wi_`, one file — no
+         * `connection.plan.json`), a job in the plan GitHub environment, and a sign-in that requests NO scope so the hub
+         * mints the plan profile's read-only set. `thoryn login --connection` does this on its own from the job's
+         * `environment` claim; the flag form omits `--scope`.
+         */
+        fun printPlanUsage(body: JsonNode, out: PrintStream) {
+            val plan = planOf(body) ?: return
+            val planEnvironment = text(plan, "environment") ?: "<plan-environment>"
+            val applyEnvironment = text(body["github"], "environment") ?: "<apply-environment>"
+            val scopes = planScopesOf(body)
+            out.println("Plan profile — a job in GitHub environment '$planEnvironment' (not '$applyEnvironment') is minted read-only scopes only" + (if (scopes.isEmpty()) "." else ": ${scopes.joinToString(" ")}."))
+            out.println("It uses the SAME connection.json — `thoryn login --connection` reads the job's own OIDC environment claim and requests no scope")
+            out.println("outside the apply environment, so the hub mints the plan profile; a write scope is refused there (invalid_scope, scope_outside_plan_profile).")
+            out.println()
+            out.println("  jobs:")
+            out.println("    plan:")
+            out.println("      runs-on: ubuntu-latest")
+            out.println("      environment: $planEnvironment      # the plan profile's GitHub environment — unprotected, so it runs on every pull request")
+            out.println("      permissions:")
+            out.println("        contents: read")
+            out.println("        id-token: write")
+            out.println("      steps:")
+            out.println("        # … install the thoryn CLI …")
+            out.println("        - run: thoryn login --connection .thoryn/connection.json     # or: ${loginLine(body).substringBefore(" --scope")}  (no --scope)")
+            out.println("        - run: thoryn provision plan --file .thoryn/provision.yaml")
         }
 
         /**
@@ -804,6 +1028,25 @@ class WorkloadIdentityCommand : Callable<Int> {
                 "github_unavailable" -> "GitHub could not be reached to look up the repository ids. Retry, or pass --owner-id and --repository-id."
                 "invalid_github_ids" -> "--owner-id and --repository-id go together: give both, or neither."
                 "workload_identity_trust_name_taken" -> "Choose another --name, or delete the existing trust first."
+                // SSO-3702 — the plan profile's refusals (product-api SSO-3701 / hub SSO-3700).
+                "plan_profile_already_set" ->
+                    "This trust already has a plan profile; a profile is set once. To change it, re-create the trust " +
+                        "(delete it and `trusts create … --plan-environment <gh-env>`), then re-paste its new wi_ client id."
+                "plan_environment_equals_apply" ->
+                    "The plan environment must differ from the trust's apply environment (--github-environment): the GitHub environment is " +
+                        "what separates \"may read\" from \"may write\". Use an unprotected one, e.g. <apply>-plan."
+                "plan_scope_not_read_only" ->
+                    "A plan profile is read-only by construction: every --plan-scope must be a tenant:<area>.read scope."
+                "plan_scope_not_subset" ->
+                    "Every --plan-scope must be among the trust's own scopes (`thoryn workload-identity trusts get <id>` lists them)."
+                "plan_profile_requires_environment" ->
+                    "A plan profile is keyed on a GitHub environment: give --plan-environment <gh-env> (with or without --plan-scope)."
+                "plan_scopes_empty" ->
+                    "The plan profile would carry no scope: the trust has no .read scope to derive from — give --plan-scope <tenant:…read>, " +
+                        "or add a .read scope to the trust."
+                "plan_profile_unsupported" ->
+                    "Only a github_actions trust carries a plan profile (the GitHub environment claim selects it); a kubernetes trust has no plan jobs."
+                "invalid_plan_environment" -> "--plan-environment must be a GitHub environment name, exactly as the plan job declares it."
                 "workload_identity_trust_not_found" ->
                     "No such trust in this environment, or you cannot read it. List them with `thoryn workload-identity trusts list`."
                 "environment_not_found" ->

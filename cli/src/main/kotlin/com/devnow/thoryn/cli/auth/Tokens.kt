@@ -60,8 +60,22 @@ data class Tokens(
     // renewal re-reads the same file instead of asking a GitHub Actions runner that is not there. Null for
     // a GitHub Actions session and for every other kind. A PATH, never the token: not a secret.
     val tokenFile: String? = null,
+    // SSO-3702 (SSO-3699 option B) — which of the trust's PROFILES a WORKLOAD IDENTITY session signed in
+    // with: [PROFILE_APPLY] (the job ran in the trust's apply GitHub environment and holds the trust's
+    // scopes) or [PROFILE_PLAN] (any other environment — the hub minted the plan profile's read-only
+    // scopes). Decided by the job's own OIDC `environment` claim against the connection's `auth.github
+    // .environment`; null when the sign-in could not tell (no environment pin in the connection, the flag
+    // form, a Kubernetes token, an older session). Shown by `login --status` / `whoami`, and named on every
+    // write refusal of a plan-profile session. Not a secret.
+    val profile: String? = null,
 ) {
     companion object {
+        /** SSO-3702 — [profile] value: the trust's APPLY profile (the reviewed environment; the trust's full scopes). */
+        const val PROFILE_APPLY: String = "apply"
+
+        /** SSO-3702 — [profile] value: the trust's PLAN profile (read-only scopes; writes are refused by the hub's ceiling). */
+        const val PROFILE_PLAN: String = "plan"
+
         /** SSO-2941 — [authMode] value marking a non-interactive API-key / client-credentials session. */
         const val AUTH_MODE_CLIENT_CREDENTIALS: String = "client_credentials"
 

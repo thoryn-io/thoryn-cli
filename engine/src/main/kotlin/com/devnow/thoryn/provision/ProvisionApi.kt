@@ -77,15 +77,27 @@ interface ProvisionApi {
     fun deleteFederationMember(memberId: String, confirmSlug: String? = null): Unit
 
     // ── Workload identity trusts (`/api/v1/workload-identity/trusts`, environment-scoped; SSO-3689) ──
-    // Scopes `tenant:workload-identity.read` (list / get) and `tenant:workload-identity.write` (create / delete);
-    // environment managers write, viewers read, anyone else is answered 404. There is NO update: the pins are
-    // immutable on the hub, so the engine never asks for one. [createWorkloadIdentityTrust] answers 201 with the
-    // trust's `clientId` (`wi_…`), `audience` and `tokenEndpoint`; a name already in use is `409
+    // Scopes `tenant:workload-identity.read` (list / get) and `tenant:workload-identity.write` (create / delete /
+    // set plan profile); environment managers write, viewers read, anyone else is answered 404. There is NO
+    // general update: the pins are immutable on the hub, so the engine never asks for one — the ONE additive
+    // mutation is [setWorkloadIdentityTrustPlanProfile] (SSO-3702 / SSO-3701; SSO-3699 option B). [createWorkloadIdentityTrust]
+    // answers 201 with the trust's `clientId` (`wi_…`), `audience` and `tokenEndpoint`; a name already in use is `409
     // workload_identity_trust_name_taken`; a scope the caller does not hold is `403 scope_not_grantable`.
     fun listWorkloadIdentityTrusts(limit: Int? = null, cursor: String? = null): JsonNode
     fun getWorkloadIdentityTrust(id: String): JsonNode
     fun createWorkloadIdentityTrust(body: Map<String, Any?>): JsonNode
     fun deleteWorkloadIdentityTrust(id: String, confirmSlug: String? = null): Unit
+
+    /**
+     * SSO-3702 (product-api SSO-3701) — `POST /api/v1/workload-identity/trusts/{id}/plan-profile`
+     * `{ environment, scopes? }`: give an existing `github_actions` trust its PLAN profile — the one additive
+     * mutation that keeps the `wi_` client (no re-create, no `owner` move). Answers 200 with the trust; `409
+     * plan_profile_already_set` when it has one (re-create the trust to change it); `400` with
+     * `plan_environment_equals_apply`, `plan_scope_not_read_only`, `plan_scope_not_subset`,
+     * `plan_profile_requires_environment`, `plan_scopes_empty`, `plan_profile_unsupported`,
+     * `invalid_plan_environment`; `403 scope_not_grantable` for a plan scope the caller does not hold.
+     */
+    fun setWorkloadIdentityTrustPlanProfile(id: String, body: Map<String, Any?>): JsonNode
 
     // ── Access grants, reach and the forward check (`/api/v1/access/grants`, `/mine`, `/check`; SSO-3112 / SSO-3659 / SSO-3673; workspace-level) ──
     fun listGrants(objectRef: String? = null, subjectRef: String? = null): JsonNode
