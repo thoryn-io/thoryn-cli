@@ -2142,7 +2142,7 @@ Thoryn with one folder, and this repo's own CI runs exactly that:
 
 | File | Declares | Verb |
 |---|---|---|
-| `.thoryn/connection.json` | **who I am** — workspace slug, client id, the *name* of the secret env var, the scope set (SSO-2948) | `thoryn login --connection` |
+| `.thoryn/connection.json` | **who I am** — workspace slug and the **workload identity trust** CI signs in under: its `wi_…` client id, audience, GitHub pins and the exact scope set; no secret and no env var naming one (SSO-2948, SSO-3690) | `thoryn login --connection` |
 | `.thoryn/provision.yaml` | **what I own** — desired-state resources: a sandbox environment + a loopback OAuth client (SSO-3088) | `thoryn provision plan / apply / destroy` |
 
 The Action:
@@ -2151,8 +2151,11 @@ The Action:
    latest `cli-v*`, or the `cli-version` input) — it needs **cli-v0.11.0+**, the first
    release carrying `thoryn provision apply`, and fails loud on an older jar,
 2. **signs in non-interactively** from the connection contract
-   (`thoryn login --connection .thoryn/connection.json`); the secret arrives ONLY as the
-   env var the contract names (`THORYN_CLI_CI_CLIENT_SECRET`), never on argv,
+   (`thoryn login --connection .thoryn/connection.json`). This repo's contract is
+   `workload_identity` (SSO-3690): the job requests its own GitHub Actions OIDC token
+   (`permissions: id-token: write`) and the CLI exchanges it under the `thoryn-cli-ci` trust — no
+   secret exists anywhere. (A `client_credentials` contract instead receives its secret ONLY as the
+   env var the contract names, never on argv.)
 3. **converges the provisioning file** — `thoryn provision plan` (logged) then
    `thoryn provision apply --file .thoryn/provision.yaml --yes`: a sandbox `cli-ci` inside
    the `thoryn` workspace and a public loopback client in it. Apply twice issues no writes;
@@ -2173,21 +2176,32 @@ your `connection.json` declares in `auth.secretEnv`.
 
 ### CI provisioning setup (one-time)
 
-Everything the run needs is either committed or minted once by a founder:
+Everything the run needs is committed, except the one thing a person must do once: create the
+workload identity trust CI signs in under (SSO-3690 — the credential ladder's "courier: never";
+the former `cli-ci` client and its `THORYN_CLI_CI_CLIENT_SECRET` repository secret are retired):
 
 ```bash
-# 0) Sign in interactively as an admin of the `thoryn` workspace (authorization-code + PKCE). The
-#    default scope set already covers every scope the provisioning file grants (SSO-3182); the hub
-#    only lets you grant what you hold.
+# 0) Sign in interactively as an admin of the `thoryn` workspace, on the production plane. The default
+#    scope set already covers the six scopes the trust carries (SSO-3182); the hub only lets you grant
+#    what you hold.
 thoryn login --workspace thoryn --issuer https://auth.stg.thoryn.org
+thoryn env use production
 
-# 1) Apply. The declared confidential client is created and its secret delivered ONCE, via SecretIo.
-#    (SSO-3113 retired the imperative `provision ci-identity` bootstrap: the identity is a resource.)
-thoryn provision apply --file .thoryn/provision.yaml --secret-file ci.secret
+# 1) Create the trust: this repository by its immutable GitHub ids, the e2e job's GitHub environment,
+#    main only, GitHub-hosted runners, exactly the scopes .thoryn/connection.json requests.
+thoryn workload-identity trusts create --name thoryn-cli-ci \
+  --repository thoryn-io/thoryn-cli --owner-id 229451779 --repository-id 1361536515 \
+  --github-environment thoryn-provision-e2e --ref refs/heads/main --github-hosted-runners-only \
+  --scope "tenant:environments.read tenant:environments.write tenant:applications.read tenant:applications.write tenant:access.read tenant:access.write" \
+  --confirm-production
 
-# 2) Set the GitHub secret named by auth.secretEnv to the contents of ci.secret; shred ci.secret.
-# 3) Dispatch provision-e2e — it converges .thoryn/provision.yaml, asserts the CI identity is confined,
-#    and removes what the run created on exit (the sandbox is a long-lived fixture and stays).
+# 2) Paste the printed clientId (wi_…) into .thoryn/connection.json (auth.clientId) and into the sandbox's
+#    grants: subject in .thoryn/provision.yaml; open a pull request. Then converge the grant and remove the
+#    retired client in ONE reviewed apply: `thoryn provision apply --file .thoryn/provision.yaml --prune
+#    --confirm thoryn --yes`, and delete the repository secret. Step by step: .thoryn/README.md.
+# 3) Dispatch provision-e2e on main — it converges .thoryn/provision.yaml with zero secrets in the
+#    repository, asserts the CI identity is confined, and removes what the run created on exit (the
+#    sandbox is a long-lived fixture and stays).
 ```
 
 No standing test user and no standing sandbox are needed any more: the provisioning file

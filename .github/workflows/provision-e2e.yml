@@ -6,22 +6,32 @@ name: provision-e2e
 # committed provisioning file (`.thoryn/provision.yaml`) with `thoryn provision apply` (SSO-3088/3089)
 # against SHARED STAGING, then `thoryn provision destroy`s it on exit. Real product APIs only.
 #
-# The ONLY secret this workflow injects is `THORYN_CLI_CI_CLIENT_SECRET` (the env var the contract's
-# `auth.secretEnv` names) — the client id, workspace, scopes and the desired resources are all in the
-# committed `.thoryn/` files.
+# This workflow injects NO secret (SSO-3690, parent SSO-3659 — the credential ladder's rung 4, "courier:
+# never"). The contract is a `workload_identity` connection: the job requests its own GitHub Actions OIDC
+# token (`permissions: id-token: write`) and the CLI exchanges it under the `thoryn-cli-ci` workload identity
+# trust for a short-lived token of the trust's `wi_…` client. The client id, workspace, scopes, the trust's
+# pins and the desired resources are all in the committed `.thoryn/` files.
+#
+# The trust PINS this job (oauthy hub `GithubActionsTrustPolicy`): the repository by its immutable ids, the
+# GitHub environment `thoryn-provision-e2e` the job declares below (a production-plane trust must pin one),
+# `ref` = `refs/heads/main` (so only a dispatch on `main` can sign in — a pull request never can), and
+# GitHub-hosted runners only. Change any of these here and the sign-in is refused with `invalid_client`
+# until the trust is changed to match (`.thoryn/connection.json`'s `auth.github` mirrors the pins so the
+# CLI can name the field that differs).
 #
 # The file provisions a SANDBOX environment (`cli-ci`) inside the `thoryn` workspace plus a loopback
 # OAuth client in it; destroy hard-deletes the sandbox (cascading the client). A leftover from a failed
 # run is ADOPTED by its slug on the next apply, never duplicated (see `.thoryn/provision.yaml`).
 #
-# Manual only (workflow_dispatch): it mutates a shared-staging workspace and needs the secret, so it
-# must not fire on push/PR. Requires a `cli-v*` release carrying `thoryn provision apply`
-# (cli-v0.11.0+) — pin one with the cli-version input until it is the latest.
+# Manual only (workflow_dispatch): it mutates a shared-staging workspace, so it must not fire on push/PR.
+# Requires a `cli-v*` release carrying `workload_identity` connection contracts (SSO-3308, cli-v0.31.0+;
+# `thoryn provision apply` itself is cli-v0.11.0+) — pin one with the cli-version input until it is the latest.
 #
-# ONE-TIME OPERATOR SETUP (see `.thoryn/README.md` "One-time bootstrap"): a founder mints the CI
-# machine client once (it is declared in the provisioning file; `thoryn provision apply --secret-file`
-# delivers its one-time secret, SSO-3113), pastes its clientId into
-# `.thoryn/connection.json`, and sets the `THORYN_CLI_CI_CLIENT_SECRET` repository secret.
+# ONE-TIME OPERATOR SETUP (see `.thoryn/README.md` "A founder creates the trust once"): a founder creates
+# the `thoryn-cli-ci` trust with `thoryn workload-identity trusts create`, pastes its `wi_…` client id into
+# `.thoryn/connection.json` and the sandbox's `grants:` subject in `.thoryn/provision.yaml`, and removes the
+# retired `cli-ci` client together with the repository secret that carried its client secret. Nothing is
+# stored in GitHub for this workflow — no secret, no variable.
 
 on:
   workflow_dispatch:
@@ -31,7 +41,7 @@ on:
         required: false
         default: "https://hub.stg.thoryn.org"
       cli-version:
-        description: "cli-v* release tag to run (default: latest). Needs cli-v0.11.0 or newer."
+        description: "cli-v* release tag to run (default: latest). Needs cli-v0.31.0 or newer (workload_identity connection contracts, SSO-3308)."
         required: false
         default: ""
       destroy:
@@ -54,6 +64,12 @@ permissions:
 jobs:
   provision:
     runs-on: ubuntu-latest
+    # SSO-3690 — the trust pins this GitHub environment (`sub` = repo:thoryn-io/thoryn-cli:environment:thoryn-provision-e2e).
+    # GitHub creates the environment on the first run that references it; it holds no secret and no variable.
+    environment: thoryn-provision-e2e
+    permissions:
+      contents: read
+      id-token: write # lets the job request its own OIDC token — the ONLY credential this job has
     steps:
       - name: Check out thoryn-cli (the .thoryn/ files)
         uses: actions/checkout@v4
@@ -62,19 +78,20 @@ jobs:
         id: provision
         uses: ./.github/actions/provision
         with:
-          # The ONLY injected secret — the env var the connection contract's auth.secretEnv names.
-          client-secret: ${{ secrets.THORYN_CLI_CI_CLIENT_SECRET }}
+          # No `client-secret`: the contract is `workload_identity` — the Action exchanges this job's OIDC token.
+          connection: .thoryn/connection.json
+          file: .thoryn/provision.yaml
           hub: ${{ inputs.hub }}
           cli-version: ${{ inputs.cli-version }}
           destroy: ${{ inputs.destroy }}
 
       # SSO-3113 (epic SSO-3108) — prove the CI identity is CONFINED, not merely that it can do its job.
       # The Action leaves the downloaded thoryn.jar and the signed-in session in the workspace.
-      #  1. Reads are confined (ADR 2026-09-15 §8): as cli-ci, `env list` must return exactly the sandbox
-      #     this identity manages. A workspace-wide identity would list the production environment too.
+      #  1. Reads are confined (ADR 2026-09-15 §8): as the trust's client, `env list` must return exactly the
+      #     sandbox this identity manages. A workspace-wide identity would list the production environment too.
       #  2. A foreign environment answers 404 — only meaningful when its EXISTENCE is known, because by
-      #     design a foreign environment and a nonexistent one are the same 404 from cli-ci's side. So the
-      #     id comes from a dispatch input set by someone who can see it, never a guessed or random id.
+      #     design a foreign environment and a nonexistent one are the same 404 from the CI identity's side. So
+      #     the id comes from a dispatch input set by someone who can see it, never a guessed or random id.
       #     This is a GET, not a DELETE: if confinement were ever broken, a destructive probe would
       #     destroy a real environment instead of failing the run.
       - name: Assert the CI identity is confined (SSO-3113)
@@ -107,10 +124,17 @@ jobs:
 
       # Downstream consumers use the Action's outputs. The destroy inside the Action runs on exit, so
       # the sandbox + client ids are only valid for the life of the job (the workspace + issuer persist).
+      # Outputs are read through `env:` (never interpolated into the script source — SSO-3635).
       - name: Show provisioned identifiers
+        env:
+          WORKSPACE_SLUG: ${{ steps.provision.outputs.workspace-slug }}
+          ENVIRONMENT: ${{ steps.provision.outputs.environment }}
+          CLIENT_ID: ${{ steps.provision.outputs.client-id }}
+          ISSUER: ${{ steps.provision.outputs.issuer }}
+          RECEIPT: ${{ steps.provision.outputs.receipt }}
         run: |
-          echo "workspace-slug = ${{ steps.provision.outputs.workspace-slug }}"
-          echo "environment    = ${{ steps.provision.outputs.environment }}"
-          echo "client-id      = ${{ steps.provision.outputs.client-id }}"
-          echo "issuer         = ${{ steps.provision.outputs.issuer }}"
-          echo "receipt        = ${{ steps.provision.outputs.receipt }}"
+          echo "workspace-slug = $WORKSPACE_SLUG"
+          echo "environment    = $ENVIRONMENT"
+          echo "client-id      = $CLIENT_ID"
+          echo "issuer         = $ISSUER"
+          echo "receipt        = $RECEIPT"

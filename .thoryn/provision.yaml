@@ -10,36 +10,62 @@
 #    plane (no `environment:`), replacing the hub-seeded `thoryn-cli` client on the shared default tenant
 #    (the platform is moving everything off that tenant). A founder creates it ONCE with
 #    `thoryn provision apply` while switched into the `thoryn` workspace; every later `apply` (CI signs in
-#    as the CI machine client, whose receipt does not own it) ADOPTS it by its fixed `clientId` and
+#    as the CI identity, whose receipt does not own it) ADOPTS it by its fixed `clientId` and
 #    converges its non-secret shape — adopted resources are never deleted by `destroy`.
-#  - `ci` (SSO-3113, epic SSO-3108): the CI machine identity `cli-ci` — a confidential
-#    `client_credentials` client on the PRODUCTION plane, holding ONLY the scopes needed to converge THIS
-#    file (environments + applications, read+write, plus `tenant:access.*` for the `grants:` block below),
-#    and granted `manager` on the `ci` SANDBOX — nothing else. Containment does the rest: managing the
-#    sandbox manages what lives inside it (the loopback client), and a machine client manages its own
-#    record by creation, so neither is restated as a grant. A founder mints it ONCE (the secret leaves
-#    through `--secret-file`, never the receipt); every later `apply` ADOPTS it, so CI can never delete
-#    the identity it signs in with.
 #  - What CI needs (SSO-3090): a SANDBOX environment inside the contract's workspace, and a public
 #    loopback OAuth client inside that sandbox.
 #
+# What this file does NOT own any more — the CI identity (SSO-3690, parent SSO-3659; the credential ladder of
+# oauthy ADR 2026-10-14-kubernetes-workload-identity-and-runtime-credential-pull, rung 4 "courier: never"):
+#  Until SSO-3690 this file declared `ci`, a confidential `client_credentials` client `cli-ci` whose secret a
+#  founder minted once (`apply --secret-file`) and carried into the repository secret
+#  `THORYN_CLI_CI_CLIENT_SECRET` — the courier pattern, in the repository that ships the ladder's tooling.
+#  The identity is now a GitHub Actions WORKLOAD IDENTITY TRUST on the `thoryn` workspace's production
+#  plane (`thoryn workload-identity trusts create`, see `.thoryn/README.md`): the e2e job exchanges its own
+#  OIDC token for a short-lived token of the trust's `wi_…` client, so NO secret exists anywhere — not in
+#  this file, not in a GitHub secret, not in a receipt. The trust is created ONCE by a founder and is only
+#  REFERENCED here (by the `grants:` subject below) and in `connection.json`; it is not declared as a
+#  resource — the engine has no trust kind yet (SSO-3689 adds `workloadIdentityTrust`; once it is on main
+#  the trust can be declared and adopted here as a follow-up).
+#
+#  HOW THE OLD CLIENT IS REMOVED — once, by the founder whose receipt owns it, as a REVIEWED removal
+#  (SSO-3659: removals only through `--prune`, never by automation; `destroy` is never run by a pipeline):
+#    thoryn login --workspace thoryn --issuer https://auth.stg.thoryn.org
+#    thoryn provision plan  --file .thoryn/provision.yaml --prune          # shows "- application ci (cli-ci)"
+#    thoryn provision apply --file .thoryn/provision.yaml --prune --confirm thoryn --yes
+#  `--prune` deletes exactly the owned resources this file no longer declares — the one `application/ci`
+#  entry of the founder's receipt (production plane, hence `--confirm thoryn`) — and the receipt drops that
+#  entry (`.thoryn/provision.receipt.json`, git-ignored, so the effect is local to the founder's machine).
+#  The same apply converges the sandbox's `grants:` block: the trust's client gains `manager`, and the
+#  `client:cli-ci manager` grant the founder's receipt recorded is revoked. If the founder's receipt no
+#  longer exists nothing is owned and `--prune` removes nothing: delete the client directly instead,
+#  `thoryn clients delete cli-ci --confirm thoryn`. Either way: NOT a `destroy` — that would also remove the
+#  sandbox and everything the receipt owns.
+#
 # The sandbox is a LONG-LIVED FIXTURE, not a per-run throwaway (settled by the product owner,
 # 2026-09-16). Creating a resource requires `manager` on its PARENT, and the parent of an environment
-# is the workspace — so the confined `cli-ci` identity structurally CANNOT create or delete an
+# is the workspace — so the confined CI identity structurally CANNOT create or delete an
 # environment. A founder creates the sandbox once (with this file); every CI run ADOPTS it by its fixed
 # slug and manages only what lives INSIDE it: the loopback client is created by each run and removed by
-# `destroy` on exit. Granting `cli-ci` manager on the WORKSPACE so it could create per-run sandboxes was
+# `destroy` on exit. Granting the CI identity manager on the WORKSPACE so it could create per-run sandboxes was
 # considered and rejected — by containment it would reach the whole production plane, including the
 # `cli` login client above, which is exactly what epic SSO-3108 exists to prevent.
 #
 # `provision-e2e` serialises runs with a concurrency group, so one fixed sandbox is enough. It also
-# asserts the confinement itself after every apply: as `cli-ci`, `thoryn env list` must return ONLY this
+# asserts the confinement itself after every apply: as the CI identity, `thoryn env list` must return ONLY this
 # sandbox, and a GET of a foreign environment must answer 404. No secrets live here; none are needed.
 apiVersion: thoryn.io/provision/v1
 resources:
   # SSO-3104 — the `thoryn` CLI's login client, in the `thoryn` workspace (production plane).
   - kind: application
     name: cli
+    # SSO-3690 — READ-ONLY for the identity that converges this file in CI (the `thoryn-cli-ci` trust).
+    # The ownership gate (SSO-3659/3673) refuses a declared resource the applying identity has no relation
+    # on; CI holds no relation on the login client and must never gain write reach on it. A founder grants
+    # the CI identity `viewer` ONCE (`thoryn access grant client:<wi_…> viewer application:cli`) so the file
+    # can VERIFY the client; any change to the login client itself is made by a founder with their own
+    # session (`thoryn clients update cli …`) — with `readOnly: true` a diff here is a red plan, by design.
+    readOnly: true
     spec:
       clientId: cli                       # fixed id: ThorynConfig.DEFAULT_CLIENT_ID signs in with it
       displayName: "Thoryn CLI"
@@ -91,42 +117,19 @@ resources:
         - tenant:workload-identity.write
       requireAuthorizationConsent: false  # first-party: no consent screen for the platform's own CLI
 
-  # SSO-3113 (epic SSO-3108) — the CI machine identity, named as the subject of the sandbox's `grants:`
-  # block below. Declaration order is presentation only: `apply` converges environments before
-  # applications whatever the file says, so SSO-3119 converges every `grants:` block in a second pass,
-  # after all resources exist — a grant may name any subject the file declares, in any order.
-  - kind: application
-    name: ci
-    spec:
-      clientId: cli-ci                    # fixed id: `.thoryn/connection.json` signs CI in with it (step 2)
-      displayName: "thoryn-cli CI"
-      clientType: confidential            # client_credentials needs a secret; minted once, via --secret-file
-      grantTypes: [client_credentials]    # no human at the keyboard: no auth-code, no device-code, no refresh
-      # LEAST PRIVILEGE: exactly what converging THIS file needs, derived from the kinds it declares —
-      # `environment` -> tenant:environments.*, `application` -> tenant:applications.*, and the `grants:`
-      # block below -> tenant:access.* (read to plan the diff, write to converge it). Nothing else: the
-      # file declares no `user` and no `federationMember`, so the identity holds no users/federation reach
-      # (CiProvisionFileConformanceTest pins this set to the file's own contents).
-      scopes:
-        - tenant:environments.read
-        - tenant:environments.write
-        - tenant:applications.read
-        - tenant:applications.write
-        - tenant:access.read
-        - tenant:access.write
-      # No `grants:` here. A client is `manager` of its OWN record by creation (creator-becomes-manager);
-      # restating that would be noise, and anything wider would hand CI reach it must not have.
-
   - kind: environment
     name: ci
     spec:
       slug: cli-ci
       displayName: "thoryn-cli CI sandbox"
     grants:
-      # SSO-3113 — the ONLY grant in this file: the CI identity manages this sandbox, and by containment
-      # everything inside it (the loopback client below). This is the whole of its reach — it is NOT a
-      # workspace admin, and nothing here grants the `cli` login client or `cli-ci` itself anything wider.
-      - subject: "client:cli-ci"
+      # SSO-3113 / SSO-3690 — the ONLY grant in this file: the CI identity manages this sandbox, and by
+      # containment everything inside it (the loopback client below). This is the whole of its reach — it is
+      # NOT a workspace admin, and nothing here grants the `cli` login client anything wider.
+      # The subject is the `wi_…` client of the `thoryn-cli-ci` workload identity trust — the SAME value as
+      # `auth.clientId` in `.thoryn/connection.json` (CiProvisionFileConformanceTest pins the two equal). It is
+      # minted by the founder's one-time `thoryn workload-identity trusts create`; paste it here.
+      - subject: "client:wi_10a7b379c79f7d1353f5798d"
         relation: manager
 
   - kind: application

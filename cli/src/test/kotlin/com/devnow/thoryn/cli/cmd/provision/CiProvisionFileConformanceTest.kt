@@ -1,9 +1,13 @@
 package com.devnow.thoryn.cli.cmd.provision
 
-import com.devnow.thoryn.provision.ProvisionFile
-import com.devnow.thoryn.cli.cmd.AccessCommand
 import com.devnow.thoryn.cli.cmd.connection.Connection
+import com.devnow.thoryn.cli.cmd.provision.CiIdentityFixture.CONNECTION_PATH
+import com.devnow.thoryn.cli.cmd.provision.CiIdentityFixture.PROVISION_PATH
+import com.devnow.thoryn.cli.cmd.provision.CiIdentityFixture.WORKLOAD_CLIENT_ID_PREFIX
+import com.devnow.thoryn.cli.cmd.provision.CiIdentityFixture.locate
+import com.devnow.thoryn.cli.cmd.provision.CiIdentityFixture.scopesToConverge
 import com.devnow.thoryn.cli.config.ThorynConfig
+import com.devnow.thoryn.provision.ProvisionFile
 import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.api.Test
 import java.io.File
@@ -13,13 +17,15 @@ import java.io.File
  * (`.thoryn/provision.yaml`, the "what I own" half of `.thoryn/`) to the CLI that ships it:
  * the file must load through [ProvisionFile] (schema-conformant), declare exactly the CI fixtures the
  * provisioning Action expects (a sandbox + a loopback client INSIDE it; the only production-plane
- * resources are the CLI's own login client and the CI machine identity), carry no secret, and stay
- * within the scope set the sibling `connection.json` requests — so a change to either file that would
- * break the CI run fails here first.
+ * resource is the CLI's own login client), carry no secret, and stay within the scope set the sibling
+ * `connection.json` requests — so a change to either file that would break the CI run fails here first.
  *
- * SSO-3113 (epic SSO-3108) adds the least-privilege half: the CI identity `cli-ci` is declared HERE,
- * holds exactly the scopes converging THIS file needs, and its whole reach is ONE grant — `manager` on
- * the `ci` sandbox. The file cannot silently widen that without failing this test.
+ * SSO-3113 (epic SSO-3108) added the least-privilege half; SSO-3690 (parent SSO-3659) moved the identity
+ * itself OUT of the file: CI signs in as a GitHub Actions workload identity trust (no secret anywhere), so
+ * the file declares NO confidential client and NO `client_credentials` grant any more — the credential
+ * ladder's rung 4 ("courier: never", oauthy ADR 2026-10-14) is retired here. The trust is only REFERENCED:
+ * its `wi_…` client is the ONE grant subject of the file, `manager` on the `ci` sandbox, and it must be the
+ * very client `connection.json` signs in with. The file cannot silently widen that without failing here.
  */
 class CiProvisionFileConformanceTest {
 
@@ -29,19 +35,20 @@ class CiProvisionFileConformanceTest {
     @Test
     fun `the committed provisioning file declares the CLI login client on the production plane plus the CI sandbox and its loopback client`() {
         assertThat(file.resources.map { it.key })
-            .containsExactly("application/cli", "application/ci", "environment/ci", "application/loopback-rp")
+            .containsExactly("application/cli", "environment/ci", "application/loopback-rp")
         val env = file.environmentResource("ci")!!
         assertThat(env.spec["slug"]).isEqualTo("cli-ci")
         val rp = file.resources.single { it.key == "application/loopback-rp" }
         assertThat(rp.environment).isEqualTo("ci") // lives INSIDE the sandbox → destroy needs no production confirmation
         assertThat(rp.spec["clientType"]).isEqualTo("public")
         assertThat(rp.spec["redirectUris"]).isEqualTo(listOf("http://127.0.0.1/callback"))
-        // SSO-3104 / SSO-3113 — the production plane holds exactly two resources: the CLI's own login
-        // client (adopted, never deleted, by every apply whose receipt does not own it) and the CI
-        // machine identity that signs those applies in.
+        // SSO-3104 / SSO-3690 — the production plane holds exactly ONE resource: the CLI's own login client
+        // (adopted, never deleted, by every apply whose receipt does not own it). The CI identity that signs
+        // those applies in is a workload identity trust — a product resource a founder creates once, not a
+        // declared application.
         val production = file.resources.filter { it.kind != ProvisionFile.KIND_ENVIRONMENT && it.environment == null }
-        assertThat(production.map { it.key }).containsExactly("application/cli", "application/ci")
-        val cli = production.single { it.key == "application/cli" }
+        assertThat(production.map { it.key }).containsExactly("application/cli")
+        val cli = production.single()
         assertThat(cli.spec["clientId"]).isEqualTo(ThorynConfig.DEFAULT_CLIENT_ID)
         assertThat(cli.spec["clientType"]).isEqualTo("public")
         assertThat(cli.spec["grantTypes"]).isEqualTo(listOf("authorization_code", "refresh_token", "urn:ietf:params:oauth:grant-type:device_code"))
@@ -85,77 +92,74 @@ class CiProvisionFileConformanceTest {
 
     @Test
     fun `the connection contract's scopes cover every kind the provisioning file declares`() {
-        val needed = file.resources.map { "tenant:${area(it.kind)}.write" }.toSet()
+        val needed = file.resources.map { "tenant:${CiIdentityFixture.area(it.kind)}.write" }.toSet()
         assertThat(Connection.scopesWithinGrant(needed, connection.scopes.toSet()))
             .withFailMessage("provision.yaml needs %s but connection.json requests only %s", needed, connection.scopes)
             .isTrue()
     }
 
+    /**
+     * SSO-3690 — the ladder's rung 4 is retired in the repository that ships the ladder's tooling: the file
+     * declares no identity whose credential would have to be carried anywhere. Every application is PUBLIC
+     * (secret-less by construction) and none may obtain a token without a human (`client_credentials`).
+     * Re-declaring a confidential CI client here is how the courier pattern would come back.
+     */
     @Test
-    fun `the declared CI machine identity is a scope-confined client_credentials client on the production plane`() {
-        val ci = file.resources.single { it.key == "application/ci" }
-        assertThat(ci.environment).isNull() // the identity itself lives on the production plane, not inside its sandbox
-        assertThat(ci.spec["clientId"]).isEqualTo(CI_CLIENT_ID)
-        assertThat(ci.spec["clientType"]).isEqualTo("confidential") // client_credentials needs a secret
-        assertThat(ci.spec["grantTypes"]).isEqualTo(listOf("client_credentials")) // no human at the keyboard
-        assertThat(ci.spec.keys).doesNotContain("redirectUris", "postLogoutRedirectUris")
-        // Exactly the scopes converging THIS file needs — no users, no federation, no email, no idp.
-        val granted = (ci.spec["scopes"] as List<*>).map { it.toString() }.toSet()
-        assertThat(granted)
-            .withFailMessage("cli-ci holds %s but converging this file needs exactly %s", granted, scopesToConverge())
-            .isEqualTo(scopesToConverge())
-    }
-
-    @Test
-    fun `the CI identity's whole declared reach is manager on the sandbox — nothing workspace-wide`() {
-        val reach = file.resources.flatMap { r ->
-            (r.grants ?: emptyList()).filter { it.subject == "client:$CI_CLIENT_ID" }.map { "${r.key} ${it.relation}" }
+    fun `the provisioning file declares no secret-bearing identity — no confidential client, no client_credentials grant`() {
+        val applications = file.resources.filter { it.kind == ProvisionFile.KIND_APPLICATION }
+        assertThat(applications).isNotEmpty()
+        applications.forEach { app ->
+            assertThat(app.spec["clientType"])
+                .withFailMessage("%s is not public — a confidential client needs a secret, and a secret needs a courier (SSO-3690)", app.key)
+                .isEqualTo("public")
+            @Suppress("UNCHECKED_CAST")
+            val grantTypes = (app.spec["grantTypes"] as? List<Any?>).orEmpty().map { it.toString() }
+            assertThat(grantTypes)
+                .withFailMessage("%s grants client_credentials — a machine identity declared here would be a secret-bearing one (SSO-3690)", app.key)
+                .doesNotContain("client_credentials")
         }
-        // ONE grant, on the sandbox. Containment covers the loopback client inside it; creator-becomes-
-        // manager covers the identity's own record — neither may be restated, nothing wider may appear.
-        assertThat(reach).containsExactly("environment/ci manager")
-        assertThat(file.resources.single { it.key == "application/ci" }.grants).isNull()
-        assertThat(file.resources.single { it.key == "application/cli" }.grants).isNull()
-        // …and the sandbox grants NOBODY else anything (a second subject here would widen CI's blast radius).
-        assertThat(file.environmentResource("ci")!!.grants!!.map { it.label }).containsExactly("client:$CI_CLIENT_ID manager")
-    }
-
-    /** The product-api scope AREA a resource kind is managed through (`tenant:<area>.<read|write>`). */
-    private fun area(kind: String): String = when (kind) {
-        ProvisionFile.KIND_ENVIRONMENT -> "environments"
-        ProvisionFile.KIND_APPLICATION -> "applications"
-        ProvisionFile.KIND_USER -> "users"
-        ProvisionFile.KIND_FEDERATION_MEMBER -> "federation"
-        ProvisionFile.KIND_EMAIL_PROVIDER -> "email"
-        else -> "idp"
+        // The retired identity by name: nothing in the file declares or targets `cli-ci` as a client any more.
+        assertThat(applications.map { it.spec["clientId"]?.toString() }).doesNotContain(RETIRED_CI_CLIENT_ID)
     }
 
     /**
-     * The LEAST-PRIVILEGE scope set an identity needs to converge this very file: read + write on every
-     * declared kind's area (the plan reads before the apply writes), plus `tenant:access.read` ALWAYS —
-     * SSO-3659: ownership is decided by the identity's own reach (`GET /api/v1/access/mine`) before any
-     * write — and `tenant:access.write` when any resource carries a `grants:` block (to converge them).
+     * SSO-3113 / SSO-3690 — the CI identity's whole declared reach is `manager` on the sandbox, nothing
+     * workspace-wide; and the identity IS the trust's client: the grant subject must be the very `wi_…` client
+     * `connection.json` signs in with (both are pasted from one `trusts create`), never the retired `cli-ci`.
      */
-    private fun scopesToConverge(): Set<String> =
-        file.resources.flatMap { listOf("tenant:${area(it.kind)}.read", "tenant:${area(it.kind)}.write") }.toSet() +
-            AccessCommand.SCOPE_READ +
-            if (file.resources.any { it.grants != null }) setOf(AccessCommand.SCOPE_WRITE) else emptySet()
-
-    private fun locate(relative: String): File {
-        var dir: File? = File(System.getProperty("user.dir")).absoluteFile
-        while (dir != null) {
-            val candidate = File(dir, relative)
-            if (candidate.isFile) return candidate
-            dir = dir.parentFile
+    @Test
+    fun `the CI identity's whole declared reach is manager on the sandbox — nothing workspace-wide`() {
+        val subject = "client:${connection.clientId}"
+        assertThat(connection.clientId).startsWith(WORKLOAD_CLIENT_ID_PREFIX)
+        val reach = file.resources.flatMap { r ->
+            (r.grants ?: emptyList()).filter { it.subject == subject }.map { "${r.key} ${it.relation}" }
         }
-        error("could not locate $relative from ${System.getProperty("user.dir")}")
+        // ONE grant, on the sandbox. Containment covers the loopback client inside it — nothing wider may appear.
+        assertThat(reach).containsExactly("environment/ci manager")
+        assertThat(file.resources.single { it.key == "application/cli" }.grants).isNull()
+        assertThat(file.resources.single { it.key == "application/loopback-rp" }.grants).isNull()
+        // …and the sandbox grants NOBODY else anything (a second subject here would widen CI's blast radius) —
+        // in particular not the retired `client:cli-ci`.
+        assertThat(file.environmentResource("ci")!!.grants!!.map { it.label }).containsExactly("$subject manager")
+        assertThat(file.resources.flatMap { it.grants.orEmpty() }.map { it.subject }).doesNotContain("client:$RETIRED_CI_CLIENT_ID")
+    }
+
+    /**
+     * SSO-3690 — with the trust declared in no committed file, `connection.json` is the one committed statement of
+     * what the identity holds, and `scopesToConverge` is what converging THIS file needs: they must be EQUAL. Not a
+     * subset — the trust is created from this exact list (`.thoryn/README.md`), so a scope here that the file does
+     * not need is reach CI must not have, and a needed scope missing here is a failing apply.
+     */
+    @Test
+    fun `the connection scopes are exactly the least-privilege set converging this file needs`() {
+        val needed = scopesToConverge(file)
+        assertThat(connection.scopes.toSet())
+            .withFailMessage("connection.json requests %s but converging provision.yaml needs exactly %s", connection.scopes, needed)
+            .isEqualTo(needed)
     }
 
     companion object {
-        private const val PROVISION_PATH = ".thoryn/provision.yaml"
-        private const val CONNECTION_PATH = ".thoryn/connection.json"
-
-        /** SSO-3113 — the fixed id of the least-privilege CI machine identity this file declares. */
-        private const val CI_CLIENT_ID = "cli-ci"
+        /** SSO-3113 → SSO-3690 — the fixed id of the retired secret-bearing CI machine client (removed once by the founder). */
+        private const val RETIRED_CI_CLIENT_ID = "cli-ci"
     }
 }

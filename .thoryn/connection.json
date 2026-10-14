@@ -5,9 +5,10 @@
     "hubBaseUrlEnv": "THORYN_HUB"
   },
   "auth": {
-    "method": "client_credentials",
-    "clientId": "cli-ci",
-    "secretEnv": "THORYN_CLI_CI_CLIENT_SECRET",
+    "method": "workload_identity",
+    "provider": "github_actions",
+    "clientId": "wi_10a7b379c79f7d1353f5798d",
+    "audience": "https://thoryn.auth.stg.thoryn.org",
     "scopes": [
       "tenant:environments.read",
       "tenant:environments.write",
@@ -15,6 +16,15 @@
       "tenant:applications.write",
       "tenant:access.read",
       "tenant:access.write"
-    ]
+    ],
+    "github": {
+      "owner": "thoryn-io",
+      "repository": "thoryn-cli",
+      "ownerId": 229451779,
+      "repositoryId": 1361536515,
+      "environment": "thoryn-provision-e2e",
+      "ref": "refs/heads/main",
+      "githubHostedRunnersOnly": true
+    }
   }
 }
