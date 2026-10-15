@@ -79,6 +79,8 @@
 # `provision-e2e` serialises runs with a concurrency group, so one fixed sandbox is enough. It also
 # asserts the confinement itself after every apply: as the CI identity, `thoryn env list` must return ONLY this
 # sandbox, and a GET of a foreign environment must answer 404. No secrets live here; none are needed.
+# SSO-3704 — the first change to this file planned by the Thoryn App on a pull request (plan profile,
+# read-only) and applied on merge behind the thoryn-provision-e2e reviewers (2026-10-15).
 apiVersion: thoryn.io/provision/v1
 resources:
   # SSO-3104 — the `thoryn` CLI's login client, in the `thoryn` workspace (production plane).
