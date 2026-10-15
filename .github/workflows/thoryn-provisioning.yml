@@ -70,7 +70,7 @@ concurrency:
 permissions: {}
 
 env:
-  THORYN_CLI_RELEASE: cli-v0.34.0
+  THORYN_CLI_RELEASE: cli-v0.35.0
   # The platform base issuer the connection contract derives the thoryn workspace's issuer from.
   THORYN_ISSUER: https://auth.stg.thoryn.org
   THORYN_HUB: https://auth.stg.thoryn.org
@@ -140,12 +140,12 @@ jobs:
           ref: ${{ inputs.head_sha }}
       - name: Apply .thoryn/provision.yaml as this repository (production plane)
         id: apply-thoryn
-        uses: thoryn-io/thoryn-cli/.github/actions/provision@cli-v0.34.0
+        uses: thoryn-io/thoryn-cli/.github/actions/provision@cli-v0.35.0
         with:
           connection: .thoryn/connection.json
           file: .thoryn/provision.yaml
           issuer: https://auth.stg.thoryn.org
-          cli-version: cli-v0.34.0
+          cli-version: cli-v0.35.0
           destroy: "false"
       # SSO-3710 — the Action asks the CLI for the fix request (THORYN_FIX_REQUEST) and exposes where it would be.
       - name: Upload the fix request
