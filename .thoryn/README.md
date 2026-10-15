@@ -7,9 +7,8 @@ the same two files and the same commands.
 | File | Declares | Schema | Verb |
 |---|---|---|---|
 | `connection.json` | **who I am** — the `thoryn` workspace and the **workload identity trust** CI signs in under: the trust's `wi_…` client id, its audience, its GitHub pins and the exact scope set. No secret, no env var naming one (SSO-3690) | `cli/src/main/resources/examples/connection.schema.json` (SSO-2948) | `thoryn login --connection .thoryn/connection.json` |
-| `provision.yaml` | **what I own** — the desired state: the CLI's own login client `cli` in the `thoryn` workspace (SSO-3104; this repository's CI identity is its platform `owner`, SSO-3697), plus a sandbox environment `cli-ci` — whose one grant makes the CI identity its `manager` — with a public loopback OAuth client inside it | `engine/src/main/resources/provision/provision.schema.json` (SSO-3088) | `thoryn provision plan / apply / destroy --file .thoryn/provision.yaml` |
+| `provision.yaml` | **what I own** — the desired state: the CLI's own login client `cli` in the `thoryn` workspace (SSO-3104; this repository's CI identity is its platform `owner`, SSO-3697; `retain: true`, SSO-3717 — never removed by `destroy` / `--prune`), plus the long-lived sandbox environment `cli-ci` (`retain: true`) — whose one grant makes the CI identity its `manager` — with a public loopback OAuth client inside it: the one resource a `destroy` removes | `engine/src/main/resources/provision/provision.schema.json` (SSO-3088) | `thoryn provision plan / apply / destroy --file .thoryn/provision.yaml` |
 | `trusts.provision.yaml` | **the one trust, declared** (SSO-3689 `kind: workloadIdentityTrust`; SSO-3697 / SSO-3705 / SSO-3704) — `thoryn-cli-ci`, adopted, production plane, with its two profiles: the reviewed apply environment and the **plan profile** `spec.plan` keyed on `thoryn-provision-e2e-plan` (read-only by construction). Applied by a **founder**, never by CI: a production-plane trust is reached through the workspace, and a file cannot declare its own bootstrap trust | the provision schema | `thoryn provision plan / apply --file .thoryn/trusts.provision.yaml` (founder session) |
-| `provision.receipt.json` | the **ownership ledger** of `provision.yaml` — committed since SSO-3697, when the App's apply job opened it as a receipt pull request; since SSO-3717 / SSO-3719 the apply job opens none and since SSO-3715 (#132) the engine writes no receipt at all (the platform is the ledger, oauthy ADR 2026-10-15) — the committed copy is a leftover to delete | written by the engine | — |
 | _(run artifact, never committed)_ `thoryn-provision-request` | the **fix request** (SSO-3710): when a job is red on a missing RIGHT — the trust's plan profile, `owner` on a declared resource, `manager` on a parent environment — the CLI writes `thoryn-provision-request.json` naming each right and the exact command a workspace admin runs; the workflows upload it `if: failure()` and the Thoryn GitHub App relays it onto the check run (two options: the commands, or a web consent — oauthy SSO-3711/3712) | `engine/src/main/resources/provision/fix-request.schema.json` | `thoryn login --connection --fix-request <path>` · `thoryn provision plan\|apply --fix-request <path>` (env `THORYN_FIX_REQUEST`) |
 | `workflow.yaml` | **how the App-dispatched workflow runs** (SSO-3719): the run-time configuration the reusable workflow `thoryn-io/thoryn-cli/.github/workflows/provisioning.yml` reads — which provisioning files with which connections (one or many), `THORYN_*` env vars for the CLI, whether to upload the fix request, the apply toggles (`prune` / `destroy`, never on by default). This repository's copy states the defaults. Unknown keys are refused: a knob that is not there is a product gap, not a script | `cli/src/main/resources/examples/workflow.schema.json` | `thoryn provision workflow check` |
 
@@ -18,15 +17,23 @@ The provisioning Action (`.github/actions/provision`) runs, in order:
 ```bash
 thoryn login --connection .thoryn/connection.json      # who I am — exchanges the job's own OIDC token, no secret
 thoryn provision plan   --file .thoryn/provision.yaml  # what would change (read-only)
-thoryn provision apply  --file .thoryn/provision.yaml --yes   # converge — twice = no writes
-# … the job uses the outputs (environment, client-id, issuer) …
-thoryn provision destroy --file .thoryn/provision.yaml --yes  # child-first; sandbox hard-delete cascades
+thoryn provision apply  --file .thoryn/provision.yaml --yes --output json  # converge — twice = no writes; the ids
+# … the job uses the outputs (environment, client-id, issuer — read from the apply's resources[]) …
+thoryn provision destroy --file .thoryn/provision.yaml --yes --output json # owner-gated, child-first: the loopback client
 ```
 
-The receipt (`provision.receipt.json`, written next to the file — **committed** since SSO-3697, see
-"Provisioning from code"; every other `*.receipt.json` under `.thoryn/` stays git-ignored) is the ownership
-ledger: `destroy` removes only what it records, and a resource that already existed when `apply`
-ran is **adopted** (converged, never deleted). No secret ever lives in either file — and since
+**There is no receipt (SSO-3715 / SSO-3717; oauthy ADR
+`2026-10-15-platform-is-the-ledger-no-committed-provisioning-receipt`).** Nothing is written beside the file,
+committed or cached, and nothing is committed back by any job: `plan`, `apply`, `destroy` and `import` read live
+state only, so the plan a reviewer reads and the state the platform enforces cannot diverge. **The platform's
+`owner` relation is the ledger**: what `destroy` / `--prune` may remove is decided by it — a `client:` identity
+(this repository's `wi_`) removes only the declared `application` / `environment` it OWNS (`manager` alone never
+lets automation delete), children before environments — and **`retain: true`** is how the reviewed file says an
+owned resource stays regardless (the destroy plan shows it as `retained by the file`). Here `cli` and the sandbox
+`ci` are retained, so the one thing a `destroy` of this file removes is the per-run loopback client the CI
+identity created (and so owns); `provision-e2e` asserts exactly that from `destroy --output json` on every run.
+The committed `provision.receipt.json` of SSO-3697 was deleted by SSO-3717 and `.gitignore` ignores every
+`.thoryn/*.receipt.json` again (an older CLI still writes one). No secret ever lives in either file — and since
 SSO-3690 none lives in the repository's GitHub settings either: `connection.json` is a
 `workload_identity` contract, so there is no env var to name (a file that needed one would use
 `passwordEnv` / `{{env.NAME}}` in `provision.yaml`, or `auth.secretEnv` in a `client_credentials`
@@ -47,9 +54,10 @@ thoryn provision plan  --file .thoryn/provision.yaml
 thoryn provision apply --file .thoryn/provision.yaml --yes
 ```
 
-Every later `apply` — CI signs in as the trust's client — **adopts** it by its fixed id and converges
-its non-secret shape; adopted resources are never removed by `destroy`, so CI cannot delete the client
-it depends on. Rotating it is editing this file.
+Every later `apply` — CI signs in as the trust's client, the client's platform `owner` — finds it by its fixed id
+and converges its non-secret shape; it is declared **`retain: true`**, so no `destroy` or `--prune` ever removes it
+(SSO-3717) — CI cannot delete the client it depends on, and neither can a founder's `destroy` of this file.
+Rotating it is editing this file.
 
 > **This repository OWNS the login client's provisioning (product owner, 2026-10-14; SSO-3697).** The engine
 > gates every resource on the signed-in identity's own platform reach (`POST /api/v1/access/check`,
@@ -145,17 +153,15 @@ It prints the trust's `clientId` (`wi_…`), `audience` and a connection snippet
 #    the thoryn workspace's issuer, no /{env} path; it only changes if the workspace moves to a custom domain).
 
 # 3) Converge the sandbox's grant AND remove the retired cli-ci client — one reviewed apply, from the
-#    founder's session, after the pull request is merged. --prune deletes exactly the owned resources the
-#    file no longer declares: the one `application/ci` entry of your receipt (production plane → --confirm).
-thoryn provision plan  --file .thoryn/provision.yaml --prune       # expect: "- application ci (cli-ci)" and
-                                                                   #         "environment ci: grant + client:wi_… manager"
-thoryn provision apply --file .thoryn/provision.yaml --prune --confirm thoryn --yes
-#    Receipt effect: .thoryn/provision.receipt.json (git-ignored, local to you) drops its `application/ci`
-#    entry; the `client:cli-ci manager` grant it recorded on the sandbox is revoked by the same apply.
-#    No receipt owning cli-ci on this machine? Then --prune has nothing to remove: delete it directly,
-#      thoryn clients delete cli-ci --confirm thoryn
-#    NEVER `thoryn provision destroy` for this — it would also remove the sandbox and everything else the
-#    receipt owns.
+#    founder's session, after the pull request is merged. (Done once on 2026-10-14, then still receipt-based.)
+#    Since SSO-3715 the platform is the ledger: `--prune` removes what the SIGNED-IN identity OWNS and the file no
+#    longer declares (`GET /api/v1/access/mine?relation=owner`) — a person owns nothing, so a founder's --prune
+#    revokes undeclared grants only; a client a person created is deleted directly:
+thoryn provision plan  --file .thoryn/provision.yaml --prune       # expect: "environment ci: grant + client:wi_… manager"
+thoryn provision apply --file .thoryn/provision.yaml --prune --yes # revokes the `client:cli-ci manager` grant on the sandbox
+thoryn clients delete cli-ci --confirm thoryn                      # the retired client itself (production plane)
+#    NEVER `thoryn provision destroy` for this — a founder's destroy removes the unowned resources they manage; the
+#    sandbox and `cli` are `retain: true` and would be shown as retained, but nothing here needs a destroy.
 
 # 4) Delete the repository secret the retired client needed. Nothing replaces it.
 gh secret delete THORYN_CLI_CI_CLIENT_SECRET -R thoryn-io/thoryn-cli
@@ -295,11 +301,12 @@ with the hub's SSO-3698 fix deployed (GitHub's *immutable subject*,
 (`404 not_found — No such access-grant target`) that SSO-3705 removed; nothing else in the run was wrong. The App's
 plan check has not run on this repository yet — step (e) is its first run.
 
-> The receipt is committed (`.gitignore` un-ignores `.thoryn/provision.receipt.json`) because the App's receipt
-> step is `git add -- ':(glob).thoryn/**/*.receipt.json'` — an ignored path would fail it. One consequence of
-> two paths sharing one file: `provision-e2e`'s `destroy` removes what its checkout's receipt owns — the
-> loopback client the App's apply created (the sandbox and `cli` are adopted, never removed); the next App
-> apply re-creates it and the receipt PR records the new id. Expected churn, not a defect.
+> **Two paths, one file, no ledger to keep in step (SSO-3717).** The App's apply converges `provision.yaml` from
+> `main`; `provision-e2e` applies the same file and then runs `destroy`. Because destroy is owner-gated and the file
+> says `retain: true` on `cli` and the sandbox, the e2e's teardown removes exactly the loopback client — whichever
+> run created it, it was this identity — and the next App apply re-creates it. Nothing records the id in between:
+> `apply --output json` prints it when a run needs it, and the platform's audit log is the durable record.
+> Expected churn, not a defect — and no receipt pull request to merge after it.
 
 ## Why the scopes are what they are
 
@@ -322,13 +329,15 @@ the identity is `manager` of the `ci` sandbox only, so product-api refuses anyth
 and two GitHub environments — the reviewed one for the write scopes, the `-plan` one for the read-only plan profile
 (oauthy ADR 2026-09-22 D2/D8; 2026-10-14 plan-identity ADR). Everything CI creates is **environment-scoped**
 (inside the `cli-ci` sandbox), so `destroy` needs no production-plane confirmation — the production-plane
-resource, the `cli` login client, is adopted by CI, never owned or removed. There is no secret to rotate; to
+resource, the `cli` login client, is owned by CI (the platform `owner` relation) and declared `retain: true`, so
+no destroy ever plans its removal. There is no secret to rotate; to
 cut CI off, delete the trust. To isolate CI blast radius entirely, bind the contract to a dedicated
 `thoryn-cli-ci` workspace instead — change `workspace.slug`, create the trust there and re-paste.
 
-> A leaked `cli-ci` sandbox (a run that failed before `destroy`) is adopted — not duplicated — by the
-> next `apply`, and adopted resources are never auto-deleted: remove it by hand with
-> `thoryn env delete <id> --confirm cli-ci` if it should go.
+> The `cli-ci` sandbox is a long-lived fixture, `retain: true`: no run removes it, and a loopback client left by a
+> run that failed before `destroy` is matched by its converge key — not duplicated — by the next `apply` and
+> removed by the next teardown. Should the sandbox itself ever go, that is a founder's
+> `thoryn env delete <id> --confirm cli-ci`, never automation's.
 
 ## Workload identity — the staging sign-in check with no secret (SSO-3308)
 

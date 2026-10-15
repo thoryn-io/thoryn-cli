@@ -8,10 +8,11 @@
 #  - `cli` (SSO-3104): the CLI's OWN customer-plane login client — the public PKCE client every
 #    `thoryn login --workspace <slug>` signs in with. It lives on the `thoryn` workspace's PRODUCTION
 #    plane (no `environment:`), replacing the hub-seeded `thoryn-cli` client on the shared default tenant
-#    (the platform is moving everything off that tenant). A founder creates it ONCE with
-#    `thoryn provision apply` while switched into the `thoryn` workspace; every later `apply` (CI signs in
-#    as the CI identity, which holds the platform `owner` relation on it since SSO-3697) ADOPTS it by its
-#    fixed `clientId` and converges its non-secret shape — adopted resources are never deleted by `destroy`.
+#    (the platform is moving everything off that tenant). A founder created it ONCE with
+#    `thoryn provision apply` while switched into the `thoryn` workspace; ONE identity converges it since: the CI
+#    identity holds the platform `owner` relation on it (SSO-3697), so every `apply` from `main` finds it by its
+#    fixed `clientId` and converges its non-secret shape — and `retain: true` (SSO-3715 / SSO-3717) says it is
+#    never removed by `destroy` or `--prune`, whoever runs them.
 #  - What CI needs (SSO-3090): a SANDBOX environment inside the contract's workspace, and a public
 #    loopback OAuth client inside that sandbox.
 #
@@ -44,37 +45,38 @@
 #    declares a resource the repository does not own, or a dry run would fail — before merge.
 #  * a push to `main` dispatches `mode=apply`: the job runs in the REVIEWED environment `thoryn-provision-e2e`
 #    (required reviewers hold it before any token is minted), signs in as `thoryn-cli-ci`, applies with
-#    `destroy: "false"` — never `--prune`, never `destroy` — and opens a follow-up pull request carrying
-#    `.thoryn/provision.receipt.json` (committed since SSO-3697: it is the ownership ledger the next apply
-#    builds on). A dispatched run executes on `main` in BOTH modes, so the GitHub environment is the only pin
-#    that separates "may read" from "may write" — the plan profile cannot write whatever this file says.
-#  `provision-e2e.yml` (dispatch: apply + confinement assertions + destroy) stays as the manual path. Its
-#  `destroy` removes what ITS checkout's receipt owns — with the receipt now committed, that is the loopback
-#  client the App's apply created (the sandbox is adopted, never removed); the next App apply re-creates it and
-#  the receipt PR records the new id. Expected churn of two paths sharing one file, not a defect.
+#    `destroy: false` and `prune: false` (`.thoryn/workflow.yaml`) — never `--prune`, never `destroy` — and ends at
+#    "Applied". NOTHING IS WRITTEN BACK (SSO-3717; oauthy ADR 2026-10-15-platform-is-the-ledger-no-committed-
+#    provisioning-receipt): since SSO-3715 the engine writes no receipt, so there is no receipt pull request and the
+#    job holds `contents: read` only. The platform is the ledger — what this repository owns is its `owner` relation
+#    on each resource, readable with `thoryn access` and re-checked by product-api on every DELETE. A dispatched run
+#    executes on `main` in BOTH modes, so the GitHub environment is the only pin that separates "may read" from "may
+#    write" — the plan profile cannot write whatever this file says.
+#  `provision-e2e.yml` (dispatch: apply + confinement assertions + destroy) stays as the manual path. Its `destroy`
+#  is OWNER-GATED (SSO-3715): a `client:` identity removes only what the platform says it OWNS, children before
+#  environments, and a `retain: true` resource never. So it removes EXACTLY the per-run `loopback-rp` client (the CI
+#  identity created it, so it owns it) and leaves `cli` and the `ci` sandbox in place as `retained by the file` rows;
+#  the next apply re-creates the loopback client. provision-e2e asserts that from `destroy --output json` on every run.
 #
-#  HOW THE OLD CLIENT IS REMOVED — once, by the founder whose receipt owns it, as a REVIEWED removal
-#  (SSO-3659: removals only through `--prune`, never by automation; `destroy` is never run by a pipeline):
-#    thoryn login --workspace thoryn --issuer https://auth.stg.thoryn.org
-#    thoryn provision plan  --file .thoryn/provision.yaml --prune          # shows "- application ci (cli-ci)"
-#    thoryn provision apply --file .thoryn/provision.yaml --prune --confirm thoryn --yes
-#  `--prune` deletes exactly the owned resources this file no longer declares — the one `application/ci`
-#  entry of the founder's receipt (production plane, hence `--confirm thoryn`) — and the receipt drops that
-#  entry (`.thoryn/provision.receipt.json`, git-ignored, so the effect is local to the founder's machine).
-#  The same apply converges the sandbox's `grants:` block: the trust's client gains `manager`, and the
-#  `client:cli-ci manager` grant the founder's receipt recorded is revoked. If the founder's receipt no
-#  longer exists nothing is owned and `--prune` removes nothing: delete the client directly instead,
-#  `thoryn clients delete cli-ci --confirm thoryn`. Either way: NOT a `destroy` — that would also remove the
-#  sandbox and everything the receipt owns.
+#  HOW THE OLD CLIENT WAS REMOVED — once, by a founder, as a REVIEWED removal (SSO-3690: the retired confidential
+#  `cli-ci` client went with `thoryn provision apply --prune --confirm thoryn`, then still receipt-based). Under
+#  SSO-3715 `--prune` removes what the signed-in identity OWNS on the platform and the file no longer declares
+#  (`GET /api/v1/access/mine?relation=owner`) — the platform is the ledger, so there is no receipt to consult and a
+#  person's `--prune` removes nothing (people cannot own; it prunes undeclared grants only). Removals stay a
+#  reviewed act: the App-dispatched apply never passes `--prune` (`.thoryn/workflow.yaml`), and `destroy` is never
+#  run by a pipeline other than provision-e2e's own teardown of what it created.
 #
 # The sandbox is a LONG-LIVED FIXTURE, not a per-run throwaway (settled by the product owner,
 # 2026-09-16). Creating a resource requires `manager` on its PARENT, and the parent of an environment
 # is the workspace — so the confined CI identity structurally CANNOT create or delete an
-# environment. A founder creates the sandbox once (with this file); every CI run ADOPTS it by its fixed
+# environment. A founder created the sandbox once (with this file); every CI run finds it by its fixed
 # slug and manages only what lives INSIDE it: the loopback client is created by each run and removed by
-# `destroy` on exit. Granting the CI identity manager on the WORKSPACE so it could create per-run sandboxes was
-# considered and rejected — by containment it would reach the whole production plane, including the
-# `cli` login client above, which is exactly what epic SSO-3108 exists to prevent.
+# `destroy` on exit. The sandbox is `retain: true` (SSO-3717) so the file SAYS it stays, instead of relying on the
+# accident that nobody owns it: `destroy` shows it as `retained by the file` and never plans its removal, which is
+# also what keeps every `destroy` of this file off the production plane (no `--confirm` needed). Granting the CI
+# identity manager on the WORKSPACE so it could create per-run sandboxes was considered and rejected — by
+# containment it would reach the whole production plane, including the `cli` login client above, which is exactly
+# what epic SSO-3108 exists to prevent.
 #
 # `provision-e2e` serialises runs with a concurrency group, so one fixed sandbox is enough. It also
 # asserts the confinement itself after every apply: as the CI identity, `thoryn env list` must return ONLY this
@@ -96,11 +98,15 @@ resources:
     # and is deliberately NOT in a `grants:` block: the engine refuses `relation: owner` there (SSO-3673) — a
     # repository cannot claim ownership by writing YAML. Until SSO-3690 this entry was `readOnly: true` with a
     # founder-granted `viewer`; that grant is revoked as redundant once `owner` is set.
-    # The fixed `clientId` keeps the adopt-by-id behaviour: the client exists (a founder created it once), so the
-    # first apply from CI ADOPTS it (`adopted: true` in the receipt) and converges its non-secret shape; adopted
-    # resources are never deleted by `destroy`, so CI cannot remove the client it depends on.
+    # The fixed `clientId` is the converge key: the client exists (a founder created it once), so every apply finds
+    # it live and converges its non-secret shape — the first apply of an existing resource is not an event (SSO-3715
+    # retired the receipt's `adopted` bit). `retain: true` is the declared replacement: converged and owned, but never
+    # removed by `destroy` / `--prune` — the destroy plan shows it as `retained by the file`. Without it an owner-gated
+    # destroy by the CI identity (the owner) WOULD remove the CLI's login client (it is on the production plane, so
+    # `--confirm thoryn` would still be required — the ADR's rejected "owner-based destroy with no retain:").
     # The plan identity IS this owner (SSO-3705 — SSO-3699 option B: one trust with a plan profile), so a PR's
     # plan check sees the owner planning its own resource; SSO-3697's `owned_elsewhere` gap is gone by design.
+    retain: true
     spec:
       clientId: cli                       # fixed id: ThorynConfig.DEFAULT_CLIENT_ID signs in with it
       displayName: "Thoryn CLI"
@@ -154,6 +160,9 @@ resources:
 
   - kind: environment
     name: ci
+    # SSO-3717 — a long-lived fixture, declared so: `destroy` / `--prune` never remove it (the plan shows
+    # `retained by the file`), and the loopback client below is the ONE thing a provision-e2e destroy removes.
+    retain: true
     spec:
       slug: cli-ci
       displayName: "thoryn-cli CI sandbox"
@@ -172,6 +181,9 @@ resources:
       - subject: "client:wi_10a7b379c79f7d1353f5798d"
         relation: manager
 
+  # The per-run fixture: created inside the sandbox by each apply (the CI identity creates it, so the platform
+  # makes it the `owner` — SSO-3673), removed by provision-e2e's `destroy` on exit (owner-gated, SSO-3715) and
+  # re-created by the next apply. The ONLY resource of this file a destroy removes.
   - kind: application
     name: loopback-rp
     environment: ci

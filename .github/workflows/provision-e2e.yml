@@ -19,13 +19,18 @@ name: provision-e2e
 # until the trust is changed to match (`.thoryn/connection.json`'s `auth.github` mirrors the pins so the
 # CLI can name the field that differs).
 #
-# The file provisions a SANDBOX environment (`cli-ci`) inside the `thoryn` workspace plus a loopback
-# OAuth client in it; destroy hard-deletes the sandbox (cascading the client). A leftover from a failed
-# run is ADOPTED by its slug on the next apply, never duplicated (see `.thoryn/provision.yaml`).
+# The file declares the CLI's login client `cli` (production plane, `retain: true`), the long-lived SANDBOX
+# `cli-ci` (`retain: true`) and a loopback OAuth client inside the sandbox. THE PLATFORM IS THE LEDGER (SSO-3715 /
+# SSO-3717; oauthy ADR 2026-10-15-platform-is-the-ledger-no-committed-provisioning-receipt): nothing is written
+# beside the file — no receipt — and `destroy` is OWNER-GATED: the CI identity removes only what the platform says
+# it OWNS, so the teardown removes EXACTLY the per-run loopback client (this identity created it) and leaves `cli`
+# and `cli-ci` as `retained by the file` rows. This workflow ASSERTS that from the destroy's JSON document on every
+# run — the ADR's dogfood verification, run rather than reasoned. A leftover loopback client from a failed run is
+# matched by its converge key on the next apply, never duplicated (see `.thoryn/provision.yaml`).
 #
 # Manual only (workflow_dispatch): it mutates a shared-staging workspace, so it must not fire on push/PR.
-# Requires a `cli-v*` release carrying `workload_identity` connection contracts (SSO-3308, cli-v0.31.0+;
-# `thoryn provision apply` itself is cli-v0.11.0+) — pin one with the cli-version input until it is the latest.
+# Requires cli-v0.36.0 or newer (the first release with `apply` / `destroy --output json` and no receipt, SSO-3715;
+# `workload_identity` connection contracts are cli-v0.31.0+) — pin one with the cli-version input until it is the latest.
 #
 # ONE-TIME OPERATOR SETUP (see `.thoryn/README.md` "A founder creates the trust once"): a founder creates
 # the `thoryn-cli-ci` trust with `thoryn workload-identity trusts create`, pastes its `wi_…` client id into
@@ -41,11 +46,11 @@ on:
         required: false
         default: "https://hub.stg.thoryn.org"
       cli-version:
-        description: "cli-v* release tag to run (default: latest). Needs cli-v0.31.0 or newer (workload_identity connection contracts, SSO-3308)."
+        description: "cli-v* release tag to run (default: latest). Needs cli-v0.36.0 or newer (apply/destroy --output json, no receipt — SSO-3715)."
         required: false
         default: ""
       destroy:
-        description: "Remove what the run created on exit (\"true\"/\"false\"). The sandbox itself is a long-lived fixture and is never removed."
+        description: "Remove what the run created on exit (\"true\"/\"false\") and assert the destroy's scope. `cli` and the sandbox are `retain: true` and are never removed."
         required: false
         default: "true"
       foreign-environment-id:
@@ -118,7 +123,7 @@ jobs:
         run: |
           set -euo pipefail
           listed=$(java -jar thoryn.jar env list --output json | jq -r 'if type == "array" then . else .data end | .[] | .slug' | sort)
-          echo "Environments visible to the CI identity:"; echo "$listed" | sed 's/^/  /'
+          echo "Environments visible to the CI identity:"; echo "$listed" | awk '{ print "  " $0 }'
           if [ "$listed" != "$EXPECTED_SANDBOX" ]; then
             echo "::error::confinement broken — expected the CI identity to see only '$EXPECTED_SANDBOX', saw: $(echo "$listed" | tr '\n' ' ')" >&2
             exit 1
@@ -139,19 +144,70 @@ jobs:
           fi
           echo "Foreign environment answered 404 — the CI identity cannot reach it."
 
+      # SSO-3717 (oauthy ADR 2026-10-15 §1, decomposition item 6 — "run, not reasoned") — prove the SCOPE of the
+      # teardown, not merely that it ran. The Action's destroy printed `{destroyed, removed[], skipped[]}`; this
+      # identity (`client:wi_…`) may remove only what the platform says it OWNS, and the file says `retain: true`
+      # on `cli` and the sandbox. So the document must show:
+      #   * removed[]  — exactly ONE row: application/loopback-rp in the sandbox (created by this identity ⇒ owned);
+      #   * skipped[]  — application/cli and environment/ci, each `retain: true` with the reason
+      #                  `retained by the file (`retain: true`) — never removed by destroy / --prune`.
+      # A loopback row that was SKIPPED instead (e.g. `… is not OWNED by this identity …`) means a live client this
+      # identity did not create — a person created it once; the fix is that person's one-time
+      # `thoryn clients delete <id> --environment cli-ci` (the row's `byHand`), after which the next apply creates it
+      # as this identity and the destroy removes it. A `cli` or `ci` row in removed[] would mean `retain:` left the
+      # file — the one way this workflow could delete the CLI's own login client, so it is a hard failure here.
+      - name: Assert destroy removed exactly the per-run loopback client — cli and the sandbox retained (SSO-3717)
+        if: inputs.destroy == 'true'
+        env:
+          DESTROY_RESULT: ${{ steps.provision.outputs.destroy-result }}
+          EXPECTED_SANDBOX: ${{ steps.provision.outputs.environment }}
+        run: |
+          set -euo pipefail
+          [ -n "$DESTROY_RESULT" ] && [ -s "$DESTROY_RESULT" ] || { echo "::error::no destroy document — the Action's teardown did not run or printed nothing (destroy-result='$DESTROY_RESULT')." >&2; exit 1; }
+          # One shape for both outcomes: `destroy` prints {destroyed, removed[], skipped[]} when it removed something and
+          # its plan {changes[]} when it had nothing to remove (every row a skip) — normalise to removed/skipped rows.
+          rows="$(jq -c '{removed: (.removed // [.changes[]? | select(.action=="remove")]), skipped: (.skipped // [.changes[]? | select(.action=="skip")])}' "$DESTROY_RESULT")"
+          echo "removed: $(echo "$rows" | jq -c '[.removed[] | {kind, name, id, environment}]')"
+          echo "skipped: $(echo "$rows" | jq -c '[.skipped[] | {kind, name, retain, reason}]')"
+          removed_keys="$(echo "$rows" | jq -r '[.removed[] | "\(.kind)/\(.name)"] | sort | join(" ")')"
+          if [ "$removed_keys" != "application/loopback-rp" ]; then
+            echo "::error::destroy removed [$removed_keys] — expected exactly application/loopback-rp. A retained resource in this list means retain: left the file; an empty list means the loopback client was not this identity's to remove (see the skipped rows' byHand)." >&2
+            echo "$rows" | jq -r '.skipped[] | select(.byHand != null) | "  \(.kind)/\(.name): \(.reason)\n    by hand: \(.byHand)"' >&2
+            exit 1
+          fi
+          loopback_env="$(echo "$rows" | jq -r '.removed[0].environment // ""')"
+          if [ "$loopback_env" != "$EXPECTED_SANDBOX" ]; then
+            echo "::error::the removed loopback client lives in '$loopback_env', expected the sandbox '$EXPECTED_SANDBOX'." >&2
+            exit 1
+          fi
+          for key in application/cli environment/ci; do
+            kind="${key%/*}"; name="${key#*/}"
+            row="$(echo "$rows" | jq -c --arg k "$kind" --arg n "$name" '[.skipped[] | select(.kind==$k and .name==$n)] | first // empty')"
+            [ -n "$row" ] || { echo "::error::$key is missing from the destroy plan's skipped rows — it must be left in place as a retained resource." >&2; exit 1; }
+            if [ "$(echo "$row" | jq -r '.retain // false')" != "true" ] || ! echo "$row" | jq -e '.reason | startswith("retained by the file")' > /dev/null; then
+              echo "::error::$key was left in place for the wrong reason — expected retain: true and 'retained by the file …', got: $(echo "$row" | jq -r '.reason')" >&2
+              exit 1
+            fi
+          done
+          echo "Destroy scope as declared: application/loopback-rp removed; application/cli and environment/ci retained by the file."
+
       # Downstream consumers use the Action's outputs. The destroy inside the Action runs on exit, so
-      # the sandbox + client ids are only valid for the life of the job (the workspace + issuer persist).
-      # Outputs are read through `env:` (never interpolated into the script source — SSO-3635).
+      # the loopback client id is only valid for the life of the job (the workspace, the sandbox, `cli` and
+      # the issuer persist). Outputs are read through `env:` (never interpolated into the script source —
+      # SSO-3635). There is no receipt (SSO-3715): the apply's and the destroy's JSON documents under
+      # $RUNNER_TEMP are the run's record, and the platform's audit log the durable one.
       - name: Show provisioned identifiers
         env:
           WORKSPACE_SLUG: ${{ steps.provision.outputs.workspace-slug }}
           ENVIRONMENT: ${{ steps.provision.outputs.environment }}
           CLIENT_ID: ${{ steps.provision.outputs.client-id }}
           ISSUER: ${{ steps.provision.outputs.issuer }}
-          RECEIPT: ${{ steps.provision.outputs.receipt }}
+          APPLY_RESULT: ${{ steps.provision.outputs.apply-result }}
+          DESTROY_RESULT: ${{ steps.provision.outputs.destroy-result }}
         run: |
           echo "workspace-slug = $WORKSPACE_SLUG"
           echo "environment    = $ENVIRONMENT"
           echo "client-id      = $CLIENT_ID"
           echo "issuer         = $ISSUER"
-          echo "receipt        = $RECEIPT"
+          echo "apply-result   = $APPLY_RESULT"
+          echo "destroy-result = $DESTROY_RESULT"
