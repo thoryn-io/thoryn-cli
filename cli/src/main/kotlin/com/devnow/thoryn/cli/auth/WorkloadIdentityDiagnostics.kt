@@ -46,6 +46,18 @@ data class WorkloadIdentityBinding(
      * whether [scope] was sent at all (a plan job sends none) and is named on a refusal.
      */
     val profile: WorkloadProfile? = null,
+    /**
+     * SSO-3722 — the connection named no apply environment and the job carries an `environment` claim, so NO scope was
+     * sent and the hub decided the profile ([WorkloadProfile.hubDecides]). Named on a refusal and in the fix.
+     */
+    val hubDecided: Boolean = false,
+    /** SSO-3722 — the `--connection` file the sign-in read, when any: the fix names the exact file to edit. */
+    val connectionFile: String? = null,
+    /**
+     * SSO-3722 — the scopes the caller ASKED for (the connection's `auth.scopes`, the flag's `--scope`), whatever was
+     * sent: the `trusts create` the fix proposes carries them even when a plan job sent none.
+     */
+    val requestedScope: String? = scope,
 )
 
 /**
@@ -211,11 +223,122 @@ object WorkloadIdentityDiagnostics {
         return path.trim('/').isEmpty()
     }
 
-    /** The whole multi-line report for a failed sign-in (no trailing newline). */
-    fun render(e: WorkloadIdentityException, binding: WorkloadIdentityBinding): String {
+    /**
+     * SSO-3722 — the fix of ONE refusal, in the fix request's own terms: missing RIGHTS ([items], each with the command a
+     * workspace admin runs) and FILE / job edits ([notes], imperative, copy-pasteable). Every refusal has at least one.
+     */
+    data class Fix(val items: List<FixRequest.MissingRight>, val notes: List<String>) {
+        val isEmpty: Boolean get() = items.isEmpty() && notes.isEmpty()
+    }
+
+    /**
+     * SSO-3722 — what fixes [e], per refusal shape (the audited list is the PR's table): a missing plan profile is the
+     * ONE right; everything else is an edit to the job, the connection file or the trust, named with the exact command.
+     */
+    fun fixFor(e: WorkloadIdentityException, binding: WorkloadIdentityBinding): Fix {
+        val file = binding.connectionFile ?: "connection.json"
+        val identity = e.jobIdentity
+        if (identity == null) {
+            return Fix(
+                emptyList(),
+                when (e.oauthError) {
+                    WorkloadIdentityFlow.ERROR_NOT_ON_GITHUB_ACTIONS -> listOf(
+                        "job: add `permissions: id-token: write` (with `contents: read`) to the job that runs `thoryn login` — GitHub sets ${WorkloadIdentityFlow.REQUEST_URL_ENV} / ${WorkloadIdentityFlow.REQUEST_TOKEN_ENV} only then",
+                        "outside GitHub Actions: sign in with `thoryn login` (a person) or `thoryn login --client-credentials` (an API key) instead",
+                    )
+                    WorkloadIdentityFlow.ERROR_JOB_TOKEN_REQUEST_FAILED -> listOf(
+                        "job: grant `permissions: id-token: write` and re-run — the runner refused the job-token request for audience '${binding.audience}'",
+                    )
+                    WorkloadIdentityFlow.ERROR_TOKEN_FILE_UNREADABLE -> listOf(
+                        "pod: mount the projected ServiceAccount token where the connection reads it — a `projected` volume with a `serviceAccountToken` source (`audience: ${binding.audience}`), or set auth.tokenSource.path in $file to the mounted path",
+                    )
+                    else -> listOf("re-run the job; if it persists, a workspace admin reads the reason with `$AUDIT_COMMAND`")
+                },
+            )
+        }
+        val kubernetes = binding.provider == PROVIDER_KUBERNETES || (binding.provider == null && identity.isKubernetes)
+        return when (e.oauthError) {
+            "invalid_client" -> {
+                planProfileGap(e, binding)?.let { return Fix(listOf(it.item()), emptyList()) }
+                val mismatches = localMismatches(identity, binding.audience, binding.pins, binding.provider, binding.kubernetesPins)
+                val notes = mutableListOf<String>()
+                if (mismatches.any { it.startsWith("aud:") }) notes += "$file: set auth.audience to the trust's audience exactly (`thoryn workload-identity trusts get <id>` prints it)" + if (kubernetes) "; the projected volume's `audience:` must be the same value" else ""
+                if (mismatches.any { it.startsWith("iss:") } && !kubernetes) notes += "job: a trust accepts only a GitHub Actions job token (${WorkloadIdentityFlow.GITHUB_ACTIONS_ISSUER}) — run `thoryn login --connection` inside the GitHub Actions job itself"
+                if (mismatches.any { it.startsWith("event_name: pull_request_target") }) notes += "job: trigger the workflow on `pull_request`, never `pull_request_target` — the platform always refuses it"
+                if (mismatches.any { it.startsWith("event_name: pull_request jobs") }) notes += "job: a production trust refuses `pull_request` jobs — run the plan from the App-dispatched workflow in the trust's plan GitHub environment, or use a sandbox trust"
+                if (mismatches.any { it.startsWith("environment:") && it.contains("declares no `environment:`") }) notes += "job: add `environment: ${binding.pins?.environment ?: "<the trust's GitHub environment>"}` to the job"
+                if (mismatches.any { it.startsWith("kubernetes.io:") }) notes += "pod: mount a `projected` volume with a `serviceAccountToken` source — a legacy Secret-based token carries no `kubernetes.io` claim"
+                val pinMismatch = mismatches.any { m -> PIN_FIELDS.any { m.startsWith("$it:") } && !m.contains("declares no `environment:`") }
+                if (pinMismatch) {
+                    notes += "trust: re-create it with the ${if (kubernetes) "pod's" else "job's"} own pins — `${trustsCreateCommand(identity, binding)}` — then replace $file with the connection.json it prints (`thoryn workload-identity trusts get <id> --connection`); or align the ${if (kubernetes) "pod" else "job"} with the trust (the differences above)"
+                }
+                if (notes.isEmpty()) {
+                    notes += "read the exact reason (field errorReason): `$AUDIT_COMMAND`"
+                    notes += "then re-create the trust with the ${if (kubernetes) "pod's" else "job's"} own pins — `${trustsCreateCommand(identity, binding)}` — and replace $file with the connection.json it prints (`thoryn workload-identity trusts get <id> --connection`), or align the ${if (kubernetes) "pod" else "job"} with the trust (`thoryn workload-identity trusts get <id>`)"
+                }
+                Fix(emptyList(), notes)
+            }
+            "invalid_scope" -> Fix(
+                emptyList(),
+                when (profileOutside(e.errorDescription)) {
+                    WorkloadProfile.PLAN -> when {
+                        binding.connectionFile != null && binding.pins?.environment != null ->
+                            listOf("$file: auth.github.environment names '${binding.pins.environment}' but the hub matched the PLAN profile for this job's environment '${identity.environment ?: "(none)"}' — set auth.github.environment to the trust's APPLY environment (paste the whole github block from `thoryn workload-identity trusts get <id> --connection`), or drop auth.scopes")
+                        binding.connectionFile != null ->
+                            listOf("$file: names no apply environment — add auth.github.environment: <the trust's apply environment> (paste the whole github block from `thoryn workload-identity trusts get <id> --connection`), or drop auth.scopes so the hub mints the matched profile")
+                        else -> listOf("job: drop --scope (the hub then mints the plan profile's read-only scopes), or request only .read scopes — never a write scope from a plan job")
+                    }
+                    WorkloadProfile.APPLY -> listOf(
+                        if (binding.connectionFile != null) "$file: auth.scopes must be a subset of the trust's scopes (`thoryn workload-identity trusts get <id>` lists them) — remove the ones outside, or list exactly the trust's scopes for its full set" else "job: pass --scope with a subset of the trust's scopes (`thoryn workload-identity trusts get <id>` lists them), or no --scope at all to receive the trust's full set",
+                    )
+                    null -> listOf(
+                        if (binding.connectionFile != null) "$file: auth.scopes must be a subset of the trust's scopes (`thoryn workload-identity trusts get <id>` lists them)" else "job: pass --scope with a subset of the trust's scopes (`thoryn workload-identity trusts get <id>` lists them), or no --scope at all",
+                    )
+                },
+            )
+            WorkloadIdentityFlow.ERROR_TRANSPORT -> Fix(emptyList(), listOf("runner: make ${binding.tokenEndpoint} reachable (egress / DNS from this runner) and re-run; the audience's host is the platform the trust lives on"))
+            else -> Fix(emptyList(), listOf("re-run the job; if it persists, a workspace admin reads the reason with `$AUDIT_COMMAND`"))
+        }
+    }
+
+    /** The pinned fields whose mismatch means "the trust's pins are not this job's". */
+    private val PIN_FIELDS = listOf("repository", "repository_id", "repository_owner_id", "environment", "ref", "runner_environment", "namespace", "serviceAccount", "iss")
+
+    /**
+     * SSO-3722 — the ONE `thoryn workload-identity trusts create` that pins the trust to THIS job (or pod), built from
+     * the token's own public claims: the repository and its immutable ids, the GitHub environment the job declares, the
+     * ref / runner pins when the connection had them, the scopes the sign-in requested (or a placeholder), the sandbox
+     * (`--environment`) the audience names or `--confirm-production` for the production plane.
+     */
+    fun trustsCreateCommand(identity: JobIdentity, binding: WorkloadIdentityBinding): String = buildString {
+        append("thoryn workload-identity trusts create --name <name>")
+        val plane = runCatching { URI(binding.audience.trim()).path }.getOrNull()?.trim('/')?.takeIf { it.isNotEmpty() }
+        plane?.let { append(" --environment $it") }
+        val kubernetes = binding.provider == PROVIDER_KUBERNETES || (binding.provider == null && identity.isKubernetes)
+        if (kubernetes) {
+            append(" --provider kubernetes --issuer ${identity.issuer ?: "<cluster issuer>"}")
+            append(" --namespace ${identity.kubernetesNamespace ?: "<namespace>"} --service-account ${identity.kubernetesServiceAccount ?: "<service-account>"}")
+        } else {
+            append(" --repository ${identity.repository ?: "<owner/repo>"}")
+            if (identity.repositoryOwnerId != null && identity.repositoryId != null) append(" --owner-id ${identity.repositoryOwnerId} --repository-id ${identity.repositoryId}")
+            (identity.environment ?: binding.pins?.environment)?.let { append(" --github-environment $it") }
+            if (binding.pins?.ref != null) append(" --ref ${identity.ref ?: binding.pins.ref}")
+            if (binding.pins?.githubHostedRunnersOnly == true) append(" --github-hosted-runners-only")
+        }
+        append(" --scope \"${binding.requestedScope?.takeIf { it.isNotBlank() } ?: "<scopes>"}\"")
+        if (plane == null) append(" --confirm-production")
+    }
+
+    /**
+     * The whole multi-line report for a failed sign-in (no trailing newline): what was sent, who the job is, every
+     * difference the CLI can see — and, SSO-3722, always the one "To fix" block ([FixRequest.render], two options:
+     * the CLI commands / edits and the run's browser consent link when [consentUrl] is known).
+     */
+    fun render(e: WorkloadIdentityException, binding: WorkloadIdentityBinding, consentUrl: String? = null): String {
+        val fix = fixFor(e, binding)
         val identity = e.jobIdentity
         // Failures before the exchange (no runner vars, GitHub refused the job-token request): the message says it all.
-        if (identity == null) return "Sign-in failed: ${e.message}"
+        if (identity == null) return "Sign-in failed: ${e.message}\n\n" + FixRequest.render(fix.items, fix.notes, consentUrl)
 
         return buildString {
             when (e.oauthError) {
@@ -227,27 +350,22 @@ object WorkloadIdentityDiagnostics {
                 }
                 "invalid_scope" -> {
                     // SSO-3702 — the hub names the PROFILE whose ceiling refused the request (SSO-3700).
-                    val outside = profileOutside(e.errorDescription)
-                    when (outside) {
+                    when (profileOutside(e.errorDescription)) {
                         WorkloadProfile.PLAN -> {
                             appendLine("Sign-in failed: the requested scope is outside the trust's PLAN profile (HTTP ${e.status ?: 400}: invalid_scope, $REASON_OUTSIDE_PLAN).")
                             appendLine(
                                 "This job runs in GitHub environment '${identity.environment ?: "(none)"}'" +
-                                    (binding.pins?.environment?.let { " — not the trust's apply environment '$it'" } ?: "") +
-                                    ", so the hub matched the trust's plan profile and mints only its read-only (.read) scopes there.",
+                                    (binding.pins?.environment?.let { " — not the trust's apply environment '$it'" } ?: " and the connection names no apply environment") +
+                                    ", so the hub matched the trust's plan profile and mints only its read-only (.read) scopes there; a write scope is never minted to a plan job.",
                             )
-                            appendLine("Fix: request no scope at all (the hub then mints the plan profile's scopes) — `thoryn login --connection` does this when")
-                            appendLine("auth.github.environment names the apply environment — or request only .read scopes. Never request a write scope from a plan job.")
                         }
                         WorkloadProfile.APPLY -> {
                             appendLine("Sign-in failed: the requested scope is outside the trust's APPLY profile (HTTP ${e.status ?: 400}: invalid_scope, $REASON_OUTSIDE_APPLY).")
-                            appendLine("The trust's scopes are the ceiling for a job in its apply environment '${identity.environment ?: "(none)"}'. Request a subset of them")
-                            appendLine("(`thoryn workload-identity trusts get <id>` lists them), or no --scope at all to receive the trust's full set.")
+                            appendLine("The trust's scopes are the ceiling for a job in its apply environment '${identity.environment ?: "(none)"}'.")
                         }
                         null -> {
                             appendLine("Sign-in failed: the requested scope is not within the trust's scopes (HTTP ${e.status ?: 400}: invalid_scope).")
                             e.errorDescription?.let { appendLine("  platform said: ${sanitize(it)}") }
-                            appendLine("Request a subset of the trust's scopes, or no --scope at all to receive the trust's full set.")
                         }
                     }
                 }
@@ -264,8 +382,9 @@ object WorkloadIdentityDiagnostics {
             appendLine(
                 field(
                     "scope",
-                    binding.scope ?: when (binding.profile) {
-                        WorkloadProfile.PLAN -> "(none requested — the hub mints the matched plan profile's read-only scopes)"
+                    binding.scope ?: when {
+                        binding.profile == WorkloadProfile.PLAN -> "(none requested — the hub mints the matched plan profile's read-only scopes)"
+                        binding.hubDecided -> "(none requested — the connection names no apply environment; the hub matches the profile from the job's environment claim)"
                         else -> "(none requested — the trust's full set)"
                     },
                 ),
@@ -280,6 +399,7 @@ object WorkloadIdentityDiagnostics {
                     ),
                 )
             }
+            if (binding.hubDecided) appendLine(field("profile", "decided by the hub (no auth.github.environment in the connection)"))
             appendLine()
             val kubernetes = binding.provider == PROVIDER_KUBERNETES || (binding.provider == null && identity.isKubernetes)
             if (kubernetes) {
@@ -307,12 +427,6 @@ object WorkloadIdentityDiagnostics {
             if (mismatches.isNotEmpty()) {
                 appendLine("Differences found locally:")
                 mismatches.forEach { appendLine("  - $it") }
-                // SSO-3710 — the one difference that is a missing RIGHT rather than a wrong pin: the same item (and
-                // the same command text) `--fix-request` writes for the check run — one rendering.
-                planProfileGap(e, binding)?.let { gap ->
-                    appendLine()
-                    appendLine(FixRequest.render(listOf(gap.item())))
-                }
             } else {
                 appendLine(
                     when {
@@ -323,7 +437,7 @@ object WorkloadIdentityDiagnostics {
                 )
             }
             appendLine()
-            append(
+            appendLine(
                 if (kubernetes) {
                     "Compare the pod above with the trust (`thoryn workload-identity trusts get <id>`): its client id, audience, " +
                         "issuer, namespace and service account must all match, the token must be a PROJECTED one (a `kubernetes.io` " +
@@ -335,6 +449,10 @@ object WorkloadIdentityDiagnostics {
                         "environment the audience names."
                 },
             )
+            appendLine()
+            // SSO-3710 / SSO-3722 — the fix, from the ONE renderer the fix request is rendered with: the plan-profile gap is
+            // an item with the same `set-plan-profile` command `--fix-request` writes; every other shape is a file / job edit.
+            append(FixRequest.render(fix.items, fix.notes, consentUrl))
         }
     }
 

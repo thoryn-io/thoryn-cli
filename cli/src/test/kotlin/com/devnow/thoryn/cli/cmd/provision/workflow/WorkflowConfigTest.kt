@@ -101,7 +101,8 @@ class WorkflowConfigTest {
         val schema = JsonMapper.builder().build().readTree(javaClass.getResourceAsStream(WorkflowConfig.SCHEMA_RESOURCE)!!.readBytes())
         assertThat(schema["properties"]["apiVersion"]["const"].asString()).isEqualTo(WorkflowConfig.API_VERSION)
         assertThat(schema["additionalProperties"].asBoolean()).isFalse()
-        assertThat(schema["properties"].propertyNames().toSet()).isEqualTo(setOf("apiVersion", "provider", "files", "env", "fixRequest", "apply"))
+        assertThat(schema["properties"].propertyNames().toSet()).isEqualTo(setOf("apiVersion", "provider", "files", "env", "fixRequest", "consentUrl", "apply"))
+        assertThat(schema["properties"]["consentUrl"]["default"].asString()).isEmpty()
         assertThat(schema["properties"]["provider"]["enum"].toList().map { it.asString() }).isEqualTo(WorkflowConfig.PROVIDERS)
         assertThat(schema["properties"]["files"]["minItems"].asInt()).isEqualTo(1)
         assertThat(schema["properties"]["files"]["items"]["additionalProperties"].asBoolean()).isFalse()
@@ -114,5 +115,25 @@ class WorkflowConfigTest {
         assertThat(apply["properties"].propertyNames().toSet()).isEqualTo(setOf("prune", "destroy", "confirm"))
         assertThat(apply["properties"]["prune"]["default"].asBoolean()).isFalse()
         assertThat(apply["properties"]["destroy"]["default"].asBoolean()).isFalse()
+    }
+
+    // ── SSO-3723 — consentUrl: the browser option's base URL is configuration ──
+
+    @Test
+    fun `consentUrl parses as the consent base URL, trailing slash dropped, and rides on the config object the workflow reads`() {
+        val c = WorkflowConfig.parse("apiVersion: thoryn.io/workflow/v1\nconsentUrl: https://app.thoryn.io/\n", ".thoryn/workflow.yaml")
+        assertThat(c.consentUrl).isEqualTo("https://app.thoryn.io")
+        assertThat(c.toStructured()["consentUrl"]).isEqualTo("https://app.thoryn.io")
+        assertThat(WorkflowConfig.defaults().consentUrl).isNull()
+        assertThat(WorkflowConfig.defaults().toStructured()["consentUrl"]).isEqualTo("")
+        assertThat(WorkflowConfig.parse("apiVersion: thoryn.io/workflow/v1\nconsentUrl: \"\"\n").consentUrl).isNull()
+    }
+
+    @Test
+    fun `consentUrl must be an https base URL without query or fragment, and THORYN_CONSENT_URL cannot be set through env`() {
+        assertThat(errorsOf("apiVersion: thoryn.io/workflow/v1\nconsentUrl: http://app.thoryn.io\n")).contains("consentUrl must be an https:// base URL")
+        assertThat(errorsOf("apiVersion: thoryn.io/workflow/v1\nconsentUrl: https://app.thoryn.io/consent?x=1\n")).contains("consentUrl must be")
+        assertThat(errorsOf("apiVersion: thoryn.io/workflow/v1\nconsentUrl: https://app.thoryn.io/github/consent\n")).isEmpty()
+        assertThat(errorsOf("apiVersion: thoryn.io/workflow/v1\nenv:\n  THORYN_CONSENT_URL: https://x.example\n")).contains("THORYN_CONSENT_URL is set by the reusable workflow itself")
     }
 }

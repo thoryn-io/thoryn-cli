@@ -39,6 +39,12 @@
       "type": "boolean",
       "default": true
     },
+    "consentUrl": {
+      "description": "SSO-3723 — the base URL of the Thoryn GitHub App's browser consent. A red job then prints `To fix — Option 2, in the browser: <consentUrl>/github/consent/run/<owner>/<repository>/<run_id>` (resolvable by run: the consent id the App mints after the run is unknowable to the job) and the fix request carries it as `options.consentUrl`. Exported to the CLI as THORYN_CONSENT_URL when the reusable workflow's `consent-url` input is empty. Configuration, never guessed from the issuer. Empty ⇒ Option 1 (the CLI commands) alone.",
+      "type": "string",
+      "pattern": "^(https://[a-z0-9]([a-z0-9-]*[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+(:[0-9]{1,5})?(/[A-Za-z0-9._~/-]*)?)?$",
+      "default": ""
+    },
     "apply": {
       "description": "Apply-time toggles. Removals are NEVER on by default.",
       "type": "object",

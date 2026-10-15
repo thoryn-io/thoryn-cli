@@ -97,7 +97,7 @@ class FixRequestTest {
         val item = FixRequest.ownedElsewhere(subject, "application:rp", "access_owned_elsewhere — application:rp is owned by another repository")
         assertThat(item.kind).isEqualTo(FixRequest.Kind.OWNER)
         assertThat(item.cli).isNull()
-        assertThat(FixRequest.render(listOf(item))).contains("(no command: an admin decides — see the reason)")
+        assertThat(FixRequest.render(listOf(item))).contains("(no command runs for you: an admin decides")
         assertThat(json.readTree(request(listOf(item)).toJson())["missing"][0]["cli"].isNull).isTrue()
     }
 
@@ -119,6 +119,50 @@ class FixRequestTest {
             "workloadIdentityTrust me: workload_identity_trust_is_self — …",
         )
         assertThat(FixRequest.render(emptyList())).isEmpty()
+    }
+
+    // ── SSO-3722 / SSO-3723 — one "To fix" block, two options ──
+
+    private val link = "https://app.thoryn.io/github/consent/run/thoryn-io/thoryn-cli/38547022158"
+
+    @Test
+    fun `render prints the two options in the fixed shape — the CLI block with items and notes, then the browser link`() {
+        val item = FixRequest.owner(subject, "application:cli", "access_not_owned — …")
+        val rendered = FixRequest.render(listOf(item), listOf("application shared: a change to the file"), link)
+        assertThat(rendered.lines().first()).isEqualTo("To fix — Option 1, with the CLI (a workspace admin):")
+        assertThat(rendered)
+            .contains("\n  - owner on application:cli for $subject: access_not_owned — …\n      ${item.cli}\n")
+            .contains("\n  - application shared: a change to the file\n")
+        assertThat(rendered.lines().last()).isEqualTo("To fix — Option 2, in the browser: $link")
+        // A note alone is still a fix (a file edit): the block is printed for it.
+        assertThat(FixRequest.render(emptyList(), listOf("connection.json: add auth.github.environment"), null))
+            .startsWith(FixRequest.OPTION_CLI_HEADING).contains("  - connection.json: add auth.github.environment")
+    }
+
+    @Test
+    fun `without a consent link Option 2 says how to get one — and the request's options carry exactly what was printed`() {
+        val item = FixRequest.manager(subject, "environment:env-1", "access_not_owned — …")
+        val rendered = FixRequest.render(listOf(item), emptyList(), null)
+        assertThat(rendered.lines().last()).isEqualTo("To fix — Option 2, in the browser: ${FixRequest.NO_CONSENT_LINK_LINE}")
+        val doc = json.readTree(request(listOf(item), notes = listOf("user x: a note")).copy(consentUrl = link).toJson())
+        assertThat(doc["options"]["cli"].asString()).isEqualTo(FixRequest.renderOption1Body(listOf(item), listOf("user x: a note")))
+        assertThat(doc["options"]["cli"].asString()).contains(item.cli!!).contains("user x: a note")
+        assertThat(doc["options"]["consentUrl"].asString()).isEqualTo(link)
+        val none = json.readTree(request(emptyList()).toJson())
+        assertThat(none["options"]["cli"].isNull).isTrue()
+        assertThat(none["options"]["consentUrl"].isNull).isTrue()
+        assertThat(schema["properties"]["options"]["required"].toList().map { it.asString() }).containsExactlyInAnyOrder("cli", "consentUrl")
+    }
+
+    @Test
+    fun `the consent link is built from the configured base URL and the run — never from a partial context`() {
+        assertThat(FixRequest.consentUrl("https://app.thoryn.io/", "thoryn-io", "thoryn-cli", 38547022158)).isEqualTo(link)
+        assertThat(FixRequest.consentUrl(null, "thoryn-io", "thoryn-cli", 38547022158)).isNull()
+        assertThat(FixRequest.consentUrl("https://app.thoryn.io", null, "thoryn-cli", 38547022158)).isNull()
+        assertThat(FixRequest.consentUrl("https://app.thoryn.io", "thoryn-io", "", 38547022158)).isNull()
+        assertThat(FixRequest.consentUrl("https://app.thoryn.io", "thoryn-io", "thoryn-cli", null)).isNull()
+        assertThat(FixRequest.consentUrl("app.thoryn.io", "thoryn-io", "thoryn-cli", 1)).isNull()
+        assertThat(link).matches(schema["properties"]["options"]["properties"]["consentUrl"]["pattern"].asString())
     }
 
     @Test

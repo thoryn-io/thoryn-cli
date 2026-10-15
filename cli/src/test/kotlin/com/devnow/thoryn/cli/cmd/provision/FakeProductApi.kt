@@ -46,6 +46,15 @@ internal class FakeProductApi : Dispatcher() {
      * creator-becomes-OWNER (a `client:` creator only, SSO-3667) does not fire unless a test makes the caller a client.
      */
     var caller = "member:founder"
+
+    /**
+     * SSO-3722 — model product-api's `EnvironmentClaimFilter` (SSO-3118, the 404-not-403 rule): with this on, every
+     * plane-scoped read or write (applications, users, federation members, the singletons) is answered `404
+     * unknown_environment` unless the caller holds at least `viewer` on that plane — the production plane included. A
+     * brand-new repository identity with no relation on anything therefore gets 404 on its very first read, exactly as
+     * thoryn-cicd run 38751887466 did. Off by default: the older tests model reach per object only.
+     */
+    var environmentClaimFilter = false
     /** SSO-3659 — a workspace admin manages everything. The DEFAULT, so a test about something else sees a founder's reach. */
     var callerIsAdmin = true
     /** The workspace id (`tnt`) — the object `workspace:<tenantId>` and the custom domain's id. */
@@ -457,6 +466,19 @@ internal class FakeProductApi : Dispatcher() {
         return null
     }
 
+    /**
+     * SSO-3722 — "reach into a plane" as product-api's filter sees it: any relation on the plane itself (held or
+     * inherited), or a direct grant on an object INSIDE it — an owner of one application in the plane reaches the plane.
+     */
+    private fun reaches(env: String?): Boolean {
+        val plane = planeRef(env)
+        if (holds(plane, "viewer")) return true
+        return grants.any { it["subject"] == caller && parentOf(it["object"].toString()) == plane }
+    }
+
+    /** The first path segment of every route product-api's EnvironmentClaimFilter guards (the plane-scoped surface). */
+    private val PLANE_SCOPED_ROUTES = setOf("applications", "users", "federation-members", "email-provider", "login-experience", "login-methods", "login-flows")
+
     private fun mintsSecret(b: Map<String, Any?>): Boolean {
         val methods = (b["clientAuthenticationMethods"] as? List<*>)?.map { it.toString() } ?: return true
         return "client_secret_basic" in methods || "client_secret_post" in methods
@@ -474,6 +496,7 @@ internal class FakeProductApi : Dispatcher() {
         if (method != "GET" && route != "/api/v1/access/check") writes += Write(method, route, env, confirm, b)
         if (method == "DELETE" && failingDeletes.any { route.startsWith(it) }) return problem(503, "unavailable")
         val seg = route.removePrefix("/api/v1/").split('/')
+        if (environmentClaimFilter && seg[0] in PLANE_SCOPED_ROUTES && !reaches(env)) return problem(404, "unknown_environment")
         return when {
             // ── environments ──
             route == "/api/v1/environments" && method == "GET" -> json(200, mapOf("environments" to environments.map { withOwner(it, "environment:${it["id"]}") }))

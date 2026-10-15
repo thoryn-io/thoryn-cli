@@ -414,6 +414,18 @@ enum class WorkloadProfile(val wire: String) {
         }
 
         fun of(wire: String?): WorkloadProfile? = entries.firstOrNull { it.wire == wire }
+
+        /**
+         * SSO-3722 — whether a `--connection` sign-in leaves the profile to the HUB: the connection names NO apply
+         * environment (no `auth.github` block, or one without `environment`) yet the job token carries an `environment`
+         * claim. The CLI then requests NO scope and the hub mints the profile the claim matches (SSO-3700's empty-request
+         * rule) — never the connection's scopes blindly, which is how the forge-plan job of thoryn-cicd run 38751382032
+         * asked for write scopes from a plan environment and was refused (`invalid_scope`, `scope_outside_plan_profile`).
+         * False for a Kubernetes token (no profiles), outside GitHub (no claim), or with the apply environment known
+         * ([select] decides locally then).
+         */
+        fun hubDecides(identity: JobIdentity, applyEnvironment: String?): Boolean =
+            applyEnvironment?.trim().isNullOrEmpty() && !identity.isKubernetes && identity.environment != null
     }
 }
 

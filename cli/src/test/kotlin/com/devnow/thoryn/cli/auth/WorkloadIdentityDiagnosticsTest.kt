@@ -1,7 +1,11 @@
 package com.devnow.thoryn.cli.auth
 
+import com.devnow.thoryn.provision.FixRequest
 import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.params.ParameterizedTest
+import org.junit.jupiter.params.provider.Arguments
+import org.junit.jupiter.params.provider.MethodSource
 
 /**
  * SSO-3308 — the report a refused workload identity sign-in prints. The platform answers every mismatch
@@ -9,6 +13,7 @@ import org.junit.jupiter.api.Test
  * difference visible locally, and where the exact reason is (the workspace audit log) — and never the
  * job token.
  */
+@org.junit.jupiter.api.TestInstance(org.junit.jupiter.api.TestInstance.Lifecycle.PER_CLASS)
 class WorkloadIdentityDiagnosticsTest {
 
     private val audience = "https://thoryn.auth.stg.thoryn.org/cli-wif"
@@ -116,7 +121,9 @@ class WorkloadIdentityDiagnosticsTest {
     @Test
     fun `a failure before any job token is just its message`() {
         val e = WorkloadIdentityException("no GitHub Actions job token available", oauthError = WorkloadIdentityFlow.ERROR_NOT_ON_GITHUB_ACTIONS)
-        assertThat(WorkloadIdentityDiagnostics.render(e, binding)).isEqualTo("Sign-in failed: no GitHub Actions job token available")
+        val report = WorkloadIdentityDiagnostics.render(e, binding)
+        assertThat(report).startsWith("Sign-in failed: no GitHub Actions job token available\n\n${FixRequest.OPTION_CLI_HEADING}")
+        assertThat(report).doesNotContain("Sent:").contains("permissions: id-token: write")
     }
 
     // ── SSO-3710 — the one refusal that is a missing RIGHT, not a wrong pin ──
@@ -137,7 +144,7 @@ class WorkloadIdentityDiagnosticsTest {
         val report = WorkloadIdentityDiagnostics.render(e, pinned)
         assertThat(report)
             .contains("environment: the trust pins GitHub environment 'thoryn-provision-e2e'; this job runs in 'thoryn-provision-e2e-plan'.")
-            .contains("Missing rights — what a workspace admin grants (1 item(s)):")
+            .contains(FixRequest.OPTION_CLI_HEADING)
             .contains(item.cli!!)
             .contains("`thoryn workload-identity trusts list`")
     }
@@ -159,5 +166,73 @@ class WorkloadIdentityDiagnosticsTest {
         val pod = JobIdentity.of(FakeJobTokens.kubernetesToken(audience))
         assertThat(WorkloadIdentityDiagnostics.planProfileGap(refused(pod), pinned.copy(provider = WorkloadIdentityDiagnostics.PROVIDER_KUBERNETES))).isNull()
         assertThat(WorkloadIdentityDiagnostics.render(refused(identity(environment = "thoryn-provision-e2e-plan", repository = "acme/billing")), pinned)).doesNotContain("set-plan-profile")
+    }
+
+    // ── SSO-3722 / SSO-3723 — EVERY refusal ends with the one "To fix" block, in two options ──
+
+    private val link = "https://app.thoryn.io/github/consent/run/thoryn-io/thoryn-cli/38547022158"
+
+    /** Every refusal shape the sign-in can print, with the text its Option 1 must carry (the audited table). */
+    private fun shapes(): List<Arguments> {
+        val connection = pinned.copy(connectionFile = ".thoryn/connection.json")
+        val noPins = binding.copy(connectionFile = ".thoryn/connection.json")
+        fun scope(desc: String?, env: String = "thoryn-provision-e2e-plan") = WorkloadIdentityException("refused", oauthError = "invalid_scope", status = 400, errorDescription = desc, jobIdentity = identity(environment = env))
+        val pod = JobIdentity.of(FakeJobTokens.kubernetesToken(audience, namespace = "other"))
+        return listOf(
+            Arguments.of("not_on_github_actions", WorkloadIdentityException("no job token", oauthError = WorkloadIdentityFlow.ERROR_NOT_ON_GITHUB_ACTIONS), binding, "permissions: id-token: write"),
+            Arguments.of("job_token_request_failed", WorkloadIdentityException("GitHub refused", oauthError = WorkloadIdentityFlow.ERROR_JOB_TOKEN_REQUEST_FAILED, status = 403), binding, "permissions: id-token: write"),
+            Arguments.of("token_file_unreadable", WorkloadIdentityException("no token at /x", oauthError = WorkloadIdentityFlow.ERROR_TOKEN_FILE_UNREADABLE), binding.copy(provider = WorkloadIdentityDiagnostics.PROVIDER_KUBERNETES), "serviceAccountToken"),
+            Arguments.of("invalid_client, no pins known", refused(identity(environment = "x")), binding, WorkloadIdentityDiagnostics.AUDIT_COMMAND),
+            Arguments.of("invalid_client, a pin differs (repository)", refused(identity(environment = "thoryn-provision-e2e", repository = "acme/billing")), connection, "--repository acme/billing --owner-id 187654321 --repository-id 1044556677 --github-environment thoryn-provision-e2e --ref refs/heads/main --scope \"tenant:environments.read\""),
+            Arguments.of("invalid_client, the job declares no environment", refused(identity()), connection, "job: add `environment: thoryn-provision-e2e` to the job"),
+            Arguments.of("invalid_client, the plan-profile gap", refused(identity(environment = "thoryn-provision-e2e-plan")), connection, FixRequest.setPlanProfileCommand(null, "thoryn-provision-e2e-plan")),
+            Arguments.of("invalid_client, a pod on the wrong namespace", refused(pod), binding.copy(provider = WorkloadIdentityDiagnostics.PROVIDER_KUBERNETES, kubernetesPins = KubernetesPins(namespace = "forge")), "--provider kubernetes --issuer ${FakeJobTokens.KUBERNETES_ISSUER} --namespace other --service-account forge-oauth2-proxy"),
+            Arguments.of("invalid_scope outside the plan profile, flag form", scope(WorkloadIdentityDiagnostics.REASON_OUTSIDE_PLAN), binding, "drop --scope"),
+            Arguments.of("invalid_scope outside the plan profile, connection without an apply environment", scope(WorkloadIdentityDiagnostics.REASON_OUTSIDE_PLAN), noPins, ".thoryn/connection.json: names no apply environment — add auth.github.environment"),
+            Arguments.of("invalid_scope outside the plan profile, connection naming the wrong apply environment", scope(WorkloadIdentityDiagnostics.REASON_OUTSIDE_PLAN, env = "thoryn-provision-e2e"), connection.copy(profile = WorkloadProfile.APPLY), "auth.github.environment names 'thoryn-provision-e2e' but the hub matched the PLAN profile"),
+            Arguments.of("invalid_scope outside the apply profile", scope(WorkloadIdentityDiagnostics.REASON_OUTSIDE_APPLY, env = "thoryn-provision-e2e"), connection, "auth.scopes must be a subset of the trust's scopes"),
+            Arguments.of("invalid_scope, unspecified", scope(null), binding, "subset of the trust's scopes"),
+            Arguments.of("token endpoint unreachable", WorkloadIdentityException("could not reach", oauthError = WorkloadIdentityFlow.ERROR_TRANSPORT, jobIdentity = identity()), binding, "make $audience/oauth2/token reachable"),
+            Arguments.of("an unknown platform error", WorkloadIdentityException("server_error", oauthError = "server_error", status = 500, jobIdentity = identity()), binding, WorkloadIdentityDiagnostics.AUDIT_COMMAND),
+        )
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("shapes")
+    fun `every refusal ends with To fix — Option 1 naming the exact edit or command, Option 2 the run's link when known`(
+        name: String, e: WorkloadIdentityException, b: WorkloadIdentityBinding, option1Text: String,
+    ) {
+        val withLink = WorkloadIdentityDiagnostics.render(e, b, link)
+        val lines = withLink.lines()
+        assertThat(lines).withFailMessage("[%s]\n%s", name, withLink).anyMatch { it == FixRequest.OPTION_CLI_HEADING }
+        assertThat(lines.last()).withFailMessage("[%s]\n%s", name, withLink).isEqualTo("${FixRequest.OPTION_BROWSER_HEADING} $link")
+        assertThat(withLink.substringAfter(FixRequest.OPTION_CLI_HEADING)).withFailMessage("[%s]\n%s", name, withLink).contains(option1Text)
+        // The fix the request would carry is the same text (one rendering).
+        val fix = WorkloadIdentityDiagnostics.fixFor(e, b)
+        assertThat(fix.isEmpty).isFalse()
+        assertThat(withLink).contains(FixRequest.renderOption1Body(fix.items, fix.notes))
+        // No link known: Option 2 says how to get one, and nothing else changes.
+        val without = WorkloadIdentityDiagnostics.render(e, b)
+        assertThat(without.lines().last()).isEqualTo("${FixRequest.OPTION_BROWSER_HEADING} ${FixRequest.NO_CONSENT_LINK_LINE}")
+        assertThat(without).doesNotContain(link)
+    }
+
+    @Test
+    fun `the trusts create command is built from the job's own claims — sandbox from the audience, production confirmed`() {
+        val sandbox = WorkloadIdentityDiagnostics.trustsCreateCommand(identity(environment = "staging"), pinned.copy(scope = "tenant:applications.write", requestedScope = "tenant:applications.write"))
+        assertThat(sandbox).isEqualTo(
+            "thoryn workload-identity trusts create --name <name> --environment cli-wif --repository thoryn-io/thoryn-cli --owner-id 187654321 --repository-id 1044556677 " +
+                "--github-environment staging --ref refs/heads/main --scope \"tenant:applications.write\"",
+        )
+        val production = WorkloadIdentityDiagnostics.trustsCreateCommand(identity(environment = "prod"), binding.copy(audience = "https://thoryn.auth.stg.thoryn.org", scope = null, requestedScope = null))
+        assertThat(production).endsWith("--github-environment prod --scope \"<scopes>\" --confirm-production").doesNotContain("--environment ")
+    }
+
+    @Test
+    fun `a hub-decided sign-in names it in the Sent block`() {
+        val e = refused(identity(environment = "forge-plan"))
+        val report = WorkloadIdentityDiagnostics.render(e, binding.copy(scope = null, hubDecided = true, connectionFile = "c.json"))
+        assertThat(report).contains("(none requested — the connection names no apply environment; the hub matches the profile from the job's environment claim)")
+            .contains("decided by the hub (no auth.github.environment in the connection)")
     }
 }

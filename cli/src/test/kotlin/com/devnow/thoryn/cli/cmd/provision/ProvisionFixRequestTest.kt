@@ -71,6 +71,36 @@ class ProvisionFixRequestTest : CommandTestBase() {
     fun unmount() {
         runnerVars.keys.forEach { System.clearProperty(it) }
         System.clearProperty(FixRequest.ENV)
+        System.clearProperty(FixRequest.CONSENT_URL_ENV)
+    }
+
+    // ── SSO-3723 — Option 2, in the browser ──
+
+    @Test
+    fun `with THORYN_CONSENT_URL the red plan prints the run's consent link from the runner's own context and the request carries it`() {
+        session()
+        System.setProperty(FixRequest.CONSENT_URL_ENV, "https://app.thoryn.io")
+        val out = File(tempHome.toFile(), "thoryn-provision-request.json")
+
+        val (exit, _, err) = runCli("provision", "plan", "--file", file(redFile).path, "--gateway", baseUrl(), "--fix-request", out.path)
+
+        assertThat(exit).isEqualTo(CommandSupport.EXIT_HTTP_ERROR)
+        val link = "https://app.thoryn.io/github/consent/run/thoryn-io/thoryn-cli/38547022158"
+        assertThat(err).contains("${FixRequest.OPTION_BROWSER_HEADING} $link")
+        assertThat(request(out)["options"]["consentUrl"].asString()).isEqualTo(link)
+    }
+
+    @Test
+    fun `without a run id — not a GitHub Actions run — no link is built even with THORYN_CONSENT_URL`() {
+        session()
+        System.setProperty(FixRequest.CONSENT_URL_ENV, "https://app.thoryn.io")
+        System.clearProperty("GITHUB_RUN_ID")
+        val out = File(tempHome.toFile(), "thoryn-provision-request.json")
+
+        val (_, _, err) = runCli("provision", "plan", "--file", file(redFile).path, "--gateway", baseUrl(), "--fix-request", out.path)
+
+        assertThat(err).contains("${FixRequest.OPTION_BROWSER_HEADING} ${FixRequest.NO_CONSENT_LINK_LINE}")
+        assertThat(request(out)["options"]["consentUrl"].isNull).isTrue()
     }
 
     /** A plan-profile workload-identity session: a JWT without `sub` (Spring AS names the principal after the client), read scopes only. */
@@ -168,7 +198,11 @@ class ProvisionFixRequestTest : CommandTestBase() {
 
         // The terminal and the file say the same thing: every `cli` the file carries is printed, verbatim.
         doc["missing"].forEach { item -> item["cli"]?.takeUnless { it.isNull }?.let { assertThat(err).contains(it.asString()) } }
-        assertThat(err).contains("Missing rights — what a workspace admin grants (4 item(s)):")
+        assertThat(err).contains(FixRequest.OPTION_CLI_HEADING).contains("${FixRequest.OPTION_BROWSER_HEADING} ${FixRequest.NO_CONSENT_LINK_LINE}")
+        // SSO-3722 — the file-fix note is in the SAME block (every red row ends with its fix), and the request's options match.
+        assertThat(err).contains("  - user prod-user: ")
+        assertThat(doc["options"]["cli"].asString()).contains("thoryn access grant $subject owner application:cli").contains("user prod-user: ")
+        assertThat(doc["options"]["consentUrl"].isNull).isTrue()
         assertThat(err).contains("Fix request written to ${out.path} (4 missing right(s), 1 note(s))")
         assertThat(err).doesNotContain("wi_other")
     }
@@ -263,7 +297,7 @@ class ProvisionFixRequestTest : CommandTestBase() {
         val (exit, _, err) = runCli("provision", "plan", "--file", file(redFile).path, "--gateway", baseUrl())
         assertThat(exit).isEqualTo(CommandSupport.EXIT_HTTP_ERROR)
         assertThat(out).doesNotExist()
-        assertThat(err).contains("thoryn access grant $subject owner application:shared").contains("Missing rights — what a workspace admin grants (3 item(s)):")
+        assertThat(err).contains("thoryn access grant $subject owner application:shared").contains(FixRequest.OPTION_CLI_HEADING)
         assertThat(err).doesNotContain("Fix request written")
     }
 }

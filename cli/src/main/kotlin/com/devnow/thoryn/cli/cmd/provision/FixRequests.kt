@@ -32,6 +32,22 @@ internal object FixRequests {
     fun target(flag: File?): Path? = flag?.toPath() ?: WorkloadIdentityFlow.runnerEnv(FixRequest.ENV)?.let { Path.of(it) }
 
     /**
+     * SSO-3723 — "Option 2, in the browser": the consent link for THIS run, from the configured base URL
+     * ([FixRequest.CONSENT_URL_ENV], set by the reusable workflow from `consent-url` / `.thoryn/workflow.yaml`
+     * `consentUrl` — configuration, never guessed from the issuer) and the job's own GitHub context: the repository
+     * (`GITHUB_REPOSITORY`, or the job token's `repository` claim) and the run (`GITHUB_RUN_ID`, or the token's `run_id`).
+     * Null when the base URL is unset or this is not a GitHub Actions run — the log then says how to get a link.
+     */
+    fun consentUrl(identity: JobIdentity? = null): String? {
+        val base = WorkloadIdentityFlow.runnerEnv(FixRequest.CONSENT_URL_ENV) ?: return null
+        val repository = WorkloadIdentityFlow.runnerEnv("GITHUB_REPOSITORY") ?: identity?.repository ?: return null
+        val runId = WorkloadIdentityFlow.runnerEnv("GITHUB_RUN_ID")?.toLongOrNull() ?: identity?.runId?.toLongOrNull() ?: return null
+        val owner = repository.substringBefore('/', "").takeIf { it.isNotEmpty() } ?: return null
+        val name = repository.substringAfter('/', "").takeIf { it.isNotEmpty() } ?: return null
+        return FixRequest.consentUrl(base, owner, name, runId)
+    }
+
+    /**
      * The repository as the GitHub Actions RUNNER states it (`GITHUB_REPOSITORY`, `GITHUB_REPOSITORY_OWNER`,
      * `GITHUB_REPOSITORY_OWNER_ID`, `GITHUB_REPOSITORY_ID`) — what `provision plan` has, holding no job token. Null
      * outside a runner. A hint: the consumer rebinds to GitHub's record of the run.
@@ -75,17 +91,21 @@ internal object FixRequests {
     }
 
     /**
-     * The request a refused `login --connection` writes: the one [FixRequest.Kind.PLAN_PROFILE] item, the trust as the
-     * connection states it (the `wi_` client and the apply environment pin; name and id null — there is no token to
-     * resolve them with), the repository and run from the job token's claims.
+     * The request a refused `login --connection` writes (SSO-3722: EVERY refusal, not only the plan-profile gap): the
+     * missing rights as items (the one [FixRequest.Kind.PLAN_PROFILE] item when that is the shape) and the file / job
+     * edits as notes — the same text the terminal printed — the trust as the connection states it (the `wi_` client and
+     * the apply environment pin; name and id null — there is no token to resolve them with), the repository and run from
+     * the job token's claims, and the run's consent link when one can be built.
      */
     fun forRefusedSignIn(
-        item: FixRequest.MissingRight,
+        items: List<FixRequest.MissingRight>,
+        notes: List<String>,
         identity: JobIdentity,
         clientId: String,
         plane: String,
         applyEnvironment: String?,
         workspace: String?,
+        consentUrl: String? = consentUrl(identity),
     ): FixRequest = FixRequest(
         cliVersion = cliVersion(),
         repository = repositoryOf(identity),
@@ -93,7 +113,9 @@ internal object FixRequests {
         workspace = workspace,
         file = null,
         trust = FixRequest.Trust(name = null, plane = plane, applyEnvironment = applyEnvironment, id = null, clientId = clientId),
-        missing = listOf(item),
+        missing = items,
+        notes = notes,
+        consentUrl = consentUrl,
     )
 
     /**
@@ -113,6 +135,7 @@ internal object FixRequests {
             trust = resolveTrust(tokens, gateway),
             missing = items,
             notes = notes,
+            consentUrl = consentUrl(),
         )
     }
 

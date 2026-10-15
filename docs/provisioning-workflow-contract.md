@@ -99,6 +99,7 @@ release tag it pins to have been cut.
 | `runs-on` | no | `ubuntu-latest` | a label, or a JSON array of labels | self-hosted pools; the runner needs bash, gh, jq, curl (Java is set up) |
 | `timeout-minutes` | no | `30` | positive integer | each job |
 | `config` | no | `.thoryn/workflow.yaml` | relative path | the run-time configuration (§5) |
+| `consent-url` | no | `""` | `https://` base URL, no query/fragment | SSO-3723 — `THORYN_CONSENT_URL` for the CLI: a red job's `To fix — Option 2, in the browser:` link, `<url>/github/consent/run/<owner>/<repo>/<run_id>`; empty ⇒ §5 `consentUrl`, else the CLI commands alone |
 
 Jobs **`plan`** and **`apply`**, each: `if: inputs.mode == '<mode>'`; `runs-on` from `inputs.runs-on`
 (`startsWith(…, '[') && fromJSON(…) || …`); `timeout-minutes` from the input; **`environment: ${{ inputs.<mode>-environment }}`
@@ -108,7 +109,8 @@ download the release's `thoryn.jar`, run **`thoryn provision workflow check --fi
 (the stub from `github.workflow_ref` — the CALLER's workflow path — the config from the input; a red check fails the job
 with each fix named) and act on its `config` object: for every `files[]` entry `thoryn login --connection <connection>` then
 `thoryn provision plan|apply --file <file>` (`apply --yes`, `--prune` / `--confirm` only as configured), the plan/apply
-output into the step summary; **`THORYN_FIX_REQUEST`** on the sign-in/plan/apply step and an
+output into the step summary; **`THORYN_FIX_REQUEST`** on the sign-in/plan/apply step, **`THORYN_CONSENT_URL`** exported on it
+from `consent-url` else the config's `consentUrl` (SSO-3723), and an
 `actions/upload-artifact` (pinned to a commit) step `if: failure() && <fixRequest>` uploading **`thoryn-provision-request`**
 (`if-no-files-found: ignore`, `retention-days: 7`); the apply job ends at **Applied** (no receipt, §4). The apply job
 carries `# thoryn-provisioning: apply-job`.
@@ -136,8 +138,10 @@ Schema `cli/src/main/resources/examples/workflow.schema.json`; loader `WorkflowC
 level; each value's grammar checked). Absent ⇒ the built-in defaults. Keys: `apiVersion: thoryn.io/workflow/v1`,
 `provider` (`github_actions` only — Forgejo is a recorded gap, see README), `files[] {file, connection}` (one or many; a
 connection defaults to the `connection.json` beside its file), `env` (`THORYN_*` names only, not workflow-owned, never
-credential-shaped; exported, never evaluated), `fixRequest` (default true), `apply.prune` / `apply.destroy` (default
-false) / `apply.confirm` (workspace slug). The check also confirms every configured file is committed.
+credential-shaped; exported, never evaluated), `fixRequest` (default true), `consentUrl` (SSO-3723 — the browser
+consent base URL, `https://` without query or fragment; `THORYN_CONSENT_URL` for the CLI when the `consent-url` input is
+empty; default empty ⇒ the CLI commands alone), `apply.prune` / `apply.destroy` (default false) / `apply.confirm`
+(workspace slug). The check also confirms every configured file is committed.
 
 ## 6. A hand-written workflow (`custom.*`) — unsupported
 

@@ -8,6 +8,7 @@ import com.devnow.thoryn.cli.cmd.examples.Prompt
 import com.devnow.thoryn.cli.config.ThorynConfig
 import com.devnow.thoryn.cli.output.OutputFormat
 import com.devnow.thoryn.cli.output.Printers
+import com.devnow.thoryn.provision.ProvisionEngine
 import picocli.CommandLine.Command
 import picocli.CommandLine.Option
 import picocli.CommandLine.Parameters
@@ -448,10 +449,6 @@ class WorkloadIdentityCommand : Callable<Int> {
             return CommandSupport.EXIT_OK
         }
 
-        /** The workspace slug for the connection snippet: from the audience's host, else the session's. */
-        private fun workspaceSlugHint(body: JsonNode): String? =
-            ThorynConfig.workspaceOfIssuer(text(body, "audience"))
-                ?: runCatching { TokenStoreFactory.default().read() }.getOrNull()?.workspace
     }
 
     /**
@@ -556,15 +553,29 @@ class WorkloadIdentityCommand : Callable<Int> {
     }
 
     /** `thoryn workload-identity trusts get <id>` */
-    @Command(name = "get", description = ["Show one trust, and the sign-in line a workflow uses with it."], mixinStandardHelpOptions = true)
+    @Command(name = "get", description = ["Show one trust, and the sign-in line a workflow uses with it (--connection: only its complete connection.json)."], mixinStandardHelpOptions = true)
     class GetSubcommand : Base() {
         @Parameters(index = "0", paramLabel = "<id>", description = ["The trust id (from `trusts create` or `trusts list`)."])
         lateinit var id: String
+
+        @Option(
+            names = ["--connection"],
+            description = [
+                "SSO-3722 — print ONLY the trust's complete connection.json (workspace.slug, auth.method/provider/clientId/audience/scopes and",
+                "the whole auth.github — incl. environment, the APPLY environment the profile selector reads — or auth.kubernetes block),",
+                "exactly as connection.schema.json defines it: paste it over .thoryn/connection.json.",
+            ],
+        )
+        var connection: Boolean = false
 
         override val requiredScope: String = SCOPE_READ
 
         override fun run(client: ProductApiClient, format: OutputFormat): Int {
             val body = client.getWorkloadIdentityTrust(id.trim())
+            if (connection) {
+                System.out.println(connectionJson(body, workspaceSlugHint(body)))
+                return CommandSupport.EXIT_OK
+            }
             when (format) {
                 OutputFormat.TABLE -> {
                     Printers.record(trustFields(body), System.out)
@@ -636,6 +647,46 @@ class WorkloadIdentityCommand : Callable<Int> {
         internal val LIST_HEADERS: List<String> = listOf("id", "name", "provider", "clientId", "pins", "scopes")
 
         private val jsonMapper: JsonMapper = JsonMapper.builder().build()
+
+        /** The workspace slug for the connection snippet: from the audience's host, else the session's. */
+        internal fun workspaceSlugHint(body: JsonNode): String? =
+            ThorynConfig.workspaceOfIssuer(text(body, "audience"))
+                ?: runCatching { TokenStoreFactory.default().read() }.getOrNull()?.workspace
+
+        /**
+         * SSO-3722 — THE connection.json of a trust, complete: rendered from the engine's [ProvisionEngine.connectionDocument]
+         * (the same document `thoryn provision apply` prints for a declared trust — one renderer), so it carries every member
+         * `connection.schema.json` defines for the provider: `auth.provider`, and for `github_actions` the WHOLE `auth.github`
+         * block — `owner`, `repository`, `ownerId`, `repositoryId`, `environment` (the APPLY environment `thoryn login
+         * --connection` compares the job's `environment` claim with), `ref`, `githubHostedRunnersOnly`. The snippet that lacked
+         * `provider` and `auth.github` made a plan job request the apply scopes (thoryn-cicd run 38751382032).
+         */
+        fun connectionJson(body: JsonNode, workspaceSlug: String?): String {
+            @Suppress("UNCHECKED_CAST")
+            val view = jsonMapper.convertValue(body, Map::class.java) as Map<String, Any?>
+            return renderJson(ProvisionEngine.connectionDocument(view, workspaceSlug))
+        }
+
+        /**
+         * A small deterministic JSON writer for the snippet: an object of scalars (`workspace`, `github`, `tokenSource`,
+         * `kubernetes`) and an array of scalars (`scopes`) print on ONE line, so the block reads as it did; `"key": value`.
+         */
+        internal fun renderJson(value: Any?, indent: String = ""): String = when (value) {
+            null -> "null"
+            is String -> jsonMapper.writeValueAsString(value)
+            is Number, is Boolean -> value.toString()
+            is Map<*, *> -> when {
+                value.isEmpty() -> "{}"
+                value.values.all { it == null || it is String || it is Number || it is Boolean } ->
+                    value.entries.joinToString(", ", "{ ", " }") { (k, v) -> "${jsonMapper.writeValueAsString(k.toString())}: ${renderJson(v)}" }
+                else -> {
+                    val inner = "$indent  "
+                    value.entries.joinToString(",\n", "{\n", "\n$indent}") { (k, v) -> "$inner${jsonMapper.writeValueAsString(k.toString())}: ${renderJson(v, inner)}" }
+                }
+            }
+            is List<*> -> value.joinToString(", ", "[", "]") { renderJson(it, indent) }
+            else -> jsonMapper.writeValueAsString(value.toString())
+        }
 
         private fun text(node: JsonNode?, field: String): String? =
             node?.get(field)?.takeIf { it.isValueNode && !it.isNull }?.asString()?.takeIf { it.isNotBlank() }
@@ -828,34 +879,10 @@ class WorkloadIdentityCommand : Callable<Int> {
 
         /**
          * SSO-3684 — the connection contract for a `kubernetes` trust: `provider: kubernetes`, the projected token as
-         * `tokenSource: {kind: file, path: …}`, the trust's pins as `auth.kubernetes` (diagnostics only), and the
-         * `connection.json` a pod's init container mounts at `/etc/thoryn/connection.json`.
+         * `tokenSource: {kind: file, path: …}`, the trust's pins as `auth.kubernetes` (diagnostics only). SSO-3722 — the
+         * same renderer as the GitHub snippet ([connectionJson]).
          */
-        fun kubernetesConnectionJson(body: JsonNode, workspaceSlug: String?): String {
-            val k = body["kubernetes"]
-            val scopes = scopesOf(body).joinToString(", ") { "\"$it\"" }
-            val endpoint = if (defaultTokenEndpoint(body)) "" else ",\n    \"tokenEndpoint\": \"${text(body, "tokenEndpoint")}\""
-            val pins = listOfNotNull(
-                text(k, "issuer")?.let { "\"issuer\": \"$it\"" },
-                text(k, "namespace")?.let { "\"namespace\": \"$it\"" },
-                text(k, "serviceAccount")?.let { "\"serviceAccount\": \"$it\"" },
-            )
-            val pinsLine = if (pins.isEmpty()) "" else ",\n    \"kubernetes\": { ${pins.joinToString(", ")} }"
-            return """
-                |{
-                |  "apiVersion": "thoryn.io/connection/v1",
-                |  "workspace": { "slug": "${workspaceSlug ?: "<your-workspace>"}" },
-                |  "auth": {
-                |    "method": "workload_identity",
-                |    "provider": "kubernetes",
-                |    "clientId": "${text(body, "clientId")}",
-                |    "audience": "${text(body, "audience")}"$endpoint,
-                |    "tokenSource": { "kind": "file", "path": "$KUBERNETES_TOKEN_FILE" },
-                |    "scopes": [$scopes]$pinsLine
-                |  }
-                |}
-            """.trimMargin()
-        }
+        fun kubernetesConnectionJson(body: JsonNode, workspaceSlug: String?): String = connectionJson(body, workspaceSlug)
 
         /** SSO-3684 — how a pod uses a `kubernetes` trust: the connection.json, the projected volume, the init container. */
         fun printKubernetesUsage(body: JsonNode, workspaceSlug: String?, out: PrintStream) {
@@ -940,24 +967,11 @@ class WorkloadIdentityCommand : Callable<Int> {
             out.println("        # … install the thoryn CLI …")
             out.println("        - run: ${loginLine(body)}")
             out.println()
-            out.println("Or commit it as .thoryn/connection.json and run `thoryn login --connection .thoryn/connection.json`:")
+            out.println("Or commit it COMPLETE as .thoryn/connection.json and run `thoryn login --connection .thoryn/connection.json`")
+            out.println("(`thoryn workload-identity trusts get ${text(body, "id") ?: "<id>"} --connection` prints it again; auth.github.environment is the apply")
+            out.println("environment the CLI compares the job's own environment claim with — without it the hub decides the profile):")
             out.println()
-            val scopes = scopesOf(body).joinToString(", ") { "\"$it\"" }
-            val endpoint = if (defaultTokenEndpoint(body)) "" else ",\n      \"tokenEndpoint\": \"${text(body, "tokenEndpoint")}\""
-            out.println(
-                """
-                |  {
-                |    "apiVersion": "thoryn.io/connection/v1",
-                |    "workspace": { "slug": "${workspaceSlug ?: "<your-workspace>"}" },
-                |    "auth": {
-                |      "method": "workload_identity",
-                |      "clientId": "${text(body, "clientId")}",
-                |      "audience": "${text(body, "audience")}"$endpoint,
-                |      "scopes": [$scopes]
-                |    }
-                |  }
-                """.trimMargin(),
-            )
+            out.println(connectionJson(body, workspaceSlug).prependIndent("  "))
             out.println()
             out.println("Each job token works once and the token lasts at most 15 minutes; the CLI requests a fresh one as needed.")
             // SSO-3702 — the plan profile: the same connection.json, a second job in the plan environment, no scope requested.
