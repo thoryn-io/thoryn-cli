@@ -6,7 +6,8 @@ import java.io.PrintStream
 
 /**
  * [ERROR] (SSO-3659) is a per-resource VERDICT, not a step: the declared resource failed the ownership
- * gate (`access_read_only` / `access_not_owned` / `access_owned_elsewhere`, see [PlannedChange.error]) or
+ * gate (`access_read_only` / `access_not_owned` / `access_owned_elsewhere`, see [PlannedChange.error]), its plane
+ * is not reachable by this identity at all (SSO-3722, `access_not_reachable`: the live read answered 404), or
  * (SSO-3715) its converge key is ambiguous (`converge_key_ambiguous`). A plan carrying one is red (non-zero
  * exit) and `apply` refuses it before writing anything.
  *
@@ -625,6 +626,10 @@ class ProvisionEngine(
             // SSO-3715 (ADR 2026-10-15 §5) — two live matches: red, never a third copy.
             return PlannedChange(r.kind, r.name, ChangeAction.ERROR, "$ERROR_CONVERGE_KEY_AMBIGUOUS — ${ex.message}", resource = r, environment = slug, error = ERROR_CONVERGE_KEY_AMBIGUOUS, fixNote = FILE_FIX_NOTE_AMBIGUOUS)
         } catch (ex: ProductApiException) {
+            // SSO-3722 — product-api answers 404 `unknown_environment` not only for a plane that does not exist but for
+            // one this identity has NO reach into (SSO-3118, the 404-not-403 rule): a brand-new repository identity gets it
+            // on its very first read. That is the missing-rights shape, not a broken read — a red row with its fix.
+            if (ex.httpStatus == 404) return unreachable(r, slug, desired, ex)
             throw ProvisionException("${r.key}: could not read live state (${ex.message})")
         }
         return when {
@@ -634,6 +639,37 @@ class ProvisionEngine(
                 resource = r, liveId = live.id, environment = slug, attributes = live.attributes, diff = live.diff, owner = live.owner, retain = r.retain,
             )
             else -> PlannedChange(r.kind, r.name, ChangeAction.NOOP, "exists and matches${keyLocationNote(r)}", resource = r, liveId = live.id, environment = slug, attributes = live.attributes, owner = live.owner, retain = r.retain)
+        }
+    }
+
+    /**
+     * SSO-3722 (the thoryn-cicd run 38751887466 shape) — the live read of a declared resource answered 404: the plane it
+     * lives in is not reachable by this identity (product-api's `EnvironmentClaimFilter` answers `unknown_environment`
+     * both for a missing environment and for one the caller holds no relation into — a new repository identity with no
+     * relation on anything). The row is red with the code [ERROR_NOT_REACHABLE] and the RIGHT that opens the plane:
+     * `owner` on the application the file declares by a fixed `clientId` (the file is to OWN it); `manager` on the
+     * declared environment when the file would create something there; a note when the parent is the WORKSPACE (the
+     * production plane without a fixed id — `manager` on the workspace is never granted to a repository identity).
+     */
+    private fun unreachable(r: ProvisionResource, slug: String?, desired: Map<String, Any?>, ex: ProductApiException): PlannedChange {
+        val plane = planeLabel(slug)
+        val code = ex.errorCode ?: "not_found"
+        val why = "the live read of ${r.key} in $plane was answered HTTP 404 ($code): this identity has no relation that reaches $plane, " +
+            "so nothing there is visible to it (a new repository identity holds no relation until a workspace admin grants one)"
+        val change = PlannedChange(r.kind, r.name, ChangeAction.ERROR, why, resource = r, environment = slug)
+        val fixedId = desired["clientId"]?.toString()?.trim()?.takeIf { r.kind == ProvisionFile.KIND_APPLICATION && it.isNotEmpty() }
+        return when {
+            fixedId != null -> {
+                val ref = objectRef(r.kind, fixedId, slug)
+                val fix = FixRequest.owner(subject, ref, "$why; the file declares `clientId: $fixedId`, so this identity is to OWN it")
+                refuse(r, change, ERROR_NOT_REACHABLE, Access.NONE, "$why (${FixRequest.hint(fix)})", fix = fix)
+            }
+            slug != null && slug != PRODUCTION_ENV_SLUG -> {
+                val ref = "$OBJECT_TYPE_ENVIRONMENT:$slug"
+                val fix = FixRequest.manager(subject, ref, "$why; the file declares `environment: $slug`, which this identity cannot see")
+                refuse(r, change, ERROR_NOT_REACHABLE, Access.NONE, "$why (${FixRequest.hint(fix)}; `$ref` is the environment as `thoryn env list` names it)", fix = fix)
+            }
+            else -> refuse(r, change, ERROR_NOT_REACHABLE, Access.NONE, "$why ($WORKSPACE_PARENT_NOTE)", fixNote = WORKSPACE_PARENT_NOTE)
         }
     }
 
@@ -758,7 +794,10 @@ class ProvisionEngine(
         fun environments(): List<JsonNode> = environments ?: try {
             listItems(clients(null).listEnvironments(), "environments").also { environments = it }
         } catch (ex: ProductApiException) {
-            throw ProvisionException("could not list the workspace's environments to resolve a resource's parent (${ex.message})")
+            // SSO-3722 — a 404 is the platform's "you reach nothing here" (SSO-3118): an empty list, so every declared
+            // resource becomes an `access_not_reachable` row with its fix instead of one opaque exception.
+            if (ex.httpStatus == 404) emptyList<JsonNode>().also { environments = it }
+            else throw ProvisionException("could not list the workspace's environments to resolve a resource's parent (${ex.message})")
         }
 
         fun environmentId(slug: String): String? = environments().firstOrNull { it.str("slug") == slug }?.str("id")
@@ -2467,6 +2506,11 @@ class ProvisionEngine(
         /** No relation on the resource, or no `manager` on the parent a create needs. */
         const val ERROR_NOT_OWNED = "access_not_owned"
         /**
+         * SSO-3722 — the live read of the resource answered 404: the plane is not reachable by this identity at all
+         * (product-api's 404-not-403 rule, SSO-3118) — a right to grant, never "could not read live state".
+         */
+        const val ERROR_NOT_REACHABLE = "access_not_reachable"
+        /**
          * SSO-3673 — the PLATFORM says another identity owns the resource: its response renders an `owner` and
          * `POST /api/v1/access/check {object, relation: owner}` is false for this one. Declare it `readOnly: true`.
          */
@@ -2541,17 +2585,31 @@ class ProvisionEngine(
             view["tokenEndpoint"]?.toString()?.takeIf { audience == null || it != "$audience/oauth2/token" }?.let { auth["tokenEndpoint"] = it }
             if (provider == ProvisionFile.PROVIDER_KUBERNETES) auth["tokenSource"] = linkedMapOf("kind" to "file", "path" to KUBERNETES_TOKEN_FILE)
             auth["scopes"] = (view["scopes"] as? List<*>).orEmpty().map { it.toString() }
-            (view["github"] as? Map<*, *>)?.let { g ->
+            (view["github"] as? Map<*, *>)?.takeIf { provider != ProvisionFile.PROVIDER_KUBERNETES }?.let { g ->
                 val pins = linkedMapOf<String, Any?>()
-                listOf("owner", "repository", "ownerId", "repositoryId", "environment", "ref").forEach { f -> g[f]?.let { v -> if (!(v is Number && v.toLong() <= 0) && v.toString().isNotBlank()) pins[f] = v } }
+                // SSO-3722 — the COMPLETE block connection.schema.json defines: `environment` is the apply environment the
+                // profile selector reads (a snippet without it made the plan job request the apply scopes — thoryn-cicd run
+                // 38751382032); `githubHostedRunnersOnly` only when the trust pins it.
+                CONNECTION_GITHUB_PINS.forEach { f -> g[f]?.let { v -> if (!(v is Number && v.toLong() <= 0) && v.toString().isNotBlank()) pins[f] = v } }
+                if (g["githubHostedRunnersOnly"] == true) pins["githubHostedRunnersOnly"] = true
                 if (pins.isNotEmpty()) auth["github"] = pins
             }
-            (view["kubernetes"] as? Map<*, *>)?.takeIf { provider == ProvisionFile.PROVIDER_KUBERNETES && it.isNotEmpty() }?.let { k -> auth["kubernetes"] = k.entries.associate { (f, v) -> f.toString() to v } }
+            (view["kubernetes"] as? Map<*, *>)?.takeIf { provider == ProvisionFile.PROVIDER_KUBERNETES }?.let { k ->
+                // Only the pins the contract defines (never `jwksUri`, `inlineKeyIds` or key material).
+                val pins = CONNECTION_KUBERNETES_PINS.mapNotNull { f -> k[f]?.toString()?.takeIf { it.isNotBlank() }?.let { f to it } }.toMap(linkedMapOf())
+                if (pins.isNotEmpty()) auth["kubernetes"] = pins
+            }
             return linkedMapOf("apiVersion" to "thoryn.io/connection/v1", "workspace" to linkedMapOf("slug" to (workspace ?: "<your-workspace>")), "auth" to auth)
         }
 
         /** SSO-3684 — where a pod's projected ServiceAccount token is mounted (the CLI's `WorkloadIdentityFlow.DEFAULT_KUBERNETES_TOKEN_FILE`). */
         const val KUBERNETES_TOKEN_FILE = "/var/run/secrets/tokens/thoryn/token"
+
+        /** The `auth.github` members of `connection.schema.json` a trust's view fills (the boolean pin is added when true). */
+        val CONNECTION_GITHUB_PINS: List<String> = listOf("owner", "repository", "ownerId", "repositoryId", "environment", "ref")
+
+        /** The `auth.kubernetes` members of `connection.schema.json` (the pins; never the key set). */
+        val CONNECTION_KUBERNETES_PINS: List<String> = listOf("issuer", "namespace", "serviceAccount")
 
         const val RELATION_MANAGER = AccessRefs.RELATION_MANAGER
         const val RELATION_VIEWER = AccessRefs.RELATION_VIEWER

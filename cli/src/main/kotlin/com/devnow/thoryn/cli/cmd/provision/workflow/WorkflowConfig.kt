@@ -22,6 +22,10 @@ import java.io.File
  *    sets, never credential-shaped — this file is committed plaintext). Serves `{{env.NAME}}` placeholders in a
  *    provisioning file (SSO-3430) and the CLI's own documented variables. Values are exported, never evaluated.
  *  - `fixRequest` — upload the SSO-3710 fix request on a red job (default true).
+ *  - `consentUrl` — SSO-3723: the base URL of the Thoryn GitHub App's browser consent, so a red job's "To fix — Option 2,
+ *    in the browser" is a link resolvable by run (`<consentUrl>/github/consent/run/<owner>/<repo>/<run_id>`). Exported to
+ *    the CLI as `THORYN_CONSENT_URL` when the reusable workflow's `consent-url` input is empty. Configuration — the CLI
+ *    never guesses it from the issuer. Absent ⇒ Option 1 alone.
  *  - `apply.prune` / `apply.destroy` / `apply.confirm` — removals, NEVER on by default: `prune` passes `--prune` to the
  *    apply; `destroy` runs `provision destroy` after a successful apply (an ephemeral fixture); `confirm` is the workspace
  *    slug a production-plane removal needs (the SSO-2413 gate).
@@ -33,6 +37,8 @@ class WorkflowConfig private constructor(
     val files: List<FileEntry>,
     val env: Map<String, String>,
     val fixRequest: Boolean,
+    /** SSO-3723 — the consent base URL (`THORYN_CONSENT_URL` for the CLI), or null. */
+    val consentUrl: String?,
     val prune: Boolean,
     val destroy: Boolean,
     val confirm: String?,
@@ -49,6 +55,7 @@ class WorkflowConfig private constructor(
         "files" to files.map { linkedMapOf("file" to it.file, "connection" to it.connection) },
         "env" to env,
         "fixRequest" to fixRequest,
+        "consentUrl" to (consentUrl ?: ""),
         "apply" to linkedMapOf("prune" to prune, "destroy" to destroy, "confirm" to (confirm ?: "")),
     )
 
@@ -70,9 +77,12 @@ class WorkflowConfig private constructor(
         const val MAX_ENV_VALUE_LENGTH = 1024
 
         /** Variables the reusable workflow sets itself (from its inputs and its own steps) — a config may not shadow them. */
-        val WORKFLOW_OWNED_ENV: Set<String> = setOf("THORYN_ISSUER", "THORYN_HUB", "THORYN_FIX_REQUEST", "THORYN_CI_PLAINTEXT_TOKENS")
+        val WORKFLOW_OWNED_ENV: Set<String> = setOf("THORYN_ISSUER", "THORYN_HUB", "THORYN_FIX_REQUEST", "THORYN_CONSENT_URL", "THORYN_CI_PLAINTEXT_TOKENS")
 
-        private val TOP_KEYS = setOf("apiVersion", "provider", "files", "env", "fixRequest", "apply")
+        /** SSO-3723 — an absolute https URL without query or fragment (an origin, or an origin plus a path). */
+        val CONSENT_URL_GRAMMAR = Regex("^https://[a-z0-9]([a-z0-9-]*[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+(:[0-9]{1,5})?(/[A-Za-z0-9._~/-]*)?$")
+
+        private val TOP_KEYS = setOf("apiVersion", "provider", "files", "env", "fixRequest", "consentUrl", "apply")
         private val FILE_KEYS = setOf("file", "connection")
         private val APPLY_KEYS = setOf("prune", "destroy", "confirm")
 
@@ -84,6 +94,7 @@ class WorkflowConfig private constructor(
             files = listOf(FileEntry(DEFAULT_FILE, DEFAULT_CONNECTION)),
             env = emptyMap(),
             fixRequest = true,
+            consentUrl = null,
             prune = false,
             destroy = false,
             confirm = null,
@@ -106,6 +117,7 @@ class WorkflowConfig private constructor(
                 files = files,
                 env = env,
                 fixRequest = root["fixRequest"]?.asBoolean() ?: true,
+                consentUrl = root["consentUrl"]?.asString()?.trim()?.trimEnd('/')?.takeIf { it.isNotEmpty() },
                 prune = apply?.get("prune")?.asBoolean() ?: false,
                 destroy = apply?.get("destroy")?.asBoolean() ?: false,
                 confirm = apply?.get("confirm")?.asString()?.takeIf { it.isNotEmpty() },
@@ -165,6 +177,7 @@ class WorkflowConfig private constructor(
                 }
             }
             root["fixRequest"]?.let { if (!it.isBoolean) errors += "fixRequest must be true or false" }
+            root["consentUrl"]?.let { if (!it.isString || (it.asString().isNotEmpty() && !CONSENT_URL_GRAMMAR.matches(it.asString().trimEnd('/')))) errors += "consentUrl must be an https:// base URL of the Thoryn GitHub App's consent page (no query or fragment), or empty" }
             root["apply"]?.let { apply ->
                 if (!apply.isObject) errors += "apply must be a mapping { prune, destroy, confirm }"
                 else {

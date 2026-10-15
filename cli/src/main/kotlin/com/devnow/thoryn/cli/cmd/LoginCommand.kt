@@ -279,7 +279,7 @@ class LoginCommand : Callable<Int> {
      */
     @Option(
         names = ["--fix-request"],
-        description = ["SSO-3710 — with a workload_identity connection: write the fix request (the missing plan profile + the exact `thoryn workload-identity trusts set-plan-profile` command, schema fix-request.schema.json) to this file when the exchange is refused and the job's GitHub environment is the only local mismatch; a workflow uploads it as the `thoryn-provision-request` artifact. Env: THORYN_FIX_REQUEST."],
+        description = ["SSO-3710 / SSO-3722 — with a workload_identity connection: write the fix request (schema fix-request.schema.json — the missing plan profile with its exact `thoryn workload-identity trusts set-plan-profile` command, or the file / job edit that fixes any other refusal, plus the run's consent link when THORYN_CONSENT_URL is set) to this file whenever the exchange is refused; a workflow uploads it as the `thoryn-provision-request` artifact. Env: THORYN_FIX_REQUEST."],
     )
     var fixRequestFile: File? = null
 
@@ -907,9 +907,13 @@ class LoginCommand : Callable<Int> {
             // SSO-3702 — the trust's APPLY environment, as the contract mirrors it: the job's own `environment` claim
             // against it decides whether the connection's scopes are requested (apply) or none (plan).
             applyEnvironment = connection.github?.environment?.takeIf { connection.effectiveProvider == Connection.PROVIDER_GITHUB_ACTIONS },
-            // SSO-3710 — a refusal that is a missing plan profile writes the fix request (the plane is the connection's).
+            // SSO-3710 / SSO-3722 — every refusal writes the fix request when asked (the plane is the connection's).
             fixRequest = FixRequests.target(fixRequestFile),
             plane = connection.environment ?: ProvisionEngine.PRODUCTION_ENV_SLUG,
+            // SSO-3722 — a GitHub connection that names no apply environment leaves the profile to the hub: no scope is
+            // sent for a job that carries an `environment` claim (never the connection's scopes blindly).
+            hubDecidesWhenApplyEnvironmentUnknown = connection.effectiveProvider == Connection.PROVIDER_GITHUB_ACTIONS,
+            connectionFile = file.path,
         )
     }
 
@@ -976,6 +980,14 @@ class LoginCommand : Callable<Int> {
         fixRequest: java.nio.file.Path? = null,
         /** SSO-3710 — the plane the trust lives in (`production`, or the sandbox slug the audience names), for the request. */
         plane: String? = null,
+        /**
+         * SSO-3722 — `--connection` with a GitHub trust: when [applyEnvironment] is unknown and the job token carries an
+         * `environment` claim, request NO scope and let the hub mint the matched profile ([WorkloadProfile.hubDecides]).
+         * False for the flag form (an explicit `--scope` is the caller's) and for a Kubernetes connection.
+         */
+        hubDecidesWhenApplyEnvironmentUnknown: Boolean = false,
+        /** SSO-3722 — the connection file, so a refusal's fix names the exact file to edit. */
+        connectionFile: String? = null,
     ): Int {
         try {
             IssuerUrlValidator.validate(audience, devMode)
@@ -1015,9 +1027,10 @@ class LoginCommand : Callable<Int> {
         // SSO-3702 — the profile the job's own token selects (known only once the token is in hand), and the scope
         // actually sent: the connection's scopes in the apply environment, NONE in any other (the plan profile).
         var selected: WorkloadProfile? = null
+        var hubDecided = false
         var jobEnvironment: String? = null
-        fun scopeSent(): String? = if (selected == WorkloadProfile.PLAN) null else requestedScope
-        fun binding() = WorkloadIdentityBinding(clientIdValue, audience, tokenEndpoint, scopeSent(), pins, provider, kubernetesPins, selected)
+        fun scopeSent(): String? = if (selected == WorkloadProfile.PLAN || hubDecided) null else requestedScope
+        fun binding() = WorkloadIdentityBinding(clientIdValue, audience, tokenEndpoint, scopeSent(), pins, provider, kubernetesPins, selected, hubDecided, connectionFile, requestedScope)
         val flow = WorkloadIdentityFlow(
             clientId = clientIdValue,
             audience = audience,
@@ -1029,6 +1042,7 @@ class LoginCommand : Callable<Int> {
             val tokens = flow.run { identity ->
                 jobEnvironment = identity.environment
                 selected = WorkloadProfile.select(identity, applyEnvironment)
+                hubDecided = hubDecidesWhenApplyEnvironmentUnknown && WorkloadProfile.hubDecides(identity, applyEnvironment)
                 scopeSent()
             }
             persistSession(
@@ -1056,7 +1070,7 @@ class LoginCommand : Callable<Int> {
                         "environment '$applyEnvironment', so no scope was requested and the hub minted the trust's plan profile. Writes are refused by design.",
                 )
                 WorkloadProfile.APPLY -> println("Profile: apply (GitHub environment '$applyEnvironment' — the trust's scopes).")
-                null -> {}
+                null -> if (hubDecided) println(PROFILE_DECIDED_BY_HUB)
             }
             tokens.scope?.let { println("Scopes: $it") }
             val minutes = tokens.expiresAtEpochSecond?.let { (it - System.currentTimeMillis() / 1000) / 60 }
@@ -1072,19 +1086,22 @@ class LoginCommand : Callable<Int> {
             EXIT_OK
         } catch (e: WorkloadIdentityException) {
             val b = binding()
-            System.err.println(WorkloadIdentityDiagnostics.render(e, b))
-            // SSO-3710 — the one refusal that is a missing RIGHT (the trust has no plan profile for the job's environment)
-            // becomes the fix request, when asked for: the same item the report above rendered, nothing more.
-            val gap = fixRequest?.let { WorkloadIdentityDiagnostics.planProfileGap(e, b) }
-            if (fixRequest != null && gap != null && e.jobIdentity != null) {
+            val consentUrl = FixRequests.consentUrl(e.jobIdentity)
+            System.err.println(WorkloadIdentityDiagnostics.render(e, b, consentUrl))
+            // SSO-3710 / SSO-3722 — EVERY refusal that had a job token becomes the fix request, when asked for: the same
+            // items (a missing plan profile) and notes (file / job edits) the report above rendered, nothing more.
+            if (fixRequest != null && e.jobIdentity != null) {
+                val fix = WorkloadIdentityDiagnostics.fixFor(e, b)
                 FixRequests.write(
                     FixRequests.forRefusedSignIn(
-                        item = gap.item(),
+                        items = fix.items,
+                        notes = fix.notes,
                         identity = e.jobIdentity,
                         clientId = clientIdValue,
                         plane = plane ?: FixRequests.planeOf(audience),
                         applyEnvironment = applyEnvironment,
                         workspace = workspaceSlug ?: ThorynConfig.workspaceOfIssuer(audience),
+                        consentUrl = consentUrl,
                     ),
                     fixRequest,
                 )
@@ -1593,6 +1610,11 @@ class LoginCommand : Callable<Int> {
 
         /** SSO-2879 / SSO-3308 — the workload identity (GitHub Actions job token) sign-in failed. */
         const val EXIT_WORKLOAD_IDENTITY_FAILED = 73
+
+        /** SSO-3722 — the sign-in line when the connection named no apply environment and the hub matched the profile. */
+        const val PROFILE_DECIDED_BY_HUB: String =
+            "Profile: decided by the hub (connection.json names no apply environment — add auth.github.environment to decide locally; " +
+                "`thoryn workload-identity trusts get <id> --connection` prints the whole github block)."
 
         /** SSO-2820 — how long to wait for the browser sign-in redirect on the loopback listener. */
         private val LOOPBACK_TIMEOUT: Duration = Duration.ofMinutes(5)

@@ -51,8 +51,9 @@ class WorkloadProfileTest {
         assertThat(report)
             .contains("outside the trust's PLAN profile (HTTP 400: invalid_scope, scope_outside_plan_profile)")
             .contains("runs in GitHub environment 'prod-plan' — not the trust's apply environment 'prod'")
-            .contains("request no scope at all")
-            .contains("Never request a write scope from a plan job")
+            // SSO-3722 — the fix is the one "To fix" block: the flag form drops --scope (a connection names the file line instead).
+            .contains(com.devnow.thoryn.provision.FixRequest.OPTION_CLI_HEADING)
+            .contains("job: drop --scope (the hub then mints the plan profile's read-only scopes), or request only .read scopes — never a write scope from a plan job")
     }
 
     @Test

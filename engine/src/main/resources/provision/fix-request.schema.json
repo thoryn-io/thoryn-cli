@@ -69,9 +69,19 @@
       "items": { "$ref": "#/$defs/missingRight" }
     },
     "notes": {
-      "description": "Failed rows that are NOT a missing right — the FILE must change (a differing read-only reference, a trust the file cannot declare, a scope the identity does not hold, a create whose parent is the workspace) — so the request says so instead of staying silent.",
+      "description": "Failed rows that are NOT a missing right — the FILE must change (a differing read-only reference, a trust the file cannot declare, a scope the identity does not hold, a create whose parent is the workspace, a connection.json that names no apply environment) — so the request says so instead of staying silent.",
       "type": "array",
       "items": { "type": "string" }
+    },
+    "options": {
+      "description": "SSO-3723 — the TWO options the log printed, as data, so the App's check-run summary and the log never disagree. `cli`: the body of 'To fix — Option 1, with the CLI (a workspace admin)' exactly as printed (every `missing[].cli` and every note), null when nothing is to fix. `consentUrl`: 'To fix — Option 2, in the browser' — the consent link for THIS run, `<consentBaseUrl>/github/consent/run/<owner>/<repository>/<run_id>` (resolvable by run: the consent id the App mints after the run is unknowable to the job), null when the job had no configured base URL (THORYN_CONSENT_URL — `.thoryn/workflow.yaml` consentUrl / the reusable workflow's consent-url input) or was not a GitHub Actions run.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cli", "consentUrl"],
+      "properties": {
+        "cli": { "type": ["string", "null"] },
+        "consentUrl": { "type": ["string", "null"], "pattern": "^https?://\\S+/github/consent/run/[^/\\s]+/[^/\\s]+/[0-9]+$" }
+      }
     }
   },
   "$defs": {

@@ -152,8 +152,9 @@ store…` line per step; that is the explicit opt-in above being announced, not 
 thoryn login --workspace <slug> [--issuer https://auth.<env>]  # Auth code + PKCE (loopback) or --device-code — ON your workspace (SSO-3104)
 thoryn login --client-credentials [--client-id <id>] # SSO-1553/2941 — non-interactive API key (CI); THORYN_API_KEY=<id>:<secret>, auto re-mints on expiry
 thoryn login --workload-identity --client-id <wi_…> --audience <aud> [--scope s]  # SSO-3308 — GitHub Actions job, NO secret (id-token: write); renews with a fresh job token
-thoryn login --connection <file> [--fix-request <path>]  # SSO-2948 — sign in from a connection contract; SSO-3710 — a refused exchange whose only local
-                                             # mismatch is the job's GitHub environment writes the fix request (the missing plan profile + its command; env THORYN_FIX_REQUEST)
+thoryn login --connection <file> [--fix-request <path>]  # SSO-2948 — sign in from a connection contract; SSO-3702/3722 — the profile is decided from the job's
+                                             # environment claim vs auth.github.environment (apply / plan / "decided by the hub" when the connection names none);
+                                             # SSO-3710/3722 — EVERY refusal ends with "To fix" (two options) and writes the fix request (env THORYN_FIX_REQUEST, SSO-3723 THORYN_CONSENT_URL)
 thoryn login --status
 thoryn logout [--rotate-key]                 # SSO-3199 — --rotate-key also discards this machine's DPoP key
 thoryn whoami [--check]                      # SSO-2860/3199/3228 — identity, scopes, expiry, DPoP key + device (--check: this device's server-side state)
@@ -372,7 +373,8 @@ thoryn workload-identity trusts create --provider kubernetes --name <n> --issuer
 thoryn workload-identity trusts set-plan-profile <id> --plan-environment <gh-env> [--plan-scope <tenant:…read>…]   # POST …/{id}/plan-profile
                                                                    # the ONE additive mutation: adds the plan profile, keeps the wi_ client (409 once set)
 thoryn workload-identity trusts list [--limit n] [--cursor c]         # GET    /api/v1/workload-identity/trusts
-thoryn workload-identity trusts get <id>                              # GET    /api/v1/workload-identity/trusts/{id} (+ the sign-in line)
+thoryn workload-identity trusts get <id> [--connection]               # GET    /api/v1/workload-identity/trusts/{id} (+ the sign-in line); --connection: ONLY the
+                                                                      # complete connection.json (SSO-3722 — provider + the whole github/kubernetes block), to paste
 thoryn workload-identity trusts delete <id> [--yes] [--confirm <slug>] # DELETE /api/v1/workload-identity/trusts/{id}
 
 # Project repositories (SSO-3435, epic SSO-3304) — set up a GitHub repository that manages your workspace
@@ -606,7 +608,8 @@ GitHub-hosted runners only.
 # pass --owner-id and --repository-id for a private one.
 thoryn workload-identity trusts create --environment staging --name billing-ci \
   --repository acme/billing --github-environment staging --scope tenant:applications.write
-# → prints the clientId (wi_…), audience and token endpoint, a job snippet and a connection.json.
+# → prints the clientId (wi_…), audience and token endpoint, a job snippet and the COMPLETE connection.json.
+thoryn workload-identity trusts get <id> --connection      # SSO-3722 — prints that connection.json again, alone, to paste
 ```
 
 In the workflow — the job needs `permissions: id-token: write` and nothing else:
@@ -625,7 +628,10 @@ jobs:
 ```
 
 Or commit the binding as a connection contract and run `thoryn login --connection .thoryn/connection.json`
-(the provisioning Action does this; leave its `client-secret` input empty):
+(the provisioning Action does this; leave its `client-secret` input empty). **Commit it complete** — `trusts create`
+prints it, `trusts get <id> --connection` prints it again, and it carries `auth.provider` and the **whole**
+`auth.github` block exactly as `connection.schema.json` defines it (SSO-3722; a snippet without `provider` and
+`github` is what made the `forge-plan` job of thoryn-cicd run 38751382032 request the apply scopes):
 
 ```json
 {
@@ -633,10 +639,11 @@ Or commit the binding as a connection contract and run `thoryn login --connectio
   "workspace": { "slug": "acme" },
   "auth": {
     "method": "workload_identity",
+    "provider": "github_actions",
     "clientId": "wi_3f0c9a1b2d4e5f6a7b8c9d0e",
     "audience": "https://acme.auth.thoryn.io/staging",
     "scopes": ["tenant:applications.write"],
-    "github": { "owner": "acme", "repository": "billing", "environment": "staging" }
+    "github": { "owner": "acme", "repository": "billing", "ownerId": 11, "repositoryId": 22, "environment": "staging", "ref": "refs/heads/main", "githubHostedRunnersOnly": true }
   }
 }
 ```
@@ -646,8 +653,9 @@ Or commit the binding as a connection contract and run `thoryn login --connectio
   CLI derive it from `workspace.slug` and `THORYN_ISSUER`; when the workspace's custom domain is active, the
   derived audience's platform host names the custom-domain issuer and the CLI uses that (SSO-3415). `tokenEndpoint` (default `<audience>/oauth2/token`)
   must be on the audience's origin — the CLI never sends a job token anywhere else.
-- `github` is optional and grants nothing: it only lets the CLI name the field that differs when a
-  sign-in is refused.
+- `github` grants nothing: it lets the CLI name the field that differs when a sign-in is refused, and its
+  `environment` is the **apply environment the profile selector reads** (below). Without it the CLI cannot tell a
+  plan job from an apply job and leaves the profile to the hub.
 - **A job token works once.** Every exchange — including the automatic renewal when a later command finds
   the 15-minute token expired — requests a fresh one from the runner. A workload session renews only inside
   the job that signed in.
@@ -681,7 +689,18 @@ Differences found locally:
   - environment: the trust pins GitHub environment 'thoryn-staging-wif'; this job declares no `environment:` (add `environment: thoryn-staging-wif` to the job).
 
 Compare the job above with the trust (`thoryn workload-identity trusts get <id>`): its client id, audience, repository ids, GitHub environment, ref and runner pin must all match, and it must live in the environment the audience names.
+
+To fix — Option 1, with the CLI (a workspace admin):
+  - job: add `environment: thoryn-staging-wif` to the job
+To fix — Option 2, in the browser: Run through the Thoryn GitHub App to get a browser link.
 ```
+
+**Every refusal ends with that `To fix` block** (SSO-3722 / SSO-3723; see "A red check names its fix" below): a
+missing `permissions: id-token: write`, a pin that differs (with the one `thoryn workload-identity trusts create …`
+that pins the trust to this job's own claims, then `trusts get <id> --connection` to paste), a scope outside the
+profile (which line of `connection.json` to change), a token endpoint that could not be reached. With
+`--fix-request` / `THORYN_FIX_REQUEST` the same text is written to the fix request — every refusal, not only the
+plan-profile gap.
 
 - A trust can carry only `tenant:` scopes your own session holds (`403 scope_not_grantable` otherwise). A
   production trust needs `--github-environment` and `--confirm-production`; `pull_request` and
@@ -729,10 +748,18 @@ plan job asking for a write scope is refused at sign-in with `invalid_scope` and
 structural — no second trust has to be configured correctly for a plan token to be unable to write.
 
 **One `connection.json`, no `auth.plan`, no `connection.plan.json`.** `thoryn login --connection` reads the
-job's own OIDC `environment` claim: in the connection's `auth.github.environment` (the apply environment)
-it requests `auth.scopes` exactly, as always; in any **other** environment it sends **no `scope`**, so the
-hub mints the matched plan profile — a plan job never asks for a write scope. The contract does not
-declare the plan scopes because it could add nothing the hub does not already enforce (at best it would ask
+job's own OIDC `environment` claim and decides **one of three ways** (SSO-3702, SSO-3722):
+
+| `auth.github.environment` | job's `environment` claim | scope sent | sign-in line |
+|---|---|---|---|
+| names the apply environment | equal to it | `auth.scopes`, exactly | `Profile: apply (GitHub environment '…' — the trust's scopes).` |
+| names the apply environment | any other | **none** — the hub mints the plan profile | `Profile: plan (read-only) — …` |
+| **absent** (no `github` block, or no `environment` in it) | present | **none** — the hub matches the profile from the claim (SSO-3700's empty-request rule); never `auth.scopes` blindly | `Profile: decided by the hub (connection.json names no apply environment — add auth.github.environment to decide locally; …)` |
+| any | absent (not GitHub; a pod) | `auth.scopes`, exactly — unchanged | — |
+
+The third row is the fix for thoryn-cicd run 38751382032, where a connection without its `github` block made the
+plan job request the apply scopes and the hub answered `invalid_scope` / `scope_outside_plan_profile`. The contract
+does not declare the plan scopes because it could add nothing the hub does not already enforce (at best it would ask
 for less, at worst for a write the hub refuses). The sign-in line names the profile:
 
 ```text
@@ -1606,14 +1633,55 @@ are that graph's check and list-objects, so the gate uses them (and `tenant:acce
 its `parent` edge) is still gated by containment — `manager` on the parent — because the platform
 re-checks every write server-side, so the engine can never admit a write the platform refuses.
 
-### A red check names its fix — `--fix-request` (SSO-3710, epic SSO-3304)
+### A red check names its fix — `--fix-request` (SSO-3710, SSO-3722, SSO-3723; epic SSO-3304)
 
 A repository bound to Thoryn needs one-time rights before its App-dispatched plan can run: the **plan
 profile** on its trust (SSO-3700), the **`owner`** relation on a resource it declares (SSO-3697), or
 `manager` on the parent environment of something it creates. When one is missing the check run is red
 in one of two places — at sign-in (`401 invalid_client`, the hub says nothing more) or at the engine's
-gate (`access_not_owned` / `access_read_only` / `access_owned_elsewhere`) — and the person reading it
-needs a path. Per oauthy ADR `2026-10-15-missing-rights-fix-path-cli-and-web-consent.md` §1 the job
+gate (`access_not_owned` / `access_read_only` / `access_owned_elsewhere`, and since SSO-3722
+`access_not_reachable`: the live read answered `404 unknown_environment` because the identity has **no reach
+into the plane at all** — product-api's 404-not-403 rule, SSO-3118 — which used to die as "could not read live
+state" before the gate) — and the person reading it needs a path.
+
+**Since SSO-3722 every refusal the CLI prints ends with the same block, in two options (SSO-3723):**
+
+```text
+To fix — Option 1, with the CLI (a workspace admin):
+  - owner on application:forge-oauth2-proxy for client:wi_10a7…: access_not_reachable — the live read of … was answered HTTP 404 (unknown_environment): …
+      thoryn access grant client:wi_10a7b379c79f7d1353f5798d owner application:forge-oauth2-proxy
+To fix — Option 2, in the browser: https://app.thoryn.io/github/consent/run/thoryn-io/thoryn-cicd/38751887466
+```
+
+Option 1 lists every missing **right** with its exact command and every **file / job edit** as a line (a
+`connection.json` that names no apply environment, a job without `environment:`, a trust to re-create with the
+job's own pins, a read-only reference that differs). Option 2 is the Thoryn GitHub App's web consent for **this
+run**, resolvable by run — `<consentUrl>/github/consent/run/<owner>/<repository>/<run_id>` from the job's own
+`GITHUB_REPOSITORY` / `GITHUB_RUN_ID` (the opaque consent id the App mints after the run is unknowable to the
+job). The base URL is **configuration** (`.thoryn/workflow.yaml` `consentUrl`, or the reusable workflow's
+`consent-url` input, reaching the CLI as `THORYN_CONSENT_URL`), never guessed from the issuer; unset, or outside
+a GitHub Actions run, the line reads `Run through the Thoryn GitHub App to get a browser link.` The fix request
+carries the same two as `options.cli` / `options.consentUrl`, so the check-run summary and the log never disagree.
+
+The audited refusals and what their Option 1 says:
+
+| Refusal | Option 1 |
+|---|---|
+| no `ACTIONS_ID_TOKEN_REQUEST_*` / GitHub refused the job token | `job: add permissions: id-token: write …`; outside GitHub: `thoryn login` / `--client-credentials` |
+| the token file is missing (a pod) | mount the projected token where `auth.tokenSource.path` says, or point the path at it |
+| `invalid_client`, only the environment differs | the **plan_profile** item: `thoryn workload-identity trusts set-plan-profile <trust-id> --plan-environment <job env>` |
+| `invalid_client`, the job declares no environment | `job: add environment: <the trust's> to the job` |
+| `invalid_client`, a pin differs (repository, ids, ref, runner, namespace, service account) | the one `thoryn workload-identity trusts create --name <name> … --repository <job's> --owner-id … --repository-id … --github-environment <job's> --scope "…"` built from the job's own claims, then `trusts get <id> --connection` over `connection.json`; or align the job |
+| `invalid_client`, no local difference | `thoryn audit query --event-type workload_identity.exchange_failed`, then the same re-create or alignment |
+| `invalid_scope` / `scope_outside_plan_profile` | `connection.json: names no apply environment — add auth.github.environment: <apply env> (paste the github block from trusts get <id> --connection), or drop auth.scopes`; names the wrong one — set it to the trust's apply environment; flag form — drop `--scope` |
+| `invalid_scope` / `scope_outside_apply_profile`, other `invalid_scope` | `auth.scopes` (or `--scope`) must be a subset of the trust's (`trusts get <id>` lists them) |
+| token endpoint unreachable, unknown error | make the endpoint reachable from the runner / re-run, then the audit log |
+| `access_not_owned`, `access_read_only` (a resource to own) | `thoryn access grant client:<wi_> owner <object>` |
+| `access_not_owned` on a create | `thoryn access grant client:<wi_> manager environment:<id>`; a workspace parent is a note (never granted to a repository identity) |
+| `access_not_reachable` (404 on the live read) | `owner application:<clientId>` for a fixed `clientId`; `manager environment:<slug>` for a declared environment; a workspace note on the production plane without a fixed id |
+| `access_owned_elsewhere` | no command runs for you: declare it `readOnly: true`, or an admin moves the ownership (the reason carries revoke-then-grant) |
+| `access_read_only` (a differing reference), `converge_key_ambiguous`, `workload_identity_trust_immutable` / `_is_self`, `scope_not_grantable`, `federated_trust_not_found` | a line naming the file edit (align the reference, declare `clientId`, declare what is live or delete the trust, drop the scope / the resource) |
+| a refused or deferred removal (destroy / `--prune`) | the `by hand:` command on the plan row | Per oauthy ADR `2026-10-15-missing-rights-fix-path-cli-and-web-consent.md` §1 the job
 writes **one file**, `thoryn-provision-request.json` (schema
 `engine/src/main/resources/provision/fix-request.schema.json`), and the workflow uploads it as the run
 artifact **`thoryn-provision-request`**. The Thoryn GitHub App reads that artifact and puts two options on
@@ -1624,13 +1692,14 @@ Both producers take the same opt-in `--fix-request <path>` (or the env var `THOR
 spelling a workflow uses, because a release that predates the flag ignores a variable and refuses a flag);
 exit codes are unchanged, and the request is never a credential — ids, names, commands:
 
-- **`thoryn login --connection --fix-request`** — on an `invalid_client` refusal whose **only** local
-  mismatch is the job's GitHub environment (the job runs in `<env>-plan`, the trust pins the apply
-  environment and has no plan profile for the job's): one `plan_profile` item with
+- **`thoryn login --connection --fix-request`** — on **every** refusal that had a job token (SSO-3722). An
+  `invalid_client` whose **only** local mismatch is the job's GitHub environment (the job runs in `<env>-plan`,
+  the trust pins the apply environment and has no plan profile for the job's) is one `plan_profile` item with
   `thoryn workload-identity trusts set-plan-profile <trust-id> --plan-environment <job env>` (`<trust-id>`,
   because a refused sign-in holds no token; `thoryn workload-identity trusts list` resolves it). Any other
-  refusal shape — a repository id, a ref, a runner, no environment at all — is a wrong pin, not a missing
-  right: today's diagnostic alone, no file.
+  shape — a repository id, a ref, a runner, no environment at all, a scope outside the profile — is a wrong pin
+  or a file edit, not a missing right: `missing` stays empty and the edit is a `notes` line (the same line the
+  log prints), so the App can still show it.
 - **`thoryn provision plan|apply --fix-request`** — on a red plan, one item per `access_*` row that is a
   right: **`owner`** on an existing object this file is to own (`access_not_owned` on a live id, or
   `access_read_only` when the identity may only view it), **`manager`** on the parent `environment:<id>`
@@ -1645,9 +1714,10 @@ exit codes are unchanged, and the request is never a credential — ids, names, 
   session names its `wi_` client only.
 
 **One rendering.** The `cli` string of every item is the same text the CLI prints on stderr (the row
-reasons quote it; a `Missing rights — what a workspace admin grants` block lists it), so the check run and
-the terminal never disagree. The binding fields the file carries — `repository`, `run` — are hints: a
-consumer takes them from GitHub's own record of the run and discards the body's copy.
+reasons quote it; the `To fix — Option 1, with the CLI (a workspace admin):` block lists it with the notes),
+`options.cli` is that block's body and `options.consentUrl` the Option 2 link — so the check run and the
+terminal never disagree. The binding fields the file carries — `repository`, `run` — are hints: a consumer
+takes them from GitHub's own record of the run and discards the body's copy.
 
 ```json
 { "version": 1, "cliVersion": "0.35.0",
@@ -1658,7 +1728,9 @@ consumer takes them from GitHub's own record of the run and discards the body's 
   "missing": [ { "kind": "owner", "object": "application:cli", "subject": "client:wi_10a7b379c79f7d1353f5798d", "environment": null,
                  "reason": "access_not_owned — this identity holds no relation on application:cli — …",
                  "cli": "thoryn access grant client:wi_10a7b379c79f7d1353f5798d owner application:cli" } ],
-  "notes": [] }
+  "notes": [],
+  "options": { "cli": "  - owner on application:cli for client:wi_10a7…: access_not_owned — …\n      thoryn access grant client:wi_10a7b379c79f7d1353f5798d owner application:cli",
+               "consentUrl": "https://app.thoryn.io/github/consent/run/thoryn-io/thoryn-cli/38547022158" } }
 ```
 
 In a workflow, set the variable on the step that signs in and plans, and upload the file on failure (the
@@ -1668,6 +1740,7 @@ reusable `provisioning.yml` (SSO-3719) and the composite Action's `fix-request` 
       - name: Plan
         env:
           THORYN_FIX_REQUEST: ${{ runner.temp }}/thoryn-provision-request.json
+          THORYN_CONSENT_URL: https://app.thoryn.io     # SSO-3723 — the "Option 2, in the browser" link's base; configuration
         run: |
           thoryn login --connection .thoryn/connection.json
           thoryn provision plan --file .thoryn/provision.yaml
@@ -1761,6 +1834,7 @@ the same pin selects the CLI the jobs run (`job.workflow_ref`), so there is no s
 | `runs-on` | `ubuntu-latest` | a runner label, or a JSON array of labels for a **self-hosted** pool: `'["self-hosted", "linux", "x64"]'` (the runner needs bash, gh, jq, curl; Java is set up). A trust pinned "GitHub-hosted runners only" refuses a self-hosted job's token — that pin is yours to change on the trust |
 | `timeout-minutes` | `30` | each job's timeout |
 | `config` | `.thoryn/workflow.yaml` | where the run-time configuration lives |
+| `consent-url` | `""` | SSO-3723 — base URL of the Thoryn GitHub App's browser consent (`THORYN_CONSENT_URL`): a red job's `To fix — Option 2, in the browser:` becomes `<url>/github/consent/run/<owner>/<repo>/<run_id>`. Empty ⇒ `.thoryn/workflow.yaml` `consentUrl`, else the commands alone |
 
 #### Run-time configuration — `.thoryn/workflow.yaml`
 
@@ -1771,8 +1845,9 @@ Committed beside your provisioning files; absent ⇒ the defaults below; schema
 |---|---|---|
 | `apiVersion` | required | `thoryn.io/workflow/v1` |
 | `files[]` | `[{file: .thoryn/provision.yaml, connection: .thoryn/connection.json}]` | **one or many** provisioning files, planned and applied in order, each signed in with its own connection (`connection` defaults to the `connection.json` beside the file — the layout `thoryn project init` and the App seed) |
-| `env` | `{}` | extra environment variables for the CLI: **`THORYN_*` names only** (the CLI's own variables, and the `{{env.NAME}}` placeholders a provisioning file reads — SSO-3430), never one the workflow sets itself (`THORYN_ISSUER`, `THORYN_HUB`, `THORYN_FIX_REQUEST`, `THORYN_CI_PLAINTEXT_TOKENS`), never credential-shaped (`*_SECRET`, `*_PASSWORD`, `*_TOKEN`, `*_KEY` — this file is committed plaintext). Values are exported, never evaluated |
+| `env` | `{}` | extra environment variables for the CLI: **`THORYN_*` names only** (the CLI's own variables, and the `{{env.NAME}}` placeholders a provisioning file reads — SSO-3430), never one the workflow sets itself (`THORYN_ISSUER`, `THORYN_HUB`, `THORYN_FIX_REQUEST`, `THORYN_CONSENT_URL`, `THORYN_CI_PLAINTEXT_TOKENS`), never credential-shaped (`*_SECRET`, `*_PASSWORD`, `*_TOKEN`, `*_KEY` — this file is committed plaintext). Values are exported, never evaluated |
 | `fixRequest` | `true` | upload the SSO-3710 fix request (`thoryn-provision-request`) when a job is red on a missing right, so the App names the fix on the check run |
+| `consentUrl` | `""` | SSO-3723 — the base URL of the App's browser consent, exported to the CLI as `THORYN_CONSENT_URL` when the `consent-url` input is empty; every `To fix` block then carries `Option 2, in the browser: <consentUrl>/github/consent/run/<owner>/<repository>/<run_id>` and the fix request `options.consentUrl`. `https://`, no query or fragment. Configuration — never guessed from the issuer |
 | `apply.prune` | `false` | pass `--prune`: remove owned resources the file no longer declares |
 | `apply.destroy` | `false` | run `thoryn provision destroy` after a successful apply — an ephemeral fixture (an e2e sandbox) |
 | `apply.confirm` | `""` | the workspace slug confirming production-plane removals (the SSO-2413 gate) |

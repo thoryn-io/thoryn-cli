@@ -136,6 +136,14 @@ inputs:
     required: false
     default: ""
 
+  consent-url:
+    description: >-
+      SSO-3723 — base URL of the Thoryn GitHub App's browser consent (the CLI's THORYN_CONSENT_URL). A red sign-in or
+      plan then prints its fix in two options — the CLI commands and `<consent-url>/github/consent/run/<owner>/<repo>/<run_id>`
+      — and the fix request carries both (`options`). Empty ⇒ the commands alone. Configuration, never guessed.
+    required: false
+    default: ""
+
 outputs:
   workspace-slug:
     description: "Slug of the workspace the resources live in (the connection contract's workspace.slug)."
@@ -240,6 +248,8 @@ runs:
         SECRET_VALUE: ${{ inputs.client-secret }}
         # SSO-3710 — where a refused workload-identity exchange writes its fix request (the CLI's `--fix-request`).
         THORYN_FIX_REQUEST: ${{ steps.fix-request.outputs.path }}
+        # SSO-3723 — the browser consent base URL for a red job's "Option 2" link (empty ⇒ commands alone).
+        THORYN_CONSENT_URL: ${{ inputs.consent-url }}
         # SSO-3296 — `issuer` wins; `hub` is the retained alias. Both env names are exported so a
         # connection contract naming either one resolves.
         THORYN_ISSUER: ${{ inputs.issuer != '' && inputs.issuer || inputs.hub }}
@@ -291,6 +301,8 @@ runs:
         THORYN_CI_PLAINTEXT_TOKENS: "1"
         # SSO-3710 — where a red plan / refused apply writes its fix request (the CLI's `--fix-request`).
         THORYN_FIX_REQUEST: ${{ steps.fix-request.outputs.path }}
+        # SSO-3723 — the browser consent base URL for a red job's "Option 2" link (empty ⇒ commands alone).
+        THORYN_CONSENT_URL: ${{ inputs.consent-url }}
       run: |
         set -euo pipefail
         if [ ! -f "$FILE" ]; then

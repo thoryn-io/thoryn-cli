@@ -123,8 +123,12 @@ object ProvisioningWorkflowContract {
             type = "number", default = "30", grammar = POSITIVE_INT_GRAMMAR, grammarHint = "a positive whole number of minutes",
         ),
         "config" to ReusableInput(
-            "Path of the committed run-time configuration the reusable workflow reads (files, env, fixRequest, apply).",
+            "Path of the committed run-time configuration the reusable workflow reads (files, env, fixRequest, consentUrl, apply).",
             default = WorkflowConfig.DEFAULT_PATH, grammar = WorkflowConfig.PATH_GRAMMAR, grammarHint = "a relative path inside the repository",
+        ),
+        "consent-url" to ReusableInput(
+            "SSO-3723 — base URL of the Thoryn GitHub App's browser consent (THORYN_CONSENT_URL for the CLI): a red job prints `To fix — Option 2, in the browser: <url>/github/consent/run/<owner>/<repo>/<run_id>`. Empty: .thoryn/workflow.yaml consentUrl, else Option 1 alone.",
+            default = "", grammar = WorkflowConfig.CONSENT_URL_GRAMMAR, grammarHint = "an https:// base URL (no query or fragment)",
         ),
     )
 

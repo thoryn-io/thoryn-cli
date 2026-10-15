@@ -28,6 +28,13 @@ import java.nio.file.Path
  * **One renderer.** The prose the CLI prints for these failures and the `cli` string the JSON carries come from the
  * same functions ([grantCommand], [setPlanProfileCommand], [render]), so the check run and the terminal never
  * disagree. Schema: [SCHEMA_RESOURCE], shipped beside `provision.schema.json`.
+ *
+ * **SSO-3722 / SSO-3723 — every refusal ends with "To fix", in two options.** [render] is the ONE block every red
+ * sign-in and every red plan row ends with: `To fix — Option 1, with the CLI (a workspace admin):` (the items' commands
+ * and the notes' file edits) and `To fix — Option 2, in the browser:` (the run's consent link, [consentUrl], or
+ * [NO_CONSENT_LINK_LINE]). The request carries the same two as [Options] (`options.cli`, `options.consentUrl`). A
+ * refusal whose fix is a FILE edit (a connection.json without its apply environment, a scope outside the trust's)
+ * has no item: it is a note, and the request is still written so the App can show it.
  */
 data class FixRequest(
     /** The schema version of this document ([VERSION]). */
@@ -48,7 +55,24 @@ data class FixRequest(
     val missing: List<MissingRight>,
     /** Failed rows that are NOT a missing right (a file fix), so the request says so instead of staying silent. */
     val notes: List<String> = emptyList(),
+    /**
+     * SSO-3723 — "Option 2, in the browser": the consent link for THIS run, resolvable by run
+     * (`<consentBaseUrl>/github/consent/run/<owner>/<repository>/<run_id>`, [consentUrl]), or null when the job has no
+     * configured base URL ([CONSENT_URL_ENV]) or is not a GitHub Actions run. The App resolves it to the consent it mints.
+     */
+    val consentUrl: String? = null,
 ) {
+    /**
+     * SSO-3723 — the two options a reader has, as DATA: [Options.cli] is the Option-1 body exactly as the log prints it
+     * (the commands and the file edits, one rendering), [Options.consentUrl] the Option-2 link or null.
+     */
+    data class Options(val cli: String?, val consentUrl: String?) {
+        fun toStructured(): Map<String, Any?> = linkedMapOf("cli" to cli, "consentUrl" to consentUrl)
+    }
+
+    /** The two options of this request — what the check-run summary shows and what the log printed. */
+    val options: Options get() = Options(renderOption1Body(missing, notes).ifEmpty { null }, consentUrl)
+
     /** GitHub's names and immutable ids of the repository (`GITHUB_REPOSITORY*` / the OIDC `repository*` claims). */
     data class Repository(val owner: String?, val ownerId: Long?, val repository: String?, val repositoryId: Long?)
 
@@ -118,6 +142,7 @@ data class FixRequest(
         "trust" to linkedMapOf("name" to trust.name, "plane" to trust.plane, "applyEnvironment" to trust.applyEnvironment, "id" to trust.id, "clientId" to trust.clientId),
         "missing" to missing.map { it.toStructured() },
         "notes" to notes,
+        "options" to options.toStructured(),
     )
 
     fun toJson(mapper: ObjectMapper = jacksonObjectMapper()): String =
@@ -152,6 +177,33 @@ data class FixRequest(
 
         /** The command that resolves [TRUST_ID_PLACEHOLDER]: lists the workspace's trusts with their pins. */
         const val LIST_TRUSTS_COMMAND: String = "thoryn workload-identity trusts list"
+
+        /**
+         * SSO-3723 — the env var naming the consent BASE URL (configuration: `.thoryn/workflow.yaml` `consentUrl` or the
+         * reusable workflow's `consent-url` input — never guessed from the issuer). Unset ⇒ Option 1 alone.
+         */
+        const val CONSENT_URL_ENV: String = "THORYN_CONSENT_URL"
+
+        /** The heading of Option 1 — the commands / file edits a workspace admin (or the repository) runs. */
+        const val OPTION_CLI_HEADING: String = "To fix — Option 1, with the CLI (a workspace admin):"
+
+        /** The heading of Option 2 — the browser consent for this run. */
+        const val OPTION_BROWSER_HEADING: String = "To fix — Option 2, in the browser:"
+
+        /** What Option 2 says when no link can be built: no configured base URL, or not a GitHub Actions run. */
+        const val NO_CONSENT_LINK_LINE: String = "Run through the Thoryn GitHub App to get a browser link."
+
+        /**
+         * SSO-3723 — the consent link for ONE run: `<base>/github/consent/run/<owner>/<repository>/<runId>`, built from the
+         * job's own GitHub context; null unless the base URL, both repository names and the run id are all known. The
+         * opaque consent id the App mints after the run completes is unknowable here, so the link is resolvable BY RUN
+         * (the orchestrator's `/github/consent/run/{owner}/{repo}/{runId}`, oauthy SSO-3723).
+         */
+        fun consentUrl(baseUrl: String?, owner: String?, repository: String?, runId: Long?): String? {
+            val base = baseUrl?.trim()?.trimEnd('/')?.takeIf { it.startsWith("https://") || it.startsWith("http://") } ?: return null
+            if (owner.isNullOrBlank() || repository.isNullOrBlank() || runId == null) return null
+            return "$base/github/consent/run/${owner.trim()}/${repository.trim()}/$runId"
+        }
 
         /** `thoryn access grant <subject> <relation> <object>` — THE spelling of a grant, for the prose and the JSON alike. */
         fun grantCommand(subject: String?, relation: String, objectRef: String): String =
@@ -207,29 +259,39 @@ data class FixRequest(
         }
 
         /**
-         * THE rendering of a list of missing rights — the block the CLI prints on stderr after the row reasons and
-         * what a reader copies. Each item: its kind and object, the reason, the command (indented, one line) and, for
-         * a placeholder trust id, the command that resolves it. Empty list ⇒ empty string.
+         * THE rendering of what is missing — the "To fix" block the CLI prints on stderr after every refusal and what a
+         * reader copies. SSO-3723: two options in one fixed shape. Option 1 ([OPTION_CLI_HEADING]) lists each missing
+         * right — its kind and object, the reason, the command (indented, one line) and, for a placeholder trust id, the
+         * command that resolves it — then every [notes] entry as a FILE edit. Option 2 ([OPTION_BROWSER_HEADING]) is the
+         * run's consent link, or [NO_CONSENT_LINK_LINE] when none can be built. The same text is the request's
+         * [Options]. Nothing to fix (no item, no note) ⇒ empty string.
          */
-        fun render(items: List<MissingRight>, writtenTo: Path? = null): String {
-            if (items.isEmpty()) return ""
+        fun render(items: List<MissingRight>, notes: List<String> = emptyList(), consentUrl: String? = null, writtenTo: Path? = null): String {
+            val body = renderOption1Body(items, notes)
+            if (body.isEmpty()) return ""
             return buildString {
-                append("Missing rights — what a workspace admin grants (${items.size} item(s)")
-                writtenTo?.let { append("; written to $it") }
-                appendLine("):")
-                items.forEach { item ->
-                    val target = item.objectRef ?: item.environment?.let { "GitHub environment '$it'" } ?: "(unknown object)"
-                    appendLine("  - ${item.kind.wire} on $target" + (item.subject?.let { " for $it" } ?: "") + ": ${item.reason}")
-                    when {
-                        item.cli != null -> {
-                            appendLine("      ${item.cli}")
-                            if (item.cli.contains(TRUST_ID_PLACEHOLDER)) appendLine("      ($TRUST_ID_PLACEHOLDER: `$LIST_TRUSTS_COMMAND` shows the trust pinned to this repository and its id)")
-                        }
-                        else -> appendLine("      (no command: an admin decides — see the reason)")
-                    }
-                }
-            }.trimEnd()
+                appendLine(OPTION_CLI_HEADING)
+                appendLine(body)
+                append(OPTION_BROWSER_HEADING).append(' ').append(consentUrl ?: NO_CONSENT_LINK_LINE)
+                writtenTo?.let { appendLine(); append("(fix request written to $it)") }
+            }
         }
+
+        /** The body of Option 1 — the items then the notes, without the heading (the request's `options.cli`). */
+        fun renderOption1Body(items: List<MissingRight>, notes: List<String> = emptyList()): String = buildString {
+            items.forEach { item ->
+                val target = item.objectRef ?: item.environment?.let { "GitHub environment '$it'" } ?: "(unknown object)"
+                appendLine("  - ${item.kind.wire} on $target" + (item.subject?.let { " for $it" } ?: "") + ": ${item.reason}")
+                when {
+                    item.cli != null -> {
+                        appendLine("      ${item.cli}")
+                        if (item.cli.contains(TRUST_ID_PLACEHOLDER)) appendLine("      ($TRUST_ID_PLACEHOLDER: `$LIST_TRUSTS_COMMAND` shows the trust pinned to this repository and its id)")
+                    }
+                    else -> appendLine("      (no command runs for you: an admin decides — declare it `readOnly: true`, or move the ownership as the reason says)")
+                }
+            }
+            notes.forEach { appendLine("  - $it") }
+        }.trimEnd()
 
         /** The prose hint the engine appends to a row's reason for a right it can name — the same [MissingRight.cli]. */
         fun hint(item: MissingRight): String = item.cli?.let { "a workspace admin grants it with `$it`" } ?: ""

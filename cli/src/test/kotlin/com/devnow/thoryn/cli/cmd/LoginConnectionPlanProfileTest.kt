@@ -159,9 +159,39 @@ class LoginConnectionPlanProfileTest : CommandTestBase() {
         assertThat(err).doesNotContain("Required scope:")
     }
 
+    // ── SSO-3722 — the apply environment unknown: the hub decides, never the connection's scopes blindly ──
+
     @Test
-    fun `a connection without the apply environment pin behaves as before — scopes requested, no profile stamped`() {
+    fun `a connection with NO github block in a job that declares an environment sends no scope — the hub mints the matched profile — and the sign-in says so`() {
+        // The live shape (thoryn-cicd run 38751382032): the committed snippet had no auth.github at all, the job ran in `forge-plan`.
+        jobIn("forge-plan")
+        platform.tokenResponses += WorkloadIdentityPlatform.json(200, """{"access_token":"AT-hub-1","token_type":"Bearer","expires_in":900,"scope":"tenant:environments.read tenant:applications.read tenant:access.read"}""")
+
+        val (exit, out, err) = runCli("login", "--connection", writeConnection(pins = null).toString())
+
+        assertThat(err).doesNotContain("Error").doesNotContain("Sign-in failed")
+        assertThat(exit).isEqualTo(0)
+        assertThat(platform.exchanges.single()).doesNotContainKey("scope")
+        assertThat(out).contains(LoginCommand.PROFILE_DECIDED_BY_HUB).contains("Scopes: tenant:environments.read tenant:applications.read tenant:access.read")
+        val stored = FileTokenStore().read()!!
+        assertThat(stored.profile).isNull()
+        assertThat(stored.jobEnvironment).isEqualTo("forge-plan")
+    }
+
+    @Test
+    fun `a github block WITHOUT environment is the same — no scope sent, the hub decides`() {
         jobIn(planEnvironment)
+
+        val (exit, out, _) = runCli("login", "--connection", writeConnection(pins = """"github": { "owner": "thoryn-io", "repository": "thoryn-cli" }""").toString())
+
+        assertThat(exit).isEqualTo(0)
+        assertThat(platform.exchanges.single()).doesNotContainKey("scope")
+        assertThat(out).contains("Profile: decided by the hub")
+    }
+
+    @Test
+    fun `outside GitHub — a job token with no environment claim — the connection's scopes are requested as before`() {
+        jobIn(null)
 
         val (exit, out, _) = runCli("login", "--connection", writeConnection(pins = null).toString())
 
@@ -169,6 +199,16 @@ class LoginConnectionPlanProfileTest : CommandTestBase() {
         assertThat(platform.exchanges.single()).containsEntry("scope", scopes.joinToString(" "))
         assertThat(out).doesNotContain("Profile:")
         assertThat(FileTokenStore().read()!!.profile).isNull()
+    }
+
+    @Test
+    fun `the flag form keeps an explicit --scope even in a job that declares an environment`() {
+        jobIn(planEnvironment)
+
+        val (exit, _, _) = runCli("login", "--workload-identity", "--client-id", clientId, "--audience", audience(), "--gateway", baseUrl(), "--scope", "tenant:environments.read")
+
+        assertThat(exit).isEqualTo(0)
+        assertThat(platform.exchanges.single()).containsEntry("scope", "tenant:environments.read")
     }
 
     @Test
@@ -186,8 +226,9 @@ class LoginConnectionPlanProfileTest : CommandTestBase() {
         assertThat(err)
             .contains("outside the trust's PLAN profile (HTTP 400: invalid_scope, scope_outside_plan_profile)")
             .contains("This job runs in GitHub environment '$planEnvironment'")
-            .contains("request no scope at all")
-            .contains("Never request a write scope from a plan job")
+            .contains(com.devnow.thoryn.provision.FixRequest.OPTION_CLI_HEADING)
+            .contains("job: drop --scope (the hub then mints the plan profile's read-only scopes), or request only .read scopes — never a write scope from a plan job")
+            .contains(com.devnow.thoryn.provision.FixRequest.OPTION_BROWSER_HEADING)
             .doesNotContain(platform.jobTokens.single())
         assertThat(FileTokenStore().read()).isNull()
     }

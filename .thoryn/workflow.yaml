@@ -8,6 +8,9 @@ files:
   - file: .thoryn/provision.yaml
     connection: .thoryn/connection.json
 fixRequest: true
+# SSO-3723 — the Thoryn GitHub App's browser-consent base URL: a red job then prints "To fix — Option 2, in the browser:
+# <consentUrl>/github/consent/run/<owner>/<repo>/<run_id>" (THORYN_CONSENT_URL for the CLI). Empty: the CLI commands alone.
+consentUrl: ""
 apply:
   prune: false
   destroy: false

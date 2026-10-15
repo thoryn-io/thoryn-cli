@@ -211,10 +211,11 @@ class ProvisionCommand : Callable<Int> {
             if (!plan.hasErrors) return
             System.err.println("${plan.errors.size} resource(s) failed the ownership check — apply would refuse this plan:")
             plan.errors.forEach { c -> System.err.println("  ! ${c.kind} ${c.name}: ${c.reason}") }
-            // SSO-3710 — the rights behind those rows, as one copy-pasteable block: the SAME items (and the same `cli`
-            // strings) a `--fix-request` file carries, rendered by the one function the request is rendered with.
-            val (items, _) = FixRequest.fromPlan(plan)
-            if (items.isNotEmpty()) System.err.println(FixRequest.render(items))
+            // SSO-3710 / SSO-3722 — the fix behind those rows, as ONE "To fix" block in two options: the SAME items (and the
+            // same `cli` strings) and the same notes a `--fix-request` file carries, rendered by the one function the request
+            // is rendered with; the browser option is the run's consent link when the workflow configured one (SSO-3723).
+            val (items, notes) = FixRequest.fromPlan(plan)
+            FixRequest.render(items, notes, FixRequests.consentUrl()).takeIf { it.isNotEmpty() }?.let { System.err.println(it) }
         }
 
         /**

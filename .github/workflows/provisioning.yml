@@ -84,10 +84,15 @@ on:
         type: number
         default: 30
       config:
-        description: "Path of the committed run-time configuration (files, env, fixRequest, apply toggles)"
+        description: "Path of the committed run-time configuration (files, env, fixRequest, consentUrl, apply toggles)"
         required: false
         type: string
         default: ".thoryn/workflow.yaml"
+      consent-url:
+        description: "SSO-3723 — base URL of the Thoryn GitHub App's browser consent (THORYN_CONSENT_URL): a red job prints its fix as the CLI commands AND a link for this run. Empty: .thoryn/workflow.yaml consentUrl, else the commands alone"
+        required: false
+        type: string
+        default: ""
 
 env:
   # The platform base issuer the connection contract derives the workspace's issuer from (both documented spellings).
@@ -162,9 +167,14 @@ jobs:
         env:
           # SSO-3710 — where `login --connection` / `provision plan` write the fix request (the CLI's `--fix-request`).
           THORYN_FIX_REQUEST: ${{ runner.temp }}/thoryn-provision-request.json
+          # SSO-3723 — the consent base URL: the input, else the config's consentUrl (exported below), else none.
+          CONSENT_URL_INPUT: ${{ inputs.consent-url }}
         run: |
           set -euo pipefail
           report="$RUNNER_TEMP/thoryn-workflow.json"
+          # SSO-3723 — a red job's "To fix — Option 2, in the browser" link: configuration only, never guessed.
+          consent="${CONSENT_URL_INPUT:-$(jq -r '.config.consentUrl // ""' "$report")}"
+          if [ -n "$consent" ]; then export THORYN_CONSENT_URL="$consent"; fi
           # env: allow-listed THORYN_* names from the config, EXPORTED (never evaluated); the CLI already refused anything else.
           while IFS=$'\t' read -r name value; do
             [ -n "$name" ] || continue
@@ -253,9 +263,13 @@ jobs:
         env:
           # SSO-3710 — where `login --connection` / `provision apply` write the fix request (the CLI's `--fix-request`).
           THORYN_FIX_REQUEST: ${{ runner.temp }}/thoryn-provision-request.json
+          # SSO-3723 — the consent base URL: the input, else the config's consentUrl (exported below), else none.
+          CONSENT_URL_INPUT: ${{ inputs.consent-url }}
         run: |
           set -euo pipefail
           report="$RUNNER_TEMP/thoryn-workflow.json"
+          consent="${CONSENT_URL_INPUT:-$(jq -r '.config.consentUrl // ""' "$report")}"
+          if [ -n "$consent" ]; then export THORYN_CONSENT_URL="$consent"; fi
           while IFS=$'\t' read -r name value; do
             [ -n "$name" ] || continue
             [[ "$name" =~ ^THORYN_[A-Z0-9_]+$ ]] || { echo "::error::refusing environment variable '$name'" >&2; exit 1; }
