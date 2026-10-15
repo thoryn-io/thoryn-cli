@@ -78,12 +78,13 @@ internal object CiIdentityFixture {
     const val AUDIENCE = "https://thoryn.auth.stg.thoryn.org"
 
     /**
-     * The thoryn-cli release the App-dispatched workflow pins — its composite Action and `thoryn.jar`. SSO-3704: at least
-     * cli-v0.34.0, the first release whose `thoryn login --connection` picks the profile from the job's own OIDC
+     * The thoryn-cli release the App-dispatched workflow pins — its composite Action and `thoryn.jar`. At least
+     * cli-v0.35.0: the first release that writes the fix request the App relays into a red check run (SSO-3710).
+     * cli-v0.34.0 was the first whose `thoryn login --connection` picks the profile from the job's own OIDC
      * `environment` claim (SSO-3702) — an older CLI in the `-plan` environment would request the six write scopes and
      * be refused by the plan profile's ceiling.
      */
-    const val CLI_RELEASE = "cli-v0.34.0"
+    const val CLI_RELEASE = "cli-v0.35.0"
 
     /** The platform base issuer the workflow provisions against (the connection derives the workspace issuer from it). */
     const val PLATFORM_ISSUER = "https://auth.stg.thoryn.org"
