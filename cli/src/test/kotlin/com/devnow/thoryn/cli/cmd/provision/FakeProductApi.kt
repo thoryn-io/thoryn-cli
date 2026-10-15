@@ -50,6 +50,8 @@ internal class FakeProductApi : Dispatcher() {
     var callerIsAdmin = true
     /** The workspace id (`tnt`) — the object `workspace:<tenantId>` and the custom domain's id. */
     var tenantId = "t-1"
+    /** SSO-3715 — route prefixes whose DELETE answers `503 unavailable` (a removal that fails at the platform; the engine keeps going child-first). */
+    val failingDeletes = mutableSetOf<String>()
     /** SSO-3113 — simulate a token WITHOUT `tenant:access.write` / `tenant:access.read` (403 insufficient_scope). */
     var denyGrantWrites = false
     var denyGrantReads = false
@@ -470,6 +472,7 @@ internal class FakeProductApi : Dispatcher() {
         val b = if (method == "GET") emptyMap() else body(req)
         // SSO-3673 — the forward check is a POST but a READ: it is recorded on `checks`, never as a write.
         if (method != "GET" && route != "/api/v1/access/check") writes += Write(method, route, env, confirm, b)
+        if (method == "DELETE" && failingDeletes.any { route.startsWith(it) }) return problem(503, "unavailable")
         val seg = route.removePrefix("/api/v1/").split('/')
         return when {
             // ── environments ──

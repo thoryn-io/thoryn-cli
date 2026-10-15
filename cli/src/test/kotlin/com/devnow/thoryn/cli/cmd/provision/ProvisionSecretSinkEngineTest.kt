@@ -6,7 +6,7 @@ import com.devnow.thoryn.cli.cmd.CommandTestBase
 import com.devnow.thoryn.provision.ChangeAction
 import com.devnow.thoryn.provision.ProvisionEngine
 import com.devnow.thoryn.provision.ProvisionFile
-import com.devnow.thoryn.provision.ProvisionReceipt
+import com.devnow.thoryn.provision.ApplyResult
 import com.devnow.thoryn.provision.SecretTarget
 import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.api.BeforeEach
@@ -89,7 +89,7 @@ class ProvisionSecretSinkEngineTest : CommandTestBase() {
     fun `plan shows the intended delivery as a line and mints nothing`() {
         val sink = RecordingDeclaredSink()
         val generic = RecordingGenericSink()
-        val plan = engine(sink, generic).plan(file, null, false)
+        val plan = engine(sink, generic).plan(file, false)
         val change = plan.changes.single()
         assertThat(change.action).isEqualTo(ChangeAction.CREATE)
         assertThat(change.secretSink).isEqualTo(target)
@@ -107,27 +107,24 @@ class ProvisionSecretSinkEngineTest : CommandTestBase() {
     @Test
     fun `a plan without a secretSink keeps the shown-once note and renders no delivery`() {
         val plain = ProvisionFile.parse(yaml.substringBefore("secretSink:").toByteArray(), "provision.yaml")
-        val plan = engine(RecordingDeclaredSink()).plan(plain, null, false)
+        val plan = engine(RecordingDeclaredSink()).plan(plain, false)
         assertThat(plan.changes.single().secretSink).isNull()
         assertThat(plan.changes.single().reason).contains("minted and shown once")
         assertThat(plan.deliveries).isZero()
     }
 
     @Test
-    fun `apply delivers the minted secret to the declared sink AFTER the client is converged and recorded`() {
+    fun `apply delivers the minted secret to the declared sink AFTER the client is converged`() {
         val console = ByteArrayOutputStream()
-        val persisted = mutableListOf<ProvisionReceipt>()
         val sink = RecordingDeclaredSink()
         val generic = RecordingGenericSink()
-        var recordedAtDelivery: List<String> = emptyList()
         var liveAtDelivery: List<Any?> = emptyList()
         sink.onDeliver = { _, _ ->
-            recordedAtDelivery = persisted.lastOrNull()?.resources?.map { it.id }.orEmpty()
             liveAtDelivery = api.applications.map { it["clientId"] }
         }
         val e = engine(sink, generic, console)
-        val plan = e.plan(file, null, false)
-        val receipt = e.apply(file, null, plan, "acme", null) { persisted += it }
+        val plan = e.plan(file, false)
+        val receipt = e.apply(file, plan, "acme", null)
 
         val id = receipt.resources.single().id
         val secret = mintedFor(id)
@@ -135,13 +132,11 @@ class ProvisionSecretSinkEngineTest : CommandTestBase() {
         assertThat(sink.calls).containsExactly(Triple(target, id, secret))
         assertThat(generic.calls).isEmpty()
         assertThat(e.undeliveredSecrets).isEmpty()
-        // ORDER: when the sink was reached, the client already existed AND the persisted receipt already held its id.
+        // ORDER: when the sink was reached, the client already existed.
         assertThat(liveAtDelivery).containsExactly(id)
-        assertThat(recordedAtDelivery).containsExactly(id)
         // The secret is nowhere but the sink call.
         val mapper = jacksonObjectMapper()
-        assertThat(mapper.writeValueAsString(receipt)).doesNotContain(secret)
-        assertThat(persisted.map { mapper.writeValueAsString(it) }).noneMatch { it.contains(secret) }
+        assertThat(mapper.writeValueAsString(receipt.toStructured())).doesNotContain(secret)
         assertThat(mapper.writeValueAsString(plan.toStructured())).doesNotContain(secret)
         assertThat(console.toString()).doesNotContain(secret)
             .contains("application forge-login: clientId=$id (client secret minted)")
@@ -154,7 +149,7 @@ class ProvisionSecretSinkEngineTest : CommandTestBase() {
         val sink = RecordingDeclaredSink { "namespace 'forge' is not reachable through the current kubectl context" }
         val generic = RecordingGenericSink()
         val e = engine(sink, generic, console)
-        val receipt = e.apply(file, null, e.plan(file, null, false), "acme", null) {}
+        val receipt = e.apply(file, e.plan(file, false), "acme", null)
         val id = receipt.resources.single().id
         assertThat(sink.calls).hasSize(1)
         assertThat(generic.calls).containsExactly(id to mintedFor(id))
@@ -171,7 +166,7 @@ class ProvisionSecretSinkEngineTest : CommandTestBase() {
         val sink = RecordingDeclaredSink { throw IllegalStateException("kubectl exploded") }
         val generic = RecordingGenericSink()
         val e = engine(sink, generic, console)
-        val receipt = e.apply(file, null, e.plan(file, null, false), "acme", null) {}
+        val receipt = e.apply(file, e.plan(file, false), "acme", null)
         assertThat(receipt.resources).hasSize(1)
         assertThat(api.applications).hasSize(1)
         assertThat(generic.calls).hasSize(1)
@@ -179,16 +174,14 @@ class ProvisionSecretSinkEngineTest : CommandTestBase() {
     }
 
     @Test
-    fun `when neither sink reaches, the client stays recorded and undelivered_secrets names the resource and the recovery`() {
+    fun `when neither sink reaches, the client stays and undelivered_secrets names the resource and the recovery`() {
         val console = ByteArrayOutputStream()
-        val persisted = mutableListOf<ProvisionReceipt>()
         // No delivery in this host (the engine default) and a generic channel that refuses (no --secret-file, no TTY).
         val e = engine(null, RecordingGenericSink(accept = false), console)
-        val receipt = e.apply(file, null, e.plan(file, null, false), "acme", null) { persisted += it }
+        val receipt = e.apply(file, e.plan(file, false), "acme", null)
 
         val id = receipt.resources.single().id
-        assertThat(api.applications.single()["clientId"]).isEqualTo(id) // exists …
-        assertThat(persisted.last().resources.single().id).isEqualTo(id) // … and is recorded
+        assertThat(api.applications.single()["clientId"]).isEqualTo(id) // exists — and the apply output carries the id
         assertThat(e.undeliveredSecrets).containsExactly(id)
         val detail = e.undeliveredSecretDetails.single()
         assertThat(detail.resourceKey).isEqualTo("application/forge-login")
@@ -202,7 +195,7 @@ class ProvisionSecretSinkEngineTest : CommandTestBase() {
             .doesNotContain(mintedFor(id))
         // A re-apply creates nothing, mints nothing, and reports nothing undelivered.
         api.reset()
-        e.apply(file, receipt, e.plan(file, receipt, false), "acme", null) {}
+        e.apply(file, e.plan(file, false), "acme", null)
         assertThat(api.writes).isEmpty()
         assertThat(e.undeliveredSecrets).isEmpty()
     }
@@ -214,7 +207,7 @@ class ProvisionSecretSinkEngineTest : CommandTestBase() {
         val sink = RecordingDeclaredSink { "kubectl said: $leaked" }
         sink.onDeliver = { _, secret -> leaked = secret }
         val e = engine(sink, RecordingGenericSink(accept = false), console)
-        val receipt = e.apply(file, null, e.plan(file, null, false), "acme", null) {}
+        val receipt = e.apply(file, e.plan(file, false), "acme", null)
         val id = receipt.resources.single().id
         assertThat(leaked).isEqualTo(mintedFor(id)) // the fake sink really did put the value in its reason …
         assertThat(console.toString()).doesNotContain(mintedFor(id)).contains("kubectl said: [redacted]") // … and nothing shows it
@@ -239,7 +232,7 @@ class ProvisionSecretSinkEngineTest : CommandTestBase() {
         val sink = RecordingDeclaredSink()
         val generic = RecordingGenericSink()
         val e = engine(sink, generic)
-        val receipt = e.apply(mixed, null, e.plan(mixed, null, false), "acme", null) {}
+        val receipt = e.apply(mixed, e.plan(mixed, false), "acme", null)
         val workerId = receipt.resources.first { it.name == "worker" }.id
         assertThat(sink.calls).isEmpty() // no secretSink declared ⇒ the declared port is never reached for
         assertThat(generic.calls).containsExactly(workerId to mintedFor(workerId)) // the confidential one, through the generic channel

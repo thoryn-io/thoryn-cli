@@ -10,9 +10,7 @@ import com.devnow.thoryn.provision.ChangeAction
 import com.devnow.thoryn.provision.ProvisionEngine
 import com.devnow.thoryn.provision.ProvisionException
 import com.devnow.thoryn.provision.ProvisionFile
-import com.devnow.thoryn.provision.ProvisionReceipt
-import com.devnow.thoryn.provision.ProvisionReceiptStore
-import com.devnow.thoryn.cli.VersionProvider
+import com.devnow.thoryn.provision.ApplyResult
 import com.devnow.thoryn.cli.config.ThorynConfig
 import tools.jackson.databind.JsonNode
 import tools.jackson.databind.json.JsonMapper
@@ -61,7 +59,7 @@ internal class RecipeUnsupportedActionException(action: String) :
  * resources are exposed to steps / verify as `{{provision.<kind>.<name>.<field>}}` (see
  * [exposeProvisioned]), the first `environment` resource becomes the environment later steps and
  * `examples run` target, and every owned resource is recorded on the recipe receipt. The provisioning
- * receipt is persisted under the example state dir ([com.devnow.thoryn.cli.cmd.examples.ExampleStateStore.provisionReceiptPath])
+ * result is exposed to the recipe's scope; nothing is persisted beside the example state (SSO-3715 — the platform is the ledger)
  * after every successful write; [teardown] destroys it child-first AFTER the recipe's own teardown
  * actions. A recipe without `provision` behaves exactly as before.
  */
@@ -117,9 +115,8 @@ internal class RecipeInterpreter(
     private var createdEnvironmentSlug: String? = null
     private var effectiveEnvironmentSlug: String? = environmentSlug
 
-    // SSO-3100 — the provisioning receipt store + the receipt this run converged (null without `provision`).
-    private val provisionReceipts = ProvisionReceiptStore()
-    private var provisioned: ProvisionReceipt? = null
+    // SSO-3100 / SSO-3715 — what this run's provisioning file converged (null without `provision`); nothing is written beside the state.
+    private var provisioned: ApplyResult? = null
 
     // SSO-2875 — accumulated as the run proceeds, folded into the receipt on success.
     private val resources = mutableListOf<ResourceRef>()
@@ -265,10 +262,10 @@ internal class RecipeInterpreter(
     // ── SSO-3100: the provisioning file (converged first, destroyed last) ────────────────────────
 
     /**
-     * Converge the recipe's provisioning file through [ProvisionEngine] (plan → apply), persisting the
-     * provisioning receipt after every write, then expose what it owns to the recipe. Fails closed —
-     * a missing / invalid file, an unset secret env var, or a refused write stops the run before any
-     * recipe step executes.
+     * Converge the recipe's provisioning file through [ProvisionEngine] (plan → apply), then expose what it
+     * resolved to the recipe. Fails closed — a missing / invalid file, an unset secret env var, or a refused
+     * write stops the run before any recipe step executes. SSO-3715 — nothing is recorded beside the example
+     * state: the platform is the ledger, and `teardown` plans the removal from the same file, live.
      */
     private fun runProvision() {
         val file = recipe.provisionFile() ?: return
@@ -278,32 +275,26 @@ internal class RecipeInterpreter(
                     "file targets the caller's STANDING workspace (its resources are provisioned before any step runs).",
             )
         }
-        val path = ctx.state.provisionReceiptPath(recipe.id).toFile()
-        val existing = try {
-            provisionReceipts.read(path)
-        } catch (ex: ProvisionException) {
-            throw RecipeException(ex.message ?: "could not read the provisioning receipt")
-        }
         val engine = provisionEngine()
         ctx.out.println("\n[provision] ${recipe.provision} — converging ${file.resources.size} resource(s) (${file.digest.take(19)}…)")
-        val receipt = try {
-            val plan = engine.plan(file, existing, prune = false)
+        val result = try {
+            val plan = engine.plan(file, prune = false)
             plan.changes.forEach { ctx.info("${it.kind} ${it.name}: ${it.action.name.lowercase()} — ${it.reason}") }
             ctx.info(
-                "${plan.creates.size} to create, ${plan.updates.size} to update, ${plan.adopts.size} to adopt, " +
+                "${plan.creates.size} to create, ${plan.updates.size} to update, " +
                     "${plan.changes.count { it.action == ChangeAction.NOOP }} unchanged",
             )
-            engine.apply(file, existing, plan, workspace?.slug ?: scope["workspaceSlug"], confirmSlug = null) { provisionReceipts.write(path, it) }
+            engine.apply(file, plan, workspace?.slug ?: scope["workspaceSlug"], confirmSlug = null)
         } catch (ex: ProvisionException) {
-            throw RecipeException("provisioning ${recipe.provision} failed: ${ex.message} (what succeeded is recorded in ${path.path}; `examples teardown` removes it)")
+            throw RecipeException("provisioning ${recipe.provision} failed: ${ex.message} (what succeeded is live; `examples teardown` removes it)")
         }
-        provisioned = receipt
-        exposeProvisioned(receipt)
+        provisioned = result
+        exposeProvisioned(result)
     }
 
     /**
      * Make the provisioning result addressable and recorded:
-     *  - scope entries `provision.<kind>.<name>.id`, plus every non-secret receipt attribute
+     *  - scope entries `provision.<kind>.<name>.id`, plus every non-secret attribute
      *    (`.slug` for an environment, `.email` for a user, `.redirectUri` / `.methods` / …) and the
      *    `.clientId` alias for an application;
      *  - the FIRST `environment` resource becomes the effective environment for later steps, verify
@@ -311,10 +302,10 @@ internal class RecipeInterpreter(
      *    recorded as an `env.delete` target: the provisioning destroy owns its removal);
      *  - the first `application` supplies the client id / redirect URI `examples run` needs when the
      *    recipe has no `applications.create` step (a later step still overrides);
-     *  - every owned resource lands on the recipe receipt's `resources` (kind / id / attributes).
+     *  - every resource lands on the recipe receipt's `resources` (kind / id / attributes).
      */
-    private fun exposeProvisioned(receipt: ProvisionReceipt) {
-        receipt.resources.forEach { o ->
+    private fun exposeProvisioned(result: ApplyResult) {
+        result.resources.forEach { o ->
             val base = "provision.${o.kind}.${o.name}"
             scope["$base.id"] = o.id
             o.attributes.forEach { (k, v) -> scope["$base.$k"] = v }
@@ -325,49 +316,64 @@ internal class RecipeInterpreter(
                 attributes = buildMap {
                     put("name", o.name)
                     o.environment?.let { put("environment", it) }
-                    if (o.adopted) put("adopted", "true")
+                    put("action", o.action.name.lowercase())
                     putAll(o.attributes)
                 },
             )
         }
-        receipt.resources.firstOrNull { it.kind == ProvisionFile.KIND_ENVIRONMENT }?.attributes?.get("slug")?.let { slug ->
+        result.resources.firstOrNull { it.kind == ProvisionFile.KIND_ENVIRONMENT }?.attributes?.get("slug")?.let { slug ->
             effectiveEnvironmentSlug = slug
             createdEnvironmentSlug = slug
             ctx.info("environment: $slug (from ${recipe.provision}) — later steps and `examples run` target it")
         }
-        receipt.resources.firstOrNull { it.kind == ProvisionFile.KIND_APPLICATION }?.let { app ->
+        result.resources.firstOrNull { it.kind == ProvisionFile.KIND_APPLICATION }?.let { app ->
             createdClientId = app.id
             createdRedirectUri = app.attributes["redirectUri"]
         }
     }
 
-    /** Destroy what the provisioning file created (child-first); `true` when nothing owned remains. */
+    /**
+     * Destroy what the provisioning file declares and this identity may remove (child-first), planned LIVE from the
+     * same file (SSO-3715 — no receipt). `true` when nothing removable remains.
+     */
     private fun destroyProvisioned(state: ExampleState): Boolean {
         if (recipe.provision == null) return true
-        val path = ctx.state.provisionReceiptPath(recipe.id).toFile()
-        val receipt = try {
-            provisionReceipts.read(path)
-        } catch (ex: ProvisionException) {
-            ctx.warn("${ex.message}; leaving it in place.")
+        val file = try {
+            recipe.provisionFile() ?: return true
+        } catch (ex: RecipeException) {
+            ctx.warn("${ex.message}; leaving the provisioned resources in place.")
             return false
-        } ?: return true
-        if (receipt.resources.isEmpty()) {
-            provisionReceipts.delete(path)
-            return true
         }
-        ctx.out.println("\n[provision] ${recipe.provision} — destroying ${receipt.resources.size} owned resource(s), child-first")
         return try {
+            // SSO-3715 — the file is re-read LIVE at teardown, so its `{{env.NAME}}` params are resolved as setup resolved a
+            // non-secret param (--set, the process env, else the recipe default); a secret param is never needed to FIND a
+            // resource (a `<key>Env` entry is skipped by a non-strict resolve). The sandbox slug the run recorded wins for the
+            // placeholder the environment's slug carries — it is the one fact about this run the state keeps.
+            recipe.params.forEach { p ->
+                val name = p["name"].asString()
+                if (scope[name] != null || p["secret"]?.asBoolean() == true) return@forEach
+                val value = overrides[name] ?: provisionEnv(name)?.takeIf { it.isNotEmpty() } ?: p["default"]?.takeIf { !it.isNull }?.asString()
+                value?.let { raw -> scope[name] = runCatching { substitute(raw) }.getOrDefault(raw) }
+            }
+            state.environmentSlug?.let { slug ->
+                file.resources.firstOrNull { it.kind == ProvisionFile.KIND_ENVIRONMENT }?.spec?.get("slug")?.toString()
+                    ?.let { raw -> ProvisionEngine.ENV_PLACEHOLDER.find(raw)?.groupValues?.get(1) }?.let { scope[it] = slug }
+            }
+            val engine = provisionEngine()
+            val plan = engine.planDestroy(file)
+            plan.skips.forEach { ctx.info("${it.kind} ${it.name}: left in place — ${it.reason}${it.byHand?.let { cmd -> " (by hand: $cmd)" } ?: ""}") }
+            if (plan.removes.isEmpty()) return true
+            ctx.out.println("\n[provision] ${recipe.provision} — destroying ${plan.removes.size} resource(s), child-first")
             // Production-plane removals are confirmed by the workspace slug the run recorded (SSO-2413 gate).
-            val outcome = provisionEngine().destroy(receipt, confirmSlug = state.workspaceSlug) { provisionReceipts.write(path, it) }
-            if (outcome.remaining.resources.isEmpty()) {
-                provisionReceipts.delete(path)
+            val outcome = engine.destroy(plan, confirmSlug = state.workspaceSlug)
+            if (outcome.failures.isEmpty()) {
                 true
             } else {
-                ctx.warn("${outcome.failures.size} provisioned resource(s) could not be removed; kept in ${path.path} for a retry.")
+                ctx.warn("${outcome.failures.size} provisioned resource(s) could not be removed; they stay live — re-run teardown to retry.")
                 false
             }
         } catch (ex: Exception) {
-            ctx.warn("provisioning destroy did not complete (${ex.message}); the receipt at ${path.path} is kept for a retry.")
+            ctx.warn("provisioning destroy did not complete (${ex.message}); re-run teardown to retry.")
             false
         }
     }
@@ -384,8 +390,7 @@ internal class RecipeInterpreter(
         out = ctx.out,
         err = ctx.err,
         env = { name -> scope[name] ?: provisionEnv(name) },
-        cliVersion = runCatching { VersionProvider.readVersion() }.getOrNull(),
-        // SSO-3659 — the ownership marker on the provisioning receipt: the identity this recipe provisions as.
+        // SSO-3659 / SSO-3715 — the identity this recipe provisions as: decides the deletion authority at teardown.
         subject = com.devnow.thoryn.cli.cmd.provision.ProvisionCommand.subjectOf(ctx.tokens),
     )
 

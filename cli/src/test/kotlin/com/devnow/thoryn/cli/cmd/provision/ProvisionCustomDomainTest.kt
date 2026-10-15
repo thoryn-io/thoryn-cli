@@ -5,7 +5,7 @@ import com.devnow.thoryn.provision.ProvisionEngine
 import com.devnow.thoryn.provision.ProvisionException
 import com.devnow.thoryn.provision.ProvisionFile
 import com.devnow.thoryn.provision.ProvisionPlan
-import com.devnow.thoryn.provision.ProvisionReceipt
+import com.devnow.thoryn.provision.ApplyResult
 import com.devnow.thoryn.cli.api.ProductApiClient
 import com.devnow.thoryn.cli.auth.Tokens
 import com.devnow.thoryn.cli.cmd.CommandTestBase
@@ -51,9 +51,9 @@ class ProvisionCustomDomainTest : CommandTestBase() {
             spec: { host: auth.acme.com }
     """
 
-    private fun apply(f: ProvisionFile, receipt: ProvisionReceipt?, prune: Boolean = false, confirm: String? = null): ProvisionReceipt {
+    private fun apply(f: ProvisionFile, prune: Boolean = false, confirm: String? = null): ApplyResult {
         val e = engine()
-        return e.apply(f, receipt, e.plan(f, receipt, prune), "acme", confirm) {}
+        return e.apply(f, e.plan(f, prune), "acme", confirm)
     }
 
     @Suppress("UNCHECKED_CAST")
@@ -64,7 +64,7 @@ class ProvisionCustomDomainTest : CommandTestBase() {
 
     @Test
     fun `plan of an unclaimed domain is a create that shows the CNAME to publish in the stable record shape`() {
-        val plan = engine().plan(file(domainFile), null, prune = false)
+        val plan = engine().plan(file(domainFile), prune = false)
 
         val change = plan.changes.single()
         assertThat(change.action).isEqualTo(ChangeAction.CREATE)
@@ -79,7 +79,7 @@ class ProvisionCustomDomainTest : CommandTestBase() {
     fun `plan of a pending claim shows both records with their TTL and the issuer in use`() {
         api.domainHost = "auth.acme.com"; api.domainState = "PENDING"
 
-        val plan = engine().plan(file(domainFile), null, prune = false)
+        val plan = engine().plan(file(domainFile), prune = false)
 
         assertThat(plan.changes.single().action).isEqualTo(ChangeAction.UPDATE)
         assertThat(records(plan).map { it.keys }).allSatisfy { assertThat(it).containsExactly("type", "name", "value", "ttl") }
@@ -94,14 +94,14 @@ class ProvisionCustomDomainTest : CommandTestBase() {
     fun `a record from a product-api that sends no ttl still carries the recommended ttl`() {
         api.domainHost = "auth.acme.com"; api.domainState = "PENDING"; api.domainTtl = null
 
-        assertThat(records(engine().plan(file(domainFile), null, prune = false)).map { it["ttl"] }).containsOnly(300)
+        assertThat(records(engine().plan(file(domainFile), prune = false)).map { it["ttl"] }).containsOnly(300)
     }
 
     @Test
     fun `plan of a suspended domain names its release time`() {
         api.domainHost = "auth.acme.com"; api.domainState = "SUSPENDED"; api.domainReleaseAt = "2026-10-27T03:00:00Z"
 
-        val change = engine().plan(file(domainFile), null, prune = false).changes.single()
+        val change = engine().plan(file(domainFile), prune = false).changes.single()
 
         assertThat(change.action).isEqualTo(ChangeAction.UPDATE)
         assertThat(change.reason).contains("SUSPENDED").contains("released at 2026-10-27T03:00:00Z")
@@ -113,7 +113,7 @@ class ProvisionCustomDomainTest : CommandTestBase() {
     @Test
     fun `apply claims and verifies, and a re-run with the records published converges then issues no writes`() {
         // DNS not published yet: the claim succeeds, the verify reports the reason — not an apply failure.
-        val first = apply(file(domainFile), null)
+        val first = apply(file(domainFile))
         assertThat(api.writes.map { "${it.method} ${it.path}" }).containsExactly("PUT /api/v1/custom-domain", "POST /api/v1/custom-domain/verify")
         assertThat(api.writes.first().body).containsEntry("domain", "auth.acme.com").containsEntry("acceptReSignIn", false)
         val owned = first.resources.single()
@@ -124,25 +124,29 @@ class ProvisionCustomDomainTest : CommandTestBase() {
 
         // Records published: the re-run verifies (an update) and the domain is VERIFIED.
         api.dnsPublished = true; api.reset()
-        val second = apply(file(domainFile), first)
+        val second = apply(file(domainFile))
         assertThat(api.writes.map { "${it.method} ${it.path}" }).containsExactly("POST /api/v1/custom-domain/verify")
         assertThat(second.resources.single().attributes).containsEntry("state", "VERIFIED")
 
         // Converged: nothing left to do.
         api.reset()
-        val plan = engine().plan(file(domainFile), second, prune = false)
+        val plan = engine().plan(file(domainFile), prune = false)
         assertThat(plan.hasChanges).isFalse()
         assertThat(plan.changes.single().action).isEqualTo(ChangeAction.NOOP)
-        apply(file(domainFile), second)
+        apply(file(domainFile))
         assertThat(api.writes).isEmpty()
     }
 
     @Test
-    fun `an existing verified domain that the file did not create is adopted and never released`() {
+    fun `an existing verified domain is a no-op, and dropping it from the file never releases it through --prune`() {
         api.domainHost = "auth.acme.com"; api.domainState = "ACTIVE"
 
-        val receipt = apply(file(domainFile), null)
-        assertThat(receipt.resources.single().adopted).isTrue()
+        // SSO-3715 — no adopted bit: a live match is a no-op (the first apply of an existing resource is not an event).
+        val plan = engine().plan(file(domainFile), prune = false)
+        assertThat(plan.changes.single().action).isEqualTo(ChangeAction.NOOP)
+        assertThat(plan.changes.single().reason).startsWith("exists and is ACTIVE")
+        val result = apply(file(domainFile))
+        assertThat(result.resources.single().action).isEqualTo(ChangeAction.NOOP)
         assertThat(api.writes).isEmpty()
 
         val empty = file("""
@@ -152,7 +156,7 @@ class ProvisionCustomDomainTest : CommandTestBase() {
                 name: other
                 spec: { slug: other }
         """)
-        apply(empty, receipt, prune = true, confirm = "acme")
+        apply(empty, prune = true, confirm = "acme")
         assertThat(api.writesTo("/api/v1/custom-domain")).isEmpty()
         assertThat(api.domainHost).isEqualTo("auth.acme.com")
     }
@@ -161,7 +165,7 @@ class ProvisionCustomDomainTest : CommandTestBase() {
     fun `acceptReSignIn is forwarded, and without it a workspace with production users gets the flag named`() {
         api.productionUsers = true
 
-        assertThatThrownBy { apply(file(domainFile), null) }
+        assertThatThrownBy { apply(file(domainFile)) }
             .isInstanceOf(ProvisionException::class.java)
             .hasMessageContaining("acceptReSignIn: true")
 
@@ -171,7 +175,7 @@ class ProvisionCustomDomainTest : CommandTestBase() {
             resources:
               - kind: customDomain
                 spec: { host: auth.acme.com, acceptReSignIn: true }
-        """), null)
+        """))
         assertThat(api.writes.first().body).containsEntry("acceptReSignIn", true)
     }
 
@@ -179,10 +183,10 @@ class ProvisionCustomDomainTest : CommandTestBase() {
     fun `a workspace without the entitlement is planned with the operator step named and apply stops there`() {
         api.domainEntitled = false
 
-        val change = engine().plan(file(domainFile), null, prune = false).changes.single()
+        val change = engine().plan(file(domainFile), prune = false).changes.single()
         assertThat(change.reason).contains("NOT ENTITLED").contains("thoryn operator custom-domain entitle")
 
-        assertThatThrownBy { apply(file(domainFile), null) }
+        assertThatThrownBy { apply(file(domainFile)) }
             .isInstanceOf(ProvisionException::class.java)
             .hasMessageContaining("OPERATOR step")
             .hasMessageContaining("thoryn operator custom-domain entitle <workspace>")
@@ -193,7 +197,7 @@ class ProvisionCustomDomainTest : CommandTestBase() {
     fun `an identity without the custom-domain grant is told which grant a workspace admin must make`() {
         api.domainReachable = false
 
-        assertThatThrownBy { engine().plan(file(domainFile), null, prune = false) }
+        assertThatThrownBy { engine().plan(file(domainFile), prune = false) }
             .isInstanceOf(ProvisionException::class.java)
             .hasMessageContaining("thoryn access grant client:<client-id> manager custom_domain:<workspace-id>")
             .hasMessageContaining("scopes alone are not enough")
@@ -203,7 +207,7 @@ class ProvisionCustomDomainTest : CommandTestBase() {
     fun `another domain already on the workspace is refused rather than silently moving the issuer`() {
         api.domainHost = "login.acme.com"; api.domainState = "ACTIVE"
 
-        assertThatThrownBy { engine().plan(file(domainFile), null, prune = false) }
+        assertThatThrownBy { engine().plan(file(domainFile), prune = false) }
             .isInstanceOf(ProvisionException::class.java)
             .hasMessageContaining("already has the custom domain 'login.acme.com'")
             .hasMessageContaining("thoryn domain remove")
@@ -212,9 +216,26 @@ class ProvisionCustomDomainTest : CommandTestBase() {
     // ── release ──────────────────────────────────────────────────────────────
 
     @Test
-    fun `dropping the resource releases the domain only with --prune, and --prune needs the workspace confirmation`() {
+    fun `a production-plane singleton is never released by destroy or --prune — the destroy plan names thoryn domain remove`() {
         api.dnsPublished = true
-        val owned = apply(file(domainFile), null)
+        apply(file(domainFile))
+        assertThat(api.domainHost).isEqualTo("auth.acme.com")
+
+        // SSO-3715 (ADR 2026-10-15 §1) — a non-ownable kind on the production plane is left in place by destroy: a skip row
+        // with the reason and the command a person runs.
+        api.reset()
+        val destroyPlan = engine().planDestroy(file(domainFile))
+        val row = destroyPlan.changes.single { it.kind == "customDomain" }
+        assertThat(row.action).isEqualTo(ChangeAction.SKIP)
+        assertThat(row.reason).contains("PRODUCTION plane").contains("never removed by destroy / --prune")
+        assertThat(row.byHand).isEqualTo("thoryn domain remove --yes")
+        assertThat(destroyPlan.removes).isEmpty()
+        engine().destroy(destroyPlan, "acme")
+        assertThat(api.writesTo("/api/v1/custom-domain")).isEmpty()
+        assertThat(api.domainHost).isEqualTo("auth.acme.com")
+
+        // Dropped from the file: there is no ledger of "it was declared once", and a singleton is never pruned — the
+        // domain stays, with or without --prune.
         val without = file("""
             apiVersion: thoryn.io/provision/v1
             resources:
@@ -222,26 +243,10 @@ class ProvisionCustomDomainTest : CommandTestBase() {
                 name: keep
                 spec: { slug: keep }
         """)
-
-        // No --prune: the domain is skipped and stays.
-        val skip = engine().plan(without, owned, prune = false)
-        assertThat(skip.changes.single { it.kind == "customDomain" }.action).isEqualTo(ChangeAction.SKIP)
         api.reset()
-        apply(without, owned)
+        apply(without, prune = true, confirm = "acme")
         assertThat(api.writesTo("/api/v1/custom-domain")).isEmpty()
         assertThat(api.domainHost).isEqualTo("auth.acme.com")
-
-        // --prune without --confirm: refused (the custom domain is on the production plane).
-        val prunePlan = engine().plan(without, owned, prune = true)
-        assertThat(prunePlan.removesOnProductionPlane).isTrue()
-        assertThatThrownBy { engine().apply(without, owned, prunePlan, "acme", null) {} }
-            .hasMessageContaining("--confirm")
-
-        // --prune --confirm: released.
-        api.reset()
-        apply(without, owned, prune = true, confirm = "acme")
-        assertThat(api.writesTo("/api/v1/custom-domain").map { it.method }).containsExactly("DELETE")
-        assertThat(api.domainHost).isNull()
     }
 
     // ── grants + validation ──────────────────────────────────────────────────
@@ -258,7 +263,7 @@ class ProvisionCustomDomainTest : CommandTestBase() {
                 spec: { host: auth.acme.com }
                 grants:
                   - { subject: "client:config-ci", relation: manager }
-        """), null)
+        """))
 
         assertThat(api.grantsOn("custom_domain:$WORKSPACE_ID")).containsExactly("client:config-ci manager")
     }

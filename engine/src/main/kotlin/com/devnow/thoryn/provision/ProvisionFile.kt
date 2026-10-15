@@ -30,10 +30,17 @@ data class ProvisionResource(
     /**
      * SSO-3659 (ADR 2026-10-13 §1) — "this repository depends on it and does not own it". A read-only
      * reference is looked up live and must MATCH: any field difference is the plan error
-     * `access_read_only`, it is never created, adopted, recorded in the receipt, or removed, and it may
-     * be declared with only `viewer` reach (an owned resource needs `manager`).
+     * `access_read_only`, it is never created or removed, and it may be declared with only `viewer`
+     * reach (an owned resource needs `manager`).
      */
     val readOnly: Boolean = false,
+    /**
+     * SSO-3715 (ADR 2026-10-15 platform-is-the-ledger §1) — "mine, keep": the file converges and owns the resource,
+     * but `destroy` / `--prune` never remove it (the destroy plan shows it as retained). Terraform's
+     * `prevent_destroy`; the declared replacement for the receipt-era adopted bit — intent in the reviewed file
+     * instead of history in a ledger. Refused together with [readOnly] (a reference is never removed anyway).
+     */
+    val retain: Boolean = false,
     /**
      * SSO-3668 (ADR 2026-10-13 production-clients-declared-in-the-config-project §2) — where `apply`
      * PUBLISHES this resource's id once it is converged (see [PublishTarget]). `application` only: the
@@ -133,9 +140,9 @@ data class ProvisionGrant(val subject: String, val relation: String) {
  * which the engine resolves at apply time and never records.
  */
 class ProvisionFile private constructor(
-    /** Where the file was read from (error messages + the receipt). */
+    /** Where the file was read from (error messages, the plan header). */
     val source: String,
-    /** `sha256:<hex>` over the raw bytes — recorded on the receipt so drift between file and receipt is visible. */
+    /** `sha256:<hex>` over the raw bytes — shown in the plan header so a reader knows which file was planned. */
     val digest: String,
     val resources: List<ProvisionResource>,
 ) {
@@ -334,6 +341,8 @@ class ProvisionFile private constructor(
 
         /** SSO-3659 — the resource-level `readOnly` flag (ADR 2026-10-13 §1): a dependency, not an owned resource. */
         const val READ_ONLY = "readOnly"
+        /** SSO-3715 — the resource-level `retain` flag (ADR 2026-10-15 §1): owned and converged, never removed by destroy / --prune. */
+        const val RETAIN = "retain"
 
         // ── SSO-3668 — `publishTo:` (ADR 2026-10-13 production-clients-declared-in-the-config-project §2) ──
 
@@ -440,6 +449,7 @@ class ProvisionFile private constructor(
                         ProvisionGrant(subject = g["subject"].asString().trim(), relation = g["relation"].asString().trim())
                     },
                     readOnly = r[READ_ONLY]?.takeIf { it.isBoolean() }?.asBoolean() ?: false,
+                    retain = r[RETAIN]?.takeIf { it.isBoolean() }?.asBoolean() ?: false,
                     publishTo = r[PUBLISH_TO]?.takeIf { it.isArray() }?.toList()?.map { t ->
                         PublishTarget(
                             kind = t["kind"].asString().trim(),
@@ -509,12 +519,17 @@ class ProvisionFile private constructor(
                     v += "$where must be an object"
                     return@forEachIndexed
                 }
-                rejectUnknownKeys(r, setOf("kind", "name", "environment", "spec", "grants", READ_ONLY, PUBLISH_TO, SECRET_SINK), where, v)
+                rejectUnknownKeys(r, setOf("kind", "name", "environment", "spec", "grants", READ_ONLY, RETAIN, PUBLISH_TO, SECRET_SINK), where, v)
                 // SSO-3659 — `readOnly: true` declares a dependency, not ownership: a boolean, and never with `grants`
                 // (a grant is a write on the object; a reference writes nothing).
                 r[READ_ONLY]?.takeIf { !it.isNull }?.let { ro ->
                     if (!ro.isBoolean()) v += "$where $READ_ONLY must be true or false"
                     else if (ro.asBoolean() && r["grants"]?.takeIf { !it.isNull } != null) v += "$where a read-only reference cannot carry 'grants' — this repository does not own it"
+                }
+                // SSO-3715 — `retain: true` is "mine, keep": a boolean, meaningless on a reference (never removed anyway).
+                r[RETAIN]?.takeIf { !it.isNull }?.let { keep ->
+                    if (!keep.isBoolean()) v += "$where $RETAIN must be true or false"
+                    else if (keep.asBoolean() && r[READ_ONLY]?.takeIf { it.isBoolean() }?.asBoolean() == true) v += "$where a read-only reference cannot carry '$RETAIN' — it is never removed; `$RETAIN` is for a resource this file owns"
                 }
                 val kind = r["kind"]?.takeIf { !it.isNull }?.asString()
                 if (kind == null || kind !in KINDS) {

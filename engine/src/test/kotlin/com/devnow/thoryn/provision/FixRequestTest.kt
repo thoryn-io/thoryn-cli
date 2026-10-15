@@ -106,7 +106,7 @@ class FixRequestTest {
         val owner = FixRequest.owner(subject, "application:foreign", "access_not_owned — …")
         val plan = ProvisionPlan(
             listOf(
-                PlannedChange("environment", "ci", ChangeAction.ADOPT, "exists", liveId = "env-1", access = "manager"),
+                PlannedChange("environment", "ci", ChangeAction.NOOP, "exists and matches", liveId = "env-1", access = "manager"),
                 PlannedChange("application", "foreign", ChangeAction.ERROR, owner.reason, error = ProvisionEngine.ERROR_NOT_OWNED, fix = owner),
                 PlannedChange("application", "shared", ChangeAction.ERROR, "access_read_only — read-only reference differs", error = ProvisionEngine.ERROR_READ_ONLY, fixNote = ProvisionEngine.FILE_FIX_NOTE),
                 PlannedChange("workloadIdentityTrust", "me", ChangeAction.ERROR, "workload_identity_trust_is_self — …", error = ProvisionEngine.ERROR_TRUST_IS_SELF),

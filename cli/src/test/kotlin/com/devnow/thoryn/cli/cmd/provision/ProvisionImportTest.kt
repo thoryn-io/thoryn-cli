@@ -1,12 +1,9 @@
 package com.devnow.thoryn.cli.cmd.provision
 
 import com.devnow.thoryn.provision.Access
-import com.devnow.thoryn.provision.OwnedResource
 import com.devnow.thoryn.provision.ProvisionEngine
-import com.devnow.thoryn.provision.ProvisionFileRef
-import com.devnow.thoryn.provision.ProvisionReceipt
+import com.devnow.thoryn.provision.ApplyResult
 import com.devnow.thoryn.provision.ProvisionFile
-import com.devnow.thoryn.provision.ProvisionReceiptStore
 import com.devnow.thoryn.cli.api.ProductApiClient
 import com.devnow.thoryn.cli.auth.Tokens
 import com.devnow.thoryn.cli.cmd.CommandTestBase
@@ -19,10 +16,10 @@ import java.io.PrintStream
 
 /**
  * SSO-3659 (ADR 2026-10-13 §2) — `thoryn provision import` is the inverse of `plan`, bounded by the same
- * relations: what the identity manages is rendered as owned (receipt `adopted: true`, never deleted), what it
- * may only view as `readOnly: true`, and what it has no relation to is not listed by the platform and so cannot
- * be imported. Engine-level through [ProvisionEngine.import]; end to end through the CLI with `--write`, whose
- * output must round-trip: the appended file plus the written receipt plan as all no-ops.
+ * relations: what the identity manages is rendered as an entry the file converges, what it may only view as
+ * `readOnly: true`, and what it has no relation to is not listed by the platform and so cannot be imported.
+ * SSO-3715 — `import` writes the file only. Engine-level through [ProvisionEngine.import]; end to end through
+ * the CLI with `--write`, whose output must round-trip: the appended file plans as all no-ops.
  */
 class ProvisionImportTest : CommandTestBase() {
 
@@ -54,8 +51,8 @@ class ProvisionImportTest : CommandTestBase() {
     )
 
     @Test
-    fun `import renders managed objects as owned entries, viewed ones as readOnly, and omits what the identity has no relation to`() {
-        val result = engine().import(existing = null, receipt = null)
+    fun `import renders managed objects as entries, viewed ones as readOnly, and omits what the identity has no relation to`() {
+        val result = engine().import(existing = null)
         assertThat(api.writes).isEmpty()
         val byKey = result.resources.associateBy { it.resource.key }
         assertThat(byKey.keys).containsExactlyInAnyOrder("environment/ci-sbx", "application/loopback-rp", "application/shared-login", "user/tester", "loginMethods/loginMethods")
@@ -65,7 +62,8 @@ class ProvisionImportTest : CommandTestBase() {
         val env = byKey.getValue("environment/ci-sbx")
         assertThat(env.access).isEqualTo(Access.MANAGER)
         assertThat(env.resource.spec).isEqualTo(mapOf("slug" to "ci-sbx", "displayName" to "CI sandbox"))
-        assertThat(env.owned).isEqualTo(OwnedResource("environment", "ci-sbx", envId, null, mapOf("slug" to "ci-sbx"), adopted = true))
+        assertThat(env.liveId).isEqualTo(envId)
+        assertThat(env.resource.readOnly).isFalse()
 
         val rp = byKey.getValue("application/loopback-rp")
         assertThat(rp.access).isEqualTo(Access.MANAGER) // by containment: manager on the sandbox
@@ -73,29 +71,22 @@ class ProvisionImportTest : CommandTestBase() {
         assertThat(rp.resource.environment).isEqualTo("ci-sbx") // the env resource this same import adds, by NAME
         assertThat(rp.resource.spec).containsEntry("clientId", "rp").containsEntry("displayName", "Loopback RP").containsEntry("clientType", "public")
             .containsEntry("redirectUris", listOf("http://127.0.0.1/callback")).containsEntry("scopes", listOf("openid", "profile"))
-        assertThat(rp.owned).isNotNull()
-        assertThat(rp.owned?.adopted).isTrue()
-        assertThat(rp.owned?.environment).isEqualTo("ci-sbx")
+        assertThat(rp.liveId).isEqualTo("rp")
         assertThat(rp.note).isNull() // public: no secret to warn about
 
         val shared = byKey.getValue("application/shared-login")
         assertThat(shared.access).isEqualTo(Access.VIEWER)
         assertThat(shared.resource.readOnly).isTrue()
         assertThat(shared.resource.environment).isNull() // production plane
-        assertThat(shared.owned).isNull()
         assertThat(shared.toEntry()).containsEntry("readOnly", true)
         assertThat(shared.note).isNull() // a reference is never written, so its secret is nobody's concern here
 
         assertThat(byKey.getValue("user/tester").resource.spec).isEqualTo(mapOf("email" to "tester@example.com", "emailVerified" to true))
         assertThat(byKey.getValue("loginMethods/loginMethods").resource.spec).isEqualTo(mapOf("methods" to listOf("password", "passkey")))
-        assertThat(byKey.getValue("loginMethods/loginMethods").owned?.id).isEqualTo("login-methods")
+        assertThat(byKey.getValue("loginMethods/loginMethods").liveId).isEqualTo("login-methods")
         assertThat(result.skipped).isEmpty()
-
-        // Everything owned survives destroy: adopted, so nothing is deleted.
-        val receipt = ProvisionReceipt(file = ProvisionFileRef("provision.yaml", "sha256:x"), appliedAt = "now", resources = result.resources.mapNotNull { it.owned })
-        val outcome = engine().destroy(receipt, "acme") {}
-        assertThat(outcome.failures).isEmpty()
-        assertThat(api.writes).isEmpty()
+        // SSO-3715 — nothing is recorded by an import: the entries are the whole result.
+        assertThat(result.resources.map { it.toStructured().keys }).allMatch { it.containsAll(setOf("kind", "spec", "id", "access")) && "owned" !in it }
     }
 
     @Test
@@ -113,7 +104,7 @@ class ProvisionImportTest : CommandTestBase() {
         // platform's `owner` relation names another repository: imported as a reference, naming no subject.
         api.seedApplication("ci-sbx", "Other RP", listOf("http://127.0.0.1/other"), clientId = "other-rp")
         api.seedGrant("client:wi_other", "owner", "application:other-rp")
-        val result = engine().import(existing, receipt = null)
+        val result = engine().import(existing)
         val byKey = result.resources.associateBy { it.resource.key }
         assertThat(byKey.keys).containsExactlyInAnyOrder("application/loopback-rp", "application/other-rp", "user/tester", "loginMethods/loginMethods")
         // The child names the ALREADY DECLARED environment resource, not the slug.
@@ -121,14 +112,12 @@ class ProvisionImportTest : CommandTestBase() {
         val other = byKey.getValue("application/other-rp")
         assertThat(other.access).isEqualTo(Access.MANAGER)
         assertThat(other.resource.readOnly).isTrue()
-        assertThat(other.owned).isNull()
         assertThat(other.note).contains("owned by another repository").doesNotContain("wi_other")
         assertThat(api.checksOn("application:other-rp")).containsExactly("owner")
-        // An object nobody owns that this identity manages is imported as owned, with no owner recorded.
+        // An object nobody owns that this identity manages is imported as an entry the file converges.
         val tester = byKey.getValue("user/tester")
         assertThat(tester.resource.readOnly).isFalse()
-        assertThat(tester.owned!!.owner).isNull()
-        assertThat(byKey.getValue("application/loopback-rp").owned!!.owner).isNull()
+        assertThat(byKey.getValue("application/loopback-rp").resource.readOnly).isFalse()
     }
 
     @Test
@@ -158,22 +147,19 @@ class ProvisionImportTest : CommandTestBase() {
 
         val written = runCli("provision", "import", "--file", file.path, "--gateway", baseUrl(), "--write")
         assertThat(written.exit).isEqualTo(0)
-        assertThat(written.out).contains("Imported 4 entry(ies)").contains("3 owned").contains("1 read-only")
+        assertThat(written.out).contains("Imported 4 entry(ies)").contains("3 to converge").contains("1 read-only").contains("Nothing else was written")
         val text = file.readText()
         assertThat(text).startsWith("# a hand-written header comment").contains("name: loopback-rp").contains("environment: ci").contains("readOnly: true")
-        val recorded = ProvisionReceiptStore().read(receipt)!!
-        assertThat(recorded.resources.map { it.key to it.adopted }).containsExactlyInAnyOrder(
-            "application/loopback-rp" to true, "user/tester" to true, "loginMethods/loginMethods" to true,
-        )
-        assertThat(recorded.resources.map { it.key }).doesNotContain("application/shared-login")
+        // SSO-3715 — the file is the only thing written: no receipt beside it.
+        assertThat(receipt).doesNotExist()
         assertThat(api.writes).isEmpty()
 
-        // The appended file + the written receipt describe exactly what is live: every imported entry is a no-op (the
-        // hand-written sandbox the import left alone is adopted, as any apply would), and a second import adds nothing.
+        // The appended file describes exactly what is live: every imported entry is a no-op (the hand-written sandbox the
+        // import left alone included), and a second import adds nothing.
         val plan = runCli("provision", "plan", "--file", file.path, "--gateway", baseUrl())
         assertThat(plan.err).isEmpty()
         assertThat(plan.exit).isEqualTo(0)
-        assertThat(plan.out).contains("0 to create, 0 to update, 1 to adopt, 0 to remove, 4 unchanged.")
+        assertThat(plan.out).contains("0 to create, 0 to update, 0 to remove, 5 unchanged.")
         val again = runCli("provision", "import", "--file", file.path, "--gateway", baseUrl(), "--write")
         assertThat(again.exit).isEqualTo(0)
         assertThat(again.out).contains("Nothing to import")
