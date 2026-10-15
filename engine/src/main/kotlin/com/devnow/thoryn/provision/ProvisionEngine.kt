@@ -70,6 +70,15 @@ data class PlannedChange(
      * renders the consumer's `connection.json` from. Null for a trust that does not exist yet.
      */
     val trust: Map<String, Any?>? = null,
+    /**
+     * SSO-3710 — on an `access_*` [ChangeAction.ERROR] row: the RIGHT that is missing and the command that grants it
+     * ([FixRequest.MissingRight]), the structured twin of the hint the [reason] already carries in prose — the one
+     * rendering, so a fix request written from this plan says exactly what the terminal said. Null on a row whose
+     * fix is a change to the FILE (a differing read-only reference, a trust the file cannot declare); see [fixNote].
+     */
+    val fix: FixRequest.MissingRight? = null,
+    /** SSO-3710 — on an `ERROR` row with no [fix]: why no right would fix it (a file fix), for the request's `notes`. */
+    val fixNote: String? = null,
 ) {
     val hasGrantChanges: Boolean get() = grantAdds.isNotEmpty() || grantRemoves.isNotEmpty()
 
@@ -89,6 +98,7 @@ data class PlannedChange(
         }
         secretSink?.let { put("secretSink", it.toStructured()) }
         trust?.let { put("trust", it) }
+        fix?.let { put("fix", it.toStructured()) }
     }
 }
 
@@ -611,21 +621,24 @@ class ProvisionEngine(
             }
             val differs = change.diff.isNotEmpty()
             return when (access) {
-                Access.NONE -> refuse(
-                    r, change, ERROR_NOT_OWNED, access,
-                    "this identity holds no relation on $ref — the resource is not visible to it and cannot be adopted, imported or converged " +
-                        "(a workspace admin grants reach with `thoryn access grant <subject> manager $ref`)",
-                )
+                // SSO-3710 — the right that fixes "not visible" is `viewer` for a read-only reference, `owner` for a
+                // resource this file is to own (the ADR's grantable set: rights on existing things, set by an admin).
+                Access.NONE -> {
+                    val why = "this identity holds no relation on $ref — the resource is not visible to it and cannot be adopted, imported or converged"
+                    val fix = if (r.readOnly) FixRequest.viewer(subject, ref, why) else FixRequest.owner(subject, ref, why)
+                    refuse(r, change, ERROR_NOT_OWNED, access, "$why (${FixRequest.hint(fix)})", fix = fix)
+                }
                 Access.VIEWER -> when {
-                    !r.readOnly -> refuse(
-                        r, change, ERROR_READ_ONLY, access,
-                        "this identity may only VIEW $ref — declare the resource `readOnly: true` to depend on it without owning it, " +
-                            "or have a workspace admin grant it `manager`",
-                    )
+                    !r.readOnly -> {
+                        val why = "this identity may only VIEW $ref — declare the resource `readOnly: true` to depend on it without owning it, or own it"
+                        val fix = FixRequest.owner(subject, ref, why)
+                        refuse(r, change, ERROR_READ_ONLY, access, "$why (${FixRequest.hint(fix)})", fix = fix)
+                    }
                     differs -> refuse(
                         r, change, ERROR_READ_ONLY, access,
                         "read-only reference differs from the live resource in ${change.diff.size} field(s) (${change.diff.keys.joinToString(", ")}) — " +
                             "a repository that does not own a resource cannot change it; align the file with what is live",
+                        fixNote = FILE_FIX_NOTE,
                     )
                     else -> reference(change, access)
                 }
@@ -634,32 +647,51 @@ class ProvisionEngine(
                         r, change, ERROR_READ_ONLY, access,
                         "declared `readOnly: true` but differs from the live resource in ${change.diff.size} field(s) (${change.diff.keys.joinToString(", ")}) — " +
                             "a read-only reference is never written; drop `readOnly` to converge it from this file, or align the file with what is live",
+                        fixNote = FILE_FIX_NOTE,
                     )
                     r.readOnly -> reference(change, access)
                     // SSO-3673 — the platform renders the object's `owner`; when there is one and the check says it is not
                     // this identity, another repository owns it. Nothing about that subject is echoed (no oracle).
-                    change.owner != null && !reach.owns(ref) -> refuse(
-                        r, change, ERROR_OWNED_ELSEWHERE, access,
-                        "$ref is owned by another repository (the platform's `owner` relation) — one repository owns a resource; " +
+                    // SSO-3710 — a dispute: the request names it (kind `owner`) with NO command — an admin decides.
+                    change.owner != null && !reach.owns(ref) -> {
+                        val why = "$ref is owned by another repository (the platform's `owner` relation) — one repository owns a resource; " +
                             "declare it `readOnly: true` here to depend on it, or have a workspace admin move the ownership " +
-                            "(`thoryn access revoke <current-owner> owner $ref`, then `thoryn access grant <subject> owner $ref`)",
-                    )
+                            "(`thoryn access revoke <current-owner> owner $ref`, then `${FixRequest.grantCommand(FixRequest.SUBJECT_PLACEHOLDER, RELATION_OWNER, ref)}`)"
+                        refuse(r, change, ERROR_OWNED_ELSEWHERE, access, why, fix = FixRequest.ownedElsewhere(subject, ref, why))
+                    }
                     else -> change.copy(access = access.label)
                 }
             }
         }
         // A create. A read-only reference is a dependency on something that exists — it is never created.
         if (r.readOnly) {
-            return refuse(r, change, ERROR_READ_ONLY, null, "declared `readOnly: true` but nothing matches it live — a read-only reference is never created; declare it without `readOnly` to own it")
+            return refuse(
+                r, change, ERROR_READ_ONLY, null,
+                "declared `readOnly: true` but nothing matches it live — a read-only reference is never created; declare it without `readOnly` to own it",
+                fixNote = FILE_FIX_NOTE,
+            )
         }
         val parent = parentRef(r, file, envSlugs, slug, reach)
             ?: return change.copy(access = Access.MANAGER.label) // the parent environment is created by this very apply: creator-becomes-manager covers both
         return if (reach.managesParent(parent)) {
             change.copy(access = Access.MANAGER.label)
         } else {
-            refuse(r, change, ERROR_NOT_OWNED, null, "creating a ${r.kind} here requires `manager` on its parent $parent, which this identity does not hold")
+            refuseCreate(r, change, parent, "creating a ${r.kind} here requires `manager` on its parent $parent, which this identity does not hold")
         }
     }
+
+    /**
+     * SSO-3710 — a create refused on its parent: `manager` on a parent ENVIRONMENT is a grantable right (an item with
+     * its command); `manager` on the WORKSPACE is not — a production-plane create needs a workspace manager, which a
+     * confined repository identity must never be — so that row is a note, not a right (ADR §3 grantable set).
+     */
+    private fun refuseCreate(r: ProvisionResource, change: PlannedChange, parent: String, why: String): PlannedChange =
+        if (parent.startsWith("$OBJECT_TYPE_WORKSPACE:")) {
+            refuse(r, change, ERROR_NOT_OWNED, null, "$why ($WORKSPACE_PARENT_NOTE)", fixNote = WORKSPACE_PARENT_NOTE)
+        } else {
+            val fix = FixRequest.manager(subject, parent, why)
+            refuse(r, change, ERROR_NOT_OWNED, null, "$why (${FixRequest.hint(fix)})", fix = fix)
+        }
 
     /**
      * SSO-3689 — the ownership gate for a `workloadIdentityTrust`: the relation this identity holds on the trust's
@@ -678,13 +710,14 @@ class ProvisionEngine(
         val where = parent ?: "its environment (created by this apply)"
         if (change.liveId != null) {
             return when (access) {
-                Access.NONE -> refuse(
-                    r, change, ERROR_NOT_OWNED, access,
-                    "this identity holds no relation on $where — a trust is reached through its environment, so it is not visible to it " +
-                        "(a workspace admin grants reach with `thoryn access grant <subject> manager $where`)",
-                )
+                // SSO-3710 — a trust has no object of its own, so the right is `manager` on its PARENT environment (a note
+                // when that parent is the workspace: a confined identity must never manage the workspace).
+                Access.NONE -> {
+                    val why = "this identity holds no relation on $where — a trust is reached through its environment, so it is not visible to it"
+                    refuseOnParent(r, change, ERROR_NOT_OWNED, access, parent, why)
+                }
                 Access.VIEWER -> if (!r.readOnly) {
-                    refuse(r, change, ERROR_READ_ONLY, access, "this identity may only VIEW $where — declare the trust `readOnly: true` to depend on it without owning it, or have a workspace admin grant it `manager`")
+                    refuseOnParent(r, change, ERROR_READ_ONLY, access, parent, "this identity may only VIEW $where — declare the trust `readOnly: true` to depend on it without owning it, or manage its environment")
                 } else {
                     reference(change, access)
                 }
@@ -692,17 +725,40 @@ class ProvisionEngine(
             }
         }
         if (r.readOnly) {
-            return refuse(r, change, ERROR_READ_ONLY, null, "declared `readOnly: true` but nothing matches it live — a read-only reference is never created; declare it without `readOnly` to own it")
+            return refuse(
+                r, change, ERROR_READ_ONLY, null,
+                "declared `readOnly: true` but nothing matches it live — a read-only reference is never created; declare it without `readOnly` to own it",
+                fixNote = FILE_FIX_NOTE,
+            )
         }
         return if (access == Access.MANAGER) {
             change.copy(access = access.label)
         } else {
-            refuse(r, change, ERROR_NOT_OWNED, null, "creating a ${r.kind} here requires `manager` on its environment $where, which this identity does not hold")
+            refuseOnParent(r, change, ERROR_NOT_OWNED, null, parent, "creating a ${r.kind} here requires `manager` on its environment $where, which this identity does not hold")
         }
     }
 
-    private fun refuse(r: ProvisionResource, change: PlannedChange, code: String, access: Access?, why: String): PlannedChange =
-        change.copy(action = ChangeAction.ERROR, reason = "$code — $why", error = code, access = access?.label, readOnly = r.readOnly, owned = change.owned)
+    /** SSO-3710 — a trust row refused on its parent plane: `manager` on an environment is an item, on the workspace a note. */
+    private fun refuseOnParent(r: ProvisionResource, change: PlannedChange, code: String, access: Access?, parent: String?, why: String): PlannedChange =
+        when {
+            parent == null || parent.startsWith("$OBJECT_TYPE_WORKSPACE:") -> refuse(r, change, code, access, "$why ($WORKSPACE_PARENT_NOTE)", fixNote = WORKSPACE_PARENT_NOTE)
+            else -> FixRequest.manager(subject, parent, why).let { fix -> refuse(r, change, code, access, "$why (${FixRequest.hint(fix)})", fix = fix) }
+        }
+
+    private fun refuse(
+        r: ProvisionResource,
+        change: PlannedChange,
+        code: String,
+        access: Access?,
+        why: String,
+        fix: FixRequest.MissingRight? = null,
+        fixNote: String? = null,
+    ): PlannedChange =
+        change.copy(
+            action = ChangeAction.ERROR, reason = "$code — $why", error = code, access = access?.label, readOnly = r.readOnly, owned = change.owned,
+            // The item's reason carries the gate's code like the row's does (`access_not_owned — …`), so a consumer reads one shape.
+            fix = fix?.copy(reason = "$code — ${fix.reason}"), fixNote = fixNote,
+        )
 
     /** A read-only reference that exists and matches: a no-op that is never owned (a stale receipt entry is dropped by `apply`). */
     private fun reference(change: PlannedChange, access: Access): PlannedChange = change.copy(
@@ -2237,6 +2293,18 @@ class ProvisionEngine(
          * `POST /api/v1/access/check {object, relation: owner}` is false for this one. Declare it `readOnly: true`.
          */
         const val ERROR_OWNED_ELSEWHERE = "access_owned_elsewhere"
+
+        /**
+         * SSO-3710 — the fix request's note for an `ERROR` row no right would fix: the FILE must change (a read-only
+         * reference that differs from what is live, a reference to something that does not exist).
+         */
+        const val FILE_FIX_NOTE = "a change to the file, not a missing right: a read-only reference must match what is live and is never created"
+        /**
+         * SSO-3710 — the note for a create (or a trust) whose parent is the WORKSPACE: `manager` on the workspace is never a
+         * consentable right (ADR 2026-10-15 §3) — a confined repository identity must not manage the workspace; a workspace
+         * admin creates the production-plane resource and grants this identity `owner` on it, or the file declares it `readOnly`.
+         */
+        const val WORKSPACE_PARENT_NOTE = "not a grantable right: `manager` on the workspace is never granted to a repository identity — a workspace admin creates it, then grants this identity `owner` on it (or declare it `readOnly: true`)"
 
         /**
          * SSO-3668 — an output's `publishTo:` target could not be reached by the signed-in credential; raised

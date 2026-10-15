@@ -28,6 +28,15 @@
 # The App completes its check run from this run's conclusion (the run-name carries the check-run id).
 # Removals are never automated: the apply step is destroy: "false", and nothing here passes --prune.
 #
+# A RED CHECK NAMES ITS FIX (SSO-3710; oauthy ADR 2026-10-15-missing-rights-fix-path-cli-and-web-consent §1). Both jobs
+# ask the CLI for a FIX REQUEST — `thoryn-provision-request.json`: every right this repository's identity is missing
+# (a plan profile on the trust, `owner` on a declared resource, `manager` on a parent environment) with the exact CLI
+# command a workspace admin runs — and upload it as the run artifact `thoryn-provision-request` when the job fails. The
+# App reads that artifact on `workflow_run.completed` and puts two options on the check run: the commands, or a web
+# consent a workspace admin approves. The request is asked for through the env var THORYN_FIX_REQUEST, not the flag:
+# the pinned release below predates `--fix-request` and ignores the variable, so the upload step simply finds no file
+# (`if-no-files-found: ignore`) until the pin moves to a release that writes it — nothing breaks either way.
+#
 # Every `inputs.*` value reaches a shell only through `env:` (the template-injection rule, oauthy SSO-3635).
 name: Thoryn provisioning
 run-name: "Thoryn provisioning ${{ inputs.mode }} ${{ inputs.head_sha }} check-run:${{ inputs.check_run_id }}"
@@ -94,12 +103,24 @@ jobs:
           set -euo pipefail
           gh release download "$THORYN_CLI_RELEASE" --repo thoryn-io/thoryn-cli --pattern thoryn.jar --dir .
       - name: Plan .thoryn/provision.yaml as this repository (production plane, the one identity's plan profile)
+        env:
+          # SSO-3710 — where `login --connection` / `provision plan` write the fix request (the CLI's `--fix-request`).
+          THORYN_FIX_REQUEST: ${{ runner.temp }}/thoryn-provision-request.json
         run: |
           set -euo pipefail
           java -jar thoryn.jar login --connection ".thoryn/connection.json"
           { echo '## Thoryn provisioning plan: .thoryn/provision.yaml'; echo; echo '<pre>'; } >> "$GITHUB_STEP_SUMMARY"
           java -jar thoryn.jar provision plan --file ".thoryn/provision.yaml" | tee -a "$GITHUB_STEP_SUMMARY"
           echo '</pre>' >> "$GITHUB_STEP_SUMMARY"
+      # SSO-3710 — the fix request, for the App to relay onto the check run. Only a failed job has one to upload.
+      - name: Upload the fix request
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: thoryn-provision-request
+          path: ${{ runner.temp }}/thoryn-provision-request.json
+          if-no-files-found: ignore
+          retention-days: 7
 
   # thoryn-provisioning: apply-job
   apply:
@@ -126,6 +147,15 @@ jobs:
           issuer: https://auth.stg.thoryn.org
           cli-version: cli-v0.34.0
           destroy: "false"
+      # SSO-3710 — the Action asks the CLI for the fix request (THORYN_FIX_REQUEST) and exposes where it would be.
+      - name: Upload the fix request
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: thoryn-provision-request
+          path: ${{ steps.apply-thoryn.outputs.fix-request }}
+          if-no-files-found: ignore
+          retention-days: 7
       - name: Open the receipt pull request
         env:
           GH_TOKEN: ${{ github.token }}

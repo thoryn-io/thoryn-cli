@@ -118,4 +118,46 @@ class WorkloadIdentityDiagnosticsTest {
         val e = WorkloadIdentityException("no GitHub Actions job token available", oauthError = WorkloadIdentityFlow.ERROR_NOT_ON_GITHUB_ACTIONS)
         assertThat(WorkloadIdentityDiagnostics.render(e, binding)).isEqualTo("Sign-in failed: no GitHub Actions job token available")
     }
+
+    // ── SSO-3710 — the one refusal that is a missing RIGHT, not a wrong pin ──
+
+    private val pinned = binding.copy(pins = TrustPins(owner = "thoryn-io", repository = "thoryn-cli", repositoryId = 1044556677, ownerId = 187654321, environment = "thoryn-provision-e2e", ref = "refs/heads/main"))
+
+    @Test
+    fun `invalid_client with the job's environment as the ONLY local mismatch is a plan-profile gap, rendered with the set-plan-profile command`() {
+        val e = refused(identity(environment = "thoryn-provision-e2e-plan"))
+
+        val gap = WorkloadIdentityDiagnostics.planProfileGap(e, pinned)
+
+        assertThat(gap).isEqualTo(WorkloadIdentityDiagnostics.PlanProfileGap(jobEnvironment = "thoryn-provision-e2e-plan", applyEnvironment = "thoryn-provision-e2e"))
+        val item = gap!!.item()
+        assertThat(item.kind).isEqualTo(com.devnow.thoryn.provision.FixRequest.Kind.PLAN_PROFILE)
+        assertThat(item.cli).isEqualTo("thoryn workload-identity trusts set-plan-profile <trust-id> --plan-environment thoryn-provision-e2e-plan")
+        // The report prints the SAME item (one rendering) right after the difference it explains.
+        val report = WorkloadIdentityDiagnostics.render(e, pinned)
+        assertThat(report)
+            .contains("environment: the trust pins GitHub environment 'thoryn-provision-e2e'; this job runs in 'thoryn-provision-e2e-plan'.")
+            .contains("Missing rights — what a workspace admin grants (1 item(s)):")
+            .contains(item.cli!!)
+            .contains("`thoryn workload-identity trusts list`")
+    }
+
+    @Test
+    fun `any other refusal shape is no gap — a second mismatch, no environment claim, no pin, a scope refusal, a Kubernetes token`() {
+        // A repository mismatch alongside the environment one: a pin problem.
+        assertThat(WorkloadIdentityDiagnostics.planProfileGap(refused(identity(environment = "thoryn-provision-e2e-plan", repository = "acme/billing")), pinned)).isNull()
+        // The job declares no environment: a missing `environment:` on the job, not a missing profile.
+        assertThat(WorkloadIdentityDiagnostics.planProfileGap(refused(identity()), pinned)).isNull()
+        // The connection pins no environment: the CLI cannot tell.
+        assertThat(WorkloadIdentityDiagnostics.planProfileGap(refused(identity(environment = "x")), binding)).isNull()
+        // The job IS in the apply environment: whatever refused it, not the profile.
+        assertThat(WorkloadIdentityDiagnostics.planProfileGap(refused(identity(environment = "thoryn-provision-e2e")), pinned)).isNull()
+        // Not invalid_client.
+        val scope = WorkloadIdentityException("refused", oauthError = "invalid_scope", status = 400, jobIdentity = identity(environment = "thoryn-provision-e2e-plan"))
+        assertThat(WorkloadIdentityDiagnostics.planProfileGap(scope, pinned)).isNull()
+        // A Kubernetes token has no profiles.
+        val pod = JobIdentity.of(FakeJobTokens.kubernetesToken(audience))
+        assertThat(WorkloadIdentityDiagnostics.planProfileGap(refused(pod), pinned.copy(provider = WorkloadIdentityDiagnostics.PROVIDER_KUBERNETES))).isNull()
+        assertThat(WorkloadIdentityDiagnostics.render(refused(identity(environment = "thoryn-provision-e2e-plan", repository = "acme/billing")), pinned)).doesNotContain("set-plan-profile")
+    }
 }

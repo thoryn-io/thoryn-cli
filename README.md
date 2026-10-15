@@ -152,6 +152,8 @@ store…` line per step; that is the explicit opt-in above being announced, not 
 thoryn login --workspace <slug> [--issuer https://auth.<env>]  # Auth code + PKCE (loopback) or --device-code — ON your workspace (SSO-3104)
 thoryn login --client-credentials [--client-id <id>] # SSO-1553/2941 — non-interactive API key (CI); THORYN_API_KEY=<id>:<secret>, auto re-mints on expiry
 thoryn login --workload-identity --client-id <wi_…> --audience <aud> [--scope s]  # SSO-3308 — GitHub Actions job, NO secret (id-token: write); renews with a fresh job token
+thoryn login --connection <file> [--fix-request <path>]  # SSO-2948 — sign in from a connection contract; SSO-3710 — a refused exchange whose only local
+                                             # mismatch is the job's GitHub environment writes the fix request (the missing plan profile + its command; env THORYN_FIX_REQUEST)
 thoryn login --status
 thoryn logout [--rotate-key]                 # SSO-3199 — --rotate-key also discards this machine's DPoP key
 thoryn whoami [--check]                      # SSO-2860/3199/3228 — identity, scopes, expiry, DPoP key + device (--check: this device's server-side state)
@@ -287,8 +289,10 @@ thoryn examples share    <name> [--output <file>]   # SSO-2876 — export the se
 # converged by name, adopted on the API's 409, never updated in place (workload_identity_trust_immutable), removed only
 # via --prune/destroy; the receipt records the wi_ client + audience; apply PRINTS the consumer's connection.json, never
 # writes it. See "Secretless clients" and "Declaring a workload-identity trust" below.
-thoryn provision plan    [--file <path>] [--prune]                       # read-only: what apply would create / remove (+ grant changes, pending publishes); exit 1 on an ownership error
-thoryn provision apply   [--file <path>] [--prune] [--confirm <ws>] [--yes] \
+thoryn provision plan    [--file <path>] [--prune] [--fix-request <path>]  # read-only: what apply would create / remove (+ grant changes, pending publishes); exit 1 on an ownership error
+                                             # SSO-3710 — --fix-request (env THORYN_FIX_REQUEST): a red plan also writes thoryn-provision-request.json — every missing RIGHT
+                                             # (owner / manager / viewer) with the exact `thoryn access grant` command a workspace admin runs; a workflow uploads it
+thoryn provision apply   [--file <path>] [--prune] [--confirm <ws>] [--yes] [--fix-request <path>] \
                          [--secret-file <path>] [--force-stdout] [--force] \
                          [--wait [--wait-until ACTIVE|VERIFIED] [--wait-timeout 15m] [--wait-interval 20s]]
 thoryn provision import  [--file <path>] [--write]                       # SSO-3659 — the inverse of plan: render what this identity may reach as
@@ -1556,6 +1560,81 @@ are that graph's check and list-objects, so the gate uses them (and `tenant:acce
 its `parent` edge) is still gated by containment — `manager` on the parent — because the platform
 re-checks every write server-side, so the engine can never admit a write the platform refuses.
 
+### A red check names its fix — `--fix-request` (SSO-3710, epic SSO-3304)
+
+A repository bound to Thoryn needs one-time rights before its App-dispatched plan can run: the **plan
+profile** on its trust (SSO-3700), the **`owner`** relation on a resource it declares (SSO-3697), or
+`manager` on the parent environment of something it creates. When one is missing the check run is red
+in one of two places — at sign-in (`401 invalid_client`, the hub says nothing more) or at the engine's
+gate (`access_not_owned` / `access_read_only` / `access_owned_elsewhere`) — and the person reading it
+needs a path. Per oauthy ADR `2026-10-15-missing-rights-fix-path-cli-and-web-consent.md` §1 the job
+writes **one file**, `thoryn-provision-request.json` (schema
+`engine/src/main/resources/provision/fix-request.schema.json`), and the workflow uploads it as the run
+artifact **`thoryn-provision-request`**. The Thoryn GitHub App reads that artifact and puts two options on
+the failed check run: the CLI commands, verbatim, or a web consent a workspace admin approves (oauthy
+SSO-3711 / SSO-3712).
+
+Both producers take the same opt-in `--fix-request <path>` (or the env var `THORYN_FIX_REQUEST` — the
+spelling a workflow uses, because a release that predates the flag ignores a variable and refuses a flag);
+exit codes are unchanged, and the request is never a credential — ids, names, commands:
+
+- **`thoryn login --connection --fix-request`** — on an `invalid_client` refusal whose **only** local
+  mismatch is the job's GitHub environment (the job runs in `<env>-plan`, the trust pins the apply
+  environment and has no plan profile for the job's): one `plan_profile` item with
+  `thoryn workload-identity trusts set-plan-profile <trust-id> --plan-environment <job env>` (`<trust-id>`,
+  because a refused sign-in holds no token; `thoryn workload-identity trusts list` resolves it). Any other
+  refusal shape — a repository id, a ref, a runner, no environment at all — is a wrong pin, not a missing
+  right: today's diagnostic alone, no file.
+- **`thoryn provision plan|apply --fix-request`** — on a red plan, one item per `access_*` row that is a
+  right: **`owner`** on an existing object this file is to own (`access_not_owned` on a live id, or
+  `access_read_only` when the identity may only view it), **`manager`** on the parent `environment:<id>`
+  of a refused create, **`viewer`** for a `readOnly: true` reference the identity cannot see; each with
+  `thoryn access grant client:<wi_…> <relation> <object>`, the subject being the session's own. An object
+  **another repository owns** (`access_owned_elsewhere`) is an `owner` item with **no command** — a dispute
+  an admin decides (the reason carries the Owner ADR's revoke-then-grant). Rows that are **file** fixes — a
+  read-only reference that differs from what is live, a trust the file cannot declare, a scope the
+  identity does not hold, a create whose parent is the **workspace** (`manager` on the workspace is never
+  granted to a repository identity) — are listed under `notes`, so the request says so. The trust's name
+  and id are resolved only when the session may list trusts (`tenant:workload-identity.read`); a plan-profile
+  session names its `wi_` client only.
+
+**One rendering.** The `cli` string of every item is the same text the CLI prints on stderr (the row
+reasons quote it; a `Missing rights — what a workspace admin grants` block lists it), so the check run and
+the terminal never disagree. The binding fields the file carries — `repository`, `run` — are hints: a
+consumer takes them from GitHub's own record of the run and discards the body's copy.
+
+```json
+{ "version": 1, "cliVersion": "0.35.0",
+  "repository": { "owner": "thoryn-io", "ownerId": 229451779, "repository": "thoryn-cli", "repositoryId": 1361536515 },
+  "run": { "id": 38547022158, "headSha": "…", "jobEnvironment": "thoryn-provision-e2e-plan" },
+  "workspace": "thoryn", "file": { "path": ".thoryn/provision.yaml", "sha256": "sha256:…" },
+  "trust": { "name": null, "plane": "production", "applyEnvironment": null, "id": null, "clientId": "wi_10a7b379c79f7d1353f5798d" },
+  "missing": [ { "kind": "owner", "object": "application:cli", "subject": "client:wi_10a7b379c79f7d1353f5798d", "environment": null,
+                 "reason": "access_not_owned — this identity holds no relation on application:cli — …",
+                 "cli": "thoryn access grant client:wi_10a7b379c79f7d1353f5798d owner application:cli" } ],
+  "notes": [] }
+```
+
+In a workflow, set the variable on the step that signs in and plans, and upload the file on failure (the
+dogfood `thoryn-provisioning.yml` and the composite Action's `fix-request` input / output are the examples):
+
+```yaml
+      - name: Plan
+        env:
+          THORYN_FIX_REQUEST: ${{ runner.temp }}/thoryn-provision-request.json
+        run: |
+          thoryn login --connection .thoryn/connection.json
+          thoryn provision plan --file .thoryn/provision.yaml
+      - name: Upload the fix request
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: thoryn-provision-request
+          path: ${{ runner.temp }}/thoryn-provision-request.json
+          if-no-files-found: ignore
+          retention-days: 7
+```
+
 ## Secret-safety (SSO-1552)
 
 Client and federation secrets are shown once and **never** pass through `argv`
@@ -2243,7 +2322,13 @@ The Action:
    outputs, read from the secret-free receipt the CLI writes next to the file, and
 5. **destroys on exit** (`thoryn provision destroy --file … --yes`, `if: always()`,
    disable with `destroy: "false"`): child-first, the sandbox hard-delete cascades the
-   client; adopted resources and the standing workspace are never touched.
+   client; adopted resources and the standing workspace are never touched,
+6. **names its fix when it fails** (SSO-3710): the Action resolves one path for the CLI's fix request
+   (the `fix-request` input, default `$RUNNER_TEMP/thoryn-provision-request.json`), hands it to the
+   sign-in and the apply steps through `THORYN_FIX_REQUEST`, and exposes it as the `fix-request`
+   output. The **caller** uploads it — `actions/upload-artifact`, `if: failure()`, name
+   `thoryn-provision-request`, `if-no-files-found: ignore` — as `provision-e2e.yml` and
+   `thoryn-provisioning.yml` do; see "A red check names its fix" above.
 
 The demo caller is `.github/workflows/provision-e2e.yml` (manual `workflow_dispatch`).
 
@@ -2387,6 +2472,7 @@ thoryn-cli/
 │   └── src/main/kotlin/com/devnow/thoryn/provision/
 │       ├── ProvisionEngine.kt                               # plan / apply / destroy / import, the ownership gate, SecretSink
 │       ├── ProvisionFile.kt + provision.schema.json         # the .thoryn/provision.yaml model
+│       ├── FixRequest.kt + fix-request.schema.json          # SSO-3710 the fix request (missing rights + their commands) and its ONE renderer
 │       ├── ProvisionReceipt.kt                              # the secret-free ownership ledger
 │       ├── ProvisionApi.kt                                  # the product-api PORT the engine converges through
 │       ├── AccessRefs.kt, CustomDomain.kt, ProductApiException.kt
@@ -2425,6 +2511,7 @@ thoryn-cli/
     │   │   ├── AuditReplayCommand.kt                        # SSO-940b
     │   │   ├── WorkloadIdentityCommand.kt                   # SSO-3308 `workload-identity trusts` (github_actions); SSO-3684 --provider kubernetes; SSO-3702 --plan-environment / set-plan-profile
     │   │   ├── connection/Connection.kt                     # SSO-2948 the connection contract (+ examples/connection.schema.json)
+    │   │   ├── provision/FixRequests.kt                     # SSO-3710 --fix-request: runner context, trust resolution, the write
     │   │   └── operator/                                    # SSO-3356 `operator login|logout|custom-domain` (operator plane)
     │   ├── config/
     │   │   └── ThorynConfig.kt                              # per-env defaults

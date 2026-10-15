@@ -68,6 +68,10 @@ data class Tokens(
     // form, a Kubernetes token, an older session). Shown by `login --status` / `whoami`, and named on every
     // write refusal of a plan-profile session. Not a secret.
     val profile: String? = null,
+    // SSO-3710 — the GitHub environment the job that signed this WORKLOAD IDENTITY session in declared (the OIDC
+    // token's `environment` claim), so a later `provision plan --fix-request` in the same job can state the
+    // environment the run was in without re-reading a job token. Null for every other session. Not a secret.
+    val jobEnvironment: String? = null,
 ) {
     companion object {
         /** SSO-3702 — [profile] value: the trust's APPLY profile (the reviewed environment; the trust's full scopes). */

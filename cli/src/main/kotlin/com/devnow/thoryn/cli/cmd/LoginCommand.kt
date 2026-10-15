@@ -32,7 +32,9 @@ import com.devnow.thoryn.cli.auth.WorkloadIdentityFlow
 import com.devnow.thoryn.cli.auth.WorkloadProfile
 import com.devnow.thoryn.cli.cmd.connection.Connection
 import com.devnow.thoryn.cli.cmd.connection.ConnectionException
+import com.devnow.thoryn.cli.cmd.provision.FixRequests
 import com.devnow.thoryn.cli.config.ThorynConfig
+import com.devnow.thoryn.provision.ProvisionEngine
 import picocli.CommandLine.Command
 import picocli.CommandLine.Option
 import java.io.File
@@ -266,6 +268,20 @@ class LoginCommand : Callable<Int> {
         description = ["Sign in from a connection contract (connection.schema.json). Derives issuer/gateway from workspace.slug; auth.method client_credentials reads the client secret from the env var named by auth.secretEnv, workload_identity exchanges the GitHub Actions job's OIDC token — or, with auth.tokenSource {kind: file}, the identity token in that file (a pod's projected ServiceAccount token) — no secret; requests exactly auth.scopes. Mutually exclusive with --issuer/--gateway/--scope/--client-id and the other modes."],
     )
     var connectionFile: File? = null
+
+    /**
+     * SSO-3710 (oauthy ADR 2026-10-15 §1) — where a REFUSED `--connection` workload identity sign-in writes its fix
+     * request (`thoryn-provision-request.json`) when the refusal is the one shape that is a missing RIGHT rather than
+     * a wrong pin: `invalid_client` with the job's GitHub environment as the only local mismatch — the trust has no
+     * plan profile for the environment the job ran in. One `plan_profile` item with the exact
+     * `thoryn workload-identity trusts set-plan-profile` command (`<trust-id>`: a refused sign-in holds no token to
+     * resolve it). Opt-in; `THORYN_FIX_REQUEST` is the same switch. The exit code is unchanged.
+     */
+    @Option(
+        names = ["--fix-request"],
+        description = ["SSO-3710 — with a workload_identity connection: write the fix request (the missing plan profile + the exact `thoryn workload-identity trusts set-plan-profile` command, schema fix-request.schema.json) to this file when the exchange is refused and the job's GitHub environment is the only local mismatch; a workflow uploads it as the `thoryn-provision-request` artifact. Env: THORYN_FIX_REQUEST."],
+    )
+    var fixRequestFile: File? = null
 
     /**
      * SSO-1145: bypass the `http://` non-loopback issuer-URL guard for local
@@ -891,6 +907,9 @@ class LoginCommand : Callable<Int> {
             // SSO-3702 — the trust's APPLY environment, as the contract mirrors it: the job's own `environment` claim
             // against it decides whether the connection's scopes are requested (apply) or none (plan).
             applyEnvironment = connection.github?.environment?.takeIf { connection.effectiveProvider == Connection.PROVIDER_GITHUB_ACTIONS },
+            // SSO-3710 — a refusal that is a missing plan profile writes the fix request (the plane is the connection's).
+            fixRequest = FixRequests.target(fixRequestFile),
+            plane = connection.environment ?: ProvisionEngine.PRODUCTION_ENV_SLUG,
         )
     }
 
@@ -953,6 +972,10 @@ class LoginCommand : Callable<Int> {
          * scope. Null ⇒ today's behaviour (the flag form, a Kubernetes token, a connection without the pin).
          */
         applyEnvironment: String? = null,
+        /** SSO-3710 — the fix-request file to write on a refusal that is a missing plan profile; null ⇒ none. */
+        fixRequest: java.nio.file.Path? = null,
+        /** SSO-3710 — the plane the trust lives in (`production`, or the sandbox slug the audience names), for the request. */
+        plane: String? = null,
     ): Int {
         try {
             IssuerUrlValidator.validate(audience, devMode)
@@ -1019,6 +1042,8 @@ class LoginCommand : Callable<Int> {
                     tokenEndpoint = tokenEndpoint,
                     tokenFile = tokenFile,
                     profile = selected?.wire,
+                    // SSO-3710 — the job's environment, so a later `provision plan --fix-request` can state the run's.
+                    jobEnvironment = jobEnvironment,
                 ),
             )
             // SSO-2863 — a fresh login resets the base tenant; drop any stale workspace selection.
@@ -1046,7 +1071,24 @@ class LoginCommand : Callable<Int> {
             )
             EXIT_OK
         } catch (e: WorkloadIdentityException) {
-            System.err.println(WorkloadIdentityDiagnostics.render(e, binding()))
+            val b = binding()
+            System.err.println(WorkloadIdentityDiagnostics.render(e, b))
+            // SSO-3710 — the one refusal that is a missing RIGHT (the trust has no plan profile for the job's environment)
+            // becomes the fix request, when asked for: the same item the report above rendered, nothing more.
+            val gap = fixRequest?.let { WorkloadIdentityDiagnostics.planProfileGap(e, b) }
+            if (fixRequest != null && gap != null && e.jobIdentity != null) {
+                FixRequests.write(
+                    FixRequests.forRefusedSignIn(
+                        item = gap.item(),
+                        identity = e.jobIdentity,
+                        clientId = clientIdValue,
+                        plane = plane ?: FixRequests.planeOf(audience),
+                        applyEnvironment = applyEnvironment,
+                        workspace = workspaceSlug ?: ThorynConfig.workspaceOfIssuer(audience),
+                    ),
+                    fixRequest,
+                )
+            }
             EXIT_WORKLOAD_IDENTITY_FAILED
         }
     }

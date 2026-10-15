@@ -1,5 +1,6 @@
 package com.devnow.thoryn.cli.auth
 
+import com.devnow.thoryn.provision.FixRequest
 import java.net.URI
 
 /**
@@ -62,6 +63,35 @@ object WorkloadIdentityDiagnostics {
 
     /** The command a workspace admin runs to read the exact reason. */
     const val AUDIT_COMMAND: String = "thoryn audit query --event-type $AUDIT_EVENT"
+
+    /**
+     * SSO-3710 — the one refusal shape the CLI can turn into a RIGHT to grant: the job's GitHub `environment` claim
+     * differs from the trust's apply environment, and nothing else differs locally — the trust has no plan profile
+     * for the environment the job ran in (the hub's `environment_mismatch`, answered as `invalid_client`).
+     */
+    data class PlanProfileGap(val jobEnvironment: String, val applyEnvironment: String) {
+        /** The fix-request item: a plan profile on the trust for the job's environment ([FixRequest.planProfile]). */
+        fun item(trustName: String? = null, trustId: String? = null): FixRequest.MissingRight =
+            FixRequest.planProfile(trustName, trustId, jobEnvironment, applyEnvironment)
+    }
+
+    /**
+     * The [PlanProfileGap] of a refusal, or null: only an `invalid_client` on a GitHub Actions token whose connection
+     * pins an apply environment, where the job DECLARES an environment, and where the ONLY local mismatch is that
+     * environment. Any other shape (a repository id, a ref, a runner, no environment at all, a Kubernetes token) is
+     * today's diagnostic alone — a different pin, not a missing right.
+     */
+    fun planProfileGap(e: WorkloadIdentityException, binding: WorkloadIdentityBinding): PlanProfileGap? {
+        if (e.oauthError != "invalid_client") return null
+        val identity = e.jobIdentity ?: return null
+        if (binding.provider == PROVIDER_KUBERNETES || identity.isKubernetes) return null
+        val apply = binding.pins?.environment ?: return null
+        val job = identity.environment ?: return null
+        if (job == apply) return null
+        val mismatches = localMismatches(identity, binding.audience, binding.pins, binding.provider, binding.kubernetesPins)
+        if (mismatches.size != 1 || !mismatches.single().startsWith("environment:")) return null
+        return PlanProfileGap(jobEnvironment = job, applyEnvironment = apply)
+    }
 
     /**
      * Differences between the job and what the trust requires that the CLI can see without the
@@ -277,6 +307,12 @@ object WorkloadIdentityDiagnostics {
             if (mismatches.isNotEmpty()) {
                 appendLine("Differences found locally:")
                 mismatches.forEach { appendLine("  - $it") }
+                // SSO-3710 — the one difference that is a missing RIGHT rather than a wrong pin: the same item (and
+                // the same command text) `--fix-request` writes for the check run — one rendering.
+                planProfileGap(e, binding)?.let { gap ->
+                    appendLine()
+                    appendLine(FixRequest.render(listOf(gap.item())))
+                }
             } else {
                 appendLine(
                     when {

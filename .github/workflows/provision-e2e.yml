@@ -85,6 +85,19 @@ jobs:
           cli-version: ${{ inputs.cli-version }}
           destroy: ${{ inputs.destroy }}
 
+      # SSO-3710 — a red run names its fix: the Action asks the CLI for the fix request (`thoryn-provision-request.json`,
+      # the missing rights with the exact commands; written by `login --connection` and `provision plan|apply` through
+      # THORYN_FIX_REQUEST) and this uploads it as the artifact the Thoryn GitHub App relays onto a check run. Only a
+      # failed job has one; a release predating `--fix-request` writes none and the step finds nothing to upload.
+      - name: Upload the fix request
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: thoryn-provision-request
+          path: ${{ steps.provision.outputs.fix-request }}
+          if-no-files-found: ignore
+          retention-days: 7
+
       # SSO-3113 (epic SSO-3108) — prove the CI identity is CONFINED, not merely that it can do its job.
       # The Action leaves the downloaded thoryn.jar and the signed-in session in the workspace.
       #  1. Reads are confined (ADR 2026-09-15 §8): as the trust's client, `env list` must return exactly the
