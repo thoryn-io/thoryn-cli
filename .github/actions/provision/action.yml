@@ -14,7 +14,7 @@
 #   .thoryn/provision.yaml   — WHAT I OWN: the desired-state resources (a sandbox environment + a
 #                              loopback OAuth client for this repo). `thoryn provision apply` converges
 #                              it (SSO-3088/3089): apply twice issues no writes; a leftover from a
-#                              failed run is adopted by its key rather than duplicated.
+#                              failed run is matched by its converge key rather than duplicated.
 #
 # What it does, end to end:
 #   1. Downloads the prebuilt `thoryn.jar` from a `cli-v*` release of thoryn-io/thoryn-cli (the
@@ -24,14 +24,20 @@
 #      The secret is supplied as the env var the contract NAMES; the base issuer as THORYN_ISSUER
 #      (SSO-3296's documented name) and its THORYN_HUB alias. Issuer/gateway/scopes derived by the CLI.
 #   3. `thoryn provision plan --file <file>` (read-only, printed for the log), then
-#      `thoryn provision apply --file <file> --yes`. The receipt the CLI writes NEXT TO the file
-#      (`<name>.receipt.json`, secret-free) is the ownership ledger.
-#   4. Exposes the workspace slug (from the contract), the provisioned environment slug, the client
-#      id and the receipt path (read from the receipt), and the per-workspace issuer the CLI resolved at
-#      sign-in (`thoryn whoami --output json` — the custom domain once it is ACTIVE, SSO-3415).
-#   5. `thoryn provision destroy --file <file> --yes` in an `if: always()` step (unless
-#      `destroy: "false"`): removes everything the receipt owns, child-first — the sandbox hard-delete
-#      cascades the client. Guaranteed on failure so a broken run never leaks a sandbox.
+#      `thoryn provision apply --file <file> --yes --output json`. SSO-3715 / SSO-3717 (oauthy ADR
+#      2026-10-15-platform-is-the-ledger-no-committed-provisioning-receipt): THERE IS NO RECEIPT — nothing is
+#      written beside the file; the ids a workflow needs are the apply's own JSON document (`resources[]`:
+#      {kind, name, id, environment, action}), kept under $RUNNER_TEMP and exposed as `apply-result`.
+#   4. Exposes the workspace slug (from the contract), the provisioned environment slug and the client id
+#      (read from `resources[]`), and the per-workspace issuer the CLI resolved at sign-in
+#      (`thoryn whoami --output json` — the custom domain once it is ACTIVE, SSO-3415).
+#   5. `thoryn provision destroy --file <file> --yes --output json` in an `if: always()` step (unless
+#      `destroy: "false"`): OWNER-GATED (SSO-3715) — a `client:` identity removes only the declared resources the
+#      platform says it OWNS, children before environments, a `retain: true` resource never (shown as
+#      `retained by the file`), and every refusal is a `skip` row with the command a person would run. The JSON
+#      document (`{destroyed, removed[], skipped[]}`) is kept under $RUNNER_TEMP and exposed as `destroy-result` so
+#      the caller can assert exactly what went (provision-e2e does). Guaranteed on failure so a broken run never
+#      leaks what it created.
 #
 # CONSUMING THIS ACTION FROM ANOTHER REPOSITORY (the thoryn-examples scenarios, a customer pipeline):
 #   - uses: actions/checkout@v4                       # YOUR repo, holding YOUR .thoryn/ files
@@ -95,7 +101,10 @@ inputs:
     required: false
     default: "https://hub.stg.thoryn.org"
   destroy:
-    description: "Run `thoryn provision destroy` on exit (\"true\"/\"false\"). Default true: never leak a sandbox from CI."
+    description: >-
+      Run `thoryn provision destroy` on exit ("true"/"false"). Default true: never leak what a run created. Owner-gated
+      (SSO-3715): only the declared resources this identity OWNS go; `retain: true` resources and anything it merely
+      manages stay and are reported as `skip` rows in the `destroy-result` document.
     required: false
     default: "true"
   confirm:
@@ -105,7 +114,9 @@ inputs:
     required: false
     default: ""
   cli-version:
-    description: "A specific `cli-v*` release tag to download (default: the latest cli-v* release)."
+    description: >-
+      A specific `cli-v*` release tag to download (default: the latest cli-v* release). Needs cli-v0.36.0 or newer:
+      the first release whose `apply` / `destroy` print `--output json` and write no receipt (SSO-3715).
     required: false
     default: ""
   java-version:
@@ -141,9 +152,18 @@ outputs:
       workspace's custom domain (https://auth.acme.com) once that is ACTIVE (SSO-3415). Never carries a
       sandbox /{env} segment.
     value: ${{ steps.apply.outputs.issuer }}
-  receipt:
-    description: "Path of the secret-free provisioning receipt (<file-name>.receipt.json, next to the file)."
-    value: ${{ steps.apply.outputs.receipt }}
+  apply-result:
+    description: >-
+      SSO-3717 — path of the JSON document `thoryn provision apply --output json` printed (`resources[]` with
+      {kind, name, id, environment, action}; secret-free). Under $RUNNER_TEMP, never in the checkout: there is no
+      receipt and nothing is written beside the file (SSO-3715).
+    value: ${{ steps.apply.outputs.apply-result }}
+  destroy-result:
+    description: >-
+      SSO-3717 — path of the JSON document `thoryn provision destroy --output json` printed on exit
+      (`{destroyed, removed[], skipped[]}`; a `skipped[]` row carries the reason — `retained by the file (`retain: true`) …`, `… is not OWNED by this identity …` — and `byHand`, the command a person runs). Exists only when the
+      teardown ran (`destroy: "true"`); empty otherwise. A caller asserts the scope of a destroy from it.
+    value: ${{ steps.destroy.outputs.destroy-result }}
   fix-request:
     description: >-
       SSO-3710 — the path the CLI writes the fix request to when a step fails on a missing right (the `fix-request`
@@ -179,11 +199,19 @@ runs:
           exit 1
         fi
         echo "Using CLI release $tag"
+        # SSO-3715 / SSO-3717 — this Action reads the ids from `apply --output json` and the destroy scope from
+        # `destroy --output json`, and expects no receipt: the first release with both is cli-v0.36.0. An older jar
+        # would write a receipt beside the file and print no JSON, so refuse it up front.
+        min="cli-v0.36.0"
+        if [ "$(printf '%s\n%s\n' "${min#cli-v}" "${tag#cli-v}" | sort -V | head -1)" != "${min#cli-v}" ]; then
+          echo "::error::release $tag predates 'thoryn provision apply --output json' (SSO-3715) — pin cli-version to $min or newer." >&2
+          exit 1
+        fi
         gh release download "$tag" --repo thoryn-io/thoryn-cli --pattern 'thoryn.jar' --dir .
         test -f thoryn.jar
         # The provisioning verbs (SSO-3088) must be present in the downloaded release.
         if ! java -jar thoryn.jar provision --help 2>/dev/null | grep -q 'apply'; then
-          echo "::error::release $tag predates 'thoryn provision apply' (SSO-3088) — pin cli-version to cli-v0.11.0 or newer." >&2
+          echo "::error::release $tag predates 'thoryn provision apply' (SSO-3088) — pin cli-version to $min or newer." >&2
           exit 1
         fi
         echo "Downloaded thoryn.jar ($(du -h thoryn.jar | cut -f1)) from release $tag."
@@ -250,8 +278,10 @@ runs:
         java -jar thoryn.jar login --connection "$CONNECTION"
         java -jar thoryn.jar login --status
 
-    # Converge the provisioning file, then read its receipt to expose ids as outputs. `plan` first is
-    # read-only and lands the diff in the job log; `apply --yes` skips the interactive confirmation.
+    # Converge the provisioning file, then read the apply's own JSON document to expose ids as outputs. `plan`
+    # first is read-only and lands the diff in the job log; `apply --yes` skips the interactive confirmation;
+    # `--output json` prints ONE document on stdout (progress goes to stderr) — the ids a workflow used to read
+    # from the receipt (SSO-3715: there is none; nothing is written beside the file).
     - name: Provision (thoryn provision apply) and expose outputs
       id: apply
       shell: bash
@@ -271,17 +301,25 @@ runs:
         [ -n "$slug" ] || { echo "::error::connection contract '$CONNECTION' has no workspace.slug." >&2; exit 1; }
 
         java -jar thoryn.jar provision plan --file "$FILE"
-        java -jar thoryn.jar provision apply --file "$FILE" --yes
+        result="$RUNNER_TEMP/thoryn-provision-apply.json"
+        java -jar thoryn.jar provision apply --file "$FILE" --yes --output json > "$result"
 
-        # The receipt is written next to the file as <name>.receipt.json — the secret-free ownership ledger.
+        # The apply's JSON document is the only record of the ids (secret-free: kinds, names, ids, slugs).
+        jq -e '.resources | type == "array"' "$result" > /dev/null \
+          || { echo "::error::apply printed no resources[] — a release predating 'apply --output json' (SSO-3715)? Pin cli-version to cli-v0.36.0 or newer." >&2; cat "$result" >&2; exit 1; }
+        echo "----- apply result ($result) -----"
+        jq . "$result"
+        echo "----------------------------------"
+        # SSO-3715 — nothing is written beside the file: a receipt here would be an older CLI's, and it must not land in a commit.
         receipt="$(dirname "$FILE")/$(basename "${FILE%.*}").receipt.json"
-        test -f "$receipt" || { echo "::error::no receipt at $receipt after apply." >&2; exit 1; }
-        echo "----- receipt ($receipt) -----"
-        cat "$receipt"
-        echo "------------------------------"
+        if [ -f "$receipt" ]; then
+          echo "::error::$receipt was written beside the file — this release still writes a receipt; pin cli-version to cli-v0.36.0 or newer (SSO-3715)." >&2
+          exit 1
+        fi
 
-        environment="$(jq -r '[.resources[] | select(.kind=="environment") | .attributes.slug] | first // ""' "$receipt")"
-        client="$(jq -r '[.resources[] | select(.kind=="application") | .id] | first // ""' "$receipt")"
+        # An `environment` row carries its own slug on attributes.slug (and on `environment`); the first `application` row's id is the client.
+        environment="$(jq -r '[.resources[] | select(.kind=="environment") | (.attributes.slug // .environment // "")] | first // ""' "$result")"
+        client="$(jq -r '[.resources[] | select(.kind=="application") | .id] | first // ""' "$result")"
         # SSO-3415 — the per-workspace issuer is the one the CLI RESOLVED at sign-in (the session's
         # issuer), never re-derived here: once the workspace's custom domain is ACTIVE its platform host
         # answers 410 naming the custom-domain issuer, and the CLI signed in there. The session issuer of
@@ -295,14 +333,19 @@ runs:
           echo "environment=$environment"
           echo "client-id=$client"
           echo "issuer=$tenant_issuer"
-          echo "receipt=$receipt"
+          echo "apply-result=$result"
         } >> "$GITHUB_OUTPUT"
         echo "Provisioned client '$client' in workspace '$slug'${environment:+ (environment $environment)} — issuer $tenant_issuer."
 
-    # MANDATORY teardown — runs even when a previous step failed, so a failed run never leaks a
-    # sandbox. `destroy` removes ONLY what the receipt owns (child-first; adopted resources are left in
-    # place), so the standing workspace and anything not created by this file are never touched.
+    # MANDATORY teardown — runs even when a previous step failed, so a failed run never leaks what it created.
+    # `destroy` is OWNER-GATED (SSO-3715; ADR 2026-10-15 §1): a `client:` identity removes only the declared
+    # resources the platform says it OWNS, children before environments; `retain: true` resources and anything
+    # it merely manages are `skip` rows (reason + the command a person runs), so the standing workspace and
+    # anything not created by this identity are never touched. `--confirm` is still required for a production-plane
+    # removal. The destroy's JSON document is kept and exposed as `destroy-result` so the caller can assert the
+    # scope of what went; a destroy error is a warning here (the caller's assertion on the document is the gate).
     - name: Teardown (thoryn provision destroy)
+      id: destroy
       if: always() && inputs.destroy == 'true'
       shell: bash
       env:
@@ -312,9 +355,16 @@ runs:
       run: |
         set -euo pipefail
         [ -f thoryn.jar ] || { echo "no CLI jar — nothing was provisioned"; exit 0; }
-        args=(provision destroy --file "$FILE" --yes)
+        result="$RUNNER_TEMP/thoryn-provision-destroy.json"
+        echo "destroy-result=$result" >> "$GITHUB_OUTPUT"
+        args=(provision destroy --file "$FILE" --yes --output json)
         [ -n "${CONFIRM:-}" ] && args+=(--confirm "$CONFIRM")
-        java -jar thoryn.jar "${args[@]}" || {
-          echo "::warning::destroy reported an error — check 'thoryn env list' for a leaked sandbox owned by $FILE." >&2
-          exit 0
-        }
+        rc=0
+        java -jar thoryn.jar "${args[@]}" > "$result" || rc=$?
+        echo "----- destroy result ($result) -----"
+        if [ -s "$result" ]; then jq . "$result" || cat "$result"; else echo "(no document)"; fi
+        echo "------------------------------------"
+        if [ "$rc" -ne 0 ]; then
+          echo "::warning::destroy exited $rc — something it planned to remove stays live; check the document above and 'thoryn env list' / 'thoryn clients list --environment <sandbox>' for what $FILE declares." >&2
+        fi
+        exit 0

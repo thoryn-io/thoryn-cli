@@ -38,6 +38,10 @@ internal object CiIdentityFixture {
     const val REUSABLE_WORKFLOW_PATH = ".github/workflows/provisioning.yml"
     const val WORKFLOW_CONFIG_PATH = ".thoryn/workflow.yaml"
 
+    /** SSO-3717 — the repository's `.gitignore`: every `<name>.receipt.json` under `.thoryn/` is ignored again (no committed receipt). */
+    const val GITIGNORE_PATH = ".gitignore"
+    const val RECEIPT_IGNORE_RULE = ".thoryn/*.receipt.json"
+
     /**
      * SSO-3704 — the two-trust shape's residue (SSO-3699 option B retired it): a second connection file, the second trust's
      * name, and the sign-in failure a plan job hit while the trust pinned only the reviewed environment. Once the one trust

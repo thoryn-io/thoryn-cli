@@ -8,14 +8,13 @@ HELP.md
 # Maven wrapper (only-script): keep mvnw / mvnw.cmd / maven-wrapper.properties;
 # the downloaded distribution lives under ~/.m2/wrapper and is never committed.
 
-# SSO-3088 — provisioning receipts (`thoryn provision apply` writes <name>.receipt.json next to the
-# file; secret-free, but per-account state like Terraform state — not committed by default).
-# SSO-3697 — EXCEPT `.thoryn/provision.receipt.json`: the App-dispatched apply job commits it through the
-# receipt pull request (`git add -- ':(glob).thoryn/**/*.receipt.json'`, the App's contract — an ignored
-# path would fail that step), so it is the committed ownership ledger the next apply builds on. The
-# founder-applied `trusts.provision.receipt.json` stays local to the founder.
+# SSO-3088 → SSO-3715 / SSO-3717 — provisioning receipts. Since cli-v0.36.0 (SSO-3715; oauthy ADR
+# 2026-10-15-platform-is-the-ledger-no-committed-provisioning-receipt) the engine writes NO receipt: `plan`, `apply`,
+# `destroy` and `import` read live state only, and the platform's `owner` relation is the ledger of what a repository
+# may remove. An older CLI (≤ cli-v0.34.x) still writes `<name>.receipt.json` next to the file, so the pattern stays
+# one release to keep such a file out of a commit. Every receipt is ignored — SSO-3697's `!.thoryn/provision.receipt.json`
+# exception is gone with the receipt pull request it served (SSO-3717): nothing is committed back by the apply job.
 .thoryn/*.receipt.json
-!.thoryn/provision.receipt.json
 
 # SSO-3119 — `--secret-file` output. `provision apply` / `clients create` write a one-time client
 # secret to the path you name, and the natural place to type is the repo you are standing in. A

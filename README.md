@@ -1550,11 +1550,11 @@ removal and re-checked by product-api on the `DELETE` (404, never widened):
 
 | the signed-in identity | `destroy` / `--prune` removes a declared resource when |
 |---|---|
-| a **`client:`** (a repository's `wi_`) | `/access/check owner` is **true** for an `application` / `environment` — `manager` alone (inherited through a sandbox a founder created, or granted) never lets automation delete; thoryn-cli's own `environment/ci` (`owner: null`, CI is `manager` by grant) stays |
+| a **`client:`** (a repository's `wi_`) | `/access/check owner` is **true** for an `application` / `environment` — `manager` alone (inherited through a sandbox a founder created, or granted) never lets automation delete; thoryn-cli's own `environment/ci` (`owner: null`, CI is `manager` by grant) would stay on that ground alone — and is `retain: true` besides (SSO-3717) |
 | a **`member:`** (a person) | they **manage** it and **nobody owns** it — people cannot own, and an owned resource belongs to its repository (`owned by a repository — change its file`) |
 | any | a **non-ownable kind** (`user`, `federationMember`, the singletons, a `workloadIdentityTrust`) goes **with its sandbox** when the identity may remove the declared parent environment (the hard-delete cascades; no call of its own) — and is **never removed on the production plane** (left in place, reported with the explicit command) |
 | any | an **environment** goes only when owned, after its children |
-| any | **`retain: true`** on the resource: never — the destroy plan shows it as `retained by the file` (Terraform's `prevent_destroy`; the declared replacement for the adopted bit — intent in the reviewed file instead of history in a ledger). thoryn-cli's own `application/cli` declares it |
+| any | **`retain: true`** on the resource: never — the destroy plan shows it as `retained by the file` (Terraform's `prevent_destroy`; the declared replacement for the adopted bit — intent in the reviewed file instead of history in a ledger). thoryn-cli's own `application/cli` and `environment/ci` declare it (SSO-3717), so its `provision-e2e` destroy removes exactly the per-run loopback client and asserts so from `destroy --output json` |
 
 Every refusal is a `skip` row with the reason and the command a person would run (`thoryn clients delete
 …`, `thoryn env delete <id> --confirm <slug>`, `thoryn domain remove --yes`, …; `--output json` →
@@ -2486,13 +2486,14 @@ Thoryn with one folder, and this repo's own CI runs exactly that:
 | File | Declares | Verb |
 |---|---|---|
 | `.thoryn/connection.json` | **who I am** — workspace slug and the **workload identity trust** CI signs in under: its `wi_…` client id, audience, GitHub pins and the exact scope set; no secret and no env var naming one (SSO-2948, SSO-3690) | `thoryn login --connection` |
-| `.thoryn/provision.yaml` | **what I own** — desired-state resources: a sandbox environment + a loopback OAuth client (SSO-3088) | `thoryn provision plan / apply / destroy` |
+| `.thoryn/provision.yaml` | **what I own** — desired-state resources: the CLI's login client `cli` and the sandbox `cli-ci`, both `retain: true` (SSO-3717), + a loopback OAuth client inside the sandbox (SSO-3088) | `thoryn provision plan / apply / destroy` |
 
 The Action:
 
 1. **downloads the released CLI** (`gh release download --pattern thoryn.jar` from the
-   latest `cli-v*`, or the `cli-version` input) — it needs **cli-v0.11.0+**, the first
-   release carrying `thoryn provision apply`, and fails loud on an older jar,
+   latest `cli-v*`, or the `cli-version` input) — it needs **cli-v0.36.0+**, the first
+   release whose `apply` / `destroy` print `--output json` and write no receipt (SSO-3715),
+   and fails loud on an older tag,
 2. **signs in non-interactively** from the connection contract
    (`thoryn login --connection .thoryn/connection.json`). This repo's contract is
    `workload_identity` (SSO-3690): the job requests its own GitHub Actions OIDC token
@@ -2500,18 +2501,23 @@ The Action:
    secret exists anywhere. (A `client_credentials` contract instead receives its secret ONLY as the
    env var the contract names, never on argv.)
 3. **converges the provisioning file** — `thoryn provision plan` (logged) then
-   `thoryn provision apply --file .thoryn/provision.yaml --yes`: a sandbox `cli-ci` inside
-   the `thoryn` workspace and a public loopback client in it. Apply twice issues no writes;
-   a sandbox left by a failed run is **matched** by its slug, never duplicated (SSO-3089),
-4. **exposes** `workspace-slug` / `environment` / `client-id` / `issuer` as outputs. Until
-   SSO-3717 moves the Action onto `apply --output json` (`resources[]`: kind / name / id /
-   environment / action) it still reads them from the receipt a `cli-v0.34.x` release writes —
-   so the Action stays pinned to that release line until SSO-3717 lands (a CLI from SSO-3715 on
-   writes no receipt), and
-5. **destroys on exit** (`thoryn provision destroy --file … --yes`, `if: always()`,
+   `thoryn provision apply --file .thoryn/provision.yaml --yes --output json`: the `cli` login
+   client, the sandbox `cli-ci` inside the `thoryn` workspace and a public loopback client in it.
+   Apply twice issues no writes; a resource left by a failed run is **matched** by its converge
+   key, never duplicated (SSO-3089). **Nothing is written beside the file** (SSO-3715 / SSO-3717):
+   the apply's JSON document is kept under `$RUNNER_TEMP` and exposed as `apply-result`; a receipt
+   turning up next to the file fails the step (an older CLI),
+4. **exposes** `workspace-slug` / `environment` / `client-id` / `issuer` as outputs, read from the
+   apply's `resources[]` (kind / name / id / environment / action) — the `environment` row's slug,
+   the first `application` row's id — and the issuer from `thoryn whoami` as before, and
+5. **destroys on exit** (`thoryn provision destroy --file … --yes --output json`, `if: always()`,
    disable with `destroy: "false"`): child-first, owner-gated (SSO-3715) — the per-run loopback
-   client the CI identity created (and so owns) goes, `cli` (retained) and `cli-ci` (unowned —
-   CI is its manager, not its owner) survive; the standing workspace is never touched,
+   client the CI identity created (and so owns) goes; `cli` and `cli-ci` are `retain: true` and are
+   shown as `retained by the file`; the standing workspace is never touched. The destroy's JSON
+   document (`{destroyed, removed[], skipped[]}`) is exposed as `destroy-result`, and
+   `provision-e2e.yml` **asserts** from it that exactly `application/loopback-rp` was removed and
+   that `application/cli` + `environment/ci` were retained (SSO-3717 — the ADR's dogfood check,
+   run rather than reasoned),
 6. **names its fix when it fails** (SSO-3710): the Action resolves one path for the CLI's fix request
    (the `fix-request` input, default `$RUNNER_TEMP/thoryn-provision-request.json`), hands it to the
    sign-in and the apply steps through `THORYN_FIX_REQUEST`, and exposes it as the `fix-request`

@@ -43,9 +43,9 @@ class CiProvisionFileConformanceTest {
         assertThat(rp.spec["clientType"]).isEqualTo("public")
         assertThat(rp.spec["redirectUris"]).isEqualTo(listOf("http://127.0.0.1/callback"))
         // SSO-3104 / SSO-3690 — the production plane holds exactly ONE resource: the CLI's own login client
-        // (adopted, never deleted, by every apply whose receipt does not own it). The CI identity that signs
-        // those applies in is a workload identity trust — a product resource a founder creates once, not a
-        // declared application.
+        // (owned by the CI identity, `retain: true` — never removed; see the retain test below). The CI identity
+        // that signs those applies in is a workload identity trust — a product resource a founder creates once,
+        // not a declared application.
         val production = file.resources.filter { it.kind != ProvisionFile.KIND_ENVIRONMENT && it.environment == null }
         assertThat(production.map { it.key }).containsExactly("application/cli")
         val cli = production.single()
@@ -201,6 +201,27 @@ class CiProvisionFileConformanceTest {
         assertThat(connection.scopes.toSet())
             .withFailMessage("connection.json requests %s but converging provision.yaml needs exactly %s", connection.scopes, needed)
             .isEqualTo(needed)
+    }
+
+    /**
+     * SSO-3717 (oauthy ADR 2026-10-15 platform-is-the-ledger §1 / §6) — the platform is the ledger and `destroy` is
+     * owner-gated, so the FILE must say what stays: `cli` (the CLI's own login client — owned by the CI identity, which
+     * is exactly why an owner-gated destroy WOULD remove it) and the long-lived `ci` sandbox are `retain: true`; the
+     * per-run `loopback-rp` is not — it is the ONE resource `provision-e2e`'s destroy removes, and that workflow
+     * asserts it from `destroy --output json`. A `retain` that leaves `cli` is the one way CI could delete the
+     * client every `thoryn login` signs in with.
+     */
+    @Test
+    fun `the login client and the sandbox are retained — the loopback client is the one resource destroy removes`() {
+        assertThat(file.resources.single { it.key == "application/cli" }.retain)
+            .withFailMessage("application/cli must be `retain: true` — an owner-gated destroy by the CI identity (its owner) would otherwise remove the CLI's login client (SSO-3717)").isTrue()
+        assertThat(file.environmentResource("ci")!!.retain)
+            .withFailMessage("environment/ci must be `retain: true` — the sandbox is a long-lived fixture the file declares to stay (SSO-3717)").isTrue()
+        assertThat(file.resources.single { it.key == "application/loopback-rp" }.retain)
+            .withFailMessage("application/loopback-rp is the per-run fixture provision-e2e's destroy removes — it must not be retained").isFalse()
+        assertThat(file.resources.filter { it.retain }.map { it.key }).containsExactlyInAnyOrder("application/cli", "environment/ci")
+        // `retain` and `readOnly` are different statements (mine-keep vs. not-mine); neither resource is a reference.
+        assertThat(file.resources.filter { it.retain }.map { it.readOnly }).containsOnly(false)
     }
 
     companion object {
