@@ -1,7 +1,7 @@
 package com.devnow.thoryn.cli.cmd.provision
 
 import com.devnow.thoryn.provision.ProvisionException
-import com.devnow.thoryn.provision.ProvisionReceipt
+import com.devnow.thoryn.provision.ApplyResult
 import com.devnow.thoryn.provision.ProvisionEngine
 import com.devnow.thoryn.provision.ProvisionFile
 import com.devnow.thoryn.cli.api.ProductApiClient
@@ -75,44 +75,42 @@ class ProvisionEngineSecretsTest : CommandTestBase() {
     )
 
     @Test
-    fun `a minted client secret leaves ONLY through the sink — never the receipt, the plan, or the console`() {
+    fun `a minted client secret leaves ONLY through the sink — never the apply output, the plan, or the console`() {
         val console = ByteArrayOutputStream()
         val captured = mutableListOf<Pair<String, String>>()
         val engine = engine(emptyMap(), PrintStream(console), ProvisionEngine.SecretSink { id, secret -> captured += id to secret; true })
-        val plan = engine.plan(confidentialApp, null, false)
+        val plan = engine.plan(confidentialApp, false)
         assertThat(plan.changes[0].reason).contains("(a client secret will be minted and shown once)")
         assertThat(plan.changes[1].reason).doesNotContain("minted") // public: no secret
-        val persisted = mutableListOf<ProvisionReceipt>()
-        val receipt = engine.apply(confidentialApp, null, plan, "acme", null) { persisted += it }
+        val receipt = engine.apply(confidentialApp, plan, "acme", null)
 
         val clientId = receipt.resources[0].id
         val secret = api.mintedSecrets.getValue(clientId)
         assertThat(captured).containsExactly(clientId to secret) // exactly once, the confidential client only
         assertThat(engine.undeliveredSecrets).isEmpty()
         val mapper = jacksonObjectMapper()
-        assertThat(mapper.writeValueAsString(receipt)).doesNotContain(secret)
-        assertThat(persisted.map { mapper.writeValueAsString(it) }).noneMatch { it.contains(secret) }
+        assertThat(mapper.writeValueAsString(receipt.toStructured())).doesNotContain(secret)
         assertThat(mapper.writeValueAsString(plan.toStructured())).doesNotContain(secret)
         assertThat(console.toString()).doesNotContain(secret).contains("client secret minted — shown once")
         assertThat(receipt.resources.map { it.key }).containsExactly("application/ci-worker", "application/spa")
     }
 
     @Test
-    fun `an undeliverable secret still records the resource and names the client for rotate-secret`() {
+    fun `an undeliverable secret still leaves the resource in place and names the client for rotate-secret`() {
         val console = ByteArrayOutputStream()
         val engine = engine(emptyMap(), PrintStream(console)) // default sink: delivers nothing
-        val receipt = engine.apply(confidentialApp, null, engine.plan(confidentialApp, null, false), "acme", null) {}
+        val receipt = engine.apply(confidentialApp, engine.plan(confidentialApp, false), "acme", null)
 
         val clientId = receipt.resources[0].id
         assertThat(engine.undeliveredSecrets).containsExactly(clientId)
-        assertThat(receipt.resources[0].id).isEqualTo(api.applications[0]["clientId"]) // exists + owned
+        assertThat(receipt.resources[0].id).isEqualTo(api.applications[0]["clientId"]) // exists
         assertThat(console.toString())
             .contains("could NOT be delivered")
             .contains("thoryn clients rotate-secret $clientId")
             .doesNotContain(api.mintedSecrets.getValue(clientId))
         // A later apply that creates nothing reports nothing undelivered.
         api.reset()
-        engine.apply(confidentialApp, receipt, engine.plan(confidentialApp, receipt, false), "acme", null) {}
+        engine.apply(confidentialApp, engine.plan(confidentialApp, false), "acme", null)
         assertThat(engine.undeliveredSecrets).isEmpty()
         assertThat(api.writes).isEmpty()
     }
@@ -124,19 +122,16 @@ class ProvisionEngineSecretsTest : CommandTestBase() {
             mapOf("TEST_USER_EMAIL" to "t@example.com", "TEST_USER_PASSWORD" to "Sup3r-Secret!", "SMTP_PASSWORD" to "smtp-s3cret"),
             PrintStream(console),
         )
-        val plan = engine.plan(file, receipt = null, prune = false)
-        val persisted = mutableListOf<ProvisionReceipt>()
-        val receipt = engine.apply(file, null, plan, workspace = "acme", confirmSlug = null) { persisted += it }
+        val plan = engine.plan(file, prune = false)
+        val receipt = engine.apply(file, plan, workspace = "acme", confirmSlug = null)
 
         val userBody = api.writes.first { it.path == "/api/v1/users" }.body
         assertThat(userBody).containsEntry("password", "Sup3r-Secret!").containsEntry("email", "t@example.com").doesNotContainKey("passwordEnv")
         val smtpBody = api.writes.first { it.path == "/api/v1/email-provider" }.body
         assertThat(smtpBody).containsEntry("smtpPassword", "smtp-s3cret").containsEntry("smtpPort", 2525).containsEntry("enabled", true)
 
-        val serialised = jacksonObjectMapper().writeValueAsString(receipt)
+        val serialised = jacksonObjectMapper().writeValueAsString(receipt.toStructured())
         assertThat(serialised).doesNotContain("Sup3r-Secret!").doesNotContain("smtp-s3cret")
-        assertThat(persisted).isNotEmpty
-        assertThat(persisted.map { jacksonObjectMapper().writeValueAsString(it) }).noneMatch { it.contains("s3cret") || it.contains("Secret!") }
         assertThat(console.toString()).doesNotContain("Sup3r-Secret!").doesNotContain("smtp-s3cret")
         assertThat(receipt.resources.map { it.key }).containsExactly("user/tester", "emailProvider/emailProvider")
         assertThat(receipt.resources[1].attributes).containsEntry("configVersion", "1").doesNotContainKey("smtpPassword")
@@ -145,8 +140,8 @@ class ProvisionEngineSecretsTest : CommandTestBase() {
     @Test
     fun `an unset secret env var fails closed before any write`() {
         val engine = engine(mapOf("TEST_USER_EMAIL" to "t@example.com"))
-        val plan = engine.plan(file, null, false)
-        assertThatThrownBy { engine.apply(file, null, plan, "acme", null) {} }
+        val plan = engine.plan(file, false)
+        assertThatThrownBy { engine.apply(file, plan, "acme", null) }
             .isInstanceOf(ProvisionException::class.java)
             .hasMessageContaining("TEST_USER_PASSWORD")
             .hasMessageContaining("not set")

@@ -92,7 +92,7 @@ class ProvisionEnvironmentPlaceholderTest : CommandTestBase() {
             out = PrintStream(console), err = PrintStream(console),
             env = { env[it] },
         )
-        val receipt = engine.apply(f, null, engine.plan(f, null, false), "acme", null) {}
+        val receipt = engine.apply(f, engine.plan(f, false), "acme", null)
         assertThat(api.writes.map { it.method + " " + it.path + " @" + it.env }).containsExactly(
             "POST /api/v1/applications @dev",
             "POST /api/v1/users @dev",

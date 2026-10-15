@@ -244,9 +244,26 @@ class ProvisionSchemaConformanceTest {
         val readOnly = schema["\$defs"]["resource"]["properties"][ProvisionFile.READ_ONLY]
         assertThat(readOnly["type"].asString()).isEqualTo("boolean")
         assertThat(readOnly["default"].asBoolean()).isFalse()
-        val exclusion = schema["\$defs"]["resource"]["allOf"].toList().last()
-        assertThat(exclusion["if"]["properties"][ProvisionFile.READ_ONLY]["const"].asBoolean()).isTrue()
-        assertThat(exclusion["then"]["not"]["required"].toList().map { it.asString() }).containsExactly("grants")
+        // The read-only exclusions the schema pins: `grants` (SSO-3659) and, SSO-3715, `retain` (a reference is never removed anyway).
+        val exclusions = schema["\$defs"]["resource"]["allOf"].toList()
+            .filter { it["if"]["properties"]?.get(ProvisionFile.READ_ONLY)?.get("const")?.asBoolean() == true && it["then"]["not"]?.get("required") != null }
+            .map { it["then"]["not"]["required"].toList().single().asString() }
+        assertThat(exclusions).contains("grants", ProvisionFile.RETAIN)
+        // SSO-3715 — `retain` is a boolean, refused with readOnly by the loader too.
+        val retain = schema["\$defs"]["resource"]["properties"][ProvisionFile.RETAIN]
+        assertThat(retain["type"].asString()).isEqualTo("boolean")
+        assertThat(retain["default"].asBoolean()).isFalse()
+        val both = yaml.readTree(
+            """
+            apiVersion: thoryn.io/provision/v1
+            resources:
+              - { kind: application, name: a, readOnly: true, retain: true, spec: { displayName: a } }
+              - { kind: application, name: b, retain: "yes", spec: { displayName: b } }
+            """.trimIndent(),
+        )
+        val rv = ProvisionFile.validate(both)
+        assertThat(rv).anyMatch { it.contains("resources[0]") && it.contains("read-only reference cannot carry 'retain'") }
+        assertThat(rv).anyMatch { it.contains("resources[1] retain must be true or false") }
     }
 
     @Test

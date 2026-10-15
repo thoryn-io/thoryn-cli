@@ -2,11 +2,9 @@ package com.devnow.thoryn.cli.cmd.provision
 
 import com.devnow.thoryn.provision.ChangeAction
 import com.devnow.thoryn.provision.ProvisionException
-import com.devnow.thoryn.provision.OwnedResource
 import com.devnow.thoryn.provision.ProvisionEngine
-import com.devnow.thoryn.provision.ProvisionFileRef
 import com.devnow.thoryn.provision.ProvisionFile
-import com.devnow.thoryn.provision.ProvisionReceipt
+import com.devnow.thoryn.provision.ApplyResult
 import com.devnow.thoryn.cli.api.ProductApiClient
 import com.devnow.thoryn.cli.auth.Tokens
 import com.devnow.thoryn.cli.cmd.CommandTestBase
@@ -28,8 +26,8 @@ import java.io.PrintStream
  * reference (any diff is `access_read_only`, declared without `readOnly` is `access_read_only` naming the
  * fix); none ⇒ `access_not_owned`; a create ⇒ `manager` on the parent (checked on the parent object), no grant
  * step; a resource the PLATFORM says another identity owns (its `owner` relation) ⇒ `access_owned_elsewhere`,
- * naming no subject. A plan with an error is refused WHOLE by `apply`. The receipt records the owner the
- * platform reported next to the applying subject.
+ * naming no subject. A plan with an error is refused WHOLE by `apply`. SSO-3715 — the owner the platform
+ * reports rides on each plan row and on `apply --output json`; there is no receipt.
  */
 class ProvisionOwnershipTest : CommandTestBase() {
 
@@ -59,9 +57,9 @@ class ProvisionOwnershipTest : CommandTestBase() {
 
     private fun file(yaml: String) = ProvisionFile.parse(yaml.trimIndent().toByteArray(), "provision.yaml")
 
-    private fun apply(f: ProvisionFile, receipt: ProvisionReceipt?, persist: (ProvisionReceipt) -> Unit = {}): ProvisionReceipt {
+    private fun apply(f: ProvisionFile): ApplyResult {
         val e = engine()
-        return e.apply(f, receipt, e.plan(f, receipt, false), "acme", null, persist)
+        return e.apply(f, e.plan(f, false), "acme", null)
     }
 
     private fun writes() = api.writes.map { it.method + " " + it.path }
@@ -85,19 +83,18 @@ class ProvisionOwnershipTest : CommandTestBase() {
                 spec: { clientId: rp, displayName: "RP", redirectUris: ["http://127.0.0.1/callback"] }
             """.trimIndent().prependIndent("  "),
         )
-        val plan = engine().plan(f, null, false)
+        val plan = engine().plan(f, false)
         val byKey = plan.changes.associateBy { "${it.kind}/${it.name}" }
         assertThat(plan.hasErrors).isFalse()
-        assertThat(byKey.getValue("environment/ci").action).isEqualTo(ChangeAction.ADOPT)
+        assertThat(byKey.getValue("environment/ci").action).isEqualTo(ChangeAction.NOOP)
         assertThat(byKey.getValue("environment/ci").access).isEqualTo("manager")
         assertThat(byKey.getValue("application/rp").action).isEqualTo(ChangeAction.UPDATE)
         assertThat(byKey.getValue("application/rp").access).isEqualTo("manager")
         assertThat(byKey.getValue("application/rp").diff.keys).containsExactly("redirectUris")
 
-        val receipt = apply(f, null)
+        val result = apply(f)
         assertThat(writes()).containsExactly("PATCH /api/v1/applications/rp")
-        assertThat(receipt.subject).isEqualTo("client:repo")
-        assertThat(receipt.resources.map { it.key }).containsExactly("environment/ci", "application/rp")
+        assertThat(result.resources.map { it.key to it.action }).containsExactly("environment/ci" to ChangeAction.NOOP, "application/rp" to ChangeAction.UPDATE)
         // The reach was read from the platform graph, workspace-level (no environment header), nothing else was written.
         assertThat(api.writes.map { it.path }).noneMatch { it.startsWith("/api/v1/access") }
         // SSO-3673 — asked PER OBJECT (`manager` on each live object), not per type: no `/access/mine` listing at all.
@@ -118,7 +115,7 @@ class ProvisionOwnershipTest : CommandTestBase() {
                 spec: { clientId: shared, displayName: "Shared", redirectUris: ["https://shared.example.com/other"] }
             """,
         )
-        val plan = engine().plan(f, null, false)
+        val plan = engine().plan(f, false)
         val change = plan.changes.single()
         assertThat(change.action).isEqualTo(ChangeAction.ERROR)
         assertThat(change.error).isEqualTo(ProvisionEngine.ERROR_READ_ONLY)
@@ -126,17 +123,15 @@ class ProvisionOwnershipTest : CommandTestBase() {
         assertThat(change.readOnly).isTrue()
         assertThat(change.reason).contains("access_read_only").contains("redirectUris")
         assertThat(plan.hasErrors).isTrue()
-        assertThat(plan.toStructured()["summary"]).isEqualTo(mapOf("create" to 0, "update" to 0, "adopt" to 0, "remove" to 0, "noop" to 0, "skip" to 0, "grants" to 0, "error" to 1, "publish" to 0, "deliver" to 0))
+        assertThat(plan.toStructured()["summary"]).isEqualTo(mapOf("create" to 0, "update" to 0, "remove" to 0, "noop" to 0, "skip" to 0, "grants" to 0, "error" to 1, "publish" to 0, "deliver" to 0))
         assertThat(change.toStructured()).containsEntry("error", "access_read_only").containsEntry("access", "viewer").containsEntry("readOnly", true)
 
-        val persisted = mutableListOf<ProvisionReceipt>()
         val e = engine()
-        assertThatThrownBy { e.apply(f, null, plan, "acme", null) { persisted += it } }
+        assertThatThrownBy { e.apply(f, plan, "acme", null) }
             .isInstanceOf(ProvisionException::class.java)
             .hasMessageContaining("nothing was written")
             .hasMessageContaining("application shared")
         assertThat(api.writes).isEmpty()
-        assertThat(persisted).isEmpty()
     }
 
     @Test
@@ -150,7 +145,7 @@ class ProvisionOwnershipTest : CommandTestBase() {
                 spec: { clientId: shared, displayName: "Shared", redirectUris: ["https://shared.example.com/cb"] }
             """,
         )
-        val change = engine().plan(f, null, false).changes.single()
+        val change = engine().plan(f, false).changes.single()
         assertThat(change.action).isEqualTo(ChangeAction.ERROR)
         assertThat(change.error).isEqualTo(ProvisionEngine.ERROR_READ_ONLY)
         assertThat(change.access).isEqualTo("viewer")
@@ -159,7 +154,7 @@ class ProvisionOwnershipTest : CommandTestBase() {
     }
 
     @Test
-    fun `a viewer resource declared readOnly that matches is a no-op reference — never owned, and a stale receipt entry is dropped without a delete`() {
+    fun `a viewer resource declared readOnly that matches is a no-op reference — never owned, never in the apply output`() {
         val f = file(
             """
             apiVersion: thoryn.io/provision/v1
@@ -170,30 +165,23 @@ class ProvisionOwnershipTest : CommandTestBase() {
                 spec: { clientId: shared, displayName: "Shared", redirectUris: ["https://shared.example.com/cb"] }
             """,
         )
-        val plan = engine().plan(f, null, false)
+        val plan = engine().plan(f, false)
         val change = plan.changes.single()
         assertThat(change.action).isEqualTo(ChangeAction.NOOP)
         assertThat(change.readOnly).isTrue()
         assertThat(change.access).isEqualTo("viewer")
-        assertThat(change.adopted).isFalse()
         assertThat(change.reason).contains("read-only reference (viewer)")
         assertThat(plan.hasChanges).isFalse()
         assertThat(plan.hasErrors).isFalse()
 
-        val receipt = apply(f, null)
+        val result = apply(f)
         assertThat(api.writes).isEmpty()
-        assertThat(receipt.resources).isEmpty()
-
-        // A receipt from before the file said `readOnly` still owns it: the entry is disowned, the client stays.
-        val stale = ProvisionReceipt(
-            file = ProvisionFileRef("provision.yaml", "sha256:old"), appliedAt = "2026-10-01T00:00:00Z", subject = "client:repo",
-            resources = listOf(OwnedResource("application", "shared", "shared", null)),
-        )
-        val after = apply(f, stale)
-        assertThat(api.writes).isEmpty()
-        assertThat(after.resources).isEmpty()
+        assertThat(result.resources).isEmpty()
         assertThat(api.applications.map { it["clientId"] }).contains("shared")
-        assertThat(console.toString()).contains("dropped from the receipt")
+        // SSO-3715 — and `destroy` never reaches for it: a reference is not this file's to remove.
+        val destroy = engine().planDestroy(f).changes.single()
+        assertThat(destroy.action).isEqualTo(ChangeAction.SKIP)
+        assertThat(destroy.reason).contains("read-only reference")
     }
 
     @Test
@@ -207,7 +195,7 @@ class ProvisionOwnershipTest : CommandTestBase() {
                 spec: { clientId: foreign, displayName: "Foreign", redirectUris: ["https://foreign.example.com/cb"] }
             """,
         )
-        val change = engine().plan(owned, null, false).changes.single()
+        val change = engine().plan(owned, false).changes.single()
         assertThat(change.action).isEqualTo(ChangeAction.ERROR)
         assertThat(change.error).isEqualTo(ProvisionEngine.ERROR_NOT_OWNED)
         assertThat(change.access).isEqualTo("none")
@@ -223,7 +211,7 @@ class ProvisionOwnershipTest : CommandTestBase() {
                 spec: { clientId: foreign, displayName: "Foreign", redirectUris: ["https://foreign.example.com/cb"] }
             """,
         )
-        val ref = engine().plan(reference, null, false).changes.single()
+        val ref = engine().plan(reference, false).changes.single()
         assertThat(ref.action).isEqualTo(ChangeAction.ERROR)
         assertThat(ref.error).isEqualTo(ProvisionEngine.ERROR_NOT_OWNED)
         assertThat(ref.readOnly).isTrue()
@@ -239,16 +227,16 @@ class ProvisionOwnershipTest : CommandTestBase() {
                 spec: { email: tester@example.com, emailVerified: true }
             """.trimIndent().prependIndent("  "),
         )
-        val plan = engine().plan(f, null, false)
+        val plan = engine().plan(f, false)
         val user = plan.changes.single { it.kind == "user" }
         assertThat(user.action).isEqualTo(ChangeAction.CREATE)
         assertThat(user.access).isEqualTo("manager")
         assertThat(plan.hasErrors).isFalse()
 
-        val receipt = apply(f, null)
+        val result = apply(f)
         assertThat(writes()).containsExactly("POST /api/v1/users")
         assertThat(api.writes.single().env).isEqualTo("ci-sbx")
-        assertThat(receipt.resources.map { it.key to it.adopted }).containsExactly("environment/ci" to true, "user/tester" to false)
+        assertThat(result.resources.map { it.key to it.action }).containsExactly("environment/ci" to ChangeAction.NOOP, "user/tester" to ChangeAction.CREATE)
         // SSO-3673 — the create was gated by a forward check on the PARENT object, not by a per-type listing.
         assertThat(api.checksOn("environment:$envId")).contains("manager")
         assertThat(api.mineReads).isEmpty()
@@ -273,7 +261,7 @@ class ProvisionOwnershipTest : CommandTestBase() {
                 spec: { slug: fresh-sbx }
             """,
         )
-        val plan = engine().plan(f, null, false)
+        val plan = engine().plan(f, false)
         val byKey = plan.changes.associateBy { "${it.kind}/${it.name}" }
         assertThat(byKey.getValue("application/web").error).isEqualTo(ProvisionEngine.ERROR_NOT_OWNED)
         assertThat(byKey.getValue("application/web").reason).contains("workspace:${api.tenantId}")
@@ -281,7 +269,7 @@ class ProvisionOwnershipTest : CommandTestBase() {
         assertThat(byKey.getValue("user/intruder").reason).contains("environment:$otherEnv")
         assertThat(byKey.getValue("environment/fresh").error).isEqualTo(ProvisionEngine.ERROR_NOT_OWNED)
         assertThat(plan.errors).hasSize(3)
-        assertThatThrownBy { engine().apply(f, null, plan, "acme", null) {} }.hasMessageContaining("3 resource(s) failed the ownership check")
+        assertThatThrownBy { engine().apply(f, plan, "acme", null) }.hasMessageContaining("3 resource(s) failed the ownership check")
         assertThat(api.writes).isEmpty()
         // SSO-3673 — the production-plane and environment creates asked the platform about THE workspace object.
         assertThat(api.checksOn("workspace:${api.tenantId}")).contains("manager")
@@ -289,7 +277,7 @@ class ProvisionOwnershipTest : CommandTestBase() {
 
         // The same file, as a workspace admin: every create is allowed (the parent of all three is the workspace / its sandbox).
         api.callerIsAdmin = true
-        assertThat(engine().plan(f, null, false).hasErrors).isFalse()
+        assertThat(engine().plan(f, false).hasErrors).isFalse()
     }
 
     @Test
@@ -309,10 +297,10 @@ class ProvisionOwnershipTest : CommandTestBase() {
                 spec: { displayName: "RP2", clientType: public, redirectUris: ["http://127.0.0.1/callback"] }
             """,
         )
-        val plan = engine().plan(f, null, false)
+        val plan = engine().plan(f, false)
         assertThat(plan.hasErrors).isFalse()
         assertThat(plan.changes.map { it.action to it.access }).containsExactly(ChangeAction.CREATE to "manager", ChangeAction.CREATE to "manager")
-        apply(f, null)
+        apply(f)
         assertThat(writes()).containsExactly("POST /api/v1/environments", "POST /api/v1/applications")
     }
 
@@ -328,7 +316,7 @@ class ProvisionOwnershipTest : CommandTestBase() {
                 spec: { clientId: rp, displayName: "RP", redirectUris: ["http://127.0.0.1/callback"] }
             """.trimIndent().prependIndent("  "),
         )
-        val refused = engine().plan(f, null, false).changes.single { it.kind == "application" }
+        val refused = engine().plan(f, false).changes.single { it.kind == "application" }
         assertThat(refused.action).isEqualTo(ChangeAction.ERROR)
         assertThat(refused.error).isEqualTo(ProvisionEngine.ERROR_OWNED_ELSEWHERE)
         assertThat(refused.access).isEqualTo("manager")
@@ -337,7 +325,7 @@ class ProvisionOwnershipTest : CommandTestBase() {
         // No oracle: the plan's wording never echoes the other subject.
         assertThat(refused.reason).doesNotContain("wi_other")
         assertThat(api.checksOn("application:rp")).contains("owner")
-        assertThatThrownBy { apply(f, null) }.isInstanceOf(ProvisionException::class.java).hasMessageContaining("access_owned_elsewhere")
+        assertThatThrownBy { apply(f) }.isInstanceOf(ProvisionException::class.java).hasMessageContaining("access_owned_elsewhere")
         assertThat(api.writes).isEmpty()
 
         // Declared readOnly and matching what is live ⇒ a reference, allowed next to the owning repository.
@@ -350,12 +338,12 @@ class ProvisionOwnershipTest : CommandTestBase() {
                 spec: { clientId: rp, displayName: "RP", redirectUris: ["http://127.0.0.1/old"] }
             """.trimIndent().prependIndent("  "),
         )
-        val ref = engine().plan(reference, null, false).changes.single { it.kind == "application" }
+        val ref = engine().plan(reference, false).changes.single { it.kind == "application" }
         assertThat(ref.action).isEqualTo(ChangeAction.NOOP)
         assertThat(ref.readOnly).isTrue()
 
         // The owner itself (`owner` implies `manager` on the model — it holds nothing else, not even on the sandbox)
-        // converges the client it owns, and its receipt records the owner.
+        // converges the client it owns, and the apply output carries the owner.
         api.caller = "client:wi_other"
         val owner = engine(subject = "client:wi_other")
         val ownersFile = file(
@@ -368,21 +356,20 @@ class ProvisionOwnershipTest : CommandTestBase() {
                 spec: { clientId: rp, displayName: "RP", redirectUris: ["http://127.0.0.1/callback"] }
             """,
         )
-        val ownerPlan = owner.plan(ownersFile, null, false)
+        val ownerPlan = owner.plan(ownersFile, false)
         assertThat(ownerPlan.hasErrors).isFalse()
         val app = ownerPlan.changes.single { it.kind == "application" }
         assertThat(app.action).isEqualTo(ChangeAction.UPDATE)
         assertThat(app.owner).isEqualTo("client:wi_other")
         // `manager` first (allowed through `owner`), then — because the live object has an owner — "is it me?": yes.
         assertThat(api.checksOn("application:rp").takeLast(2)).containsExactly("manager", "owner")
-        val receipt = owner.apply(ownersFile, null, ownerPlan, "acme", null) {}
+        val result = owner.apply(ownersFile, ownerPlan, "acme", null)
         assertThat(writes()).containsExactly("PATCH /api/v1/applications/rp")
-        assertThat(receipt.subject).isEqualTo("client:wi_other")
-        assertThat(receipt.resources.single { it.kind == "application" }.owner).isEqualTo("client:wi_other")
+        assertThat(result.resources.single { it.kind == "application" }.owner).isEqualTo("client:wi_other")
     }
 
     @Test
-    fun `an unowned resource converges and the receipt records the owner the platform reports — null, then the owner an admin sets, then the creator on a create`() {
+    fun `an unowned resource converges and the apply output carries the owner the platform reports — null, then the owner an admin sets, then the creator on a create`() {
         val f = file(
             managedEnv + "\n" + """
               - kind: application
@@ -395,7 +382,7 @@ class ProvisionOwnershipTest : CommandTestBase() {
                 spec: { displayName: "Fresh", clientType: public, redirectUris: ["http://127.0.0.1/fresh"] }
             """.trimIndent().prependIndent("  "),
         )
-        val first = apply(f, null)
+        val first = apply(f)
         val byKey = first.resources.associateBy { it.key }
         // Nobody owns `rp` (a person created it): recorded as such; no owner check was needed for it.
         assertThat(byKey.getValue("application/rp").owner).isNull()
@@ -408,10 +395,10 @@ class ProvisionOwnershipTest : CommandTestBase() {
         // A workspace admin makes this repository the owner of `rp`: the next (no-op) apply records what the platform reports.
         api.seedGrant("client:repo", "owner", "application:rp")
         api.reset()
-        val second = apply(f, first)
+        val second = apply(f)
         assertThat(api.writes).isEmpty()
         assertThat(second.resources.single { it.key == "application/rp" }.owner).isEqualTo("client:repo")
-        assertThat(second.resources.single { it.key == "application/rp" }.adopted).isTrue()
+        assertThat(second.resources.single { it.key == "application/rp" }.action).isEqualTo(ChangeAction.NOOP)
     }
 
     @Test
@@ -432,7 +419,7 @@ class ProvisionOwnershipTest : CommandTestBase() {
     @Test
     fun `a session that cannot check its own access fails closed naming tenant access read — before any resource is probed for writes`() {
         api.denyGrantReads = true
-        assertThatThrownBy { engine().plan(file(managedEnv), null, false) }
+        assertThatThrownBy { engine().plan(file(managedEnv), false) }
             .isInstanceOf(ProvisionException::class.java)
             .hasMessageContaining("POST /api/v1/access/check")
             .hasMessageContaining("tenant:access.read")

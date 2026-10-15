@@ -150,20 +150,19 @@ class ExamplesApplyShareTest : CommandTestBase() {
         val receipt = ReceiptStore().read("sandbox-demo")!!
         assertThat(receipt.resources.map { it.kind }).containsExactly("environment", "application", "loginMethods")
         assertThat(receipt.verify).allMatch { it.passed }
-        assertThat(ExampleStateStore().provisionReceiptPath("sandbox-demo").toFile()).exists()
 
         // A second apply is refused while the setup exists (unchanged guard) …
         assertThat(runCli("examples", "apply", "sandbox-demo", "--yes", "--hub", baseUrl(), "--gateway", baseUrl()).err).contains("teardown")
 
-        // … and teardown destroys what the provisioning file created, child-first (sandbox last).
+        // … and teardown destroys what the provisioning file declares and the founder may remove, child-first (sandbox last);
+        // SSO-3715 — the sign-in policy goes WITH its sandbox (the cascade), no reset call of its own.
         api.reset()
         val down = runCli("examples", "teardown", "sandbox-demo", "--hub", baseUrl(), "--gateway", baseUrl())
         assertThat(down.exit).isEqualTo(0)
         assertThat(api.provisioningWrites.map { it.method + " " + it.path }).containsExactly(
-            "DELETE /api/v1/login-methods", "DELETE /api/v1/applications/${receipt.resources[1].id}", "DELETE /api/v1/environments/${receipt.resources[0].id}",
+            "DELETE /api/v1/applications/${receipt.resources[1].id}", "DELETE /api/v1/environments/${receipt.resources[0].id}",
         )
         assertThat(api.environments).isEmpty()
-        assertThat(ExampleStateStore().provisionReceiptPath("sandbox-demo").toFile()).doesNotExist()
         assertThat(ReceiptStore().read("sandbox-demo")).isNull()
     }
 

@@ -7,8 +7,7 @@ import com.devnow.thoryn.provision.ChangeAction
 import com.devnow.thoryn.provision.ProvisionEngine
 import com.devnow.thoryn.provision.ProvisionException
 import com.devnow.thoryn.provision.ProvisionFile
-import com.devnow.thoryn.provision.ProvisionFileRef
-import com.devnow.thoryn.provision.ProvisionReceipt
+import com.devnow.thoryn.provision.ApplyResult
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.assertThatThrownBy
 import org.junit.jupiter.api.BeforeEach
@@ -41,8 +40,8 @@ class ProvisionWorkloadIdentityPlanProfileTest : CommandTestBase() {
 
     private fun file(yaml: String) = ProvisionFile.parse(yaml.trimIndent().toByteArray(), "provision.yaml")
 
-    private fun apply(f: ProvisionFile, receipt: ProvisionReceipt?, e: ProvisionEngine = engine()): ProvisionReceipt =
-        e.apply(f, receipt, e.plan(f, receipt, false), "acme", "acme") {}
+    private fun apply(f: ProvisionFile, e: ProvisionEngine = engine()): ApplyResult =
+        e.apply(f, e.plan(f, false), "acme", "acme")
 
     private val pins = mapOf("owner" to "thoryn-io", "repository" to "thoryn-cli", "ownerId" to 229451779L, "repositoryId" to 1361536515L, "environment" to "thoryn-provision-e2e", "ref" to "refs/heads/main", "githubHostedRunnersOnly" to true)
     private val sixScopes = listOf("tenant:environments.read", "tenant:environments.write", "tenant:applications.read", "tenant:applications.write", "tenant:access.read", "tenant:access.write")
@@ -64,8 +63,8 @@ class ProvisionWorkloadIdentityPlanProfileTest : CommandTestBase() {
     private val withExplicitPlan = trustYaml("plan: { environment: thoryn-provision-e2e-plan, scopes: [tenant:environments.read, tenant:access.read] }")
 
     @Test
-    fun `a declared plan profile rides on the create — scopes only when listed — and the receipt and connection document are the one-trust shape`() {
-        val receipt = apply(file(withDerivedPlan), null)
+    fun `a declared plan profile rides on the create — scopes only when listed — and the apply output and connection document are the one-trust shape`() {
+        val receipt = apply(file(withDerivedPlan))
         val post = api.writes.single { it.method == "POST" && it.path == "/api/v1/workload-identity/trusts" }
         @Suppress("UNCHECKED_CAST")
         assertThat(post.body["plan"] as Map<String, Any?>).containsEntry("environment", "thoryn-provision-e2e-plan").doesNotContainKey("scopes")
@@ -79,31 +78,31 @@ class ProvisionWorkloadIdentityPlanProfileTest : CommandTestBase() {
 
         // A second plan / apply is a no-op; the plan row names the profile.
         api.reset(); console.reset()
-        val again = engine().plan(file(withDerivedPlan), receipt, false)
+        val again = engine().plan(file(withDerivedPlan), false)
         assertThat(again.changes.single().action).isEqualTo(ChangeAction.NOOP)
         @Suppress("UNCHECKED_CAST")
         assertThat(again.changes.single().trust?.get("plan") as Map<String, Any?>).containsEntry("environment", "thoryn-provision-e2e-plan")
         assertThat(again.changes.single().trust?.get("subjectPatterns") as List<*>).hasSize(2)
-        apply(file(withDerivedPlan), receipt)
+        apply(file(withDerivedPlan))
         assertThat(api.writes.filter { it.method != "GET" }).isEmpty()
 
         // Explicit plan scopes are sent as declared.
         api.trusts.clear(); api.reset()
-        apply(file(withExplicitPlan), null)
+        apply(file(withExplicitPlan))
         @Suppress("UNCHECKED_CAST")
         assertThat(api.writes.single { it.method == "POST" && it.path == "/api/v1/workload-identity/trusts" }.body["plan"] as Map<String, Any?>)
             .containsEntry("scopes", listOf("tenant:environments.read", "tenant:access.read"))
     }
 
     @Test
-    fun `a declared plan profile on a live trust WITHOUT one is converged by the additive set-plan-profile call — the wi_ client stays, and the same receipt owns it`() {
+    fun `a declared plan profile on a live trust WITHOUT one is converged by the additive set-plan-profile call — the wi_ client stays`() {
         val id = api.seedTrust(null, "thoryn-cli-ci", pins = pins, scopes = sixScopes, clientId = "wi_10a7b379c79f7d1353f5798d")
-        // Adopt first without a plan block: the trust is owned, unchanged.
-        val adopted = apply(file(trustYaml(null)), null)
-        assertThat(adopted.resources.single().adopted).isTrue()
+        // First without a plan block: the live trust matches, unchanged.
+        val matched = apply(file(trustYaml(null)))
+        assertThat(matched.resources.single().action).isEqualTo(ChangeAction.NOOP)
         api.reset(); console.reset()
 
-        val plan = engine().plan(file(withDerivedPlan), adopted, false)
+        val plan = engine().plan(file(withDerivedPlan), false)
         val change = plan.changes.single()
         assertThat(change.action).isEqualTo(ChangeAction.UPDATE)
         assertThat(change.error).isNull()
@@ -111,32 +110,32 @@ class ProvisionWorkloadIdentityPlanProfileTest : CommandTestBase() {
         assertThat(change.reason).contains("adds the plan profile").contains("thoryn-provision-e2e-plan").contains("wi_10a7b379c79f7d1353f5798d stays")
         assertThat(plan.hasErrors).isFalse()
 
-        val receipt = engine().apply(file(withDerivedPlan), adopted, plan, "acme", "acme") {}
+        val receipt = engine().apply(file(withDerivedPlan), plan, "acme", "acme")
         val writes = api.writes.filter { it.method != "GET" }
         assertThat(writes.map { it.method + " " + it.path }).containsExactly("POST /api/v1/workload-identity/trusts/$id/plan-profile")
         assertThat(writes.single().body).containsEntry("environment", "thoryn-provision-e2e-plan").doesNotContainKey("scopes")
-        // The identity is untouched: same id, same wi_ client, still adopted (never deleted by destroy).
-        val owned = receipt.resources.single()
-        assertThat(owned.id).isEqualTo(id)
-        assertThat(owned.attributes[ProvisionEngine.ATTR_CLIENT_ID]).isEqualTo("wi_10a7b379c79f7d1353f5798d")
-        assertThat(owned.adopted).isTrue()
+        // The identity is untouched: same id, same wi_ client.
+        val updated = receipt.resources.single()
+        assertThat(updated.id).isEqualTo(id)
+        assertThat(updated.attributes[ProvisionEngine.ATTR_CLIENT_ID]).isEqualTo("wi_10a7b379c79f7d1353f5798d")
+        assertThat(updated.action).isEqualTo(ChangeAction.UPDATE)
         assertThat(api.trusts.single()["clientId"]).isEqualTo("wi_10a7b379c79f7d1353f5798d")
         assertThat(console.toString()).contains("~ workloadIdentityTrust thoryn-cli-ci: plan profile added").contains("wi_ client wi_10a7b379c79f7d1353f5798d unchanged")
 
         // Converged: the next plan is a no-op and the next apply writes nothing.
         api.reset()
-        assertThat(engine().plan(file(withDerivedPlan), receipt, false).changes.single().action).isEqualTo(ChangeAction.NOOP)
-        apply(file(withDerivedPlan), receipt)
+        assertThat(engine().plan(file(withDerivedPlan), false).changes.single().action).isEqualTo(ChangeAction.NOOP)
+        apply(file(withDerivedPlan))
         assertThat(api.writes.filter { it.method != "GET" }).isEmpty()
 
-        // The same additive convergence on an adopt (no receipt yet): plan says update-while-adopting, apply adds the profile.
+        // The same additive convergence on a trust this file never applied before: plan says exists — adds the profile.
         api.trusts.clear(); api.reset(); console.reset()
         api.seedTrust(null, "thoryn-cli-ci", pins = pins, scopes = sixScopes, clientId = "wi_fresh")
-        val adopting = engine().plan(file(withDerivedPlan), null, false).changes.single()
-        assertThat(adopting.action).isEqualTo(ChangeAction.UPDATE)
-        assertThat(adopting.reason).startsWith("exists (adopting)")
-        val fresh = apply(file(withDerivedPlan), null)
-        assertThat(fresh.resources.single().adopted).isTrue()
+        val existing = engine().plan(file(withDerivedPlan), false).changes.single()
+        assertThat(existing.action).isEqualTo(ChangeAction.UPDATE)
+        assertThat(existing.reason).startsWith("exists — adds the plan profile")
+        val fresh = apply(file(withDerivedPlan))
+        assertThat(fresh.resources.single().action).isEqualTo(ChangeAction.UPDATE)
         assertThat(api.writes.filter { it.method != "GET" }.map { it.path }).containsExactly("/api/v1/workload-identity/trusts/${api.trusts.single()["id"]}/plan-profile")
     }
 
@@ -144,26 +143,26 @@ class ProvisionWorkloadIdentityPlanProfileTest : CommandTestBase() {
     fun `a live plan profile that differs from the declared one is workload_identity_trust_immutable naming the re-create, and apply refuses whole`() {
         api.seedTrust(null, "thoryn-cli-ci", pins = pins, scopes = sixScopes, plan = mapOf("environment" to "another-plan", "scopes" to readScopes))
 
-        val plan = engine().plan(file(withDerivedPlan), null, false)
+        val plan = engine().plan(file(withDerivedPlan), false)
         val change = plan.changes.single()
         assertThat(change.action).isEqualTo(ChangeAction.ERROR)
         assertThat(change.error).isEqualTo(ProvisionEngine.ERROR_TRUST_IMMUTABLE)
         assertThat(change.diff).containsOnlyKeys("plan.environment")
         assertThat(change.diff["plan.environment"]).isEqualTo("another-plan → thoryn-provision-e2e-plan")
         assertThat(change.reason).contains("already carries a plan profile that differs").contains("re-create the trust")
-        assertThatThrownBy { engine().apply(file(withDerivedPlan), null, plan, "acme", "acme") {} }.isInstanceOf(ProvisionException::class.java).hasMessageContaining("nothing was written")
+        assertThatThrownBy { engine().apply(file(withDerivedPlan), plan, "acme", "acme") }.isInstanceOf(ProvisionException::class.java).hasMessageContaining("nothing was written")
         assertThat(api.writes.filter { it.method != "GET" }).isEmpty()
 
         // Explicit plan scopes that differ from the live profile's are a difference too.
         api.trusts.clear()
         api.seedTrust(null, "thoryn-cli-ci", pins = pins, scopes = sixScopes, plan = mapOf("environment" to "thoryn-provision-e2e-plan", "scopes" to readScopes))
-        val scopesDiffer = engine().plan(file(withExplicitPlan), null, false).changes.single()
+        val scopesDiffer = engine().plan(file(withExplicitPlan), false).changes.single()
         assertThat(scopesDiffer.action).isEqualTo(ChangeAction.ERROR)
         assertThat(scopesDiffer.diff).containsOnlyKeys("plan.scopes")
         // …while a derived declaration (no scopes listed) matches whatever the hub derived.
-        assertThat(engine().plan(file(withDerivedPlan), null, false).changes.single().action).isEqualTo(ChangeAction.ADOPT)
+        assertThat(engine().plan(file(withDerivedPlan), false).changes.single().action).isEqualTo(ChangeAction.NOOP)
         // And a file that declares no plan block does not compare the live one at all.
-        assertThat(engine().plan(file(trustYaml(null)), null, false).changes.single().action).isEqualTo(ChangeAction.ADOPT)
+        assertThat(engine().plan(file(trustYaml(null)), false).changes.single().action).isEqualTo(ChangeAction.NOOP)
     }
 
     @Test
@@ -203,18 +202,17 @@ class ProvisionWorkloadIdentityPlanProfileTest : CommandTestBase() {
             """,
         )
         val e = engine()
-        assertThatThrownBy { e.apply(f, null, e.plan(f, null, false), "acme", "acme") {} }.hasMessageContaining("scope_not_grantable")
+        assertThatThrownBy { e.apply(f, e.plan(f, false), "acme", "acme") }.hasMessageContaining("scope_not_grantable")
     }
 
     @Test
     fun `import renders a live plan profile with its scopes made explicit, and the rendered entry round-trips as a no-op`() {
         api.seedTrust(null, "thoryn-cli-ci", pins = pins, scopes = sixScopes, plan = mapOf("environment" to "thoryn-provision-e2e-plan", "scopes" to readScopes))
-        val result = engine().import(existing = null, receipt = null)
+        val result = engine().import(existing = null)
         val entry = result.resources.single { it.resource.kind == "workloadIdentityTrust" }
         assertThat(entry.resource.spec["plan"]).isEqualTo(mapOf("environment" to "thoryn-provision-e2e-plan", "scopes" to readScopes))
         val yaml = "apiVersion: thoryn.io/provision/v1\nresources:\n  - { kind: workloadIdentityTrust, name: thoryn-cli-ci, spec: ${tools.jackson.databind.json.JsonMapper.builder().build().writeValueAsString(entry.resource.spec)} }\n"
-        val receipt = ProvisionReceipt(file = ProvisionFileRef("provision.yaml", "sha256:x"), appliedAt = "now", resources = listOfNotNull(entry.owned))
-        assertThat(engine().plan(file(yaml), receipt, false).changes.single().action).isEqualTo(ChangeAction.NOOP)
+        assertThat(engine().plan(file(yaml), false).changes.single().action).isEqualTo(ChangeAction.NOOP)
     }
 
     @Test
@@ -235,7 +233,7 @@ class ProvisionWorkloadIdentityPlanProfileTest : CommandTestBase() {
         )
 
         api.caller = "client:wi_10a7b379c79f7d1353f5798d"
-        val ownerPlan = engine(callerScopes = readScopes.toSet(), subject = "client:wi_10a7b379c79f7d1353f5798d").plan(f, null, false)
+        val ownerPlan = engine(callerScopes = readScopes.toSet(), subject = "client:wi_10a7b379c79f7d1353f5798d").plan(f, false)
         assertThat(ownerPlan.hasErrors).isFalse()
         val mine = ownerPlan.changes.single()
         assertThat(mine.action).isEqualTo(ChangeAction.UPDATE)
@@ -249,12 +247,12 @@ class ProvisionWorkloadIdentityPlanProfileTest : CommandTestBase() {
         api.caller = "client:wi_other"
         api.seedGrant("client:wi_other", "manager", "application:cli")
         val foreign = engine(subject = "client:wi_other")
-        val foreignPlan = foreign.plan(f, null, false)
+        val foreignPlan = foreign.plan(f, false)
         val refused = foreignPlan.changes.single()
         assertThat(refused.action).isEqualTo(ChangeAction.ERROR)
         assertThat(refused.error).isEqualTo(ProvisionEngine.ERROR_OWNED_ELSEWHERE)
         assertThat(refused.reason).doesNotContain("wi_10a7b379c79f7d1353f5798d")
-        assertThatThrownBy { foreign.apply(f, null, foreignPlan, "acme", "acme") {} }.isInstanceOf(ProvisionException::class.java).hasMessageContaining(ProvisionEngine.ERROR_OWNED_ELSEWHERE)
+        assertThatThrownBy { foreign.apply(f, foreignPlan, "acme", "acme") }.isInstanceOf(ProvisionException::class.java).hasMessageContaining(ProvisionEngine.ERROR_OWNED_ELSEWHERE)
         assertThat(api.writes).isEmpty()
     }
 }

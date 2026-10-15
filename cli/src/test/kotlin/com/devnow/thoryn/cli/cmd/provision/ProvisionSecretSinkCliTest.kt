@@ -2,7 +2,6 @@ package com.devnow.thoryn.cli.cmd.provision
 
 import com.devnow.thoryn.cli.cmd.CommandTestBase
 import com.devnow.thoryn.cli.cmd.SecretIo
-import com.devnow.thoryn.provision.ProvisionReceiptStore
 import com.devnow.thoryn.provision.SecretTarget
 import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.api.AfterEach
@@ -96,10 +95,10 @@ class ProvisionSecretSinkCliTest : CommandTestBase() {
         // … the value was on the render's stdin and NOWHERE on argv …
         assertThat(kubectl.calls[2].second?.toString(Charsets.UTF_8)).isEqualTo(secret)
         assertThat(kubectl.allArgs).noneMatch { it.contains(secret) }
-        // … and it never reached the console or the receipt.
-        assertThat(apply.out).doesNotContain(secret).contains("client secret delivered → kubernetesSecret forge/forge-login key client-secret").contains("Applied. 1 resource(s) owned.")
-        val receiptFile = File(f.parentFile, "provision.receipt.json")
-        assertThat(receiptFile.readText()).doesNotContain(secret).contains(id)
+        // … and it never reached the console (SSO-3715 — there is no receipt to reach).
+        assertThat(apply.out).doesNotContain(secret).contains("client secret delivered → kubernetesSecret forge/forge-login key client-secret").contains("Applied. 1 resource(s) converged")
+        assertThat(f.parentFile.listFiles()!!.map { it.name }).noneMatch { it.endsWith(".receipt.json") }
+        assertThat(api.applications.single()["clientId"]).isEqualTo(id)
 
         // A re-apply mints nothing and touches kubectl for nothing: a secret exists only on create.
         api.reset(); kubectl.calls.clear()
@@ -116,9 +115,9 @@ class ProvisionSecretSinkCliTest : CommandTestBase() {
         val apply = runCli("provision", "apply", "--file", f.path, "--gateway", baseUrl(), "--yes")
         val id = api.applications.single()["clientId"].toString()
         assertThat(apply.exit).isEqualTo(SecretIo.EXIT_NO_SECRET).isNotEqualTo(0)
-        // The client exists and the receipt records it …
-        assertThat(apply.out).contains("Applied. 1 resource(s) owned.")
-        assertThat(ProvisionReceiptStore().read(File(f.parentFile, "provision.receipt.json"))!!.resources.single().id).isEqualTo(id)
+        // The client exists (the platform is the ledger) …
+        assertThat(apply.out).contains("Applied. 1 resource(s) converged")
+        assertThat(api.applications.single()["clientId"]).isEqualTo(id)
         // … nothing was written to the cluster, and no namespace was created …
         assertThat(kubectl.secrets).isEmpty()
         assertThat(kubectl.invocations).noneMatch { it.contains("create namespace") }.noneMatch { it.contains("apply") }

@@ -253,12 +253,23 @@ thoryn examples share    <name> [--output <file>]   # SSO-2876 — export the se
 # per-environment singletons emailProvider / loginTheme / loginFlow / loginMethods — the last, SSO-3100,
 # is the sign-in METHOD allow-list `login-methods set` writes; destroy resets it — and, SSO-3413, the
 # workspace-level singleton customDomain: plan shows the DNS records, apply claims + verifies, only
-# --prune/destroy with --confirm release it). The receipt next to the file
-# (<name>.receipt.json) is the ownership ledger. SSO-3089: every resource is read LIVE by its converge
-# key before any write (env slug, app displayName within its env, user email, member displayName, the
-# singletons by existence): equal ⇒ no-op, different ⇒ update with only the changed fields, existing
-# but unmanaged ⇒ adopted (converged from then on, NEVER deleted by destroy/--prune), deleted out of
-# band ⇒ re-created. Apply twice issues no writes. Secrets never enter the file — name the env var (`passwordEnv`,
+# --prune/destroy with --confirm release it). SSO-3715 (ADR 2026-10-15 platform-is-the-ledger): THERE IS
+# NO RECEIPT — nothing is written beside the file, committed or cached; plan / apply / destroy / import read
+# live state only, and `apply --output json` / `plan --output json` carry the resolved ids (`resources[]`:
+# {kind, name, id, environment, action}). SSO-3089: every resource is read LIVE by its converge key before
+# any write (env slug; app `clientId` when declared, else displayName within its env — TWO live matches are
+# the red row converge_key_ambiguous, never a third copy; user email; member displayName; trusts by name;
+# the singletons by existence): equal ⇒ no-op, different ⇒ update with only the changed fields, deleted out
+# of band ⇒ re-created; "adopt" is gone — the first apply of an existing resource is not an event. Apply
+# twice issues no writes. What destroy / --prune may REMOVE is the platform's `owner` relation: a `client:`
+# identity (a repository's wi_) removes only what it OWNS (manager alone never lets automation delete), a
+# person removes what they manage and nobody owns, non-ownable kinds (user, federationMember, the
+# singletons, a trust) go WITH their sandbox and are never removed on the production plane (reported with
+# the command a person runs), environments go last and only when owned; `retain: true` keeps a resource
+# regardless (shown as "retained"). `--prune` removes what the identity OWNS and the file no longer
+# declares, and revokes undeclared grants on the declared objects it may delete (never the owner tuple, a
+# workspace userset or itself). See "Ownership is decided by your identity's reach" below.
+# Secrets never enter the file — name the env var (`passwordEnv`,
 # `smtpPasswordEnv`, `clientSecretEnv`) or use `{{env.NAME}}`; they are resolved at apply and never
 # recorded. Production-plane removals need `--confirm <workspace-slug>` (the SSO-2413 gate).
 # SSO-3430: a resource's `environment:` may also be `{{env.NAME}}` (e.g. "{{env.THORYN_ENVIRONMENT}}", how an
@@ -274,7 +285,7 @@ thoryn examples share    <name> [--output <file>]   # SSO-2876 — export the se
 # receive its clientId AFTER apply converged it, on EVERY apply (an upsert) — `kind: githubActionsVariable` is
 # `gh variable set <NAME> --body <clientId> --repo <owner/name> --env <environment>` through your own `gh` login.
 # plan prints the pending publish as a line; an unreachable target is `publish_target_unreachable` AFTER the client
-# exists and is in the receipt, naming the one `gh variable set` to run by hand. See "Publishing an application's
+# exists, naming the one `gh variable set` to run by hand. See "Publishing an application's
 # client id to the repository that deploys it" below.
 # SSO-3659 (ADR 2026-10-13 converge §5): a confidential application's `secretSink:` says WHERE its minted client
 # secret is delivered — `kind: kubernetesSecret` (your own `kubectl`, value on stdin, namespace never created) or
@@ -286,8 +297,8 @@ thoryn examples share    <name> [--output <file>]   # SSO-2876 — export the se
 # `[federated_assertion]` with `federatedTrust: <trust name>` (rung 2: the pod's / job's platform token IS the client
 # credential; nothing is minted) — converged on update too; `client_secret_post` is not declarable. New kind
 # `workloadIdentityTrust` (provider github_actions | forgejo | kubernetes + that provider's pins, scopes, confirmProduction):
-# converged by name, adopted on the API's 409, never updated in place (workload_identity_trust_immutable), removed only
-# via --prune/destroy; the receipt records the wi_ client + audience; apply PRINTS the consumer's connection.json, never
+# converged by name (also on the API's 409), never updated in place (workload_identity_trust_immutable), removed only
+# with its sandbox; the plan shows the wi_ client + audience; apply PRINTS the consumer's connection.json, never
 # writes it. See "Secretless clients" and "Declaring a workload-identity trust" below.
 thoryn provision plan    [--file <path>] [--prune] [--fix-request <path>]  # read-only: what apply would create / remove (+ grant changes, pending publishes); exit 1 on an ownership error
                                              # SSO-3710 — --fix-request (env THORYN_FIX_REQUEST): a red plan also writes thoryn-provision-request.json — every missing RIGHT
@@ -296,14 +307,14 @@ thoryn provision apply   [--file <path>] [--prune] [--confirm <ws>] [--yes] [--f
                          [--secret-file <path>] [--force-stdout] [--force] \
                          [--wait [--wait-until ACTIVE|VERIFIED] [--wait-timeout 15m] [--wait-interval 20s]]
 thoryn provision import  [--file <path>] [--write]                       # SSO-3659 — the inverse of plan: render what this identity may reach as
-                                             # provision.yaml entries (manager ⇒ owned, receipt `adopted: true`; viewer or owned by another repository ⇒ `readOnly: true`); --write appends them
+                                             # provision.yaml entries (manager ⇒ an entry the file converges; viewer or owned by another repository ⇒ `readOnly: true`); --write appends them (the file only)
                                              # converge; environments first, dependants into them.
                                              # SSO-3414 — --wait blocks until the file's customDomain is ACTIVE (or VERIFIED), verifying each round.
                                              # SSO-3113 — a confidential application it CREATES gets a one-time client secret, delivered via
                                              # SecretIo (--secret-file, or an interactive TTY; a pipe is refused unless --force-stdout); undeliverable
                                              # ⇒ the client is still recorded, exit 65, `thoryn clients rotate-secret <id>` named. A resource's
                                              # `grants:` block is converged with it (see "Least-privilege access grants").
-thoryn provision destroy [--file <path>|--receipt <path>] [--confirm <ws>] [--yes] # remove everything owned, child-first (sandbox hard-delete cascades)
+thoryn provision destroy [--file <path>] [--confirm <ws>] [--yes] # remove what the file declares AND this identity may remove (owner-gated), child-first; prints the destroy plan first
 
 # Least-privilege access grants (SSO-3113, epic SSO-3108) — who may manage / view which resource.
 # Thin wrappers over product-api /api/v1/access (the SSO-3112 contract). Subjects: member:<sub> | client:<clientId>;
@@ -1003,7 +1014,7 @@ connection's `provisionFile` from `.thoryn/template.json`: `.thoryn/` for an app
 - **`provision.yaml`** — what the repository owns, as a starter in the same shapes
   `thoryn provision` already converges. An app project declares its OAuth client in its sandbox
   (`kind: application`, public with PKCE, a framework-default redirect URI to adjust). A config project's
-  production section declares the workspace's sandbox environment (adopted by its slug, named as it is);
+  production section declares the workspace's sandbox environment (matched by its slug, named as it is);
   its sandbox section anchors on that sandbox by slug only — that connection holds
   `tenant:environments.read`, so nothing in the starter can need a write — and names the kinds to add
   (`loginMethods`, `federationMember`, `emailProvider`, `loginTheme`, `loginFlow`). It is seeded only
@@ -1117,7 +1128,7 @@ step reads before it writes, and the report says `Checked the … project` inste
 | `Trust 'starter-…' … exists but pins another …` (exit 4) | A trust with the deterministic name exists with other pins or scopes. Delete it (`thoryn workload-identity trusts delete <id> --environment <env>`) and re-run. |
 | `GitHub does not show the config repository … to your gh sign-in` (app, exit 4, `config_repository_not_found`) | `--config-repo` names a repository that does not exist or that your `gh` login cannot see. Nothing was changed on either side. The command never creates the config repository: create it with `thoryn project init config --repo <owner>/<name> …`, or ask for access, and re-run. The output lists the by-hand steps (clone, branch `thoryn/app-<name>`, the entry to append, `gh pr create`). |
 | `The production client cannot be added to <cfg>:.thoryn/environments/production/provision.yaml: …` (app, exit 4, `config_provision_file_unusable`) | The config repository's production file is not valid YAML, its `resources:` list is not the last top-level key, or the result would not validate. Nothing was changed. Fix the file on its default branch (or add the entry by hand — the output shows it) and re-run. |
-| `Production client pending review: <url>` (app, success) | The entry went to the config repository as a pull request from `thoryn/app-<name>`. A reviewer of the config project merges it; the approved production run creates the client and publishes its id to this repository's `production` GitHub environment as `THORYN_PRODUCTION_CLIENT_ID`. If that publish cannot reach this repository, the output names the one `gh variable set` to run with the id from the production receipt. |
+| `Production client pending review: <url>` (app, success) | The entry went to the config repository as a pull request from `thoryn/app-<name>`. A reviewer of the config project merges it; the approved production run creates the client and publishes its id to this repository's `production` GitHub environment as `THORYN_PRODUCTION_CLIENT_ID`. If that publish cannot reach this repository, the output names the one `gh variable set` to run with the id from the production run's `apply --output json`. |
 | `… the file was re-rendered and its comments are not kept` (app, success) | The config repository already declared this client with other values (another `--production-url`, say). Replacing an entry re-renders the file from its parsed tree, so its comments are lost on the branch; review the diff in the pull request. Adding an entry keeps every existing line. |
 
 ### Least-privilege access grants (SSO-3113, epic SSO-3108)
@@ -1132,7 +1143,7 @@ provisions. Two surfaces, one grammar:
   or inspecting who can reach what. `list` needs `--object` and/or `--subject`; `mine` answers
   for the session's own subject (`{ "data": [ "environment:<id>", … ] }`).
 - **`grants:` on a resource in `provision.yaml`** — declarative, converged by `provision apply`
-  like any other field. The **object is implicit** (it derives from the receipt id the resource
+  like any other field. The **object is implicit** (it derives from the live id the resource
   resolves to — `environment:<id>`, `application:<clientId>`, `user:<id>`,
   `federation_member:<id>`, and the per-environment singletons by their env slug —
   `email_provider:<envSlug>`, `login_theme:…`, `login_flow:…`, `login_methods:…`), so a file can
@@ -1146,15 +1157,19 @@ provisions. Two surfaces, one grammar:
       - { subject: "client:cli-ci", relation: manager }   # the CI identity manages ONLY this sandbox
   ```
 
-  After the resource exists (create / adopt / update / even a no-op), `apply` lists the object's
-  grants (`GET /api/v1/access/grants?object=…`), **POSTs the missing ones and DELETEs the ones the
-  file no longer declares — on that object only**. Grants on objects the file does not own are
-  never touched, and the workspace admin userset (`workspace:<id>#admin`) is never revoked. Omit
-  `grants:` to leave an object's grants unmanaged; `grants: []` declares none. `plan` prints the
-  grant diff (`grant + client:cli-ci manager`) and counts it. A session without
-  `tenant:access.write` **fails closed** with the scope named — the resource itself is already
-  recorded in the receipt by then, so nothing is lost; re-run after `thoryn login --scope
-  tenant:access.write` (or after granting the CI client that scope).
+  After the resource exists (create / update / even a no-op), `apply` lists the object's grants
+  (`GET /api/v1/access/grants?object=…`) and **POSTs the missing ones**. Grants are **additive by
+  default** (SSO-3715, ADR 2026-10-15 §2): a live grant the block does not declare is shown as
+  `present, not declared` (`plan` prints it, `--output json` carries it as `changes[].grantsUndeclared`)
+  and left alone — there is no ledger of "this file granted it". With **`--prune`**, on every declared
+  object the caller may delete (the owner rule below), the undeclared grants are **revoked** — except
+  the `owner` tuple, workspace usersets (`workspace:<id>#admin`, any `workspace:` subject) and the
+  caller's own subject. Grants on objects the file does not declare are never touched. Omit `grants:`
+  to leave an object's grants unmanaged; `grants: []` declares none. `plan` prints the grant diff
+  (`grant + client:cli-ci manager`, `grant - … (not declared; --prune)`) and counts it. A session
+  without `tenant:access.write` **fails closed** with the scope named — the resource itself is live
+  by then, so nothing is lost; re-run after `thoryn login --scope tenant:access.write` (or after
+  granting the CI client that scope).
 
 Since SSO-3182 the two scopes are part of the DEFAULT `thoryn login` scope set (the default set is
 exactly the `cli` login client's registered scopes in `.thoryn/provision.yaml`, which the product side
@@ -1168,9 +1183,8 @@ identity) is minted a **one-time `client_secret`** on create. `provision apply` 
 the same `SecretIo` channel as `thoryn clients create`: written to `--secret-file <path>`
 (owner-only `0600`; a second confidential client in the same apply lands at `<path>.<clientId>`),
 or printed to an interactive TTY with a `WARNING`; a non-interactive stdout is refused unless
-`--force-stdout`. The secret never enters the receipt, the plan, or a log — receipts stay
-secret-free by construction. If it cannot be delivered the client is **still created and
-recorded** (it exists), and `apply` exits **65** naming
+`--force-stdout`. The secret never enters the plan or a log. If it cannot be delivered the client
+is **still created** (it exists), and `apply` exits **65** naming
 `thoryn clients rotate-secret <clientId> --secret-file <path>` to mint a fresh one. `plan` marks
 such a create with `(a client secret will be minted and shown once)`.
 
@@ -1179,9 +1193,9 @@ such a create with `(a client secret will be minted and shown once)`.
 Per oauthy ADR `2026-10-13-provisioning-as-code-converge-github-app-and-fga-ownership.md` §5, **a secret is
 delivered where it is consumed, never into a CI secret store**: a confidential application declares a
 `secretSink:`, and `apply` hands the one-time client secret to that place the moment the client is
-converged and recorded in the receipt. The `--secret-file` / TTY channel above stays the default when no
-sink is declared, and the fallback when the declared one cannot be reached. The value never enters the
-file, the plan, the receipt, a log, or a `kubectl` argument.
+converged. The `--secret-file` / TTY channel above stays the default when no sink is declared, and the
+fallback when the declared one cannot be reached. The value never enters the file, the plan, a log, or a
+`kubectl` argument.
 
 The forge's own login client (`thoryn-cicd/.thoryn/provision.yaml`, the ADR's first consumer), delivered
 into the cluster the job already has a kubeconfig for:
@@ -1216,8 +1230,8 @@ What `thoryn provision` does with it:
   secret → kubernetesSecret forge/forgejo-thoryn-login key client-secret`; in `--output json`,
   `changes[].secretSink` and `summary.deliver`) and marks the create `(a client secret will be minted and
   delivered to …)`. No secret exists at plan time: `plan` mints nothing and runs no `kubectl`.
-- **`apply`** creates the client, **records it in the receipt**, and only then delivers — so a sink that
-  cannot be reached never costs the client its receipt entry. `kubernetesSecret` goes through **your own
+- **`apply`** creates the client and only then delivers — so a sink that cannot be reached never costs
+  anything: the client is live, and the next plan reads it. `kubernetesSecret` goes through **your own
   `kubectl`** (whatever context it is configured with; thoryn handles no cluster credential), the
   `install-forge` pattern with the value **on stdin, never on argv**:
   `kubectl version --client` → `kubectl get namespace <ns> -o name` (reachability and existence in one read)
@@ -1226,11 +1240,11 @@ What `thoryn provision` does with it:
   to overwrite an existing file unless `apply --force`.
 - **A sink that cannot be reached** (no `kubectl`, a wrong context, a missing namespace, RBAC, an existing
   file) is a reason, printed with the value redacted; the secret then falls back to `--secret-file` (or an
-  interactive TTY). **When nothing reaches**, the client stays created and recorded and `apply` exits **65**
+  interactive TTY). **When nothing reaches**, the client stays created and `apply` exits **65**
   with `undelivered_secrets`, naming the resource, the sink, the reason and the recovery:
 
   ```
-  Error: undelivered_secrets — every resource was converged and recorded in the receipt, but the client secret of 1 created application(s) could not be delivered:
+  Error: undelivered_secrets — every resource was converged, but the client secret of 1 created application(s) could not be delivered:
     application/forge-forgejo-login (clientId 7f1c…) → kubernetesSecret forge/forgejo-thoryn-login key client-secret: namespace 'forge' is not reachable through the current kubectl context (…); thoryn never creates a namespace
       mint a new secret by hand: thoryn clients rotate-secret 7f1c… --secret-file <path>
   ```
@@ -1291,19 +1305,18 @@ What `thoryn provision` does with it:
   githubActionsVariable acme/billing-web (environment production) THORYN_PRODUCTION_CLIENT_ID`; in
   `--output json`, `changes[].publishTo`) and reaches no target — a pull-request check shows where the
   id will land.
-- **`apply`** publishes **after** the resource is converged and recorded in the receipt (the id is
-  known), on **every** apply — an upsert, so a re-created client propagates without a second step and a
+- **`apply`** publishes **after** the resource is converged (the id is known), on **every** apply — an upsert, so a re-created client propagates without a second step and a
   variable someone changed by hand is repaired. The publisher is your own `gh` login:
   `gh variable set THORYN_PRODUCTION_CLIENT_ID --body <clientId> --repo acme/billing-web --env production`,
   creating the environment when it does not exist (bare, with no protection rules) and **never
   writing an existing environment** — its reviewers and branch policy stay what the app repository's
   admins set.
-- **The receipt records what was published** (`resources[].published[]`: kind, repository, environment,
-  name) so a reviewer or an `import` reader sees which repository carries the id.
+- **The target itself is the record** (SSO-3715): the plan / job summary shows where the id lands, and
+  `apply --output json` carries the id (`resources[].id`).
 - **A target the `gh` login cannot reach** (the repository is not visible, `gh` is not signed in, the
   environment cannot be created) is the apply error `publish_target_unreachable`, raised **after**
-  convergence: the client exists, the receipt records its id, the exit is non-zero, and the error names
-  the one `gh variable set … --body <id from the receipt> …` a human can run.
+  convergence: the client exists, `--output json` still prints its id, the exit is non-zero, and the
+  error names the one `gh variable set … --body <id> …` a human can run.
 
 Rules the schema and the loader both enforce: `publishTo` sits on `kind: application` only (an
 application's clientId is the one output a resource has); it is refused on a `readOnly: true` reference
@@ -1377,10 +1390,11 @@ resources:
 - **All three converge on UPDATE**, not only at create (the 2026-10-13 ADR's reading note): a changed
   method set or trust binding is one `PATCH` carrying exactly that field. **The key location is the
   exception you should know about:** product-api's `ApplicationResponse` does not render `jwksUri` / `jwks`
-  (a product gap, reported on the PR), so the engine records what the file last applied in the receipt
-  (`attributes.jwksUri`, `attributes.jwksKids` — never a key) and diffs against that; an **adopted** client
-  with a declared key location is sent it **once** (`(not readable from the API — sent once to converge)`
-  in the plan) and is a no-op afterwards.
+  yet (SSO-3716), and since SSO-3715 there is no receipt to remember what the file last sent, so the key
+  location is **never diffed**: it is sent on create and **re-sent, idempotently, with every update** of the
+  client (the plan's row says `key location declared — not readable from the API, re-sent with any update`).
+  A changed `jwksUri` / `jwks` **alone** therefore plans no update until SSO-3716 lands — change it together
+  with any rendered field, or re-send it by hand (`thoryn clients update`).
 - **Order:** `apply` converges environments, then every `workloadIdentityTrust`, then everything else — so
   a client may bind a trust the same file declares; the plan shows the pending binding as
   `federatedTrust: (unset) → billing-pods (created by this apply)`. Removal is child-first: clients before
@@ -1431,29 +1445,30 @@ resources:
 
 What `thoryn provision` does with it:
 
-- **Converge by name.** A trust of that name in the plane is **adopted** (every DECLARED field must
+- **Converge by name.** A trust of that name in the plane is a **no-op** (every DECLARED field must
   match: `provider`, `scopes` as a set, the pins; a field the file leaves out is not compared); absent, it
   is **created** (`POST /api/v1/workload-identity/trusts`, with the file's `repository: owner/name` as the
   API's `owner` + `repository`); a `409 workload_identity_trust_name_taken` between the lookup and the
-  create adopts the matching trust, as `project init` does. **There is no update:** a trust's pins and
+  create converges onto the matching trust, as `project init` does. **There is no update:** a trust's pins and
   scopes are immutable on the hub, so a declared field that differs from the live trust is the plan error
   **`workload_identity_trust_immutable`**, naming the fix — declare what is live, or
-  `thoryn workload-identity trusts delete <id>` and re-apply to re-create it. Removal is only through
-  `--prune` / `destroy` (the production plane gated by `--confirm <workspace-slug>`), clients first.
+  `thoryn workload-identity trusts delete <id>` and re-apply to re-create it. A trust has no platform
+  object of its own, so `destroy` removes it only **with its sandbox** (when the identity may remove the
+  declared parent environment — the hard-delete cascades); on the production plane it is never removed by
+  `destroy` / `--prune` and the plan names `thoryn workload-identity trusts delete <id> --yes --confirm …`.
 - **The one additive exception — `plan:` (SSO-3702).** A `github_actions` trust's plan profile is compared
   like a pin (`plan.environment`; `plan.scopes` only when the file lists them — a derived declaration
   matches whatever the hub derived), with one exception: a **declared profile on a live trust that has
   none** is a plain `update` that calls the additive `POST …/{id}/plan-profile` (`~ workloadIdentityTrust
-  …: plan profile added`) — the `wi_` client, its `owner` relation and the consumer's `connection.json` stay,
-  and the receipt keeps the same id. A live profile that **differs** from the declared one is the red plan
+  …: plan profile added`) — the `wi_` client, its `owner` relation and the consumer's `connection.json` stay. A live profile that **differs** from the declared one is the red plan
   `workload_identity_trust_immutable` ("re-create the trust"). The file refuses what the API refuses, with
   its codes: `plan_profile_unsupported` (not `github_actions`), `plan_profile_requires_environment`,
   `plan_environment_equals_apply`, `plan_scope_not_read_only`, `plan_scope_not_subset`, `plan_scopes_empty`.
   The printed `connection.json` is unchanged — one file serves both profiles (the hub decides by the job's
   `environment` claim); `plan` shows `plan-profile <env> [<scopes>]` on the trust's row and `import`
   renders a live profile with its scopes made explicit.
-- **The receipt records** the trust id, its **`wi_…` workload client** (`attributes.clientId`), its
-  `audience` and `provider` — nothing secret exists on a trust.
+- **The plan row and `apply --output json`** carry the trust id, its **`wi_…` workload client**
+  (`attributes.clientId`), its `audience` and `provider` — nothing secret exists on a trust.
 - **The scope ceiling.** A trust may carry only `tenant:` scopes the **applying identity itself holds**
   (the hub's `403 scope_not_grantable`): a trust can never widen the reach of the repository that declares
   it. `plan` states the ceiling on every create; when the session's scopes are known (the token's `scope`
@@ -1479,8 +1494,8 @@ What `thoryn provision` does with it:
   `viewer` ⇒ only a matching `readOnly: true` reference, none ⇒ `access_not_owned`. A trust cannot carry
   `grants:`, `publishTo:` or `secretSink:`.
 - **`import`** renders every trust of a plane the identity may reach (`github` / `forgejo` /
-  `kubernetes` pins, `scopes`, `confirmProduction` on the production plane) — owned as `adopted: true`,
-  `readOnly: true` for a viewer. Inline Kubernetes keys are not rendered by the API: the entry carries a
+  `kubernetes` pins, `scopes`, `confirmProduction` on the production plane) — as an entry the file
+  converges, `readOnly: true` for a viewer. Inline Kubernetes keys are not rendered by the API: the entry carries a
   note to add `spec.kubernetes.jwks` by hand (`kubectl get --raw /openid/v1/jwks`).
 
 **The structural limit — a file cannot declare its OWN bootstrap trust.** The identity that applies a
@@ -1507,9 +1522,9 @@ fails closed with the scope named): `manager` for a resource the file would chan
 
 | what the platform answers for the live object | `plan` / `apply` |
 |---|---|
-| `manager` (direct, through the `owner` relation, or inherited through `parent` from its environment / workspace) | the normal converge (create / update / adopt / no-op) |
+| `manager` (direct, through the `owner` relation, or inherited through `parent` from its environment / workspace) | the normal converge (create / update / no-op) |
 | `viewer` only | allowed only as `readOnly: true`; **any field diff** is `access_read_only`; declared without `readOnly` is `access_read_only` naming the fix |
-| none | `access_not_owned` — not visible to this identity; cannot be adopted, imported or converged |
+| none | `access_not_owned` — not visible to this identity; cannot be imported or converged |
 | does not exist yet | a create needs `manager` on the **parent** (`environment:<id>`, or the workspace for the production plane / an environment / the custom domain), checked on that parent object; creator-becomes-manager (and, for a `client:` creator, creator-becomes-**owner**) on the platform then makes the identity its manager — no grant step |
 | the resource's `owner` is another identity | `access_owned_elsewhere` unless declared `readOnly: true` — the plan says "another repository", never who |
 
@@ -1518,9 +1533,35 @@ A failed gate is an `error` row in the plan (`--output json` → `changes[].erro
 **whole** plan before writing anything — never a partial apply that owns the half it may touch.
 
 **`readOnly: true`** on any kind means *"this repository depends on it and does not own it"*: the
-resource is looked up live and must match the declared spec; it is never created, adopted, recorded
-in the receipt (a receipt entry from before it was marked read-only is dropped — the resource stays),
-removed, or granted on (`grants:` is refused on a reference).
+resource is looked up live and must match the declared spec; it is never created, removed, or granted
+on (`grants:`, `publishTo:`, `secretSink:` and `retain:` are refused on a reference).
+
+**The platform is the ledger — what `destroy` and `--prune` may remove (SSO-3715, ADR
+`2026-10-15-platform-is-the-ledger-no-committed-provisioning-receipt`).** There is **no receipt**:
+nothing is written beside the file, committed or cached, so the plan a reviewer reads and the state
+the platform enforces cannot diverge. The receipt-era "adopted, so never deleted" rail is retired with
+it; the deletion authority is the platform's `owner` relation, evaluated by the engine before every
+removal and re-checked by product-api on the `DELETE` (404, never widened):
+
+| the signed-in identity | `destroy` / `--prune` removes a declared resource when |
+|---|---|
+| a **`client:`** (a repository's `wi_`) | `/access/check owner` is **true** for an `application` / `environment` — `manager` alone (inherited through a sandbox a founder created, or granted) never lets automation delete; thoryn-cli's own `environment/ci` (`owner: null`, CI is `manager` by grant) stays |
+| a **`member:`** (a person) | they **manage** it and **nobody owns** it — people cannot own, and an owned resource belongs to its repository (`owned by a repository — change its file`) |
+| any | a **non-ownable kind** (`user`, `federationMember`, the singletons, a `workloadIdentityTrust`) goes **with its sandbox** when the identity may remove the declared parent environment (the hard-delete cascades; no call of its own) — and is **never removed on the production plane** (left in place, reported with the explicit command) |
+| any | an **environment** goes only when owned, after its children |
+| any | **`retain: true`** on the resource: never — the destroy plan shows it as `retained by the file` (Terraform's `prevent_destroy`; the declared replacement for the adopted bit — intent in the reviewed file instead of history in a ledger). thoryn-cli's own `application/cli` declares it |
+
+Every refusal is a `skip` row with the reason and the command a person would run (`thoryn clients delete
+…`, `thoryn env delete <id> --confirm <slug>`, `thoryn domain remove --yes`, …; `--output json` →
+`changes[].byHand`). `destroy` prints that plan first, then removes the `remove` rows child-first;
+`--confirm <workspace-slug>` is still required for any production-plane removal, and automation never
+runs `destroy` or `--prune`. **`--prune`** additionally removes the `application` / `environment` the
+platform lists this `client:` identity as **owner** of (`GET /api/v1/access/mine?relation=owner`) and the
+file no longer declares — the platform is the ledger of what a repository owns, so "owned but no longer
+declared" needs no receipt; a person owns nothing, so their `--prune` prunes grants only (one note row
+says so). **Converge keys are the identity of a resource:** declare `clientId` on an application (the
+starters render `<repo>-<name>`) — two live matches of a display name are the red row
+`converge_key_ambiguous` ("declare `clientId`"), never a create of a third.
 
 **One owning repository per resource — a platform fact.** The platform model has an `owner` relation
 on `application` and `environment`: at most **one** subject per object (a database invariant on the
@@ -1530,25 +1571,25 @@ owns it — a person's create has no owner) or by a workspace admin with
 `thoryn access grant <subject> owner <object>`. The product owner decided (2026-10-13) that an owner is
 a **workload identity only** — people are managers and admins, never owners. The owner is rendered on
 the application (`owner: { subject }`); when it is set and `/access/check` says this identity is not
-it, the resource is `access_owned_elsewhere`. The receipt records the owner the platform reported next
-to the applying `subject` (`resources[].owner`) — informational; the gate always asks the platform. A
+it, the resource is `access_owned_elsewhere`. The plan row and `apply --output json` carry the owner the
+platform reported (`owner`) — informational; the gate always asks the platform. A
 `grants:` entry **cannot** carry `relation: owner`: the loader refuses it, naming the admin's fix — a
 repository cannot claim ownership by writing YAML. Moving ownership is a workspace admin's
 `thoryn access revoke <current> owner <object>`, then `thoryn access grant <new> owner <object>`.
 
-The former `--peer-receipt` flag (other repositories' committed receipts as the ownership marker) is
-**removed**: it was an interim for the platform marker that now exists, nothing else consumed it, and
-a hint that can refuse is an authority — the receipt's `subject` stays as a record of who applied.
+The former `--peer-receipt` flag (other repositories' committed receipts as the ownership marker) was
+removed with SSO-3673, and the receipt itself with SSO-3715: the platform's `owner` relation is the one
+marker, and the platform's audit log the record of who applied.
 
 **`thoryn provision import [--write]`** is the inverse of `plan`, bounded by the same relations: it
 lists what the identity may reach (`GET /api/v1/access/mine` for `manager`, then `viewer` — the one
 place the per-type listing is still used) and renders each live resource the file does not yet
-declare as an entry — `manager` objects as owned (recorded `adopted: true` in the receipt, so
-`destroy` never deletes them), `viewer` objects and objects the platform says another repository owns
-as `readOnly: true`. Nothing the identity has no relation to is listed, so nothing it has no relation
-to can be imported; the hub's rows stay the authority. Without `--write` it prints the YAML it would
-add (notes and unrenderable objects on stderr); `--write` appends under the file's `resources:` list
-(the file is created when absent), re-validates it, and writes the receipt. A `loginFlow` cannot be
+declare as an entry — `manager` objects as entries the file converges (and, by the owner rule above, may
+remove), `viewer` objects and objects the platform says another repository owns as `readOnly: true`.
+Nothing the identity has no relation to is listed, so nothing it has no relation to can be imported;
+the hub's rows stay the authority. Without `--write` it prints the YAML it would add (notes and
+unrenderable objects on stderr); `--write` appends under the file's `resources:` list (the file is
+created when absent) and re-validates it — the file is the only thing written. A `loginFlow` cannot be
 rendered (its `templateId` is not recoverable from the active flow); write-only secrets
 (`smtpPasswordEnv`, `clientSecretEnv`) must be added by hand before an update is converged.
 
@@ -2251,8 +2292,8 @@ verify:
 ```
 
 `thoryn examples apply` (and `setup`) **provisions first**: it plans + applies the file with
-the same converge engine as `thoryn provision apply` (create / update / adopt by converge
-key — a re-apply issues no writes, a leftover sandbox is adopted by its slug), then runs the
+the same converge engine as `thoryn provision apply` (create / update / no-op by converge
+key — a re-apply issues no writes, a leftover sandbox is matched by its slug), then runs the
 recipe's own steps and `verify`. The file's `{{env.NAME}}` placeholders and `<key>Env` secret
 references resolve **first from the recipe's params** (so `passwordEnv: demoPassword` reads the
 `secret: true` param, `slug: "{{env.envSlug}}"` reads `envSlug`) and **then from the process
@@ -2266,11 +2307,11 @@ apply so you can sign in with it (SSO-3102). What the file owns is exposed to
 the recipe as `{{provision.<kind>.<name>.id}}` (plus `.slug` for an environment, `.email` for
 a user, `.clientId` / `.redirectUri` for an application, `.methods` for `loginMethods`), the
 first `environment` resource becomes the environment later steps and `examples run` target,
-and every resource lands on the recipe receipt. The provisioning receipt itself is written
-next to the example state (`~/.config/thoryn/examples/<name>.provision.receipt.json`) after
-every successful write. `thoryn examples teardown` runs the recipe's own teardown actions and
-**then destroys** the provisioned resources child-first (adopted ones are left in place); a
-failed removal keeps the state + receipt so a re-run can retry. A recipe that creates its own
+and every resource lands on the recipe receipt. No provisioning receipt is written (SSO-3715):
+`thoryn examples teardown` runs the recipe's own teardown actions and **then destroys** what the
+provisioning file declares and you may remove, planned live from the same file (the owner rule
+above — a founder removes the sandbox and the clients nobody owns; users and singletons go with
+the sandbox) child-first; a failed removal keeps the state so a re-run can retry. A recipe that creates its own
 workspace (`hub.createWorkspace`) cannot also carry a provisioning file — the file targets the
 caller's standing workspace. Recipes without `provision` behave exactly as before.
 
@@ -2317,12 +2358,16 @@ The Action:
 3. **converges the provisioning file** — `thoryn provision plan` (logged) then
    `thoryn provision apply --file .thoryn/provision.yaml --yes`: a sandbox `cli-ci` inside
    the `thoryn` workspace and a public loopback client in it. Apply twice issues no writes;
-   a sandbox left by a failed run is **adopted** by its slug, never duplicated (SSO-3089),
-4. **exposes** `workspace-slug` / `environment` / `client-id` / `issuer` / `receipt` as
-   outputs, read from the secret-free receipt the CLI writes next to the file, and
+   a sandbox left by a failed run is **matched** by its slug, never duplicated (SSO-3089),
+4. **exposes** `workspace-slug` / `environment` / `client-id` / `issuer` as outputs. Until
+   SSO-3717 moves the Action onto `apply --output json` (`resources[]`: kind / name / id /
+   environment / action) it still reads them from the receipt a `cli-v0.34.x` release writes —
+   so the Action stays pinned to that release line until SSO-3717 lands (a CLI from SSO-3715 on
+   writes no receipt), and
 5. **destroys on exit** (`thoryn provision destroy --file … --yes`, `if: always()`,
-   disable with `destroy: "false"`): child-first, the sandbox hard-delete cascades the
-   client; adopted resources and the standing workspace are never touched,
+   disable with `destroy: "false"`): child-first, owner-gated (SSO-3715) — the per-run loopback
+   client the CI identity created (and so owns) goes, `cli` (retained) and `cli-ci` (unowned —
+   CI is its manager, not its owner) survive; the standing workspace is never touched,
 6. **names its fix when it fails** (SSO-3710): the Action resolves one path for the CLI's fix request
    (the `fix-request` input, default `$RUNNER_TEMP/thoryn-provision-request.json`), hands it to the
    sign-in and the apply steps through `THORYN_FIX_REQUEST`, and exposes it as the `fix-request`
@@ -2375,7 +2420,7 @@ thoryn workload-identity trusts set-plan-profile <trust-id> --plan-environment t
 ```
 
 No standing test user and no standing sandbox are needed any more: the provisioning file
-creates (or adopts) the sandbox and the client per run.
+creates (or matches) the sandbox and the client per run.
 
 ## Operator commands
 
@@ -2470,10 +2515,9 @@ thoryn-cli/
 ├── engine/                                                  # io.thoryn:thoryn-provision-engine — the provisioning engine as a LIBRARY (SSO-3662)
 │   ├── pom.xml
 │   └── src/main/kotlin/com/devnow/thoryn/provision/
-│       ├── ProvisionEngine.kt                               # plan / apply / destroy / import, the ownership gate, SecretSink
+│       ├── ProvisionEngine.kt                               # plan / apply / destroy / import, the ownership gate + deletion authority (no receipt — SSO-3715), SecretSink
 │       ├── ProvisionFile.kt + provision.schema.json         # the .thoryn/provision.yaml model
 │       ├── FixRequest.kt + fix-request.schema.json          # SSO-3710 the fix request (missing rights + their commands) and its ONE renderer
-│       ├── ProvisionReceipt.kt                              # the secret-free ownership ledger
 │       ├── ProvisionApi.kt                                  # the product-api PORT the engine converges through
 │       ├── AccessRefs.kt, CustomDomain.kt, ProductApiException.kt
 │       └── (no picocli, no TTY, no CLI type — pinned by ProvisionEngineLibraryBoundaryArchTest)

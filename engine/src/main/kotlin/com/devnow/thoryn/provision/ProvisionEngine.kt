@@ -3,14 +3,17 @@ package com.devnow.thoryn.provision
 import tools.jackson.databind.JsonNode
 import java.io.File
 import java.io.PrintStream
-import java.time.Instant
 
 /**
  * [ERROR] (SSO-3659) is a per-resource VERDICT, not a step: the declared resource failed the ownership
- * gate (`access_read_only` / `access_not_owned` / `access_owned_elsewhere`, see [PlannedChange.error]).
- * A plan carrying one is red (non-zero exit) and `apply` refuses it before writing anything.
+ * gate (`access_read_only` / `access_not_owned` / `access_owned_elsewhere`, see [PlannedChange.error]) or
+ * (SSO-3715) its converge key is ambiguous (`converge_key_ambiguous`). A plan carrying one is red (non-zero
+ * exit) and `apply` refuses it before writing anything.
+ *
+ * SSO-3715 (ADR 2026-10-15 platform-is-the-ledger §1) — `ADOPT` is gone from the vocabulary: a live match is
+ * [NOOP] ("exists and matches") or [UPDATE]; the first apply of an existing resource is not an event.
  */
-enum class ChangeAction { CREATE, UPDATE, ADOPT, NOOP, REMOVE, SKIP, ERROR }
+enum class ChangeAction { CREATE, UPDATE, NOOP, REMOVE, SKIP, ERROR }
 
 /** SSO-3659 — the relation the signed-in identity holds on a live platform object (ADR 2026-10-13 §1). */
 enum class Access(val label: String) { MANAGER("manager"), VIEWER("viewer"), NONE("none") }
@@ -22,17 +25,36 @@ data class PlannedChange(
     val action: ChangeAction,
     val reason: String,
     val resource: ProvisionResource? = null,
-    val owned: OwnedResource? = null,
-    /** SSO-3089 — the live id the resource resolved to (owned, or matched by its converge key). */
+    /** SSO-3089 — the live id the resource resolved to by its converge key (null for a create). */
     val liveId: String? = null,
+    /**
+     * SSO-3715 — the environment SLUG the live resource lives in (`null` ⇒ the production plane; an `environment`
+     * resource records its own slug under [attributes]). Rendered as `environment` by `--output json` so a workflow
+     * reads where an id lands from the plan / apply output — there is no receipt.
+     */
+    val environment: String? = null,
+    /**
+     * SSO-3715 — non-secret attributes of the live resource a reader needs next to its id (`slug` of an environment,
+     * `email` of a user, `clientId` of a trust's workload client, the first `redirectUri`); never a key or a secret.
+     */
+    val attributes: Map<String, String> = emptyMap(),
     /** SSO-3089 — for UPDATE: field → "old → new" (non-secret fields only). */
     val diff: Map<String, String> = emptyMap(),
-    /** SSO-3089 — the resource existed before this file managed it (never deleted by destroy/prune). */
-    val adopted: Boolean = false,
     /** SSO-3113 — grants (`<subject> <relation>`) the file declares on this object that do not exist live. */
     val grantAdds: List<String> = emptyList(),
-    /** SSO-3113 — grants live on this object that the file no longer declares (never the admin userset). */
+    /**
+     * SSO-3113 / SSO-3715 (ADR 2026-10-15 §2) — grants live on this object that the file does not declare and that
+     * `apply --prune` WILL revoke: only on an object the caller may delete ([mayRemove]), never the `owner` tuple, a
+     * workspace userset (`workspace:…`) or the caller's own subject.
+     */
     val grantRemoves: List<String> = emptyList(),
+    /**
+     * SSO-3715 (ADR 2026-10-15 §2) — grants live on this object that the file does not declare and that this run
+     * leaves in place: "present, not declared" (informational, never red). Without `--prune` every undeclared
+     * grant lands here; with it, the ones the exclusions keep (owner / workspace userset / self) and every one on an
+     * object the caller may not delete.
+     */
+    val grantUndeclared: List<String> = emptyList(),
     /**
      * SSO-3413 / SSO-3414 — a `customDomain`'s live view: host, state, entitlement, the issuer in use, and
      * the DNS records to publish as `{type, name, value, ttl}` ([DnsRecord]).
@@ -40,18 +62,25 @@ data class PlannedChange(
     val customDomain: Map<String, Any?>? = null,
     /**
      * SSO-3659 — the relation the signed-in identity holds on the live object (`manager` / `viewer` /
-     * `none`), or `manager` for a create whose parent it manages. Null for receipt-only rows (skip / remove).
+     * `none`), or `manager` for a create whose parent it manages. Null for a remove / skip row.
      */
     val access: String? = null,
-    /** SSO-3659 — the file declares this resource `readOnly: true` (a dependency; never owned, never in the receipt). */
+    /** SSO-3659 — the file declares this resource `readOnly: true` (a dependency; never owned, never removed). */
     val readOnly: Boolean = false,
-    /** SSO-3659 — the ownership-gate error code when [action] is [ChangeAction.ERROR] (`access_*`), else null. */
+    /** SSO-3715 — the file declares this resource `retain: true`: converged and owned, never removed by destroy / --prune. */
+    val retain: Boolean = false,
+    /** SSO-3659 — the gate's error code when [action] is [ChangeAction.ERROR] (`access_*`, `converge_key_ambiguous`), else null. */
     val error: String? = null,
     /**
      * SSO-3673 — the platform `owner` of the live object as its response renders it (`owner.subject`), or null
-     * when the platform reports none (or the kind renders none). Carried to the receipt ([OwnedResource.owner]).
+     * when the platform reports none (or the kind renders none).
      */
     val owner: String? = null,
+    /**
+     * SSO-3715 — on a removal row that is refused or left to a person ([ChangeAction.SKIP] in a destroy / prune plan):
+     * the command a human would run instead, or null when the row needs no command (retained, removed with its sandbox).
+     */
+    val byHand: String? = null,
     /**
      * SSO-3668 — the outputs `apply` will PUBLISH this resource's id to once it is converged (every apply, an
      * upsert). Shown as a line of the plan — a pull-request check shows where the id will land — and never
@@ -60,8 +89,8 @@ data class PlannedChange(
     val publishTo: List<PublishTarget> = emptyList(),
     /**
      * SSO-3659 (ADR 2026-10-13 §5) — where `apply` will DELIVER the client secret this CREATE mints, the moment the
-     * client is converged and recorded. Shown as a line of the plan (a pull-request check shows where the secret
-     * will land); nothing is minted by `plan`. Only on a CREATE of a confidential application with a `secretSink:`.
+     * client is converged. Shown as a line of the plan (a pull-request check shows where the secret will land);
+     * nothing is minted by `plan`. Only on a CREATE of a confidential application with a `secretSink:`.
      */
     val secretSink: SecretTarget? = null,
     /**
@@ -82,17 +111,29 @@ data class PlannedChange(
 ) {
     val hasGrantChanges: Boolean get() = grantAdds.isNotEmpty() || grantRemoves.isNotEmpty()
 
+    /** `<kind>/<name>` — the file's key of this row. */
+    val key: String get() = "$kind/$name"
+
+    /** SSO-3715 — a non-environment resource with no sandbox slug lives on the production plane. */
+    val onProductionPlane: Boolean get() = kind != ProvisionFile.KIND_ENVIRONMENT && (environment.isNullOrBlank() || environment == ProvisionEngine.PRODUCTION_ENV_SLUG)
+
     fun toStructured(): Map<String, Any?> = buildMap {
         put("kind", kind); put("name", name); put("action", action.name.lowercase()); put("reason", reason)
         liveId?.let { put("id", it) }
+        // SSO-3715 — the plane as a workflow needs it: `environment` is the slug (null ⇒ production), so an
+        // `environment` resource's own slug rides on `attributes.slug` exactly as `apply --output json` renders it.
+        if (kind != ProvisionFile.KIND_ENVIRONMENT) put("environment", environment)
+        if (attributes.isNotEmpty()) put("attributes", attributes)
         if (diff.isNotEmpty()) put("diff", diff)
-        if (adopted) put("adopted", true)
         if (hasGrantChanges) put("grants", mapOf("add" to grantAdds, "remove" to grantRemoves))
+        if (grantUndeclared.isNotEmpty()) put("grantsUndeclared", grantUndeclared)
         customDomain?.let { put("customDomain", it) }
         access?.let { put("access", it) }
         if (readOnly) put("readOnly", true)
+        if (retain) put("retain", true)
         error?.let { put("error", it) }
         owner?.let { put("owner", it) }
+        byHand?.let { put("byHand", it) }
         if (publishTo.isNotEmpty()) {
             put("publishTo", publishTo.map { mapOf("kind" to it.kind, "repository" to it.repository, "environment" to it.environment, "name" to it.name) })
         }
@@ -105,8 +146,9 @@ data class PlannedChange(
 class ProvisionPlan(val changes: List<PlannedChange>) {
     val creates: List<PlannedChange> get() = changes.filter { it.action == ChangeAction.CREATE }
     val updates: List<PlannedChange> get() = changes.filter { it.action == ChangeAction.UPDATE }
-    val adopts: List<PlannedChange> get() = changes.filter { it.action == ChangeAction.ADOPT }
     val removes: List<PlannedChange> get() = changes.filter { it.action == ChangeAction.REMOVE }
+    /** SSO-3715 — rows a destroy / prune plan leaves in place (retained, refused, left to a person, removed with their sandbox). */
+    val skips: List<PlannedChange> get() = changes.filter { it.action == ChangeAction.SKIP }
     /** SSO-3113 — resources whose grants differ (a no-op resource can still carry grant changes). */
     val grantChanges: Int get() = changes.sumOf { it.grantAdds.size + it.grantRemoves.size }
     /**
@@ -117,24 +159,29 @@ class ProvisionPlan(val changes: List<PlannedChange>) {
     val publishes: Int get() = changes.sumOf { it.publishTo.size }
     /** SSO-3659 — client secrets `apply` will mint AND deliver to a declared `secretSink:` (a CREATE each; never by plan). */
     val deliveries: Int get() = changes.count { it.secretSink != null }
-    val hasChanges: Boolean get() = creates.isNotEmpty() || updates.isNotEmpty() || adopts.isNotEmpty() || removes.isNotEmpty() || grantChanges > 0 || publishes > 0
+    val hasChanges: Boolean get() = creates.isNotEmpty() || updates.isNotEmpty() || removes.isNotEmpty() || grantChanges > 0 || publishes > 0
     /** SSO-3659 — resources that failed the ownership gate; a plan with one is red and `apply` refuses it. */
     val errors: List<PlannedChange> get() = changes.filter { it.action == ChangeAction.ERROR }
     val hasErrors: Boolean get() = errors.isNotEmpty()
 
     /** True when any planned removal targets the workspace's PRODUCTION plane (confirmation-gated). */
-    val removesOnProductionPlane: Boolean
-        get() = removes.any { it.owned?.let { o -> ProvisionEngine.onProductionPlane(o) } == true }
+    val removesOnProductionPlane: Boolean get() = removes.any { it.onProductionPlane }
+
+    /**
+     * SSO-3715 — the resolved ids per declared resource, `{kind, name, id, environment, action}` (+ `attributes`,
+     * `owner`), in file order: what a workflow reads from `plan --output json` instead of a receipt.
+     */
+    fun resolvedResources(): List<Map<String, Any?>> = changes.filter { it.resource != null && it.liveId != null }.map { it.toResolved() }
 
     fun toStructured(): Map<String, Any?> = mapOf(
         "changes" to changes.map { it.toStructured() },
+        "resources" to resolvedResources(),
         "summary" to mapOf(
             "create" to creates.size,
             "update" to updates.size,
-            "adopt" to adopts.size,
             "remove" to removes.size,
             "noop" to changes.count { it.action == ChangeAction.NOOP },
-            "skip" to changes.count { it.action == ChangeAction.SKIP },
+            "skip" to skips.size,
             "grants" to grantChanges,
             "error" to errors.size,
             "publish" to publishes,
@@ -143,18 +190,25 @@ class ProvisionPlan(val changes: List<PlannedChange>) {
     )
 }
 
+/** SSO-3715 — a plan row's `{kind, name, id, environment, action, attributes, owner}` for `--output json`. */
+private fun PlannedChange.toResolved(): Map<String, Any?> = buildMap {
+    put("kind", kind); put("name", name); put("id", liveId)
+    put("environment", if (kind == ProvisionFile.KIND_ENVIRONMENT) attributes["slug"] else environment)
+    put("action", action.name.lowercase())
+    if (attributes.isNotEmpty()) put("attributes", attributes)
+    owner?.let { put("owner", it) }
+}
+
 /**
  * SSO-3659 (ADR 2026-10-13 §2) — one live resource `import` would add to the provisioning file: the
- * rendered [resource] (owned, or `readOnly: true` when the identity may only view it or another receipt
- * owns it), its live id, the [access] the identity holds, the receipt entry it becomes ([owned] —
- * `adopted: true`, never deleted by destroy; null for a read-only reference), and a [note] for what the
- * file cannot carry (a write-only secret, an unrecoverable template).
+ * rendered [resource] (`readOnly: true` when the identity may only view it or another repository owns it),
+ * its live id, the [access] the identity holds, and a [note] for what the file cannot carry (a write-only
+ * secret, an unrecoverable template). SSO-3715 — `import` writes the file only; nothing else is recorded.
  */
 data class ImportedResource(
     val resource: ProvisionResource,
     val liveId: String,
     val access: Access,
-    val owned: OwnedResource?,
     val note: String? = null,
 ) {
     /** The `provision.yaml` entry, key order as a human would write it. */
@@ -174,42 +228,107 @@ data class ImportedResource(
 /** The outcome of an import: what would be added, and what was reachable but could not be rendered (with why). */
 data class ImportResult(val resources: List<ImportedResource>, val skipped: List<String>)
 
-/** The outcome of a destroy / prune pass: what is still owned, and which removals failed. */
-data class RemovalOutcome(val remaining: ProvisionReceipt, val failures: List<String>)
+/**
+ * SSO-3715 (ADR 2026-10-15 §5 "nothing stays local") — one declared resource as `apply` left it: its `kind` +
+ * `name` (the file's key), the live id, the environment SLUG it lives in (`null` ⇒ the production plane; an
+ * `environment` records its own slug under `attributes.slug`), non-secret attributes, the platform `owner` the
+ * response rendered, and what this apply did to it. The in-memory shape behind `apply --output json` — never
+ * written anywhere: the platform is the ledger, and the next run reads it live again.
+ */
+data class AppliedResource(
+    val kind: String,
+    val name: String,
+    val id: String,
+    val environment: String? = null,
+    val attributes: Map<String, String> = emptyMap(),
+    val owner: String? = null,
+    val action: ChangeAction = ChangeAction.NOOP,
+) {
+    val key: String get() = "$kind/$name"
+
+    fun toStructured(): Map<String, Any?> = buildMap {
+        put("kind", kind); put("name", name); put("id", id)
+        put("environment", if (kind == ProvisionFile.KIND_ENVIRONMENT) attributes["slug"] else environment)
+        put("action", action.name.lowercase())
+        if (attributes.isNotEmpty()) put("attributes", attributes)
+        owner?.let { put("owner", it) }
+    }
+}
+
+/**
+ * SSO-3715 — the outcome of an `apply`: every declared resource with the id it resolved to ([resources], file
+ * order), the `plan --output json` shape a workflow reads ids from (`{kind, name, id, environment, action}`).
+ */
+class ApplyResult(val resources: List<AppliedResource>, val workspace: String? = null) {
+    fun toStructured(): Map<String, Any?> = mapOf(
+        "workspace" to workspace,
+        "resources" to resources.map { it.toStructured() },
+        "summary" to mapOf(
+            "create" to resources.count { it.action == ChangeAction.CREATE },
+            "update" to resources.count { it.action == ChangeAction.UPDATE },
+            "noop" to resources.count { it.action == ChangeAction.NOOP },
+        ),
+    )
+}
+
+/** The outcome of a destroy / prune pass: what was removed, and which planned removals failed (kept live; a re-run retries). */
+data class RemovalOutcome(val removed: List<AppliedResource>, val failures: List<String>)
 
 /**
  * SSO-3088 / SSO-3089 (epic SSO-3087) — the provisioning engine behind `thoryn provision plan | apply | destroy`.
  *
  * **Converge, not create (SSO-3089).** Every declared resource is looked up LIVE by its converge key
- * before any write: an owned resource by its recorded id (a 404 means it was deleted out of band and is
- * re-created); an unowned one by its natural key (environment `slug`, application `displayName` within
- * its environment, user `email`, federation member `displayName`, the per-environment singletons by
- * existence — `loginMethods` (SSO-3100) by its stored allow-list, compared as a set). Found + equal ⇒ `noop`; found + different ⇒ `update` with exactly the changed fields;
- * found but not yet managed ⇒ `adopt` (recorded as owned with `adopted=true` — converged from then on,
- * but NEVER deleted by `destroy`/`--prune`: the CLI only removes what it created); absent ⇒ `create`.
- * A second `apply` therefore issues no writes.
+ * before any write: environment `slug`; application `clientId` when declared, else `displayName` within
+ * its environment; user `email`; federation member `displayName`; trust `name`; the per-environment
+ * singletons by existence — `loginMethods` (SSO-3100) by its stored allow-list, compared as a set. Found +
+ * equal ⇒ `noop`; found + different ⇒ `update` with exactly the changed fields; absent ⇒ `create`. A second
+ * `apply` therefore issues no writes. **Ambiguity is an error, not a create (SSO-3715):** two live matches
+ * of a converge key are the red row `converge_key_ambiguous` ("declare `clientId`") — never a third copy.
  *
- * **Ownership is the receipt.** `destroy` and `--prune` act only on receipt-recorded, non-adopted ids.
+ * **The platform is the ledger (SSO-3715; ADR 2026-10-15 platform-is-the-ledger-no-committed-provisioning-receipt).**
+ * `plan`, `apply`, `destroy` and `import` read live state only. Nothing is written beside the file — no
+ * receipt, committed or cached — so the plan a reviewer reads and the state the platform enforces cannot
+ * diverge. The receipt-era `adopted` bit is retired with the receipt: a live match is `noop` / `update`, and
+ * what `destroy` / `--prune` may remove is decided by the platform's `owner` relation ([mayRemove]):
+ *
+ *  - a **`client:` identity** (a repository's `wi_`) removes a declared `application` / `environment` only
+ *    when `/access/check owner` is true for it — `manager` alone (inherited through a sandbox a founder
+ *    created, or granted) is never enough for automation to delete;
+ *  - a **`member:` identity** (a person) removes what it **manages and nobody owns** — people cannot own, and
+ *    an owned resource belongs to its repository ("owned by a repository — change its file");
+ *  - **non-ownable kinds** (`user`, `federationMember`, the singletons, a `workloadIdentityTrust`) are removed
+ *    WITH their sandbox — when the caller may delete the declared parent environment (the hard-delete
+ *    cascades them) — and are never removed on the production plane by `destroy` / `--prune`: left in place,
+ *    reported with the explicit command ([PlannedChange.byHand]);
+ *  - environments are removed after their children, and only when owned;
+ *  - **`retain: true`** (the declared replacement for the adopted bit) is converged and owned but never
+ *    removed — shown as "retained" in the destroy plan.
+ *
+ * Every refusal is a `skip` row carrying the reason and the command a human would run; `--confirm
+ * <workspace-slug>` is still required for any production-plane removal.
  *
  * **Secrets.** A `spec` key ending in `Env` names the env var carrying a secret; it is resolved at apply
- * time, forwarded to the product API, and NEVER written to the receipt, the plan, or the console. A
- * write-only secret (an SMTP password, a federation client secret) cannot be read back, so it never
- * causes a diff on its own; it is re-sent whenever the resource is created or updated.
+ * time, forwarded to the product API, and NEVER written to the plan or the console. A write-only secret
+ * (an SMTP password, a federation client secret) cannot be read back, so it never causes a diff on its
+ * own; it is re-sent whenever the resource is created or updated. The same holds for an application's
+ * `private_key_jwt` key location (`jwksUri` / `jwks`): product-api does not render it yet (SSO-3716), so it
+ * is never diffed — it is sent on create and re-sent, idempotently, on every update of the client.
  *
  * **Server-minted client secrets (SSO-3113).** A confidential `application` (product-api's default
  * `clientType`) is created with a ONE-TIME `client_secret` on the create response. It leaves the engine
  * EXCLUSIVELY through [secretSink] (the consumer's channel: the CLI's `--secret-file` / guarded-stdout
- * `SecretIo`) — never the receipt, the plan, the console, or a log. When the sink refuses it, the
- * resource is still recorded (it exists) and its clientId lands on [undeliveredSecrets] so the CLI's
- * `apply` can exit `SecretIo.EXIT_NO_SECRET` and point at `thoryn clients rotate-secret`.
+ * `SecretIo`) — never the plan, the console, or a log. When the sink refuses it, the resource exists all
+ * the same and its clientId lands on [undeliveredSecrets] so the CLI's `apply` can exit
+ * `SecretIo.EXIT_NO_SECRET` and point at `thoryn clients rotate-secret`.
  *
- * **Grants (SSO-3113, ordering SSO-3119).** A resource's `grants:` block is converged in a SECOND pass,
- * once EVERY resource in the file exists: the object's grants are listed (`GET /api/v1/access/grants?object=…`),
- * missing ones POSTed and ones the file no longer declares DELETEd — for THAT object only (never an
- * object the file does not own), never the workspace admin userset. The object ref derives from the
- * receipt id ([objectRef]). The second pass is what lets a block name a subject the same file declares
- * under another kind or further down; converging inline would read the file's own kind ordering as a
- * dependency order it never had. A session without `tenant:access.write` fails closed with a clear message.
+ * **Grants (SSO-3113, ordering SSO-3119, prune SSO-3715 — ADR 2026-10-15 §2).** A resource's `grants:` block
+ * is converged in a SECOND pass, once EVERY resource in the file exists: the object's grants are listed
+ * (`GET /api/v1/access/grants?object=…`) and the missing ones POSTed. Grants are **additive by default**: a
+ * live grant the block does not declare is shown as "present, not declared" and left alone. With `--prune`,
+ * on every declared object the caller may delete ([mayRemove]), the undeclared ones are DELETEd — except
+ * the `owner` tuple, workspace usersets (`workspace:…`) and the caller's own subject. The object ref
+ * derives from the live id ([objectRef]). The second pass is what lets a block name a subject the same
+ * file declares under another kind or further down. A session without `tenant:access.write` fails closed.
  *
  * **Ownership is decided by the identity's platform reach (SSO-3659; ADR 2026-10-13 §1), asked per
  * OBJECT (SSO-3673; ADR 2026-10-13 platform-owner-relation-and-forward-check).** Before any write, every
@@ -219,63 +338,58 @@ data class RemovalOutcome(val remaining: ProvisionReceipt, val failures: List<St
  * answered over the platform store with the model's containment rules (`manager = this ∪ owner ∪
  * parent.manager`). `manager` ⇒ the normal converge; `viewer` ⇒ the resource may be declared
  * `readOnly: true` as a dependency and must MATCH (any diff is `access_read_only`); none ⇒
- * `access_not_owned` — not visible, never adopted, imported or converged. A CREATE needs `manager` on the
- * parent (`environment:<id>`, or the workspace for the production plane / an environment / the custom
- * domain), asked with the same check on the parent object; creator-becomes-manager (and, for a `client:`
- * creator, creator-becomes-OWNER) on the platform then makes this identity the resource's manager — no
- * grant step, no race. A failed gate is a [ChangeAction.ERROR] row (red plan, non-zero exit) and [apply]
- * refuses the whole plan before writing. **One owning repository per resource is a PLATFORM fact:** the
- * `owner` relation (one subject per `application` / `environment`, a database invariant on the platform,
- * granted by a workspace admin or set at create for a `client:` creator) is rendered on the resource as
+ * `access_not_owned` — not visible, never imported or converged. A CREATE needs `manager` on the parent
+ * (`environment:<id>`, or the workspace for the production plane / an environment / the custom domain),
+ * asked with the same check on the parent object; creator-becomes-manager (and, for a `client:` creator,
+ * creator-becomes-OWNER) on the platform then makes this identity the resource's manager — no grant step,
+ * no race. A failed gate is a [ChangeAction.ERROR] row (red plan, non-zero exit) and [apply] refuses the
+ * whole plan before writing. **One owning repository per resource is a PLATFORM fact:** the `owner`
+ * relation (one subject per `application` / `environment`, a database invariant on the platform, granted
+ * by a workspace admin or set at create for a `client:` creator) is rendered on the resource as
  * `owner: { subject }`; when the live object has an owner and `/access/check` says this identity is not
  * it, the resource is `access_owned_elsewhere` unless declared `readOnly: true` here — the plan names no
- * other subject, only "another repository". The receipt records the owner the platform reported
- * ([OwnedResource.owner]). The former `--peer-receipt` comparison of receipts is gone: the receipt is no
- * longer the marker. `GET /api/v1/access/mine` (the per-TYPE reverse index) remains the LISTING read
- * [import] is built on. Note that the public `POST /api/v1/fga/check` / `list-objects` evaluate the
- * TENANT's own authorization model over the environment-partitioned tenant tuple store, not the platform
- * resource graph — `/api/v1/access/check` and `/mine` are that graph's check and list-objects.
+ * other subject, only "another repository". `GET /api/v1/access/mine` (the per-TYPE reverse index) is the
+ * LISTING read [import] is built on, and (SSO-3715) what `--prune` reads to find the resources a `client:`
+ * identity OWNS and the file no longer declares. Note that the public `POST /api/v1/fga/check` /
+ * `list-objects` evaluate the TENANT's own authorization model over the environment-partitioned tenant
+ * tuple store, not the platform resource graph — `/api/v1/access/check` and `/mine` are that graph's
+ * check and list-objects.
  *
  * **Outputs (SSO-3668; ADR 2026-10-13 production-clients-declared-in-the-config-project §2).** An
  * `application`'s `publishTo:` targets receive its clientId through [outputSink] — the sibling of
- * [secretSink] for a value that is PUBLIC by construction — AFTER the resource is converged and recorded
- * in the receipt (the id is known), on EVERY apply (an upsert: a re-created client propagates without a
- * second step). A target the sink cannot reach does not undo anything: the client exists, the receipt
- * records its id, and `apply` ends with [PublishTargetUnreachableException] (`publish_target_unreachable`)
- * naming the one `gh variable set` a human can run with the id from the receipt. `plan` never publishes;
- * it shows the pending publish as a line. The receipt records what WAS published ([OwnedResource.published]).
- * Like [SecretSink], the library ships no [OutputSink] that runs a process: the CLI's is `gh variable set`.
+ * [secretSink] for a value that is PUBLIC by construction — AFTER the resource is converged (the id is
+ * known), on EVERY apply (an upsert: a re-created client propagates without a second step). A target the
+ * sink cannot reach does not undo anything: the client exists, and `apply` ends with
+ * [PublishTargetUnreachableException] (`publish_target_unreachable`) naming the one `gh variable set` a
+ * human can run with the id from the apply output. `plan` never publishes; it shows the pending publish as
+ * a line. Like [SecretSink], the library ships no [OutputSink] that runs a process: the CLI's is `gh variable set`.
  *
  * **Declared secret delivery (SSO-3659; ADR 2026-10-13 converge §5, production-clients ADR §3 tier 3).** A
  * confidential `application` may declare a `secretSink:` ([SecretTarget] — a key of an existing namespace's
  * Kubernetes Secret, or an owner-only file): where the one-time `client_secret` is CONSUMED. `apply` hands
- * the minted value to [declaredSecretSink] IMMEDIATELY AFTER the client is converged and recorded in the
- * receipt (so an unreachable sink never costs the client its receipt entry), falls back to the generic
- * [secretSink] (the CLI's `--secret-file` / guarded TTY) when the declared one answers a reason, and — when
- * neither reaches — leaves the client in place and reports it on [undeliveredSecretDetails]
+ * the minted value to [declaredSecretSink] IMMEDIATELY AFTER the client is converged, falls back to the
+ * generic [secretSink] (the CLI's `--secret-file` / guarded TTY) when the declared one answers a reason, and
+ * — when neither reaches — leaves the client in place and reports it on [undeliveredSecretDetails]
  * (`undelivered_secrets`): the host exits non-zero naming the resource and the recovery
- * `thoryn clients rotate-secret <clientId> --secret-file <path>`. The value never enters the receipt, the
- * plan, the console or a log — a sink's reason is redacted of it before it is printed. `plan` shows the
- * intended delivery as a line ([PlannedChange.secretSink]) and mints nothing. The library ships no sink
- * that runs `kubectl` or writes a file: the CLI's does (`CliDeclaredSecretSink`).
+ * `thoryn clients rotate-secret <clientId> --secret-file <path>`. The value never enters the plan, the
+ * console or a log — a sink's reason is redacted of it before it is printed. `plan` shows the intended
+ * delivery as a line ([PlannedChange.secretSink]) and mints nothing. The library ships no sink that runs
+ * `kubectl` or writes a file: the CLI's does (`CliDeclaredSecretSink`).
  *
  * [clients] yields a tenant-scoped [ProvisionApi] bound to an environment slug (`null` ⇒ the
- * production plane); [persist] is invoked after every successful write so the receipt on disk always
- * reflects reality even when a later step fails.
+ * production plane).
  *
  * **A library since SSO-3662** (ADR 2026-10-13-provision-engine-shared-library): this class, the file
- * model, the receipt model and [SecretSink] are `io.thoryn:thoryn-provision-engine`, the module the CLI
- * is built on and that anything else needing to converge a provisioning file in-process consumes. The
- * module knows nothing of picocli, a TTY, or the CLI's session — it reaches product-api only through the
- * [ProvisionApi] port the consumer hands it, and reports through the [out] / [err] streams it is given.
+ * model and [SecretSink] are `io.thoryn:thoryn-provision-engine`, the module the CLI is built on and that
+ * anything else needing to converge a provisioning file in-process consumes. The module knows nothing of
+ * picocli, a TTY, or the CLI's session — it reaches product-api only through the [ProvisionApi] port the
+ * consumer hands it, and reports through the [out] / [err] streams it is given.
  */
 class ProvisionEngine(
     private val clients: (environmentSlug: String?) -> ProvisionApi,
     private val out: PrintStream = System.out,
     private val err: PrintStream = System.err,
     private val env: (String) -> String? = { System.getenv(it) },
-    private val cliVersion: String? = null,
-    private val now: () -> Instant = { Instant.now() },
     /** SSO-3113 — the single channel a minted `client_secret` leaves through; the default delivers nothing. */
     private val secretSink: SecretSink = SecretSink.undeliverable(),
     /**
@@ -285,9 +399,11 @@ class ProvisionEngine(
     private val workspaceId: String? = null,
     /**
      * SSO-3659 — the signed-in identity's platform subject (`client:<clientId>` / `member:<sub>`), derived
-     * from the token by the caller exactly as product-api derives it. Recorded on the receipt
-     * ([ProvisionReceipt.subject]) for display / audit; the gate itself never sends it — `/api/v1/access/check`
-     * and `/mine` answer for the CALLER's own subject, so the subject is always the token's, never the file's.
+     * from the token by the caller exactly as product-api derives it. SSO-3715 — it decides the SHAPE of the
+     * deletion authority ([mayRemove]: owner for a `client:`, unowned-manager for a `member:`) and is excluded
+     * from `--prune`'s grant revocations; the gate itself never sends it — `/api/v1/access/check` and `/mine`
+     * answer for the CALLER's own subject, so the subject is always the token's, never the file's. Null (a
+     * person's opaque token — a machine session always names its client) ⇒ the person's rule applies.
      */
     private val subject: String? = null,
     /**
@@ -332,7 +448,7 @@ class ProvisionEngine(
      * target (if any) and the (redacted) reason. The client exists and is owned; [recovery] mints a new secret.
      */
     data class UndeliveredSecret(val resourceKey: String, val clientId: String, val target: SecretTarget?, val reason: String) {
-        /** The one command a human runs instead — with the clientId from the receipt. */
+        /** The one command a human runs instead — with the clientId from the apply output. */
         val recovery: String get() = recoverSecret(clientId)
     }
 
@@ -342,7 +458,7 @@ class ProvisionEngine(
      * `gh variable set … --env` (creating the environment when absent, never touching an existing one's
      * protection); the GitHub App with its own gateway. [publish] answers `null` when the value landed,
      * else WHY the target could not be reached (shown to the operator; never the value itself — which is a
-     * client id and public anyway, but the message names the receipt as its source).
+     * client id and public anyway, but the message names the apply output as its source).
      */
     fun interface OutputSink {
         fun publish(target: PublishTarget, value: String): String?
@@ -355,24 +471,24 @@ class ProvisionEngine(
 
     /** SSO-3668 — one `publishTo:` target `apply` could not reach: which resource, which target, and why. */
     data class PublishFailure(val resourceKey: String, val target: PublishTarget, val value: String, val reason: String) {
-        /** The one command a human runs instead, with the id from the receipt. */
+        /** The one command a human runs instead, with the id from the apply output. */
         val byHand: String get() = target.byHand(value)
     }
 
     /**
-     * SSO-3668 — `apply` converged and recorded every resource, but one or more outputs could not be
-     * published (`publish_target_unreachable`). Raised AFTER convergence, once the receipt is persisted
-     * ([receipt] is that receipt), so nothing is lost: the human fallback is each failure's [PublishFailure.byHand].
+     * SSO-3668 — `apply` converged every resource, but one or more outputs could not be published
+     * (`publish_target_unreachable`). Raised AFTER convergence ([result] is what was applied, ids included), so
+     * nothing is lost: the human fallback is each failure's [PublishFailure.byHand].
      */
-    class PublishTargetUnreachableException(val failures: List<PublishFailure>, val receipt: ProvisionReceipt) : ProvisionException(
-        "$ERROR_PUBLISH_UNREACHABLE — every resource was converged and recorded in the receipt, but " +
+    class PublishTargetUnreachableException(val failures: List<PublishFailure>, val result: ApplyResult) : ProvisionException(
+        "$ERROR_PUBLISH_UNREACHABLE — every resource was converged, but " +
             "${failures.size} output(s) could not be published:\n  " +
             failures.joinToString("\n  ") { "${it.resourceKey} → ${it.target.label}: ${it.reason}\n    publish it by hand: ${it.byHand}" },
     )
 
     /**
      * SSO-3113 — clientIds of confidential applications created by the last [apply] whose one-time
-     * secret the [secretSink] could NOT deliver. The clients exist (and are owned); the operator must
+     * secret the [secretSink] could NOT deliver. The clients exist; the operator must
      * mint a new secret with `thoryn clients rotate-secret <clientId>`.
      */
     private val undelivered = mutableListOf<UndeliveredSecret>()
@@ -382,7 +498,7 @@ class ProvisionEngine(
 
     /**
      * SSO-3113 — the single channel a server-minted `client_secret` leaves the engine through. [emit]
-     * returns `true` when delivered, `false` when refused — the resource is still recorded and its
+     * returns `true` when delivered, `false` when refused — the resource exists all the same and its
      * clientId lands on [undeliveredSecrets]. SSO-3662: the library ships NO sink that touches a TTY or a
      * file system; each consumer brings its own — the CLI's `CliSecretSink` (the `--secret-file` /
      * guarded-stdout `SecretIo` channel `thoryn clients create` uses, exit `SecretIo.EXIT_NO_SECRET` when
@@ -399,20 +515,23 @@ class ProvisionEngine(
 
     // ── plan ─────────────────────────────────────────────────────────────────────────────────────
 
-    fun plan(file: ProvisionFile, receipt: ProvisionReceipt?, prune: Boolean): ProvisionPlan {
+    /**
+     * What `apply` would do: every declared resource probed live, gated, its grants diffed, then (with
+     * [prune]) the resources this `client:` identity OWNS on the platform and the file no longer declares, as
+     * removals. SSO-3715 — reads live only; there is no receipt to consult.
+     */
+    fun plan(file: ProvisionFile, prune: Boolean): ProvisionPlan {
         trustLists.clear()
-        val ownedByKey = receipt?.resources.orEmpty().associateBy { it.key }
         val changes = mutableListOf<PlannedChange>()
-        // Environment slugs known so far (owned / live), so dependants can be probed in the right plane.
+        // Environment slugs known so far (live), so dependants can be probed in the right plane.
         val envSlugs = mutableMapOf<String, String>()
         val reach = Reach()
         orderForApply(file.resources).forEach { r ->
-            val owned = ownedByKey[r.key]
             val slug = planSlug(r, file, envSlugs)
             // SSO-3659 — the ownership gate sits between the live lookup and everything that would write:
             // a resource that fails it plans no grants (its object may not even be visible to this identity).
-            val change = gate(r, probe(r, file, owned, envSlugs), file, envSlugs, slug, reach)
-                .let { c -> if (c.action == ChangeAction.ERROR || c.readOnly) c else planGrants(r, c, slug, owned) }
+            val change = gate(r, probe(r, file, envSlugs), file, envSlugs, slug, reach)
+                .let { c -> if (c.action == ChangeAction.ERROR || c.readOnly) c else planGrants(r, c, slug, prune, file, envSlugs, reach) }
                 // SSO-3668 — a resource that will be converged publishes its id afterwards (every apply); shown, never done, by plan.
                 .let { c -> if (c.action == ChangeAction.ERROR || c.readOnly || r.publishTo.isEmpty()) c else c.copy(publishTo = r.publishTo, reason = c.reason + "; publishes its id to ${r.publishTo.size} target(s)") }
                 // SSO-3659 — a CREATE of a confidential application mints a secret; where it will be delivered is shown, never done, by plan.
@@ -423,16 +542,49 @@ class ProvisionEngine(
                 envSlugs[r.name] = resolveSpec(r, strict = false)["slug"].toString()
             }
         }
-        val declared = file.resources.map { it.key }.toSet()
-        orderForRemove(receipt?.resources.orEmpty().filter { it.key !in declared }).forEach { o ->
-            changes += when {
-                !prune -> PlannedChange(o.kind, o.name, ChangeAction.SKIP, "owned but no longer declared — re-run with --prune to remove", owned = o, liveId = o.id)
-                o.adopted -> PlannedChange(o.kind, o.name, ChangeAction.SKIP, "adopted (not created by this file) — left in place, dropped from the receipt", owned = o, liveId = o.id, adopted = true)
-                !deletable(o.kind) -> PlannedChange(o.kind, o.name, ChangeAction.SKIP, "no delete API for a ${o.kind} singleton — left in place, dropped from the receipt", owned = o, liveId = o.id)
-                else -> PlannedChange(o.kind, o.name, ChangeAction.REMOVE, "owned but no longer declared (--prune)", owned = o, liveId = o.id)
+        if (prune) changes += planPruneOwned(file, changes, reach)
+        return ProvisionPlan(changes)
+    }
+
+    /**
+     * SSO-3715 (ADR 2026-10-15 §1 / §5) — what `--prune` removes besides grants: every `application` /
+     * `environment` the platform lists this identity as OWNER of (`GET /api/v1/access/mine?relation=owner`) that
+     * the file does not declare. The platform is the ledger of what a repository owns, so "owned but no longer
+     * declared" needs no receipt. A `member:` identity owns nothing (people are managers, never owners), so
+     * nothing undeclared can be attributed to its file — reported as one note. Children first, environments last.
+     */
+    private fun planPruneOwned(file: ProvisionFile, declared: List<PlannedChange>, reach: Reach): List<PlannedChange> {
+        if (subject == null || !subject.startsWith("client:")) {
+            return listOf(
+                PlannedChange(
+                    "prune", "undeclared", ChangeAction.SKIP,
+                    "--prune removes what this identity OWNS and the file no longer declares; a ${subject?.substringBefore(':') ?: "person's"} identity owns nothing on the platform " +
+                        "(people are managers, never owners), so only undeclared grants on the declared objects are pruned — remove a resource by hand (`thoryn clients delete <clientId>`, `thoryn env delete <id> --confirm <slug>`)",
+                ),
+            )
+        }
+        val declaredApps = declared.filter { it.kind == ProvisionFile.KIND_APPLICATION }.mapNotNull { it.liveId }.toSet()
+        val declaredEnvs = declared.filter { it.kind == ProvisionFile.KIND_ENVIRONMENT }.mapNotNull { it.liveId }.toSet()
+        val rows = mutableListOf<PlannedChange>()
+        val sandboxSlugs = reach.environments().filter { it.str("kind") != PRODUCTION_ENV_SLUG && it.str("slug") != PRODUCTION_ENV_SLUG }.mapNotNull { it.str("slug") }
+        reach.ids(OBJECT_TYPE_APPLICATION, RELATION_OWNER).filter { it == decodePlatformId(it) && it !in declaredApps }.sorted().forEach { id ->
+            // The plane it lives in: the first one whose GET answers (production first) — the engine needs the header to delete it.
+            val plane = (listOf<String?>(null) + sandboxSlugs).firstOrNull { fetchOrNull { clients(it).getApplication(id) } != null }
+            rows += if (plane == null && fetchOrNull { clients(null).getApplication(id) } == null) {
+                PlannedChange(ProvisionFile.KIND_APPLICATION, id, ChangeAction.SKIP, "owned by this identity on the platform but not readable in any environment — left in place", liveId = id)
+            } else {
+                PlannedChange(ProvisionFile.KIND_APPLICATION, id, ChangeAction.REMOVE, "owned by this identity (the platform's `owner` relation) and not declared in the file (--prune)", liveId = id, environment = plane, owner = subject)
             }
         }
-        return ProvisionPlan(changes)
+        reach.ids(OBJECT_TYPE_ENVIRONMENT, RELATION_OWNER).filter { it == decodePlatformId(it) && it !in declaredEnvs }.sorted().forEach { id ->
+            val node = reach.environments().firstOrNull { it.str("id") == id }
+            rows += if (node == null) {
+                PlannedChange(ProvisionFile.KIND_ENVIRONMENT, id, ChangeAction.SKIP, "owned by this identity on the platform but not in the workspace's environment list — left in place", liveId = id)
+            } else {
+                PlannedChange(ProvisionFile.KIND_ENVIRONMENT, node.str("slug") ?: id, ChangeAction.REMOVE, "owned by this identity (the platform's `owner` relation) and not declared in the file (--prune); its contents go with it", liveId = id, attributes = buildMap { node.str("slug")?.let { put("slug", it) } }, owner = subject)
+            }
+        }
+        return orderForRemove(rows)
     }
 
     /**
@@ -447,43 +599,51 @@ class ProvisionEngine(
         else -> envSlugs[r.environment]
     }
 
-    /** Live lookup by converge key → create / update / adopt / noop for one declared resource. */
-    private fun probe(r: ProvisionResource, file: ProvisionFile, owned: OwnedResource?, envSlugs: Map<String, String>): PlannedChange {
-        if (r.kind == ProvisionFile.KIND_CUSTOM_DOMAIN) return probeCustomDomain(r, owned)
+    /** Live lookup by converge key → create / update / noop for one declared resource. */
+    private fun probe(r: ProvisionResource, file: ProvisionFile, envSlugs: Map<String, String>): PlannedChange {
+        if (r.kind == ProvisionFile.KIND_CUSTOM_DOMAIN) return probeCustomDomain(r)
         val slug: String? = when {
             r.kind == ProvisionFile.KIND_ENVIRONMENT -> null
             r.environment == null -> null
             file.environmentResource(r.environment) == null -> r.environment
             else -> envSlugs[r.environment]
-                ?: return PlannedChange(r.kind, r.name, ChangeAction.CREATE, "environment '${r.environment}' will be created first${mintNote(r)}", resource = r)
+                ?: return PlannedChange(r.kind, r.name, ChangeAction.CREATE, "environment '${r.environment}' will be created first${mintNote(r)}", resource = r, retain = r.retain)
         }
         var desired = resolveSpec(r, strict = false)
         // SSO-3689 — a trust converges by its name and is never updated in place (its pins are immutable on the hub).
-        if (r.kind == ProvisionFile.KIND_WORKLOAD_IDENTITY_TRUST) return probeTrust(r, owned, slug, desired)
+        if (r.kind == ProvisionFile.KIND_WORKLOAD_IDENTITY_TRUST) return probeTrust(r, slug, desired)
         // SSO-3689 — `federatedTrust` names a trust; the API takes its id, so the name is resolved (same environment) first.
         if (r.kind == ProvisionFile.KIND_APPLICATION) {
             federatedTrustRef(r, file, slug, atApply = false)?.let { ref ->
-                ref.error?.let { why -> return PlannedChange(r.kind, r.name, ChangeAction.ERROR, "$ERROR_FEDERATED_TRUST_NOT_FOUND — $why", resource = r, owned = owned, error = ERROR_FEDERATED_TRUST_NOT_FOUND) }
+                ref.error?.let { why -> return PlannedChange(r.kind, r.name, ChangeAction.ERROR, "$ERROR_FEDERATED_TRUST_NOT_FOUND — $why", resource = r, error = ERROR_FEDERATED_TRUST_NOT_FOUND) }
                 desired = desired + (ProvisionFile.SPEC_FEDERATED_TRUST to (ref.id ?: "${ref.name} $PENDING_TRUST_MARKER"))
             }
         }
         val live = try {
-            lookup(r, owned, slug, desired)
+            lookup(r, slug, desired)
+        } catch (ex: ConvergeKeyAmbiguousException) {
+            // SSO-3715 (ADR 2026-10-15 §5) — two live matches: red, never a third copy.
+            return PlannedChange(r.kind, r.name, ChangeAction.ERROR, "$ERROR_CONVERGE_KEY_AMBIGUOUS — ${ex.message}", resource = r, environment = slug, error = ERROR_CONVERGE_KEY_AMBIGUOUS, fixNote = FILE_FIX_NOTE_AMBIGUOUS)
         } catch (ex: ProductApiException) {
             throw ProvisionException("${r.key}: could not read live state (${ex.message})")
         }
         return when {
-            live == null && owned != null -> PlannedChange(r.kind, r.name, ChangeAction.CREATE, "owned id ${owned.id} no longer exists — will be re-created${mintNote(r)}", resource = r, owned = owned)
-            live == null -> PlannedChange(r.kind, r.name, ChangeAction.CREATE, "not found by its converge key${mintNote(r)}", resource = r)
+            live == null -> PlannedChange(r.kind, r.name, ChangeAction.CREATE, "not found by its converge key${mintNote(r)}", resource = r, environment = slug, retain = r.retain)
             live.diff.isNotEmpty() -> PlannedChange(
-                r.kind, r.name, ChangeAction.UPDATE,
-                if (owned == null) "exists (adopting) — ${live.diff.size} field(s) differ" else "${live.diff.size} field(s) differ",
-                resource = r, owned = owned, liveId = live.id, diff = live.diff, adopted = owned?.adopted ?: true, owner = live.owner,
+                r.kind, r.name, ChangeAction.UPDATE, "exists — ${live.diff.size} field(s) differ${keyLocationNote(r)}",
+                resource = r, liveId = live.id, environment = slug, attributes = live.attributes, diff = live.diff, owner = live.owner, retain = r.retain,
             )
-            owned == null -> PlannedChange(r.kind, r.name, ChangeAction.ADOPT, "exists and matches — adopted under management (never deleted by destroy)", resource = r, liveId = live.id, adopted = true, owner = live.owner)
-            else -> PlannedChange(r.kind, r.name, ChangeAction.NOOP, "owned (id ${live.id}) and matches", resource = r, owned = owned, liveId = live.id, adopted = owned.adopted, owner = live.owner)
+            else -> PlannedChange(r.kind, r.name, ChangeAction.NOOP, "exists and matches${keyLocationNote(r)}", resource = r, liveId = live.id, environment = slug, attributes = live.attributes, owner = live.owner, retain = r.retain)
         }
     }
+
+    /**
+     * SSO-3715 — until product-api renders the key location (SSO-3716), a declared `jwksUri` / `jwks` is never diffed:
+     * it is sent on create and re-sent with every update. The plan says so, so a reader knows why a changed key
+     * location alone plans no update.
+     */
+    private fun keyLocationNote(r: ProvisionResource): String =
+        if (r.kind == ProvisionFile.KIND_APPLICATION && KEY_LOCATION_FIELDS.any { r.spec[it] != null }) " (key location declared — not readable from the API, re-sent with any update; SSO-3716)" else ""
 
     /** SSO-3113 — the plan marker for a confidential application about to be created (its secret is shown once). */
     private fun mintNote(r: ProvisionResource): String = when {
@@ -511,17 +671,23 @@ class ProvisionEngine(
     /**
      * SSO-3113 — attach the grant diff to a planned change: for a CREATE every declared grant is an add
      * (nothing exists yet); otherwise the object's live grants are listed and compared as a set. A
-     * resource without a `grants:` block is left untouched (nothing is even read).
+     * resource without a `grants:` block is left untouched (nothing is even read). SSO-3715 (ADR 2026-10-15
+     * §2) — an undeclared live grant is "present, not declared" unless [prune] is set AND the caller may
+     * delete the object ([mayRemove]); the exclusions ([grantDiff]) hold either way.
      */
-    private fun planGrants(r: ProvisionResource, change: PlannedChange, slug: String?, owned: OwnedResource?): PlannedChange {
+    private fun planGrants(r: ProvisionResource, change: PlannedChange, slug: String?, prune: Boolean, file: ProvisionFile, envSlugs: Map<String, String>, reach: Reach): PlannedChange {
         val declared = r.grants ?: return change
         if (change.action == ChangeAction.CREATE || change.liveId == null) {
             return change.copy(grantAdds = declared.map { it.label })
         }
-        val (adds, removes) = grantDiff(declared, liveGrants(r, objectRef(r.kind, change.liveId, slug)), owned?.grants.orEmpty())
-        if (adds.isEmpty() && removes.isEmpty()) return change
-        val note = "; grants: +${adds.size} −${removes.size}"
-        return change.copy(reason = change.reason + note, grantAdds = adds, grantRemoves = removes)
+        val revoke = prune && mayRemove(r, change, slug, file, envSlugs, reach).allowed
+        val (adds, removes, undeclared) = grantDiff(declared, liveGrants(r, objectRef(r.kind, change.liveId, slug)), revoke)
+        if (adds.isEmpty() && removes.isEmpty() && undeclared.isEmpty()) return change
+        val note = buildString {
+            if (adds.isNotEmpty() || removes.isNotEmpty()) append("; grants: +${adds.size} −${removes.size}")
+            if (undeclared.isNotEmpty()) append("; ${undeclared.size} grant(s) present, not declared" + if (prune && !revoke) " (kept: this identity may not delete the object)" else "")
+        }
+        return change.copy(reason = change.reason + note, grantAdds = adds, grantRemoves = removes, grantUndeclared = undeclared)
     }
 
     // ── ownership gate (SSO-3659; ADR 2026-10-13 §1 — per object since SSO-3673) ────────────────
@@ -624,7 +790,7 @@ class ProvisionEngine(
                 // SSO-3710 — the right that fixes "not visible" is `viewer` for a read-only reference, `owner` for a
                 // resource this file is to own (the ADR's grantable set: rights on existing things, set by an admin).
                 Access.NONE -> {
-                    val why = "this identity holds no relation on $ref — the resource is not visible to it and cannot be adopted, imported or converged"
+                    val why = "this identity holds no relation on $ref — the resource is not visible to it and cannot be imported or converged"
                     val fix = if (r.readOnly) FixRequest.viewer(subject, ref, why) else FixRequest.owner(subject, ref, why)
                     refuse(r, change, ERROR_NOT_OWNED, access, "$why (${FixRequest.hint(fix)})", fix = fix)
                 }
@@ -755,18 +921,151 @@ class ProvisionEngine(
         fixNote: String? = null,
     ): PlannedChange =
         change.copy(
-            action = ChangeAction.ERROR, reason = "$code — $why", error = code, access = access?.label, readOnly = r.readOnly, owned = change.owned,
+            action = ChangeAction.ERROR, reason = "$code — $why", error = code, access = access?.label, readOnly = r.readOnly, retain = r.retain,
             // The item's reason carries the gate's code like the row's does (`access_not_owned — …`), so a consumer reads one shape.
             fix = fix?.copy(reason = "$code — ${fix.reason}"), fixNote = fixNote,
         )
 
-    /** A read-only reference that exists and matches: a no-op that is never owned (a stale receipt entry is dropped by `apply`). */
+    /** A read-only reference that exists and matches: a no-op that is never owned, never removed. */
     private fun reference(change: PlannedChange, access: Access): PlannedChange = change.copy(
         action = ChangeAction.NOOP,
-        reason = "read-only reference (${access.label}) — exists and matches; this file does not own it" +
-            if (change.owned != null) "; dropped from the receipt" else "",
-        readOnly = true, access = access.label, adopted = false, diff = emptyMap(),
+        reason = "read-only reference (${access.label}) — exists and matches; this file does not own it",
+        readOnly = true, access = access.label, diff = emptyMap(),
     )
+
+    // ── deletion authority (SSO-3715; ADR 2026-10-15 §1) ────────────────────────────────────────
+
+    /** The verdict of [mayRemove]: whether this identity may remove the live resource, else why not and what a human runs. */
+    private class RemovalVerdict(val allowed: Boolean, val reason: String, val byHand: String? = null, val cascade: Boolean = false) {
+        companion object {
+            val ALLOWED = RemovalVerdict(true, "")
+        }
+    }
+
+    /**
+     * Whether the signed-in identity may remove the declared, live resource — the ADR's rule, evaluated here before
+     * every removal and re-checked by product-api on the DELETE (404, never widened):
+     *  - `retain: true` ⇒ never; a `readOnly` reference ⇒ never (it is not this file's);
+     *  - an ownable kind (`application` / `environment`): a `client:` identity needs `/access/check owner` (manager
+     *    alone never suffices for automation); a `member:` identity needs `manager` on an object NOBODY owns;
+     *  - a non-ownable kind (`user`, `federationMember`, a singleton, a trust): with its sandbox — when the file
+     *    declares the parent environment and this identity may remove THAT (the hard-delete cascades); never on
+     *    the production plane (left in place, reported with its command).
+     * An unknown subject (a person's opaque token; a machine session always names its client) takes the person's rule.
+     */
+    private fun mayRemove(r: ProvisionResource, change: PlannedChange, slug: String?, file: ProvisionFile, envSlugs: Map<String, String>, reach: Reach, visiting: Set<String> = emptySet()): RemovalVerdict {
+        val id = change.liveId ?: return RemovalVerdict(false, "nothing matches it live — nothing to remove")
+        if (r.readOnly) return RemovalVerdict(false, "read-only reference — this file does not own it, so it is never removed")
+        if (r.retain) return RemovalVerdict(false, RETAINED)
+        val plane = if (r.kind == ProvisionFile.KIND_ENVIRONMENT) null else slug
+        val subjectType = subject?.substringBefore(':')
+        if (r.kind in OWNABLE_KINDS) {
+            val ref = objectRef(r.kind, id, plane)
+            val byHand = removeByHand(r.kind, id, plane, change.attributes["slug"])
+            return when (subjectType) {
+                "client" -> when {
+                    reach.owns(ref) -> RemovalVerdict.ALLOWED
+                    change.owner != null -> RemovalVerdict(false, "$ref is owned by another repository (the platform's `owner` relation) — change its file; a workspace admin moves ownership with `thoryn access revoke <current-owner> owner $ref`", byHand)
+                    else -> RemovalVerdict(false, "$ref is not OWNED by this identity — `manager` alone never lets automation delete; a workspace admin grants `${FixRequest.grantCommand(subject, RELATION_OWNER, ref)}`, or a person removes it", byHand)
+                }
+                else -> when {
+                    change.owner != null -> RemovalVerdict(false, "$ref is owned by a repository (the platform's `owner` relation) — change its file; people cannot own, so a person's destroy leaves it", byHand)
+                    reach.holds(ref, RELATION_MANAGER) -> RemovalVerdict.ALLOWED
+                    else -> RemovalVerdict(false, "this identity does not manage $ref", byHand)
+                }
+            }
+        }
+        // Non-ownable: with the sandbox, never on the production plane.
+        val byHand = removeByHand(r.kind, id, plane, null)
+        if (plane == null || plane == PRODUCTION_ENV_SLUG) {
+            return RemovalVerdict(false, "a ${r.kind} on the PRODUCTION plane is never removed by destroy / --prune — left in place", byHand)
+        }
+        val parent = file.resources.firstOrNull { it.kind == ProvisionFile.KIND_ENVIRONMENT && (it.name == r.environment || envSlugs[it.name] == plane) }
+            ?: return RemovalVerdict(false, "lives in sandbox '$plane', which this file does not declare — a ${r.kind} is removed with its sandbox only; left in place", byHand)
+        if (parent.key in visiting) return RemovalVerdict(false, "its sandbox '$plane' cannot be removed", byHand)
+        val parentId = reach.environmentId(plane) ?: return RemovalVerdict(false, "its sandbox '$plane' is not in the workspace's environment list", byHand)
+        val parentChange = PlannedChange(parent.kind, parent.name, ChangeAction.NOOP, "", resource = parent, liveId = parentId, attributes = mapOf("slug" to plane), owner = reach.environments().firstOrNull { it.str("id") == parentId }?.let { ProvisionApi.ownerOf(it) })
+        val parentVerdict = mayRemove(parent, parentChange, null, file, envSlugs, reach, visiting + r.key)
+        return if (parentVerdict.allowed) {
+            RemovalVerdict(true, "removed with its sandbox '$plane' (the environment hard-delete cascades; no call of its own)", cascade = true)
+        } else {
+            RemovalVerdict(false, "removed only with its sandbox '$plane', which stays (${parentVerdict.reason.substringBefore(" —")}) — left in place", byHand)
+        }
+    }
+
+    /** The command a person runs to remove one resource of [kind] by hand (the CLI's own verbs; `--environment` for a sandbox). */
+    private fun removeByHand(kind: String, id: String, plane: String?, envSlug: String?): String {
+        val env = plane?.let { " --environment $it" } ?: ""
+        val confirm = if (plane == null) " --confirm <workspace-slug>" else ""
+        return when (kind) {
+            ProvisionFile.KIND_ENVIRONMENT -> "thoryn env delete $id --confirm ${envSlug ?: "<slug>"}"
+            ProvisionFile.KIND_APPLICATION -> "thoryn clients delete $id$confirm$env"
+            ProvisionFile.KIND_USER -> "DELETE /api/v1/users/$id (the CLI has no `users delete`; `thoryn users suspend $id$confirm$env` disables the sign-in)"
+            ProvisionFile.KIND_FEDERATION_MEMBER -> "thoryn federation delete $id$confirm$env"
+            ProvisionFile.KIND_EMAIL_PROVIDER -> "DELETE /api/v1/email-provider (reset to the platform sender)$env"
+            ProvisionFile.KIND_LOGIN_METHODS -> "thoryn login-methods reset$env"
+            ProvisionFile.KIND_LOGIN_THEME -> "thoryn branding set (no delete surface; set the platform defaults)$env"
+            ProvisionFile.KIND_LOGIN_FLOW -> "activate another login flow (no delete surface)$env"
+            ProvisionFile.KIND_CUSTOM_DOMAIN -> "thoryn domain remove --yes"
+            ProvisionFile.KIND_WORKLOAD_IDENTITY_TRUST -> "thoryn workload-identity trusts delete $id --yes${if (plane == null) " --confirm <workspace-slug>" else ""}$env"
+            else -> "remove it through the console"
+        }
+    }
+
+    // ── destroy (SSO-3715) ───────────────────────────────────────────────────────────────────────
+
+    /**
+     * What `destroy` would remove: every declared resource resolved live and judged by [mayRemove] — a
+     * [ChangeAction.REMOVE] row when this identity may remove it, a [ChangeAction.SKIP] row (with the reason and
+     * the command a human runs) when not. Children first, trusts next, environments last. Reads only.
+     */
+    fun planDestroy(file: ProvisionFile): ProvisionPlan {
+        trustLists.clear()
+        val envSlugs = mutableMapOf<String, String>()
+        val reach = Reach()
+        val probed = mutableListOf<Triple<ProvisionResource, PlannedChange, String?>>()
+        orderForApply(file.resources).forEach { r ->
+            val slug = planSlug(r, file, envSlugs)
+            val change = probe(r, file, envSlugs)
+            if (r.kind == ProvisionFile.KIND_ENVIRONMENT && change.liveId != null) envSlugs[r.name] = resolveSpec(r, strict = false)["slug"].toString()
+            probed += Triple(r, change, slug)
+        }
+        val rows = probed.map { (r, change, slug) ->
+            if (change.action == ChangeAction.ERROR) return@map change
+            val verdict = mayRemove(r, change, slug, file, envSlugs, reach)
+            when {
+                change.liveId == null -> PlannedChange(r.kind, r.name, ChangeAction.SKIP, "not found by its converge key — nothing to remove", resource = r, environment = slug, retain = r.retain)
+                verdict.allowed && verdict.cascade -> change.copy(action = ChangeAction.SKIP, reason = verdict.reason, access = null)
+                verdict.allowed -> change.copy(action = ChangeAction.REMOVE, reason = "will be removed" + if (r.kind == ProvisionFile.KIND_ENVIRONMENT) " (its contents go with it)" else "", access = null)
+                else -> change.copy(action = ChangeAction.SKIP, reason = verdict.reason, byHand = verdict.byHand, access = null)
+            }
+        }
+        return ProvisionPlan(orderForRemove(rows))
+    }
+
+    /**
+     * Execute a [planDestroy] plan (or the removals of an `apply --prune` plan): every [ChangeAction.REMOVE] row,
+     * child-first. Best-effort: a failed removal is reported and the resource stays live for a retry. Refuses up
+     * front when a production-plane removal lacks [confirmSlug].
+     */
+    fun destroy(plan: ProvisionPlan, confirmSlug: String?): RemovalOutcome {
+        if (plan.removesOnProductionPlane && confirmSlug.isNullOrBlank()) {
+            throw ProvisionException("destroy would remove resources on the PRODUCTION plane; re-run with --confirm <workspace-slug>.")
+        }
+        val removed = mutableListOf<AppliedResource>()
+        val failures = mutableListOf<String>()
+        orderForRemove(plan.removes).forEach { change ->
+            try {
+                remove(change, confirmSlug)
+                removed += AppliedResource(change.kind, change.name, change.liveId ?: "", change.environment, change.attributes, change.owner, ChangeAction.REMOVE)
+            } catch (ex: Exception) {
+                failures += "${change.key} (id ${change.liveId}): ${ex.message}"
+                err.println("  ! ${change.kind} ${change.name} could not be removed (${ex.message}); it stays live — re-run to retry.")
+            }
+        }
+        return RemovalOutcome(removed, failures)
+    }
+
 
     /**
      * The platform object a CREATE needs `manager` on: the workspace for an environment, the custom domain and
@@ -800,21 +1099,20 @@ class ProvisionEngine(
 
     /**
      * The inverse of [plan], bounded by the same relations: every live platform object the identity holds
-     * `manager` on is rendered as an OWNED entry (its receipt row `adopted: true` — never deleted by destroy),
-     * every one it may only `viewer` as `readOnly: true`; an object the platform says another identity OWNS
-     * (SSO-3673: its response renders an `owner` and `/access/check owner` is false for this identity) is
-     * rendered `readOnly: true` as well. Nothing the identity has no relation to is listed by the platform, so
-     * nothing it has no relation to can be imported — the file cannot claim by being written. Resources
-     * [existing] already declares (or [receipt] already owns) are left out; what is reachable but cannot be
-     * rendered as a `provision.yaml` entry lands on [ImportResult.skipped] with the reason. Reads only.
+     * `manager` on is rendered as an entry the file converges (and, by the §1 rule, may remove), every one it
+     * may only `viewer` as `readOnly: true`; an object the platform says another identity OWNS (SSO-3673: its
+     * response renders an `owner` and `/access/check owner` is false for this identity) is rendered
+     * `readOnly: true` as well. Nothing the identity has no relation to is listed by the platform, so nothing
+     * it has no relation to can be imported — the file cannot claim by being written. Resources [existing]
+     * already declares are left out; what is reachable but cannot be rendered as a `provision.yaml` entry
+     * lands on [ImportResult.skipped] with the reason. Reads only; SSO-3715 — `import` writes the file only.
      */
-    fun import(existing: ProvisionFile?, receipt: ProvisionReceipt?): ImportResult {
+    fun import(existing: ProvisionFile?): ImportResult {
         val reach = Reach()
         val out = mutableListOf<ImportedResource>()
         val skipped = mutableListOf<String>()
         fun skip(why: String) { skipped += why }
         val declared = existing?.resources.orEmpty()
-        val ownedRefs = receipt?.resources.orEmpty().mapNotNull { o -> runCatching { objectRef(o.kind, o.id, o.environment) }.getOrNull() }.toSet()
         val names = declared.map { it.key }.toMutableSet()
         fun uniqueName(kind: String, base: String): String {
             val root = slugName(base).ifEmpty { kind.lowercase() }
@@ -836,13 +1134,11 @@ class ProvisionEngine(
             owner != null && !reach.owns(ref) -> true to "owned by another repository (the platform's `owner` relation) — imported as a read-only reference"
             else -> false to null
         }
-        fun add(kind: String, name: String, environment: String?, environmentSlug: String?, id: String, access: Access, spec: Map<String, Any?>, attributes: Map<String, String> = emptyMap(), note: String? = null, owner: String? = null) {
+        fun add(kind: String, name: String, environment: String?, environmentSlug: String?, id: String, access: Access, spec: Map<String, Any?>, note: String? = null, owner: String? = null) {
             val ref = objectRef(kind, id, environmentSlug)
-            if (ref in ownedRefs) return
             val (readOnly, ownerNote) = readOnlyFor(ref, access, owner)
             val resource = ProvisionResource(kind = kind, name = name, environment = environment, spec = spec, readOnly = readOnly)
-            val owned = if (readOnly) null else OwnedResource(kind, name, id, environmentSlug, attributes, adopted = true, owner = owner)
-            out += ImportedResource(resource, id, access, owned, listOfNotNull(ownerNote, note).joinToString("; ").ifEmpty { null })
+            out += ImportedResource(resource, id, access, listOfNotNull(ownerNote, note).joinToString("; ").ifEmpty { null })
         }
 
         // Environments first: a child rendered below names its sandbox by the resource NAME when the same import adds it.
@@ -855,7 +1151,7 @@ class ProvisionEngine(
             if (declared.any { it.kind == ProvisionFile.KIND_ENVIRONMENT && it.spec["slug"] == slug }) return@forEach
             val name = uniqueName(ProvisionFile.KIND_ENVIRONMENT, slug)
             envName[slug] = name
-            add(ProvisionFile.KIND_ENVIRONMENT, name, null, null, id, access, linkedMapOf("slug" to slug, "displayName" to (node.str("name") ?: slug)), mapOf("slug" to slug), owner = ProvisionApi.ownerOf(node))
+            add(ProvisionFile.KIND_ENVIRONMENT, name, null, null, id, access, linkedMapOf("slug" to slug, "displayName" to (node.str("name") ?: slug)), owner = ProvisionApi.ownerOf(node))
         }
         /** The environment a per-environment object lives in: the first plane that answers its GET (production first). */
         fun locate(read: (ProvisionApi) -> JsonNode): Pair<String?, JsonNode>? =
@@ -871,7 +1167,6 @@ class ProvisionEngine(
             val confidential = !n.str("clientType").equals("public", ignoreCase = true)
             add(
                 ProvisionFile.KIND_APPLICATION, uniqueName(ProvisionFile.KIND_APPLICATION, n.str("displayName") ?: id), environmentField(plane), plane, id, access, spec,
-                buildMap { (spec["redirectUris"] as? List<*>)?.firstOrNull()?.toString()?.let { put("redirectUri", it) } },
                 if (confidential && access == Access.MANAGER) "its existing client secret is not recoverable; `thoryn clients rotate-secret $id --secret-file <path>` mints a new one" else null,
                 owner = ProvisionApi.ownerOf(n),
             )
@@ -882,7 +1177,7 @@ class ProvisionEngine(
             if (declared.any { it.kind == ProvisionFile.KIND_USER && it.spec["email"].toString().equals(email, ignoreCase = true) }) return@forEach
             val spec = linkedMapOf<String, Any?>("email" to email)
             n["emailVerified"]?.takeIf { it.isBoolean }?.let { spec["emailVerified"] = it.asBoolean() }
-            add(ProvisionFile.KIND_USER, uniqueName(ProvisionFile.KIND_USER, email.substringBefore('@')), environmentField(plane), plane, id, access, spec, mapOf("email" to email))
+            add(ProvisionFile.KIND_USER, uniqueName(ProvisionFile.KIND_USER, email.substringBefore('@')), environmentField(plane), plane, id, access, spec)
         }
         reachable(OBJECT_TYPE_FEDERATION_MEMBER).forEach { (id, access) ->
             val (plane, n) = locate { it.getFederationMember(id) } ?: return@forEach skip("federation_member:$id — listed as reachable but not readable in any environment")
@@ -891,7 +1186,6 @@ class ProvisionEngine(
             listOf("displayName", "discoveryUrl", "clientId").forEach { f -> n.str(f)?.let { spec[f] = it } }
             add(
                 ProvisionFile.KIND_FEDERATION_MEMBER, uniqueName(ProvisionFile.KIND_FEDERATION_MEMBER, n.str("displayName") ?: id), environmentField(plane), plane, id, access, spec,
-                buildMap { spec["providerType"]?.toString()?.let { put("providerType", it) } },
                 if (access == Access.MANAGER) "its upstream client secret is write-only: add `clientSecretEnv: <VAR>` before an update is converged" else null,
             )
         }
@@ -912,7 +1206,6 @@ class ProvisionEngine(
             if (spec["smtpHost"] == null) return@forEach skip("email_provider:$id — configured without an SMTP host; not a declarable emailProvider")
             add(
                 ProvisionFile.KIND_EMAIL_PROVIDER, ProvisionFile.KIND_EMAIL_PROVIDER, environmentField(plane), plane, n.str("providerType") ?: "email-provider", access, spec,
-                buildMap { n.str("smtpHost")?.let { put("smtpHost", it) }; n.str("fromAddress")?.let { put("fromAddress", it) } },
                 if (access == Access.MANAGER) "the SMTP password is write-only: add `smtpPasswordEnv: <VAR>` before an update is converged" else null,
             )
         }
@@ -932,7 +1225,7 @@ class ProvisionEngine(
             if (singletonDeclared(ProvisionFile.KIND_LOGIN_METHODS, plane)) return@forEach
             val stored = fetchOrNull { clients(plane).getLoginMethods() }?.get("stored")?.takeIf { !it.isNull && it.isArray } ?: return@forEach
             val methods = stored.toList().map { it.asString() }
-            add(ProvisionFile.KIND_LOGIN_METHODS, ProvisionFile.KIND_LOGIN_METHODS, environmentField(plane), plane, "login-methods", access, linkedMapOf("methods" to methods), mapOf("methods" to methods.joinToString(",")))
+            add(ProvisionFile.KIND_LOGIN_METHODS, ProvisionFile.KIND_LOGIN_METHODS, environmentField(plane), plane, "login-methods", access, linkedMapOf("methods" to methods))
         }
         reachable(OBJECT_TYPE_LOGIN_FLOW).forEach { (id, _) ->
             skipped += "login_flow:$id — a loginFlow is declared by its templateId, which the active flow does not record; declare it by hand"
@@ -943,10 +1236,7 @@ class ProvisionEngine(
             val view = CustomDomainView.of(body)
             val host = view.domain?.takeIf { it.isNotBlank() } ?: return@forEach
             if (view.state == CustomDomainView.NONE) return@forEach
-            add(
-                ProvisionFile.KIND_CUSTOM_DOMAIN, ProvisionFile.KIND_CUSTOM_DOMAIN, null, null, id, access, linkedMapOf("host" to host),
-                buildMap { put("host", host); put("state", view.state); view.issuer?.let { put("issuer", it) } },
-            )
+            add(ProvisionFile.KIND_CUSTOM_DOMAIN, ProvisionFile.KIND_CUSTOM_DOMAIN, null, null, id, access, linkedMapOf("host" to host))
         }
         // SSO-3689 — workload-identity trusts: no access object of their own, so reach is the PLANE's (the workspace
         // for production, the environment for a sandbox); the API lists them only for a viewer or better.
@@ -955,7 +1245,6 @@ class ProvisionEngine(
             plane == null -> if (workspaceId != null && reach.holds("$OBJECT_TYPE_WORKSPACE:$workspaceId", RELATION_VIEWER)) Access.VIEWER else Access.NONE
             else -> reach.environmentId(plane)?.let { reach.on(objectRef(ProvisionFile.KIND_ENVIRONMENT, it, null)) } ?: Access.NONE
         }
-        val ownedTrustIds = receipt?.resources.orEmpty().filter { it.kind == ProvisionFile.KIND_WORKLOAD_IDENTITY_TRUST }.map { it.id }.toSet()
         val ownClientId = subject?.takeIf { it.startsWith("client:") }?.substringAfter(':')
         (listOf<String?>(null) + sandboxSlugs).forEach { plane ->
             val access = planeAccess(plane)
@@ -964,7 +1253,6 @@ class ProvisionEngine(
             trusts.forEach { n ->
                 val name = n.str("name") ?: return@forEach
                 val id = n.str("id") ?: return@forEach
-                if (id in ownedTrustIds) return@forEach
                 val envField = environmentField(plane)
                 if (declared.any { it.kind == ProvisionFile.KIND_WORKLOAD_IDENTITY_TRUST && it.name == name && (it.environment == envField || it.environment == plane) }) return@forEach
                 // The structural limit: the identity applying a file cannot declare its OWN bootstrap trust.
@@ -979,8 +1267,7 @@ class ProvisionEngine(
                 }
                 val (spec, note) = trustSpecOf(n, production = plane == null)
                 val resource = ProvisionResource(ProvisionFile.KIND_WORKLOAD_IDENTITY_TRUST, name, envField, spec, readOnly = access == Access.VIEWER)
-                val owned = if (access == Access.VIEWER) null else OwnedResource(ProvisionFile.KIND_WORKLOAD_IDENTITY_TRUST, name, id, plane, trustAttributes(trustView(n)), adopted = true)
-                out += ImportedResource(resource, id, access, owned, note)
+                out += ImportedResource(resource, id, access, note)
             }
         }
         return ImportResult(out, skipped)
@@ -989,20 +1276,19 @@ class ProvisionEngine(
     // ── apply ────────────────────────────────────────────────────────────────────────────────────
 
     /**
-     * Execute [plan]: creates / updates / adopts in dependency order (environments first), then converges
+     * Execute [plan]: creates / updates in dependency order (environments first), then publishes, then converges
      * every `grants:` block (SSO-3119 — after all of them exist, so a grant may name any subject the file
-     * declares), then prunes. [confirmSlug] is the workspace slug confirming production-plane removals
-     * (refused up front when missing). Returns the receipt as it stands after the pass; throws on the
-     * first failed step (with everything before it already persisted).
+     * declares), then removes what `--prune` planned. [confirmSlug] is the workspace slug confirming
+     * production-plane removals (refused up front when missing). Returns every declared resource with the id it
+     * resolved to ([ApplyResult] — the `--output json` document); throws on the first failed step (everything
+     * before it is live already — a re-run converges the rest, there is no ledger to repair).
      */
     fun apply(
         file: ProvisionFile,
-        receipt: ProvisionReceipt?,
         plan: ProvisionPlan,
         workspace: String?,
         confirmSlug: String?,
-        persist: (ProvisionReceipt) -> Unit,
-    ): ProvisionReceipt {
+    ): ApplyResult {
         // SSO-3659 — a plan with an ownership error is refused WHOLE, before the first write: a red plan on a
         // pull request must mean "nothing would have happened", and a partial apply would silently own the half
         // this identity may touch.
@@ -1016,43 +1302,11 @@ class ProvisionEngine(
             throw ProvisionException("--prune would remove resources on the PRODUCTION plane; re-run with --confirm <workspace-slug>.")
         }
         trustLists.clear()
-        applyWorkspace = workspace ?: receipt?.workspace
-        val owned = receipt?.resources.orEmpty().toMutableList()
-        fun current() = ProvisionReceipt(
-            file = ProvisionFileRef(file.source, file.digest),
-            appliedAt = now().toString(),
-            cliVersion = cliVersion,
-            workspace = workspace ?: receipt?.workspace,
-            // SSO-3659 — the ownership marker: who applied this receipt (kept from the receipt when unknown here).
-            subject = subject ?: receipt?.subject,
-            resources = owned.toList(),
-        )
-        fun record(o: OwnedResource) {
-            // Replace IN PLACE so the receipt keeps creation order (destroy removes child-first by it).
-            val i = owned.indexOfFirst { it.key == o.key }
-            // SSO-3119 — a resource write carries no grants; keep the grant ownership the receipt holds,
-            // so dropping a `grants:` block does not silently disown what this file granted.
-            // SSO-3668 — likewise the published outputs: the publish pass below sets them explicitly.
-            val merged = o.copy(
-                grants = if (i >= 0 && o.grants.isEmpty()) owned[i].grants else o.grants,
-                published = if (i >= 0 && o.published.isEmpty()) owned[i].published else o.published,
-            )
-            if (i >= 0) owned[i] = merged else owned += merged
-            persist(current())
-        }
-        /** SSO-3119 — set the owned-grant set EXPLICITLY (it may legitimately become empty). */
-        fun recordGrants(key: String, grants: List<String>) {
-            val i = owned.indexOfFirst { it.key == key }
-            if (i < 0 || owned[i].grants == grants) return
-            owned[i] = owned[i].copy(grants = grants)
-            persist(current())
-        }
-        /** SSO-3668 — set what this apply PUBLISHED for a resource EXPLICITLY (only the targets that were reached). */
-        fun recordPublished(key: String, published: List<PublishedOutput>) {
-            val i = owned.indexOfFirst { it.key == key }
-            if (i < 0 || owned[i].published == published) return
-            owned[i] = owned[i].copy(published = published)
-            persist(current())
+        applyWorkspace = workspace
+        val applied = mutableListOf<AppliedResource>()
+        fun record(a: AppliedResource) {
+            val i = applied.indexOfFirst { it.key == a.key }
+            if (i >= 0) applied[i] = a else applied += a
         }
         undelivered.clear()
         // SSO-3119 — grants converge in a SECOND pass, after EVERY resource in the file exists.
@@ -1062,49 +1316,33 @@ class ProvisionEngine(
         // file had not created yet. That earns the opaque 404 of ADR 2026-09-15 §8 (one answer for an
         // unknown object, an unknown subject and insufficient reach), and it DEADLOCKS: a re-run reaches
         // the same grant before the same missing client. Deferring the whole block drops the ordering
-        // dependency — a `grants:` block may name anything the file declares, in any order. Ownership is
-        // still safe: every resource is recorded in the receipt by the time the pass runs, so a grant
-        // failure loses nothing and a re-run converges the outstanding grants alone.
-        // The grants THIS FILE already owns per object, from the receipt as it stood before this pass —
-        // `record` rewrites the entry from the resource write, which carries no grants (SSO-3119).
-        val ownedGrantsByKey = receipt?.resources.orEmpty().associate { it.key to it.grants }
-        val pendingGrants = mutableListOf<Pair<ProvisionResource, String>>()
-        // SSO-3668 — outputs publish in their own pass too, once the resource is converged and RECORDED (the id
-        // is known and already in the receipt), so an unreachable target can never cost the id.
+        // dependency — a `grants:` block may name anything the file declares, in any order.
+        val pendingGrants = mutableListOf<Triple<ProvisionResource, String, PlannedChange>>()
+        // SSO-3668 — outputs publish in their own pass too, once the resource is converged (the id is known), so an
+        // unreachable target can never cost the id.
         val pendingPublishes = mutableListOf<Pair<ProvisionResource, String>>()
         plan.changes.filter { it.resource != null }.forEach { change ->
             val r = change.resource!!
-            // SSO-3659 — a read-only reference is never written and never owned: a receipt entry from before the
-            // file declared it `readOnly` is dropped (disowned, not deleted) so destroy / --prune cannot reach it.
-            if (r.readOnly) {
-                if (owned.removeIf { it.key == r.key }) {
-                    out.println("  = ${r.kind} ${r.name}: read-only reference — dropped from the receipt, left in place")
-                    persist(current())
-                }
-                return@forEach
-            }
-            val resolved: OwnedResource? = when (change.action) {
-                // SSO-3659 — a minted client secret is delivered AFTER the client is recorded: the receipt holds the id before
-                // any sink is reached for, so an unreachable sink can never cost the client its entry.
-                ChangeAction.CREATE -> create(r, file, owned).let { c -> record(c.owned); c.mintedSecret?.let { deliverSecret(r, c.owned.id, it) }; c.owned }
-                ChangeAction.UPDATE -> update(r, file, owned, change).also { record(it) }
-                ChangeAction.ADOPT -> adopt(r, file, owned, change).also { record(it) }
-                // SSO-3673 — a no-op still refreshes the owner the platform reported (an admin may have moved it since).
-                ChangeAction.NOOP -> owned.firstOrNull { it.key == r.key }?.let { o -> if (o.owner == change.owner) o else o.copy(owner = change.owner).also { record(it) } }
+            // SSO-3659 — a read-only reference is never written and never owned.
+            if (r.readOnly) return@forEach
+            val resolved: AppliedResource? = when (change.action) {
+                // SSO-3659 — a minted client secret is delivered AFTER the client exists; an unreachable sink costs nothing.
+                ChangeAction.CREATE -> create(r, file, applied).let { c -> record(c.applied); c.mintedSecret?.let { deliverSecret(r, c.applied.id, it) }; c.applied }
+                ChangeAction.UPDATE -> update(r, file, applied, change).also { record(it) }
+                ChangeAction.NOOP -> change.liveId?.let { AppliedResource(r.kind, r.name, it, change.environment, change.attributes, change.owner, ChangeAction.NOOP) }?.also { record(it) }
                 else -> null
             }
             if (r.grants != null && resolved != null) {
-                pendingGrants += r to objectRef(r.kind, resolved.id, resolved.environment)
+                pendingGrants += Triple(r, objectRef(r.kind, resolved.id, resolved.environment), change)
             }
             if (r.publishTo.isNotEmpty() && resolved != null) {
                 pendingPublishes += r to resolved.id
             }
         }
-        // SSO-3668 — publish AFTER convergence: every resource exists and is in the receipt by now. Failures are
-        // collected, not thrown, so the grants and prune below still converge; they end the apply afterwards.
+        // SSO-3668 — publish AFTER convergence: every resource exists by now. Failures are collected, not thrown, so
+        // the grants and prune below still converge; they end the apply afterwards.
         val publishFailures = mutableListOf<PublishFailure>()
         pendingPublishes.forEach { (r, id) ->
-            val reached = mutableListOf<PublishedOutput>()
             r.publishTo.forEach { target ->
                 val reason = try {
                     outputSink.publish(target, id)
@@ -1112,72 +1350,23 @@ class ProvisionEngine(
                     ex.message ?: ex.javaClass.simpleName
                 }
                 if (reason == null) {
-                    reached += PublishedOutput.of(target)
                     out.println("  > ${r.kind} ${r.name}: published clientId=$id → ${target.label}")
                 } else {
                     publishFailures += PublishFailure(r.key, target, id, reason)
-                    err.println("  ! ${r.kind} ${r.name}: could not publish its clientId to ${target.label} ($reason). The client exists and is recorded; by hand: ${target.byHand(id)}")
+                    err.println("  ! ${r.kind} ${r.name}: could not publish its clientId to ${target.label} ($reason). The client exists; by hand: ${target.byHand(id)}")
                 }
             }
-            recordPublished(r.key, reached)
         }
-        pendingGrants.forEach { (r, ref) ->
-            recordGrants(r.key, convergeGrants(r, ref, ownedGrantsByKey[r.key].orEmpty()))
+        pendingGrants.forEach { (r, ref, change) -> convergeGrants(r, ref, change.grantRemoves) }
+        // SSO-3715 — `--prune`: the owned-and-undeclared removals the plan carries, child-first (each refusal was a skip row already).
+        val pruned = destroy(ProvisionPlan(plan.removes), confirmSlug)
+        if (pruned.failures.isNotEmpty()) {
+            throw ProvisionException("${pruned.failures.size} planned removal(s) failed (everything else was applied; re-run to retry):\n  " + pruned.failures.joinToString("\n  "))
         }
-        // Prune: drop skipped entries from the receipt, remove the rest child-first.
-        plan.changes.filter { it.action == ChangeAction.SKIP && it.owned != null && (it.owned.adopted || !deletable(it.owned.kind)) }.forEach { change ->
-            owned.removeIf { it.key == change.owned!!.key }
-            persist(current())
-        }
-        plan.removes.forEach { change ->
-            val o = change.owned ?: return@forEach
-            remove(o, confirmSlug)
-            owned.removeIf { it.key == o.key }
-            persist(current())
-        }
-        val result = current()
-        persist(result)
-        // SSO-3668 — raised LAST: the receipt above records every id, so the fallback is one command per target.
+        val result = ApplyResult(applied.toList(), workspace)
+        // SSO-3668 — raised LAST: everything above is live, so the fallback is one command per target with the id from [result].
         if (publishFailures.isNotEmpty()) throw PublishTargetUnreachableException(publishFailures, result)
         return result
-    }
-
-    // ── destroy ──────────────────────────────────────────────────────────────────────────────────
-
-    /**
-     * Remove every owned resource this file CREATED, child-first (environments last); adopted resources
-     * and singletons without a delete API are left in place and dropped from the receipt. Best-effort: a
-     * failed removal is reported and kept for a retry. Refuses up front when a production-plane removal
-     * lacks [confirmSlug].
-     */
-    fun destroy(receipt: ProvisionReceipt, confirmSlug: String?, persist: (ProvisionReceipt) -> Unit): RemovalOutcome {
-        val targets = orderForRemove(receipt.resources)
-        if (targets.any { removable(it) && onProductionPlane(it) } && confirmSlug.isNullOrBlank()) {
-            throw ProvisionException("destroy would remove resources on the PRODUCTION plane; re-run with --confirm <workspace-slug>.")
-        }
-        val owned = receipt.resources.toMutableList()
-        val failures = mutableListOf<String>()
-        fun current() = receipt.copy(appliedAt = now().toString(), resources = owned.toList())
-        targets.forEach { o ->
-            if (!removable(o)) {
-                val why = if (o.adopted) "adopted, not created by this file" else "no delete API for this singleton"
-                out.println("  ${o.kind} ${o.name}: $why — left in place, dropped from the receipt")
-                owned.removeIf { it.key == o.key }
-                persist(current())
-                return@forEach
-            }
-            try {
-                remove(o, confirmSlug)
-                owned.removeIf { it.key == o.key }
-                persist(current())
-            } catch (ex: Exception) {
-                failures += "${o.key} (id ${o.id}): ${ex.message}"
-                err.println("  ! ${o.kind} ${o.name} could not be removed (${ex.message}); kept in the receipt for a retry.")
-            }
-        }
-        val remaining = current()
-        persist(remaining)
-        return RemovalOutcome(remaining, failures)
     }
 
     // ── live lookup per kind (SSO-3089) ──────────────────────────────────────────────────────────
@@ -1188,7 +1377,17 @@ class ProvisionEngine(
      */
     private class Live(val id: String, val diff: Map<String, String>, val attributes: Map<String, String> = emptyMap(), val owner: String? = null)
 
-    private fun lookup(r: ProvisionResource, owned: OwnedResource?, slug: String?, desired: Map<String, Any?>): Live? = when (r.kind) {
+    /** SSO-3715 — two live resources match one converge key; the plan is red (`converge_key_ambiguous`), never a third copy. */
+    private class ConvergeKeyAmbiguousException(message: String) : RuntimeException(message)
+
+    /** The one live match of a converge key, or none; two or more is [ConvergeKeyAmbiguousException]. */
+    private fun <T> List<T>.singleMatchOrNull(what: String, fix: String): T? = when (size) {
+        0 -> null
+        1 -> first()
+        else -> throw ConvergeKeyAmbiguousException("$size live resources match $what — $fix")
+    }
+
+    private fun lookup(r: ProvisionResource, slug: String?, desired: Map<String, Any?>): Live? = when (r.kind) {
         ProvisionFile.KIND_ENVIRONMENT -> {
             val wanted = desired["slug"].toString()
             val node = listItems(clients(null).listEnvironments(), "environments").firstOrNull { it.str("slug") == wanted }
@@ -1199,91 +1398,85 @@ class ProvisionEngine(
         }
         ProvisionFile.KIND_APPLICATION -> {
             val client = clients(slug)
-            // SSO-3104 — a spec with a fixed `clientId` (the CLI's own `cli` login client) is adopted by that
-            // id, so a re-apply from a receipt that does not own it (CI) converges it instead of creating a
-            // duplicate by display name.
+            // SSO-3104 / SSO-3715 — the converge key: a fixed `clientId` when declared (the file SHOULD declare one),
+            // else the `displayName` within the environment — and two matches of a display name are an error, not a create.
             val fixedId = desired["clientId"]?.toString()?.takeIf { it.isNotBlank() }
-            val node = owned?.let { fetchOrNull { client.getApplication(it.id) } }
-                ?: fixedId?.let { fetchOrNull { client.getApplication(it) } }
-                ?: listItems(client.listApplications(), "data").filter { it.str("displayName") == desired["displayName"] }.singleOrNull()
+            val node = fixedId?.let { fetchOrNull { client.getApplication(it) } }
+                ?: listItems(client.listApplications(), "data").filter { it.str("displayName") == desired["displayName"] }
+                    .singleMatchOrNull("displayName '${desired["displayName"]}' in ${planeLabel(slug)}", "declare `clientId` on the resource to say which one")
             node?.let { n ->
-                // SSO-3689 — the client-authentication fields converge on UPDATE too (ADR 2026-10-14 §11): the methods and
-                // the bound trust are read from the response; the key location is NOT rendered by the API (product gap,
-                // see the PR), so the receipt holds what this file last applied and a change converges from that.
+                // SSO-3689 — the client-authentication fields converge on UPDATE too (ADR 2026-10-14 §11): the methods and the
+                // bound trust are read from the response. SSO-3715 — the key location (`jwksUri` / `jwks`) is NOT rendered by
+                // the API (SSO-3716) and there is no receipt to remember it by, so it is never diffed: sent on create, re-sent
+                // with every update ([applicationBody]).
                 val fields = listOf("displayName", "redirectUris", "postLogoutRedirectUris", "scopes", "grantTypes", ProvisionFile.SPEC_CLIENT_AUTHENTICATION_METHODS, ProvisionFile.SPEC_FEDERATED_TRUST)
-                val live = n.toMap(fields).toMutableMap()
-                live[ProvisionFile.SPEC_JWKS_URI] = owned?.attributes?.get(ATTR_JWKS_URI)
-                live[ProvisionFile.SPEC_JWKS] = owned?.attributes?.get(ATTR_JWKS_KIDS)?.split(',')?.filter { it.isNotEmpty() }
-                val want = desired.filterKeys { it in fields || it == ProvisionFile.SPEC_JWKS_URI || it == ProvisionFile.SPEC_JWKS }.toMutableMap()
-                want[ProvisionFile.SPEC_JWKS]?.let { want[ProvisionFile.SPEC_JWKS] = jwkKids(it) }
-                val diff = diffOf(want, live).mapValues { (field, change) ->
-                    if (owned == null && field in KEY_LOCATION_FIELDS && live[field] == null) change.replaceFirst("(unset)", "(not readable from the API — sent once to converge)") else change
-                }
-                Live(n.str("clientId") ?: n.str("client_id") ?: "", diff, owner = ProvisionApi.ownerOf(n))
+                val live = n.toMap(fields)
+                val want = desired.filterKeys { it in fields }
+                val id = n.str("clientId") ?: n.str("client_id") ?: ""
+                Live(id, diffOf(want, live), buildMap { (plain(n["redirectUris"] ?: return@buildMap) as? List<*>)?.firstOrNull()?.toString()?.let { put("redirectUri", it) } }, owner = ProvisionApi.ownerOf(n))
             }
         }
         ProvisionFile.KIND_USER -> {
             val client = clients(slug)
             val email = desired["email"].toString()
-            val node = owned?.let { fetchOrNull { client.getUser(it.id) } }
-                ?: listItems(client.listUsers(email = email), "items").firstOrNull { it.str("email").equals(email, ignoreCase = true) }
+            val node = listItems(client.listUsers(email = email), "items").firstOrNull { it.str("email").equals(email, ignoreCase = true) }
             node?.let { n ->
                 val fields = listOf("emailVerified")
-                Live(n.str("id") ?: n.str("userId") ?: "", diffOf(desired.filterKeys { it in fields }, n.toMap(fields)))
+                Live(n.str("id") ?: n.str("userId") ?: "", diffOf(desired.filterKeys { it in fields }, n.toMap(fields)), mapOf("email" to email))
             }
         }
         ProvisionFile.KIND_FEDERATION_MEMBER -> {
             val client = clients(slug)
-            val node = owned?.let { fetchOrNull { client.getFederationMember(it.id) } }
-                ?: desired["displayName"]?.let { dn -> listItems(client.listFederationMembers(), "data").filter { it.str("displayName") == dn }.singleOrNull() }
+            val node = desired["displayName"]?.let { dn ->
+                listItems(client.listFederationMembers(), "data").filter { it.str("displayName") == dn }
+                    .singleMatchOrNull("federation member displayName '$dn' in ${planeLabel(slug)}", "give the members distinct display names")
+            }
             node?.let { n ->
                 val fields = listOf("displayName", "discoveryUrl", "clientId")
-                Live(n.str("memberId") ?: n.str("id") ?: "", diffOf(desired.filterKeys { it in fields }, n.toMap(fields)))
+                Live(n.str("memberId") ?: n.str("id") ?: "", diffOf(desired.filterKeys { it in fields }, n.toMap(fields)), buildMap { n.str("providerType")?.let { put("providerType", it) } })
             }
         }
         ProvisionFile.KIND_EMAIL_PROVIDER -> {
             val n = clients(slug).getEmailProvider()
-            if (n["configured"]?.asBoolean() == false && owned == null) null
+            if (n["configured"]?.asBoolean() == false) null
             else {
                 val fields = listOf("smtpHost", "smtpPort", "smtpUsername", "transportSecurity", "fromAddress", "fromName", "replyTo", "enabled")
-                Live(n.str("providerType") ?: "email-provider", diffOf(desired.filterKeys { it in fields }, n.toMap(fields)))
+                Live(n.str("providerType") ?: "email-provider", diffOf(desired.filterKeys { it in fields }, n.toMap(fields)), buildMap { n.str("smtpHost")?.let { put("smtpHost", it) } })
             }
         }
         ProvisionFile.KIND_LOGIN_THEME -> {
             val stored = clients(slug).getLoginBranding()["stored"]
             val fields = listOf("logoUrl", "primaryColor", "backgroundColor", "borderRadiusPx", "theme", "cssVariables")
             val live = stored?.toMap(fields).orEmpty()
-            if (owned == null && live.values.all { it == null }) null
+            if (live.values.all { it == null }) null
             else Live("login-theme", diffOf(desired.filterKeys { it in fields }, live))
         }
         ProvisionFile.KIND_LOGIN_FLOW -> {
+            // SSO-3715 — the active flow does not record its template, so a loginFlow converges by EXISTENCE: an active
+            // flow is a match (its version is the id); none ⇒ the template is applied. A changed `templateId` alone is
+            // not detected (the same limit `import` reports) — re-apply it by hand.
             val active = fetchOrNull { clients(slug).getActiveLoginFlow() }
             val version = active?.get("version")?.takeIf { !it.isNull }?.asInt()?.toString()
-            when {
-                owned == null -> null // a template can't be recognised from the active flow; applying it mints a version
-                version == owned.id -> Live(version, emptyMap())
-                else -> Live(version ?: "", mapOf("activeVersion" to "${version ?: "(none)"} → re-apply template ${desired["templateId"]}"))
-            }
+            version?.let { Live(it, emptyMap(), mapOf("activeVersion" to it)) }
         }
         ProvisionFile.KIND_LOGIN_METHODS -> {
-            // SSO-3100 — the stored allow-list (null ⇒ the platform default policy, nothing to converge
-            // against unless already owned). Compared as a SET: order is display-only.
+            // SSO-3100 — the stored allow-list (null ⇒ the platform default policy, nothing to converge against).
+            // Compared as a SET: order is display-only.
             val stored = clients(slug).getLoginMethods()["stored"]?.takeIf { !it.isNull && it.isArray }
             val wanted = (desired["methods"] as? List<*>)?.map { it.toString().trim().lowercase() }
-            if (stored == null && owned == null) null
-            else Live("login-methods", diffOf(mapOf("methods" to wanted), mapOf("methods" to stored?.let { plain(it) })))
+            stored?.let { Live("login-methods", diffOf(mapOf("methods" to wanted), mapOf("methods" to plain(it))), mapOf("methods" to it.toList().joinToString(",") { m -> m.asString() })) }
         }
         else -> null
     }
 
-    // ── per-kind create / update / adopt ─────────────────────────────────────────────────────────
+    // ── per-kind create / update ─────────────────────────────────────────────────────────────────
 
     /** A created resource and — for a confidential application — the one-time secret the create response carried. */
-    private class Created(val owned: OwnedResource, val mintedSecret: String? = null)
+    private class Created(val applied: AppliedResource, val mintedSecret: String? = null)
 
-    private fun create(r: ProvisionResource, file: ProvisionFile, owned: List<OwnedResource>): Created {
+    private fun create(r: ProvisionResource, file: ProvisionFile, applied: List<AppliedResource>): Created {
         val spec = resolveSpec(r, strict = true)
-        if (r.kind == ProvisionFile.KIND_APPLICATION) return createApplication(r, file, owned, spec)
+        if (r.kind == ProvisionFile.KIND_APPLICATION) return createApplication(r, file, applied, spec)
         return Created(when (r.kind) {
             ProvisionFile.KIND_ENVIRONMENT -> {
                 val slug = spec["slug"].toString()
@@ -1292,40 +1485,40 @@ class ProvisionEngine(
                 val id = resp.str("id") ?: throw ProvisionException("${r.key}: the environment create returned no id")
                 val liveSlug = resp.str("slug") ?: slug
                 out.println("  + environment ${r.name}: id=$id slug=$liveSlug")
-                OwnedResource(r.kind, r.name, id, environment = null, attributes = mapOf("slug" to liveSlug), owner = ProvisionApi.ownerOf(resp))
+                AppliedResource(r.kind, r.name, id, environment = null, attributes = mapOf("slug" to liveSlug), owner = ProvisionApi.ownerOf(resp), action = ChangeAction.CREATE)
             }
             ProvisionFile.KIND_USER -> {
-                val slug = targetSlug(r, file, owned)
+                val slug = targetSlug(r, file, applied)
                 val resp = clients(slug).createUser(spec)
                 val id = resp.str("id") ?: resp.str("userId") ?: throw ProvisionException("${r.key}: the user create returned no id")
                 val email = resp.str("email") ?: spec["email"]?.toString()
                 out.println("  + user ${r.name}: id=$id${email?.let { " email=$it" } ?: ""}")
-                OwnedResource(r.kind, r.name, id, slug, buildMap { email?.let { put("email", it) } })
+                AppliedResource(r.kind, r.name, id, slug, buildMap { email?.let { put("email", it) } }, action = ChangeAction.CREATE)
             }
             ProvisionFile.KIND_FEDERATION_MEMBER -> {
-                val slug = targetSlug(r, file, owned)
+                val slug = targetSlug(r, file, applied)
                 val resp = clients(slug).createFederationMember(spec)
                 val id = resp.str("memberId") ?: resp.str("id") ?: throw ProvisionException("${r.key}: the federation-member create returned no id")
                 out.println("  + federationMember ${r.name}: id=$id")
-                OwnedResource(r.kind, r.name, id, slug, buildMap { spec["providerType"]?.toString()?.let { put("providerType", it) } })
+                AppliedResource(r.kind, r.name, id, slug, buildMap { spec["providerType"]?.toString()?.let { put("providerType", it) } }, action = ChangeAction.CREATE)
             }
-            ProvisionFile.KIND_EMAIL_PROVIDER -> putEmailProvider(r, targetSlug(r, file, owned), spec, "+")
-            ProvisionFile.KIND_LOGIN_THEME -> putLoginTheme(r, targetSlug(r, file, owned), spec, "+")
-            ProvisionFile.KIND_LOGIN_FLOW -> applyLoginFlow(r, targetSlug(r, file, owned), spec, "+")
-            ProvisionFile.KIND_LOGIN_METHODS -> putLoginMethods(r, targetSlug(r, file, owned), spec, "+")
+            ProvisionFile.KIND_EMAIL_PROVIDER -> putEmailProvider(r, targetSlug(r, file, applied), spec, "+")
+            ProvisionFile.KIND_LOGIN_THEME -> putLoginTheme(r, targetSlug(r, file, applied), spec, "+")
+            ProvisionFile.KIND_LOGIN_FLOW -> applyLoginFlow(r, targetSlug(r, file, applied), spec, "+")
+            ProvisionFile.KIND_LOGIN_METHODS -> putLoginMethods(r, targetSlug(r, file, applied), spec, "+")
             ProvisionFile.KIND_CUSTOM_DOMAIN -> claimCustomDomain(r, spec)
-            ProvisionFile.KIND_WORKLOAD_IDENTITY_TRUST -> createTrust(r, file, owned, spec)
+            ProvisionFile.KIND_WORKLOAD_IDENTITY_TRUST -> createTrust(r, file, applied, spec)
             else -> throw ProvisionException("${r.key}: unsupported kind '${r.kind}'")
         })
     }
 
-    private fun createApplication(r: ProvisionResource, file: ProvisionFile, owned: List<OwnedResource>, spec: Map<String, Any?>): Created {
-        val slug = targetSlug(r, file, owned)
+    private fun createApplication(r: ProvisionResource, file: ProvisionFile, applied: List<AppliedResource>, spec: Map<String, Any?>): Created {
+        val slug = targetSlug(r, file, applied)
         val resp = clients(slug).createApplication(applicationBody(r, spec, slug))
         val id = resp.str("clientId") ?: resp.str("client_id") ?: throw ProvisionException("${r.key}: the application create returned no clientId")
-        // SSO-3113 — the ONE server-minted secret goes to a sink and NOWHERE else: never a field, the receipt, the
-        // plan, the console, or a log. The response node is not retained. SSO-3659 — it is handed back to [apply],
-        // which delivers it only once the client is RECORDED ([deliverSecret]).
+        // SSO-3113 — the ONE server-minted secret goes to a sink and NOWHERE else: never a field, the plan, the console,
+        // or a log. The response node is not retained. SSO-3659 — it is handed back to [apply], which delivers it only
+        // once the client exists ([deliverSecret]).
         val secret = (resp.str("clientSecret") ?: resp.str("client_secret"))?.takeIf { it.isNotEmpty() }
         val note = when {
             secret == null -> ""
@@ -1334,15 +1527,15 @@ class ProvisionEngine(
         }
         out.println("  + application ${r.name}: clientId=$id${slug?.let { " env=$it" } ?: ""}$note")
         // SSO-3673 — the owner the create established (creator-becomes-owner for a `client:` caller), as reported.
-        val created = OwnedResource(r.kind, r.name, id, slug, applicationAttributes(spec), owner = ProvisionApi.ownerOf(resp))
+        val created = AppliedResource(r.kind, r.name, id, slug, applicationAttributes(spec), owner = ProvisionApi.ownerOf(resp), action = ChangeAction.CREATE)
         return Created(created, secret)
     }
 
     /**
-     * SSO-3659 (ADR 2026-10-13 §5) — deliver a minted client secret, called by [apply] right AFTER the client is
-     * recorded: first the declared `secretSink:` through [declaredSecretSink] (a reason ⇒ not delivered, printed
-     * redacted of the value), then the host's generic [secretSink] (`--secret-file` / guarded TTY). When neither
-     * reaches, the client stays (it exists and is owned) and lands on [undeliveredSecretDetails] with the recovery.
+     * SSO-3659 (ADR 2026-10-13 §5) — deliver a minted client secret, called by [apply] right AFTER the client exists:
+     * first the declared `secretSink:` through [declaredSecretSink] (a reason ⇒ not delivered, printed redacted of
+     * the value), then the host's generic [secretSink] (`--secret-file` / guarded TTY). When neither reaches, the
+     * client stays and lands on [undeliveredSecretDetails] with the recovery.
      */
     private fun deliverSecret(r: ProvisionResource, clientId: String, secret: String) {
         fun redact(text: String?): String = (text ?: "unknown failure").replace(secret, "[redacted]")
@@ -1370,17 +1563,17 @@ class ProvisionEngine(
         undelivered += UndeliveredSecret(r.key, clientId, target, redact(reason ?: "no secret channel is available"))
         err.println(
             "  ! application ${r.name}: $ERROR_UNDELIVERED_SECRETS — its client secret was minted but could NOT be delivered (clientId $clientId). " +
-                "The client exists and is owned; mint a new secret with `${recoverSecret(clientId)}`.",
+                "The client exists; mint a new secret with `${recoverSecret(clientId)}`.",
         )
     }
 
     /** Converge an existing resource: send exactly the changed (non-secret) fields plus any write-only secret. */
-    private fun update(r: ProvisionResource, file: ProvisionFile, owned: List<OwnedResource>, change: PlannedChange): OwnedResource {
+    private fun update(r: ProvisionResource, file: ProvisionFile, applied: List<AppliedResource>, change: PlannedChange): AppliedResource {
         val spec = resolveSpec(r, strict = true)
         val id = change.liveId ?: throw ProvisionException("${r.key}: update planned without a live id")
         val changed = spec.filterKeys { it in change.diff.keys }
-        val slug = if (r.kind == ProvisionFile.KIND_ENVIRONMENT) null else targetSlug(r, file, owned)
-        val base = OwnedResource(r.kind, r.name, id, slug, adopted = change.adopted, owner = change.owner)
+        val slug = if (r.kind == ProvisionFile.KIND_ENVIRONMENT) null else targetSlug(r, file, applied)
+        val base = AppliedResource(r.kind, r.name, id, slug, owner = change.owner, action = ChangeAction.UPDATE)
         return when (r.kind) {
             ProvisionFile.KIND_ENVIRONMENT -> {
                 clients(null).renameEnvironment(id, mapOf("name" to spec["displayName"].toString()))
@@ -1388,8 +1581,10 @@ class ProvisionEngine(
                 base.copy(attributes = mapOf("slug" to spec["slug"].toString()))
             }
             ProvisionFile.KIND_APPLICATION -> {
-                clients(slug).updateApplication(id, applicationBody(r, changed, slug))
-                out.println("  ~ application ${r.name}: updated ${change.diff.keys} (clientId $id)")
+                // SSO-3715 — the key location rides on every update (idempotent): the API cannot tell us whether it changed.
+                val keyLocation = spec.filterKeys { it in KEY_LOCATION_FIELDS }
+                clients(slug).updateApplication(id, applicationBody(r, changed + keyLocation, slug))
+                out.println("  ~ application ${r.name}: updated ${change.diff.keys}${if (keyLocation.isNotEmpty()) " + key location" else ""} (clientId $id)")
                 base.copy(attributes = applicationAttributes(spec))
             }
             // SSO-3689 — a differing pin or scope set is never planned (`workload_identity_trust_immutable`); SSO-3702 — the ONE
@@ -1412,33 +1607,16 @@ class ProvisionEngine(
                 out.println("  ~ federationMember ${r.name}: updated ${change.diff.keys} (id $id)")
                 base.copy(attributes = buildMap { spec["providerType"]?.toString()?.let { put("providerType", it) } })
             }
-            ProvisionFile.KIND_EMAIL_PROVIDER -> putEmailProvider(r, slug, spec, "~").copy(adopted = change.adopted)
-            ProvisionFile.KIND_LOGIN_THEME -> putLoginTheme(r, slug, spec, "~").copy(adopted = change.adopted)
-            ProvisionFile.KIND_LOGIN_FLOW -> applyLoginFlow(r, slug, spec, "~").copy(adopted = change.adopted)
-            ProvisionFile.KIND_LOGIN_METHODS -> putLoginMethods(r, slug, spec, "~").copy(adopted = change.adopted)
-            ProvisionFile.KIND_CUSTOM_DOMAIN -> verifyDomain(r, spec).copy(adopted = change.adopted)
+            ProvisionFile.KIND_EMAIL_PROVIDER -> putEmailProvider(r, slug, spec, "~").copy(action = ChangeAction.UPDATE)
+            ProvisionFile.KIND_LOGIN_THEME -> putLoginTheme(r, slug, spec, "~").copy(action = ChangeAction.UPDATE)
+            ProvisionFile.KIND_LOGIN_FLOW -> applyLoginFlow(r, slug, spec, "~").copy(action = ChangeAction.UPDATE)
+            ProvisionFile.KIND_LOGIN_METHODS -> putLoginMethods(r, slug, spec, "~").copy(action = ChangeAction.UPDATE)
+            ProvisionFile.KIND_CUSTOM_DOMAIN -> verifyDomain(r, spec).copy(action = ChangeAction.UPDATE)
             else -> throw ProvisionException("${r.key}: unsupported kind '${r.kind}'")
         }
     }
 
-    /** Take an existing, matching resource under management without writing anything. */
-    private fun adopt(r: ProvisionResource, file: ProvisionFile, owned: List<OwnedResource>, change: PlannedChange): OwnedResource {
-        val id = change.liveId ?: throw ProvisionException("${r.key}: adopt planned without a live id")
-        val slug = if (r.kind == ProvisionFile.KIND_ENVIRONMENT) null else targetSlug(r, file, owned)
-        out.println("  = ${r.kind} ${r.name}: adopted (id $id) — will be converged, never deleted by destroy")
-        val resolved = resolveSpec(r, strict = true)
-        val attributes = when (r.kind) {
-            ProvisionFile.KIND_ENVIRONMENT -> mapOf("slug" to resolved["slug"].toString())
-            ProvisionFile.KIND_USER -> mapOf("email" to resolved["email"].toString())
-            ProvisionFile.KIND_CUSTOM_DOMAIN -> mapOf("host" to hostOf(resolved))
-            // SSO-3689 — the receipt records the trust's `wi_` client and audience; the consumer's connection.json is shown.
-            ProvisionFile.KIND_WORKLOAD_IDENTITY_TRUST -> change.trust?.let { view -> printTrustConnection(view); trustAttributes(view) } ?: emptyMap()
-            else -> emptyMap()
-        }
-        return OwnedResource(r.kind, r.name, id, slug, attributes, adopted = true, owner = change.owner)
-    }
-
-    private fun putEmailProvider(r: ProvisionResource, slug: String?, spec: Map<String, Any?>, mark: String): OwnedResource {
+    private fun putEmailProvider(r: ProvisionResource, slug: String?, spec: Map<String, Any?>, mark: String): AppliedResource {
         val body = linkedMapOf<String, Any?>()
         spec["smtpHost"].nonBlank()?.let { body["smtpHost"] = it }
         spec["providerType"].nonBlank()?.let { body["providerType"] = it }
@@ -1455,14 +1633,14 @@ class ProvisionEngine(
         val id = resp.str("providerType") ?: "email-provider"
         out.println("  $mark emailProvider: type=$id host=${body["smtpHost"]}")
         // NEVER the password — only the non-secret provider shape.
-        return OwnedResource(r.kind, r.name, id, slug, buildMap {
+        return AppliedResource(r.kind, r.name, id, slug, buildMap {
             resp.str("smtpHost")?.let { put("smtpHost", it) }
             resp.str("fromAddress")?.let { put("fromAddress", it) }
             resp.str("configVersion")?.let { put("configVersion", it) }
-        })
+        }, action = ChangeAction.CREATE)
     }
 
-    private fun putLoginTheme(r: ProvisionResource, slug: String?, spec: Map<String, Any?>, mark: String): OwnedResource {
+    private fun putLoginTheme(r: ProvisionResource, slug: String?, spec: Map<String, Any?>, mark: String): AppliedResource {
         val body = linkedMapOf<String, Any?>()
         listOf("logoUrl", "primaryColor", "backgroundColor", "theme").forEach { k -> spec[k].nonBlank()?.let { body[k] = it } }
         spec["borderRadiusPx"]?.let { coerceInt(it)?.let { px -> body["borderRadiusPx"] = px } }
@@ -1477,13 +1655,13 @@ class ProvisionEngine(
         val resp = clients(slug).putLoginBranding(body)
         val effective = resp["effective"]
         out.println("  $mark loginTheme: theme=${effective?.str("theme") ?: "(default)"}")
-        return OwnedResource(r.kind, r.name, "login-theme", slug, buildMap {
+        return AppliedResource(r.kind, r.name, "login-theme", slug, buildMap {
             effective?.str("theme")?.let { put("theme", it) }
             effective?.str("primaryColor")?.let { put("primaryColor", it) }
-        })
+        }, action = ChangeAction.CREATE)
     }
 
-    private fun applyLoginFlow(r: ProvisionResource, slug: String?, spec: Map<String, Any?>, mark: String): OwnedResource {
+    private fun applyLoginFlow(r: ProvisionResource, slug: String?, spec: Map<String, Any?>, mark: String): AppliedResource {
         val client = clients(slug)
         val templateId = spec["templateId"].toString()
         val draft = client.applyLoginFlowTemplate(templateId)
@@ -1492,20 +1670,20 @@ class ProvisionEngine(
         val activate = spec["activate"]?.let { coerceBool(it) } ?: true
         if (activate) client.activateLoginFlow(version)
         out.println("  $mark loginFlow: template=$templateId version=$version${if (activate) " (active)" else " (draft)"}")
-        return OwnedResource(r.kind, r.name, version.toString(), slug, mapOf("templateId" to templateId, "activated" to activate.toString()))
+        return AppliedResource(r.kind, r.name, version.toString(), slug, mapOf("templateId" to templateId, "activated" to activate.toString()), action = ChangeAction.CREATE)
     }
 
     /**
      * SSO-3100 — PUT the FULL sign-in method allow-list (`thoryn login-methods set`): replace, not merge.
      * Tokens are normalised (trimmed, lower-cased); the server rejects an unknown or empty list.
      */
-    private fun putLoginMethods(r: ProvisionResource, slug: String?, spec: Map<String, Any?>, mark: String): OwnedResource {
+    private fun putLoginMethods(r: ProvisionResource, slug: String?, spec: Map<String, Any?>, mark: String): AppliedResource {
         val methods = (spec["methods"] as? List<*>).orEmpty().mapNotNull { it?.toString()?.trim()?.lowercase()?.takeIf { m -> m.isNotEmpty() } }.distinct()
         if (methods.isEmpty()) throw ProvisionException("${r.key}: spec.methods must list at least one sign-in method")
         val resp = clients(slug).putLoginMethods(methods)
         val stored = resp["stored"]?.takeIf { !it.isNull && it.isArray }?.toList()?.map { it.asString() } ?: methods
         out.println("  $mark loginMethods: ${stored.joinToString(", ")}")
-        return OwnedResource(r.kind, r.name, "login-methods", slug, mapOf("methods" to stored.joinToString(",")))
+        return AppliedResource(r.kind, r.name, "login-methods", slug, mapOf("methods" to stored.joinToString(",")), action = ChangeAction.CREATE)
     }
 
     // ── customDomain (SSO-3413 / SSO-3414) ───────────────────────────────────────────────────────
@@ -1518,8 +1696,7 @@ class ProvisionEngine(
      * |---|---|---|
      * | no domain (`NONE`) | create | claims `spec.host` (`PUT`), then verifies once |
      * | `spec.host`, `PENDING` / `SUSPENDED` | update | verifies the DNS records (`POST /verify`) |
-     * | `spec.host`, `VERIFIED` / `ACTIVE`, not yet in the receipt | adopt | nothing (recorded, never released) |
-     * | `spec.host`, `VERIFIED` / `ACTIVE`, owned | noop | nothing |
+     * | `spec.host`, `VERIFIED` / `ACTIVE` | noop | nothing |
      * | another host | — | refuses: moving the issuer to another host is a deliberate `thoryn domain remove` first |
      *
      * A failing DNS proof is NOT an apply failure — the records are the customer's to publish, and DNS takes
@@ -1528,7 +1705,7 @@ class ProvisionEngine(
      * ([CustomDomainMessages.NOT_ENTITLED]); an identity with no reach gets the grant it needs
      * named ([CustomDomainMessages.NO_ACCESS]).
      */
-    private fun probeCustomDomain(r: ProvisionResource, owned: OwnedResource?): PlannedChange {
+    private fun probeCustomDomain(r: ProvisionResource): PlannedChange {
         val host = hostOf(resolveSpec(r, strict = false))
         val body = try {
             clients(null).getCustomDomain()
@@ -1539,17 +1716,17 @@ class ProvisionEngine(
         val view = CustomDomainView.of(body)
         val id = customDomainId()
         val details = view.toStructured() + ("desiredHost" to host)
+        val attributes = buildMap { put("host", host); put("state", view.state); view.issuer?.let { put("issuer", it) } }
         return when {
             view.state == CustomDomainView.NONE && !view.entitled -> PlannedChange(
                 r.kind, r.name, ChangeAction.CREATE,
                 "claim $host — NOT ENTITLED: ${CustomDomainMessages.NOT_ENTITLED} (apply stops here until then)",
-                resource = r, owned = owned, customDomain = details,
+                resource = r, customDomain = details, retain = r.retain,
             )
             view.state == CustomDomainView.NONE -> PlannedChange(
                 r.kind, r.name, ChangeAction.CREATE,
-                (if (owned != null) "owned domain no longer exists — " else "") +
-                    "claim $host and verify it (the claim issues the TXT ownership value; the CNAME points at ${view.cnameTarget ?: "the platform host"})",
-                resource = r, owned = owned, customDomain = details + ("records" to plannedRecords(host, view)),
+                "claim $host and verify it (the claim issues the TXT ownership value; the CNAME points at ${view.cnameTarget ?: "the platform host"})",
+                resource = r, customDomain = details + ("records" to plannedRecords(host, view)), retain = r.retain,
             )
             !view.domain.equals(host, ignoreCase = true) -> throw ProvisionException(
                 "${r.key}: the workspace already has the custom domain '${view.domain}' (${view.state}), not '$host'. " +
@@ -1560,18 +1737,9 @@ class ProvisionEngine(
                 r.kind, r.name, ChangeAction.UPDATE,
                 "${view.state}${view.lastCheckReason?.let { " ($it)" } ?: ""} — apply verifies the DNS records" +
                     (view.releaseAt?.let { "; released at $it unless it verifies before" } ?: ""),
-                resource = r, owned = owned, liveId = id, diff = mapOf("state" to "${view.state} → verify"),
-                adopted = owned?.adopted ?: true, customDomain = details,
+                resource = r, liveId = id, attributes = attributes, diff = mapOf("state" to "${view.state} → verify"), customDomain = details, retain = r.retain,
             )
-            owned == null -> PlannedChange(
-                r.kind, r.name, ChangeAction.ADOPT,
-                "exists (${view.state}) — adopted under management (never released by destroy)",
-                resource = r, liveId = id, adopted = true, customDomain = details,
-            )
-            else -> PlannedChange(
-                r.kind, r.name, ChangeAction.NOOP, "owned and ${view.state}",
-                resource = r, owned = owned, liveId = id, adopted = owned.adopted, customDomain = details,
-            )
+            else -> PlannedChange(r.kind, r.name, ChangeAction.NOOP, "exists and is ${view.state}", resource = r, liveId = id, attributes = attributes, customDomain = details, retain = r.retain)
         }
     }
 
@@ -1582,7 +1750,7 @@ class ProvisionEngine(
         }
 
     /** `PUT /api/v1/custom-domain`, then one verify attempt. */
-    private fun claimCustomDomain(r: ProvisionResource, spec: Map<String, Any?>): OwnedResource {
+    private fun claimCustomDomain(r: ProvisionResource, spec: Map<String, Any?>): AppliedResource {
         val host = hostOf(spec)
         val claimed = try {
             clients(null).putCustomDomain(host, coerceBool(spec["acceptReSignIn"]))
@@ -1598,7 +1766,7 @@ class ProvisionEngine(
      * `POST /api/v1/custom-domain/verify` while the domain is `PENDING` / `SUSPENDED`. A failing proof
      * (`422 verification_failed`) or an inconclusive resolver (`503 dns_unavailable`) is reported, not thrown.
      */
-    private fun verifyDomain(r: ProvisionResource, spec: Map<String, Any?>, after: JsonNode? = null): OwnedResource {
+    private fun verifyDomain(r: ProvisionResource, spec: Map<String, Any?>, after: JsonNode? = null): AppliedResource {
         val host = hostOf(spec)
         val client = clients(null)
         var body = after ?: client.getCustomDomain()
@@ -1625,11 +1793,11 @@ class ProvisionEngine(
         }
         val view = CustomDomainView.of(body)
         out.println("  = customDomain: $host is ${view.state}; the workspace issues on ${view.issuer ?: "its platform host"}")
-        return OwnedResource(r.kind, r.name, customDomainId(), null, buildMap {
+        return AppliedResource(r.kind, r.name, customDomainId(), null, buildMap {
             put("host", host)
             put("state", view.state)
             view.issuer?.let { put("issuer", it) }
-        })
+        }, action = ChangeAction.CREATE)
     }
 
     private fun printDomainRecords(body: JsonNode) {
@@ -1655,7 +1823,7 @@ class ProvisionEngine(
         },
     )
 
-    /** The receipt id of the workspace-level singleton: the workspace id (`tnt`), else a stable placeholder. */
+    /** The id of the workspace-level singleton: the workspace id (`tnt`), else a stable placeholder. */
     private fun customDomainId(): String = workspaceId?.takeIf { it.isNotBlank() } ?: CUSTOM_DOMAIN_FALLBACK_ID
 
     private fun hostOf(spec: Map<String, Any?>): String =
@@ -1672,38 +1840,42 @@ class ProvisionEngine(
         throw grantFailure(r, ex, AccessRefs.SCOPE_READ, "read the grants on $ref")
     }
 
+    /** The grant diff of one object: what to add, what `--prune` revokes, what stays "present, not declared". */
+    private data class GrantDiff(val adds: List<String>, val removes: List<String>, val undeclared: List<String>)
+
     /**
-     * Adds = declared but not live.
-     *
-     * Removes = live, no longer declared, AND previously granted by THIS FILE ([owned], carried on the
-     * receipt) — SSO-3119. A `grants:` block converges what it placed itself, never what it merely found:
-     * the creator's own `member:<sub> manager` (SSO-3110 creator-becomes-manager) and any grant an admin
-     * made by hand survive an apply that does not mention them. Same rule [OwnedResource.adopted] states
-     * for resources; without it a CI apply would silently revoke the human who created the sandbox. The
-     * workspace admin userset (`workspace:<id>#admin`) stays excluded besides, as defence in depth.
+     * Adds = declared but not live. SSO-3715 (ADR 2026-10-15 §2) — grants are additive by default: a live grant the
+     * block does not declare is [GrantDiff.undeclared] ("present, not declared"), shown and left alone. With
+     * [revoke] (`--prune` on an object the caller may delete) it is a remove — EXCEPT the `owner` tuple (the
+     * platform's one-owner relation is an admin's to move), a workspace userset (`workspace:<id>#admin` and any
+     * other `workspace:` subject — defence in depth) and the caller's own subject (an apply never saws off the
+     * branch it sits on). No "granted by this file" marker exists any more — the declaration is the file, the
+     * authority is the owner.
      */
-    private fun grantDiff(declared: List<ProvisionGrant>, live: List<String>, owned: List<String>): Pair<List<String>, List<String>> {
+    private fun grantDiff(declared: List<ProvisionGrant>, live: List<String>, revoke: Boolean): GrantDiff {
         val wanted = declared.map { it.label }.distinct()
         val have = live.distinct()
         val adds = wanted.filter { it !in have }
-        val removes = have.filter {
-            it !in wanted && it in owned && !AccessRefs.ADMIN_USERSET_PATTERN.matches(it.substringBefore(' '))
+        val undeclared = have.filter { it !in wanted }
+        if (!revoke) return GrantDiff(adds, emptyList(), undeclared)
+        val (removes, kept) = undeclared.partition { label ->
+            val (grantee, relation) = label.split(' ', limit = 2)
+            relation != RELATION_OWNER && !grantee.startsWith("$OBJECT_TYPE_WORKSPACE:") && grantee != subject
         }
-        return adds to removes
+        return GrantDiff(adds, removes, kept)
     }
 
     /**
-     * Converge the `grants:` block on ONE object: list, POST the missing, DELETE the undeclared ones this
-     * file granted itself. Returns the grants the file owns AFTERWARDS — what it just POSTed, plus what it
-     * already owned and still declares and is still live — for the receipt (SSO-3119).
+     * Converge the `grants:` block on ONE object: list, POST the missing, DELETE the ones the plan decided to revoke
+     * ([removes] — `--prune` on an object the caller may delete, after the exclusions). The live set is re-read here
+     * so a grant someone added between plan and apply is never revoked on a stale diff.
      */
-    private fun convergeGrants(r: ProvisionResource, ref: String, owned: List<String>): List<String> {
-        val declared = r.grants ?: return owned
+    private fun convergeGrants(r: ProvisionResource, ref: String, removes: List<String>) {
+        val declared = r.grants ?: return
         val live = liveGrants(r, ref)
-        val (adds, removes) = grantDiff(declared, live, owned)
-        val wanted = declared.map { it.label }.distinct()
-        val nextOwned = (owned.filter { it in live && it in wanted } + adds).distinct()
-        if (adds.isEmpty() && removes.isEmpty()) return nextOwned
+        val adds = grantDiff(declared, live, revoke = false).adds
+        val revoke = removes.filter { it in live }
+        if (adds.isEmpty() && revoke.isEmpty()) return
         val client = clients(null)
         try {
             adds.forEach { label ->
@@ -1711,15 +1883,14 @@ class ProvisionEngine(
                 client.createGrant(subject, relation, ref)
                 out.println("  + grant ${r.kind} ${r.name}: $subject $relation on $ref")
             }
-            removes.forEach { label ->
+            revoke.forEach { label ->
                 val (subject, relation) = label.split(' ', limit = 2)
                 client.deleteGrant(subject, relation, ref)
-                out.println("  - grant ${r.kind} ${r.name}: $subject $relation on $ref (no longer declared)")
+                out.println("  - grant ${r.kind} ${r.name}: $subject $relation on $ref (not declared; --prune)")
             }
         } catch (ex: ProductApiException) {
             throw grantFailure(r, ex, AccessRefs.SCOPE_WRITE, "converge the grants on $ref")
         }
-        return nextOwned
     }
 
     /** Fail closed: a 403 `insufficient_scope` on the access API names the missing scope and the login line. */
@@ -1735,46 +1906,47 @@ class ProvisionEngine(
 
     // ── per-kind remove ──────────────────────────────────────────────────────────────────────────
 
-    private fun remove(o: OwnedResource, confirmSlug: String?) {
-        when (o.kind) {
+    private fun remove(c: PlannedChange, confirmSlug: String?) {
+        val id = c.liveId ?: throw ProvisionException("${c.key}: removal planned without a live id")
+        when (c.kind) {
             ProvisionFile.KIND_ENVIRONMENT -> {
                 // A sandbox hard-delete is confirmed by the environment's OWN slug (SSO-2960 contract).
-                clients(null).deleteEnvironment(o.id, o.attributes["slug"])
-                out.println("  - environment ${o.name}: hard-deleted (id ${o.id})")
+                clients(null).deleteEnvironment(id, c.attributes["slug"])
+                out.println("  - environment ${c.name}: hard-deleted (id $id)")
             }
             ProvisionFile.KIND_APPLICATION -> {
-                clients(o.environment).deleteApplication(o.id, confirmSlug)
-                out.println("  - application ${o.name}: deleted (clientId ${o.id})")
+                clients(c.environment).deleteApplication(id, confirmSlug)
+                out.println("  - application ${c.name}: deleted (clientId $id)")
             }
             ProvisionFile.KIND_USER -> {
-                clients(o.environment).deleteUser(o.id, confirmSlug)
-                out.println("  - user ${o.name}: deleted (id ${o.id})")
+                clients(c.environment).deleteUser(id, confirmSlug)
+                out.println("  - user ${c.name}: deleted (id $id)")
             }
             ProvisionFile.KIND_FEDERATION_MEMBER -> {
-                clients(o.environment).deleteFederationMember(o.id, confirmSlug)
-                out.println("  - federationMember ${o.name}: detached (id ${o.id})")
+                clients(c.environment).deleteFederationMember(id, confirmSlug)
+                out.println("  - federationMember ${c.name}: detached (id $id)")
             }
             ProvisionFile.KIND_EMAIL_PROVIDER -> {
-                clients(o.environment).deleteEmailProvider(confirmSlug)
+                clients(c.environment).deleteEmailProvider(confirmSlug)
                 out.println("  - emailProvider: reset to the platform sender")
             }
             ProvisionFile.KIND_LOGIN_METHODS -> {
                 // SSO-3100 — the delete path IS a reset: back to the default (every method offered).
-                clients(o.environment).resetLoginMethods()
+                clients(c.environment).resetLoginMethods()
                 out.println("  - loginMethods: reset to the default (every method offered)")
             }
             ProvisionFile.KIND_CUSTOM_DOMAIN -> {
                 // SSO-3413 — reached only through `--prune` / `destroy`, both production-plane gated by `--confirm`.
                 clients(null).deleteCustomDomain()
-                out.println("  - customDomain: released ${o.attributes["host"] ?: ""} — the workspace issues on its platform host again")
+                out.println("  - customDomain: released ${c.attributes["host"] ?: ""} — the workspace issues on its platform host again")
             }
             ProvisionFile.KIND_WORKLOAD_IDENTITY_TRUST -> {
                 // SSO-3689 — only through `--prune` / `destroy`; the trust's workload client stops authenticating at once.
-                clients(o.environment).deleteWorkloadIdentityTrust(o.id, confirmSlug)
-                trustLists.remove(o.environment)
-                out.println("  - workloadIdentityTrust ${o.name}: deleted (id ${o.id}; its workload client ${o.attributes[ATTR_CLIENT_ID] ?: "wi_…"} stops authenticating at once)")
+                clients(c.environment).deleteWorkloadIdentityTrust(id, confirmSlug)
+                trustLists.remove(c.environment)
+                out.println("  - workloadIdentityTrust ${c.name}: deleted (id $id; its workload client ${c.attributes[ATTR_CLIENT_ID] ?: "wi_…"} stops authenticating at once)")
             }
-            else -> throw ProvisionException("${o.key}: no delete API for kind '${o.kind}'")
+            else -> throw ProvisionException("${c.key}: no delete API for kind '${c.kind}'")
         }
     }
 
@@ -1810,10 +1982,9 @@ class ProvisionEngine(
      * (the hub has no update; the pins are immutable by design). A trust whose workload client IS the applying identity is
      * refused: a file cannot declare the bootstrap trust it signs in with.
      */
-    private fun probeTrust(r: ProvisionResource, owned: OwnedResource?, slug: String?, desired: Map<String, Any?>): PlannedChange {
+    private fun probeTrust(r: ProvisionResource, slug: String?, desired: Map<String, Any?>): PlannedChange {
         val node = try {
-            owned?.let { fetchOrNull { clients(slug).getWorkloadIdentityTrust(it.id) } }
-                ?: fetchOrNull { trustsOf(slug) }?.firstOrNull { it.str("name") == r.name }
+            fetchOrNull { trustsOf(slug) }?.firstOrNull { it.str("name") == r.name }
         } catch (ex: ProductApiException) {
             throw ProvisionException("${r.key}: could not read live state (${ex.message})")
         }
@@ -1824,21 +1995,21 @@ class ProvisionEngine(
                     r.kind, r.name, ChangeAction.ERROR,
                     "$ERROR_SCOPE_NOT_GRANTABLE — a trust can carry only tenant: scopes the applying identity itself holds, and this one does not hold ${notHeld.joinToString(", ")}: " +
                         "drop the scope from spec.scopes, or sign in with it (grant the CI identity that scope) first",
-                    resource = r, owned = owned, error = ERROR_SCOPE_NOT_GRANTABLE,
+                    resource = r, environment = slug, error = ERROR_SCOPE_NOT_GRANTABLE,
                 )
             }
-            val why = if (owned != null) "owned id ${owned.id} no longer exists — will be re-created" else "not found by its name in ${planeLabel(slug)}"
-            return PlannedChange(r.kind, r.name, ChangeAction.CREATE, "$why — mints its wi_ workload client$SCOPE_CEILING_NOTE", resource = r, owned = owned)
+            return PlannedChange(r.kind, r.name, ChangeAction.CREATE, "not found by its name in ${planeLabel(slug)} — mints its wi_ workload client$SCOPE_CEILING_NOTE", resource = r, environment = slug, retain = r.retain)
         }
         val id = node.str("id") ?: ""
         val view = trustView(node)
+        val attributes = trustAttributes(view)
         val clientId = node.str("clientId")
         if (clientId != null && subject == "client:$clientId") {
             return PlannedChange(
                 r.kind, r.name, ChangeAction.ERROR,
                 "$ERROR_TRUST_IS_SELF — this trust's workload client $clientId is the identity applying this file: a repository cannot declare its OWN bootstrap trust " +
                     "(it was created once by a person, and a file that owned it could remove the identity it signs in with); drop the resource",
-                resource = r, owned = owned, liveId = id, error = ERROR_TRUST_IS_SELF, trust = view,
+                resource = r, liveId = id, environment = slug, attributes = attributes, error = ERROR_TRUST_IS_SELF, trust = view,
             )
         }
         val diff = diffOf(trustDesired(desired), trustLive(node))
@@ -1850,24 +2021,23 @@ class ProvisionEngine(
         return when {
             planOnly && !liveHasPlan -> PlannedChange(
                 r.kind, r.name, ChangeAction.UPDATE,
-                (if (owned == null) "exists (adopting) — " else "") + "adds the plan profile (GitHub environment '${(desired[ProvisionFile.TRUST_PLAN] as? Map<*, *>)?.get("environment")}', read-only scopes) " +
+                "exists — adds the plan profile (GitHub environment '${(desired[ProvisionFile.TRUST_PLAN] as? Map<*, *>)?.get("environment")}', read-only scopes) " +
                     "through the one additive set-plan-profile call; the wi_ workload client ${clientId ?: ""} stays".replace("  ", " "),
-                resource = r, owned = owned, liveId = id, diff = diff, adopted = owned?.adopted ?: true, trust = view,
+                resource = r, liveId = id, environment = slug, attributes = attributes, diff = diff, trust = view, retain = r.retain,
             )
             planOnly -> PlannedChange(
                 r.kind, r.name, ChangeAction.ERROR,
                 "$ERROR_TRUST_IMMUTABLE — the live trust already carries a plan profile that differs from the declared one (${diff.keys.joinToString(", ")}); a plan profile is set once: " +
                     "declare what is live, or re-create the trust (`thoryn workload-identity trusts delete $id${slug?.let { " --environment $it" } ?: ""}`, then re-apply — a new wi_ client, re-paste it)",
-                resource = r, owned = owned, liveId = id, diff = diff, adopted = owned?.adopted ?: true, error = ERROR_TRUST_IMMUTABLE, trust = view,
+                resource = r, liveId = id, environment = slug, attributes = attributes, diff = diff, error = ERROR_TRUST_IMMUTABLE, trust = view,
             )
             diff.isNotEmpty() -> PlannedChange(
                 r.kind, r.name, ChangeAction.ERROR,
                 "$ERROR_TRUST_IMMUTABLE — ${diff.size} declared field(s) differ from the live trust (${diff.keys.joinToString(", ")}); a trust's pins and scopes are immutable on the hub: " +
                     "declare what is live, or delete it (`thoryn workload-identity trusts delete $id${slug?.let { " --environment $it" } ?: ""}`) and re-apply to re-create it",
-                resource = r, owned = owned, liveId = id, diff = diff, adopted = owned?.adopted ?: true, error = ERROR_TRUST_IMMUTABLE, trust = view,
+                resource = r, liveId = id, environment = slug, attributes = attributes, diff = diff, error = ERROR_TRUST_IMMUTABLE, trust = view,
             )
-            owned == null -> PlannedChange(r.kind, r.name, ChangeAction.ADOPT, "exists and matches — adopted under management (never deleted by destroy)", resource = r, liveId = id, adopted = true, trust = view)
-            else -> PlannedChange(r.kind, r.name, ChangeAction.NOOP, "owned (id $id) and matches", resource = r, owned = owned, liveId = id, adopted = owned.adopted, trust = view)
+            else -> PlannedChange(r.kind, r.name, ChangeAction.NOOP, "exists and matches", resource = r, liveId = id, environment = slug, attributes = attributes, trust = view, retain = r.retain)
         }
     }
 
@@ -1922,7 +2092,7 @@ class ProvisionEngine(
     private fun jwkKids(jwks: Any?): List<String> =
         ((jwks as? Map<*, *>)?.get("keys") as? List<*>).orEmpty().mapNotNull { (it as? Map<*, *>)?.get("kid")?.toString() }.sorted()
 
-    /** The live trust as a plan / receipt view: never key material, never anything secret (a trust has none). */
+    /** The live trust as a plan view: never key material, never anything secret (a trust has none). */
     private fun trustView(n: JsonNode): Map<String, Any?> = buildMap {
         listOf("id", "name", "clientId", "audience", "tokenEndpoint", "provider", "environment").forEach { f -> n.str(f)?.let { put(f, it) } }
         n["scopes"]?.takeIf { it.isArray }?.let { put("scopes", it.toList().map { s -> s.asString() }) }
@@ -1933,7 +2103,7 @@ class ProvisionEngine(
         n["kubernetes"]?.takeIf { it.isObject }?.let { k -> put("kubernetes", listOf("issuer", "namespace", "serviceAccount").mapNotNull { f -> k.str(f)?.let { f to it } }.toMap()) }
     }
 
-    /** The receipt attributes of a trust: its `wi_` workload client, its audience and provider (what a reader needs; nothing secret). */
+    /** The attributes of a trust: its `wi_` workload client, its audience and provider (what a reader needs; nothing secret). */
     private fun trustAttributes(view: Map<String, Any?>): Map<String, String> = buildMap {
         view["clientId"]?.toString()?.let { put(ATTR_CLIENT_ID, it) }
         view["audience"]?.toString()?.let { put("audience", it) }
@@ -2003,11 +2173,10 @@ class ProvisionEngine(
 
     /**
      * SSO-3702 — the ONE additive mutation of a live trust (SSO-3699 decision (b)): `POST …/{id}/plan-profile` with the
-     * declared profile. The `wi_` client, its `owner` relation and the consumer's `connection.json` all stay; the
-     * receipt keeps the same id and attributes. Only reached for a plan whose diff is the plan profile on a trust
+     * declared profile. The `wi_` client, its `owner` relation and the consumer's `connection.json` all stay. Only reached for a plan whose diff is the plan profile on a trust
      * without one ([probeTrust]).
      */
-    private fun setTrustPlanProfile(r: ProvisionResource, change: PlannedChange, slug: String?, spec: Map<String, Any?>): OwnedResource {
+    private fun setTrustPlanProfile(r: ProvisionResource, change: PlannedChange, slug: String?, spec: Map<String, Any?>): AppliedResource {
         val id = change.liveId ?: throw ProvisionException("${r.key}: plan-profile update planned without a live id")
         val body = planProfileBody(spec) ?: throw ProvisionException("${r.key}: plan-profile update planned without a declared spec.${ProvisionFile.TRUST_PLAN}")
         val resp = try {
@@ -2018,16 +2187,16 @@ class ProvisionEngine(
         trustLists.remove(slug)
         val view = trustView(resp)
         out.println("  ~ workloadIdentityTrust ${r.name}: plan profile added — GitHub environment '${body["environment"]}' is minted read-only scopes ${((view[ProvisionFile.TRUST_PLAN] as? Map<*, *>)?.get("scopes") as? List<*>)?.joinToString(" ") ?: "(derived by the hub)"}; wi_ client ${view["clientId"] ?: change.trust?.get("clientId") ?: ""} unchanged (id $id)")
-        return OwnedResource(r.kind, r.name, id, slug, trustAttributes(view.ifEmpty { change.trust.orEmpty() }), adopted = change.adopted, owner = change.owner)
+        return AppliedResource(r.kind, r.name, id, slug, trustAttributes(view.ifEmpty { change.trust.orEmpty() }), owner = change.owner, action = ChangeAction.UPDATE)
     }
 
     /**
-     * Create the trust; a `409 workload_identity_trust_name_taken` (a race with another writer) adopts the matching trust
-     * of that name — exactly as `project init` does — or refuses when it differs. Prints the `wi_` client, the audience
+     * Create the trust; a `409 workload_identity_trust_name_taken` (a race with another writer) converges onto the matching
+     * trust of that name — exactly as `project init` does — or refuses when it differs. Prints the `wi_` client, the audience
      * and the consumer's `connection.json`; never writes that file (it belongs to the consumer repository).
      */
-    private fun createTrust(r: ProvisionResource, file: ProvisionFile, owned: List<OwnedResource>, spec: Map<String, Any?>): OwnedResource {
-        val slug = targetSlug(r, file, owned)
+    private fun createTrust(r: ProvisionResource, file: ProvisionFile, applied: List<AppliedResource>, spec: Map<String, Any?>): AppliedResource {
+        val slug = targetSlug(r, file, applied)
         val resp = try {
             clients(slug).createWorkloadIdentityTrust(trustBody(r.name, spec))
         } catch (ex: ProductApiException) {
@@ -2036,18 +2205,18 @@ class ProvisionEngine(
                 val diff = live?.let { diffOf(trustDesired(spec), trustLive(it)) }
                 if (live != null && diff!!.isEmpty()) {
                     val view = trustView(live)
-                    out.println("  = workloadIdentityTrust ${r.name}: the name was taken by a matching trust meanwhile — adopted (id ${view["id"]}, clientId ${view["clientId"]})")
+                    out.println("  = workloadIdentityTrust ${r.name}: the name was taken by a matching trust meanwhile — converged (id ${view["id"]}, clientId ${view["clientId"]})")
                     printTrustConnection(view)
-                    return OwnedResource(r.kind, r.name, view["id"].toString(), slug, trustAttributes(view), adopted = true)
+                    return AppliedResource(r.kind, r.name, view["id"].toString(), slug, trustAttributes(view), action = ChangeAction.NOOP)
                 }
                 // SSO-3702 — the racing writer created it WITHOUT the declared plan profile: the additive mutation still applies.
                 if (live != null && diff!!.keys.all { it.startsWith(PLAN_FIELD_PREFIX) } && live[ProvisionFile.TRUST_PLAN]?.takeIf { it.isObject && it.str("environment") != null } == null) {
                     val view = trustView(live)
-                    out.println("  = workloadIdentityTrust ${r.name}: the name was taken by a matching trust meanwhile — adopted (id ${view["id"]}, clientId ${view["clientId"]})")
-                    val adopted = PlannedChange(r.kind, r.name, ChangeAction.UPDATE, "adds the plan profile", resource = r, liveId = view["id"].toString(), diff = diff, adopted = true, trust = view)
-                    val owned = setTrustPlanProfile(r, adopted, slug, spec)
+                    out.println("  = workloadIdentityTrust ${r.name}: the name was taken by a matching trust meanwhile — converged (id ${view["id"]}, clientId ${view["clientId"]})")
+                    val planned = PlannedChange(r.kind, r.name, ChangeAction.UPDATE, "adds the plan profile", resource = r, liveId = view["id"].toString(), diff = diff, trust = view)
+                    val result = setTrustPlanProfile(r, planned, slug, spec)
                     printTrustConnection(view)
-                    return owned
+                    return result
                 }
                 throw ProvisionException("${r.key}: $ERROR_TRUST_IMMUTABLE — a trust named '${r.name}' already exists in ${planeLabel(slug)} with other pins or scopes; declare what is live, or delete it and re-apply")
             }
@@ -2058,7 +2227,7 @@ class ProvisionEngine(
         val id = view["id"]?.toString() ?: throw ProvisionException("${r.key}: the trust create returned no id")
         out.println("  + workloadIdentityTrust ${r.name}: id=$id clientId=${view["clientId"]} audience=${view["audience"]}${slug?.let { " env=$it" } ?: ""}")
         printTrustConnection(view)
-        return OwnedResource(r.kind, r.name, id, slug, trustAttributes(view))
+        return AppliedResource(r.kind, r.name, id, slug, trustAttributes(view), action = ChangeAction.CREATE)
     }
 
     /** The trust service's refusals, each with what to do next (the same guidance `thoryn workload-identity trusts create` gives). */
@@ -2088,7 +2257,7 @@ class ProvisionEngine(
     )
 
     /**
-     * Print the consumer's `connection.json` for a trust `apply` created or adopted (ADR 2026-09-09 connection
+     * Print the consumer's `connection.json` for a trust `apply` created or converged onto (ADR 2026-09-09 connection
      * contract) — NEVER written by apply: it belongs to the repository / workload that signs in with the trust.
      */
     private fun printTrustConnection(view: Map<String, Any?>) {
@@ -2140,11 +2309,9 @@ class ProvisionEngine(
         return body
     }
 
-    /** The receipt attributes of an application: its first redirect URI and (SSO-3689) the key location this file last applied — never a key. */
+    /** The attributes of an application a reader needs next to its id: its first redirect URI — never a key. */
     private fun applicationAttributes(spec: Map<String, Any?>): Map<String, String> = buildMap {
         (spec["redirectUris"] as? List<*>)?.firstOrNull()?.toString()?.let { put("redirectUri", it) }
-        spec[ProvisionFile.SPEC_JWKS_URI]?.toString()?.trim()?.takeIf { it.isNotEmpty() }?.let { put(ATTR_JWKS_URI, it) }
-        (spec[ProvisionFile.SPEC_JWKS] as? Map<*, *>)?.let { put(ATTR_JWKS_KIDS, jwkKids(it).joinToString(",")) }
     }
 
     // ── helpers ──────────────────────────────────────────────────────────────────────────────────
@@ -2159,16 +2326,16 @@ class ProvisionEngine(
             resources.filter { it.kind != ProvisionFile.KIND_ENVIRONMENT && it.kind != ProvisionFile.KIND_WORKLOAD_IDENTITY_TRUST }
 
     /** Child-first: everything in reverse order, then the trusts the clients were bound to, environments last (their hard-delete cascades). */
-    private fun orderForRemove(owned: List<OwnedResource>): List<OwnedResource> =
-        owned.filter { it.kind != ProvisionFile.KIND_ENVIRONMENT && it.kind != ProvisionFile.KIND_WORKLOAD_IDENTITY_TRUST }.reversed() +
-            owned.filter { it.kind == ProvisionFile.KIND_WORKLOAD_IDENTITY_TRUST }.reversed() +
-            owned.filter { it.kind == ProvisionFile.KIND_ENVIRONMENT }.reversed()
+    private fun orderForRemove(rows: List<PlannedChange>): List<PlannedChange> =
+        rows.filter { it.kind != ProvisionFile.KIND_ENVIRONMENT && it.kind != ProvisionFile.KIND_WORKLOAD_IDENTITY_TRUST }.reversed() +
+            rows.filter { it.kind == ProvisionFile.KIND_WORKLOAD_IDENTITY_TRUST }.reversed() +
+            rows.filter { it.kind == ProvisionFile.KIND_ENVIRONMENT }.reversed()
 
-    /** The slug a resource targets: an env resource of this file (must already be owned), an existing slug, or null. */
-    private fun targetSlug(r: ProvisionResource, file: ProvisionFile, owned: List<OwnedResource>): String? {
+    /** The slug a resource targets: an env resource of this file (converged earlier in this apply), an existing slug, or null. */
+    private fun targetSlug(r: ProvisionResource, file: ProvisionFile, applied: List<AppliedResource>): String? {
         val ref = r.environment ?: return null
         if (file.environmentResource(ref) == null) return ref
-        return owned.firstOrNull { it.kind == ProvisionFile.KIND_ENVIRONMENT && it.name == ref }?.attributes?.get("slug")
+        return applied.firstOrNull { it.kind == ProvisionFile.KIND_ENVIRONMENT && it.name == ref }?.attributes?.get("slug")
             ?: throw ProvisionException("${r.key} targets environment '$ref', declared in this file but not provisioned")
     }
 
@@ -2279,13 +2446,24 @@ class ProvisionEngine(
 
         val ENV_NAME_PATTERN = Regex("^[A-Za-z_][A-Za-z0-9_]*$")
 
-        /** SSO-3413 — the customDomain receipt id when the session carries no `tnt` (grants then cannot name it). */
+        /** SSO-3413 — the customDomain id when the session carries no `tnt` (grants then cannot name it). */
         const val CUSTOM_DOMAIN_FALLBACK_ID = "custom-domain"
 
         // ── SSO-3659 — the ownership gate's vocabulary (ADR 2026-10-13 §1) ──
 
         /** The resource may only be viewed (or is declared `readOnly`) and the file would change it. */
         const val ERROR_READ_ONLY = "access_read_only"
+        /**
+         * SSO-3715 (ADR 2026-10-15 §5) — two or more live resources match the declared converge key (an application's
+         * `displayName` within its environment, a federation member's `displayName`): red, never a create of a third.
+         */
+        const val ERROR_CONVERGE_KEY_AMBIGUOUS = "converge_key_ambiguous"
+        /** SSO-3715 — the fix request's note for a `converge_key_ambiguous` row: the FILE must say which one (`clientId`). */
+        const val FILE_FIX_NOTE_AMBIGUOUS = "a change to the file, not a missing right: declare `clientId` so the converge key names exactly one live resource"
+        /** SSO-3715 — the destroy / prune plan's reason for a `retain: true` resource. */
+        const val RETAINED = "retained by the file (`retain: true`) — never removed by destroy / --prune"
+        /** SSO-3715 — the kinds the platform model defines `owner` on; every other kind is removed with its sandbox or by hand. */
+        val OWNABLE_KINDS: Set<String> = setOf(ProvisionFile.KIND_APPLICATION, ProvisionFile.KIND_ENVIRONMENT)
         /** No relation on the resource, or no `manager` on the parent a create needs. */
         const val ERROR_NOT_OWNED = "access_not_owned"
         /**
@@ -2308,13 +2486,13 @@ class ProvisionEngine(
 
         /**
          * SSO-3668 — an output's `publishTo:` target could not be reached by the signed-in credential; raised
-         * AFTER convergence (the resource exists and its id is in the receipt), never a refusal before it.
+         * AFTER convergence (the resource exists and its id is in the apply output), never a refusal before it.
          */
         const val ERROR_PUBLISH_UNREACHABLE = "publish_target_unreachable"
 
         /**
          * SSO-3659 (ADR 2026-10-13 §5) — a minted client secret reached neither its declared `secretSink:` nor the
-         * host's generic channel. Reported AFTER the client is converged and recorded; the recovery is [recoverSecret].
+         * host's generic channel. Reported AFTER the client is converged; the recovery is [recoverSecret].
          */
         const val ERROR_UNDELIVERED_SECRETS = "undelivered_secrets"
 
@@ -2338,11 +2516,10 @@ class ProvisionEngine(
         /** The diff value of a `federatedTrust` whose trust this same apply creates first. */
         const val PENDING_TRUST_MARKER = "(created by this apply)"
         const val SCOPE_TRUST_WRITE = "tenant:workload-identity.write"
-        /** Receipt attribute keys (never a key or a secret: a URI, kids, a public client id). */
-        const val ATTR_JWKS_URI = "jwksUri"
-        const val ATTR_JWKS_KIDS = "jwksKids"
+        /** The attribute key of a trust's `wi_` workload client (a public client id, never a secret). */
         const val ATTR_CLIENT_ID = "clientId"
-        private val KEY_LOCATION_FIELDS = setOf(ProvisionFile.SPEC_JWKS_URI, ProvisionFile.SPEC_JWKS)
+        /** SSO-3715 — the `private_key_jwt` key location: never diffed until product-api renders it (SSO-3716); re-sent on every update. */
+        val KEY_LOCATION_FIELDS: Set<String> = setOf(ProvisionFile.SPEC_JWKS_URI, ProvisionFile.SPEC_JWKS)
         private const val MAX_TRUST_PAGES = 50
         private val json = tools.jackson.databind.json.JsonMapper.builder().build()
 
@@ -2422,19 +2599,8 @@ class ProvisionEngine(
             .trimEnd('-')
         val ENV_PLACEHOLDER = Regex("""\{\{\s*env\.([A-Za-z_][A-Za-z0-9_]*)\s*}}""")
 
-        /** Kinds the customer plane can delete; `loginTheme` / `loginFlow` have no delete surface (`loginMethods` resets via DELETE, SSO-3100). */
-        fun deletable(kind: String): Boolean = kind !in setOf(ProvisionFile.KIND_LOGIN_THEME, ProvisionFile.KIND_LOGIN_FLOW)
-
-        /** Owned, created by this file (not adopted), and of a deletable kind. */
-        fun removable(o: OwnedResource): Boolean = !o.adopted && deletable(o.kind)
-
-        /** An owned non-environment resource with no sandbox slug lives on the production plane. */
-        fun onProductionPlane(o: OwnedResource): Boolean =
-            o.kind != ProvisionFile.KIND_ENVIRONMENT &&
-                (o.environment.isNullOrBlank() || o.environment == PRODUCTION_ENV_SLUG)
-
         /**
-         * SSO-3113 — the access-API OBJECT ref of an owned resource, derived from its receipt id (the
+         * SSO-3113 — the access-API OBJECT ref of a resource, derived from its live id (the
          * SSO-3112 contract): `environment:<id>`, `application:<clientId>`, `user:<id>`,
          * `federation_member:<id>`; the per-environment singletons are keyed by their environment SLUG
          * (`email_provider:<envSlug>`, `login_theme:<envSlug>`, `login_flow:<envSlug>`,
@@ -2452,7 +2618,7 @@ class ProvisionEngine(
                 ProvisionFile.KIND_LOGIN_THEME -> "login_theme:$envSlug"
                 ProvisionFile.KIND_LOGIN_FLOW -> "login_flow:$envSlug"
                 ProvisionFile.KIND_LOGIN_METHODS -> "login_methods:$envSlug"
-                // SSO-3413 — the workspace-level singleton; its receipt id IS the workspace id (`tnt`).
+                // SSO-3413 — the workspace-level singleton; its id IS the workspace id (`tnt`).
                 ProvisionFile.KIND_CUSTOM_DOMAIN -> "custom_domain:$id"
                 else -> throw ProvisionException("$kind: no access object type for this kind")
             }

@@ -6,11 +6,7 @@ import com.devnow.thoryn.provision.ImportedResource
 import com.devnow.thoryn.provision.ProvisionEngine
 import com.devnow.thoryn.provision.ProvisionException
 import com.devnow.thoryn.provision.ProvisionFile
-import com.devnow.thoryn.provision.ProvisionFileRef
 import com.devnow.thoryn.provision.ProvisionPlan
-import com.devnow.thoryn.provision.ProvisionReceipt
-import com.devnow.thoryn.provision.ProvisionReceiptStore
-import com.devnow.thoryn.cli.VersionProvider
 import com.devnow.thoryn.cli.api.ProductApiException
 import com.devnow.thoryn.cli.auth.JwtClaims
 import com.devnow.thoryn.cli.auth.Tokens
@@ -43,12 +39,20 @@ import java.util.concurrent.Callable
  * Subcommands:
  *  - `plan` / `apply` / `destroy` — SSO-3088 (epic SSO-3087): provisioning-as-code over the
  *    `.thoryn/provision.yaml` desired-state file (see [ProvisionEngine]). `plan` shows what `apply`
- *    would do; `apply` converges (a second run is a no-op; `--prune` removes what the file dropped);
- *    `destroy` removes everything the file's receipt owns, child-first. Production-plane removals are
- *    confirmation-gated with `--confirm <workspace-slug>`, like `env delete` / `clients delete`.
+ *    would do; `apply` converges (a second run is a no-op; `--prune` removes what this identity OWNS and
+ *    the file no longer declares, and revokes undeclared grants on the objects it may delete);
+ *    `destroy` removes what the file declares and this identity may remove, child-first. Production-plane
+ *    removals are confirmation-gated with `--confirm <workspace-slug>`, like `env delete` / `clients delete`.
+ *    **SSO-3715 (ADR 2026-10-15 platform-is-the-ledger): there is NO receipt.** Every verb reads live state
+ *    only; `apply --output json` / `plan --output json` carry the resolved ids (`resources[]`:
+ *    `{kind, name, id, environment, action}`) a workflow used to read from the receipt. What `destroy` /
+ *    `--prune` may remove is the platform's `owner` relation: a `client:` identity removes only what it owns
+ *    (manager alone never suffices for automation), a person removes what they manage and nobody owns,
+ *    non-ownable kinds go with their sandbox and never on the production plane; `retain: true` keeps a
+ *    resource regardless. Every refusal is a `skip` row with the reason and the command a human runs.
  *    SSO-3113: `apply --secret-file <path>` / `--force-stdout` deliver a confidential application's
  *    one-time client secret through [SecretIo] (exactly as `clients create`); an undeliverable secret
- *    still records the resource and exits [SecretIo.EXIT_NO_SECRET]. A resource's `grants:` block is
+ *    still leaves the resource in place and exits [SecretIo.EXIT_NO_SECRET]. A resource's `grants:` block is
  *    converged with it (`thoryn access` is the imperative twin).
  *  - SSO-3659 (ADR 2026-10-13 §1/§2): ownership is decided by the signed-in identity's platform reach —
  *    `plan` and `apply` gate every declared resource (`manager` ⇒ converge; `viewer` ⇒ only a matching
@@ -57,19 +61,19 @@ import java.util.concurrent.Callable
  *    platform PER OBJECT (`POST /api/v1/access/check`), and "owned elsewhere" (`access_owned_elsewhere`) is
  *    the platform's `owner` relation on the resource — the former `--peer-receipt` flag (other repositories'
  *    receipts as the marker) is REMOVED; nothing else consumed it.
- *    `import [--write]` renders what the identity may reach as `provision.yaml` entries (`manager` ⇒ owned,
- *    recorded `adopted: true`; `viewer` ⇒ `readOnly: true`, as is an object another repository owns); without
- *    `--write` it only prints them.
+ *    `import [--write]` renders what the identity may reach as `provision.yaml` entries (`manager` ⇒ an entry
+ *    the file converges; `viewer` ⇒ `readOnly: true`, as is an object another repository owns); without
+ *    `--write` it only prints them. SSO-3715 — `import` writes the file only.
  *  - SSO-3668 (ADR 2026-10-13 production-clients-declared-in-the-config-project §2): an `application`'s
  *    `publishTo:` targets receive its clientId after `apply` converged it — through [GitHubActionsVariablePublisher]
  *    (`gh variable set … --env`, the customer's own `gh` login) on every apply. `plan` prints the pending publish
- *    as a line and writes nothing. An unreachable target is `publish_target_unreachable` AFTER the client exists
- *    and is in the receipt: exit [CommandSupport.EXIT_HTTP_ERROR], naming the `gh variable set` to run by hand.
+ *    as a line and writes nothing. An unreachable target is `publish_target_unreachable` AFTER the client exists:
+ *    exit [CommandSupport.EXIT_HTTP_ERROR], naming the `gh variable set` to run by hand.
  *  - **SSO-3659 (ADR 2026-10-13 converge §5)** — a confidential application's `secretSink:` receives its minted
- *    secret through [CliDeclaredSecretSink] right after `apply` converged and recorded the client: `kubernetesSecret`
+ *    secret through [CliDeclaredSecretSink] right after `apply` converged the client: `kubernetesSecret`
  *    via the operator's own `kubectl` (value on stdin, never argv; the namespace is never created), `file` via the
  *    owner-only writer (no overwrite unless `--force`). A sink that cannot be reached falls back to `--secret-file` /
- *    the TTY; when nothing reaches, the client stays recorded and `apply` exits [SecretIo.EXIT_NO_SECRET] with
+ *    the TTY; when nothing reaches, the client stays and `apply` exits [SecretIo.EXIT_NO_SECRET] with
  *    `undelivered_secrets`, naming the resource and `thoryn clients rotate-secret <clientId> --secret-file <path>`.
  *    `plan` prints the intended delivery as a line and mints nothing.
  */
@@ -94,13 +98,10 @@ class ProvisionCommand : Callable<Int> {
 
     // ── SSO-3088: plan / apply / destroy over .thoryn/provision.yaml ────────────────────────────
 
-    /** Options every provisioning verb shares: the file, its receipt, the gateway, the output format. */
+    /** Options every provisioning verb shares: the file, the gateway, the output format. */
     internal open class FileOptions {
         @Option(names = ["--file", "-f"], description = ["Provisioning file (default: .thoryn/provision.yaml, .yml or .json)."])
         var file: File? = null
-
-        @Option(names = ["--receipt"], description = ["Receipt path (default: next to the file as <name>.receipt.json)."])
-        var receipt: File? = null
 
         @Option(names = ["--gateway"], description = ["Override the customer-plane gateway URL (default: the gateway recorded at `thoryn login`)."], defaultValue = ThorynConfig.DEFAULT_GATEWAY)
         var gateway: String = ThorynConfig.DEFAULT_GATEWAY
@@ -122,35 +123,15 @@ class ProvisionCommand : Callable<Int> {
         /** SSO-3710 — the fix-request file to write, from the flag or `THORYN_FIX_REQUEST`; null ⇒ none. */
         fun fixRequestTarget(): java.nio.file.Path? = FixRequests.target(fixRequest)
 
-        /** Resolve + load the file (or fail with a usage error) and locate its receipt. */
-        fun open(): Session? {
+        /** Resolve + load the file (or fail with a usage error). SSO-3715 — the file is the only input; nothing sits beside it. */
+        fun open(): ProvisionFile? {
             val target = file ?: ProvisionFile.resolveDefault() ?: run {
                 System.err.println("No provisioning file found — expected ${ProvisionFile.DEFAULT_DIR}/${ProvisionFile.DEFAULT_FILES.first()} (or pass --file).")
                 return null
             }
-            val parsed = ProvisionFile.load(target)
-            val store = ProvisionReceiptStore()
-            val receiptPath = receipt ?: store.defaultPathFor(target)
-            return Session(parsed, store, receiptPath, store.read(receiptPath))
-        }
-
-        /** Locate the receipt only (destroy does not need a valid file, just its receipt). */
-        fun openReceipt(): Pair<File, ProvisionReceipt?>? {
-            val store = ProvisionReceiptStore()
-            val path = receipt ?: (file ?: ProvisionFile.resolveDefault())?.let { store.defaultPathFor(it) } ?: run {
-                System.err.println("No provisioning file or receipt found — pass --file or --receipt.")
-                return null
-            }
-            return path to store.read(path)
+            return ProvisionFile.load(target)
         }
     }
-
-    internal class Session(
-        val file: ProvisionFile,
-        val store: ProvisionReceiptStore,
-        val receiptPath: File,
-        val receipt: ProvisionReceipt?,
-    )
 
     internal companion object {
         /** An engine whose clients target the file's per-resource environment on the caller's session. */
@@ -167,11 +148,10 @@ class ProvisionCommand : Callable<Int> {
             clients = { slug -> CommandSupport.gatewayClient(gateway, tokens, applyEnvironment = false, environmentOverride = slug ?: "") },
             // SSO-3414 — with --output json|yaml stdout carries ONE document; the per-resource progress goes to stderr.
             out = if (format == OutputFormat.TABLE) System.out else System.err,
-            cliVersion = runCatching { VersionProvider.readVersion() }.getOrNull(),
             secretSink = secretSink,
             // SSO-3413 — the workspace id (`tnt`) names the workspace-level custom domain's access object.
             workspaceId = runCatching { JwtClaims.of(tokens.accessToken)["tnt"]?.asString() }.getOrNull()?.takeIf { it.isNotBlank() },
-            // SSO-3659 — who applied, on the receipt (display / audit; SSO-3673: the owner marker is the platform's).
+            // SSO-3659 / SSO-3715 — the caller's subject: the SHAPE of the deletion authority (owner for a client:, unowned-manager for a member:).
             subject = subjectOf(tokens),
             outputSink = outputSink,
             declaredSecretSink = declaredSecretSink,
@@ -253,13 +233,16 @@ class ProvisionCommand : Callable<Int> {
             plan.changes.forEach { c ->
                 println("  ${c.kind.padEnd(w1)}  ${c.name.padEnd(w2)}  ${c.action.name.lowercase().padEnd(6)}  ${c.reason}")
             }
+            // SSO-3715 — a refused / deferred removal names the command a person runs instead.
+            plan.changes.filter { it.byHand != null }.forEach { c -> println("      ${c.kind} ${c.name}: by hand: ${c.byHand}") }
             plan.changes.filter { it.diff.isNotEmpty() }.forEach { c ->
                 c.diff.forEach { (field, change) -> println("      ${c.kind} ${c.name}: $field: $change") }
             }
-            // SSO-3113 — grant changes per object (a no-op resource can still carry them).
-            plan.changes.filter { it.hasGrantChanges }.forEach { c ->
+            // SSO-3113 — grant changes per object (a no-op resource can still carry them); SSO-3715 — undeclared live grants are shown, not red.
+            plan.changes.filter { it.hasGrantChanges || it.grantUndeclared.isNotEmpty() }.forEach { c ->
                 c.grantAdds.forEach { println("      ${c.kind} ${c.name}: grant + $it") }
-                c.grantRemoves.forEach { println("      ${c.kind} ${c.name}: grant - $it") }
+                c.grantRemoves.forEach { println("      ${c.kind} ${c.name}: grant - $it (not declared; --prune)") }
+                c.grantUndeclared.forEach { println("      ${c.kind} ${c.name}: grant   $it (present, not declared)") }
             }
             // SSO-3668 — where apply will publish the id (a line, never a write: plan reaches no target).
             plan.changes.filter { it.publishTo.isNotEmpty() }.forEach { c ->
@@ -286,8 +269,9 @@ class ProvisionCommand : Callable<Int> {
                 if (d["state"] == CustomDomainView.NONE) println("        (the TXT ownership record is issued when apply claims the domain)")
             }
             println(
-                "  ${plan.creates.size} to create, ${plan.updates.size} to update, ${plan.adopts.size} to adopt, " +
+                "  ${plan.creates.size} to create, ${plan.updates.size} to update, " +
                     "${plan.removes.size} to remove, ${plan.changes.count { it.action == ChangeAction.NOOP }} unchanged" +
+                    (if (plan.skips.isNotEmpty()) ", ${plan.skips.size} skipped" else "") +
                     (if (plan.grantChanges > 0) ", ${plan.grantChanges} grant change(s)" else "") +
                     (if (plan.publishes > 0) ", ${plan.publishes} output(s) to publish" else "") +
                     (if (plan.deliveries > 0) ", ${plan.deliveries} client secret(s) to deliver" else "") +
@@ -337,23 +321,24 @@ class ProvisionCommand : Callable<Int> {
     /**
      * `thoryn provision plan [--file] [--prune]` — read-only: what `apply` would do. SSO-3089 — reads the
      * LIVE state of every declared resource by its converge key (so it needs a session), and reports
-     * create / update (with the changed fields) / adopt / no-op / remove.
+     * create / update (with the changed fields) / no-op / remove. `--output json` carries `resources[]`
+     * (`{kind, name, id, environment, action}`), the ids a workflow reads (SSO-3715).
      */
-    @Command(name = "plan", description = ["Show what `apply` would create / update / adopt / remove for the provisioning file (read-only)."], mixinStandardHelpOptions = true)
+    @Command(name = "plan", description = ["Show what `apply` would create / update / remove for the provisioning file (read-only)."], mixinStandardHelpOptions = true)
     internal class PlanSubcommand : FileOptions(), Callable<Int> {
-        @Option(names = ["--prune"], description = ["Also plan removal of owned resources the file no longer declares."])
+        @Option(names = ["--prune"], description = ["Also plan the removal of resources this identity OWNS that the file no longer declares, and of undeclared grants on the declared objects it may delete."])
         var prune: Boolean = false
 
         override fun call(): Int {
             val format = CommandSupport.parseFormat(outputRaw) ?: return CommandSupport.EXIT_USAGE
-            val s = try { open() ?: return CommandSupport.EXIT_USAGE } catch (ex: ProvisionException) {
+            val file = try { open() ?: return CommandSupport.EXIT_USAGE } catch (ex: ProvisionException) {
                 System.err.println("Error: ${ex.message}"); return CommandSupport.EXIT_USAGE
             }
             val tokens = CommandSupport.readTokens() ?: return CommandSupport.EXIT_NOT_SIGNED_IN
             gateway = CommandSupport.resolveGateway(gateway, tokens)
             return try {
-                val plan = engine(gateway, tokens, format = format).plan(s.file, s.receipt, prune)
-                renderPlan(plan, s.file, format, fixRequestTarget(), tokens, gateway)
+                val plan = engine(gateway, tokens, format = format).plan(file, prune)
+                renderPlan(plan, file, format, fixRequestTarget(), tokens, gateway)
             } catch (ex: Exception) {
                 fail(ex, gateway, format)
             }
@@ -366,13 +351,14 @@ class ProvisionCommand : Callable<Int> {
      * client secret, delivered through [SecretIo] like `thoryn clients create` — written to
      * `--secret-file` (owner-only; a second one in the same apply lands at `<path>.<clientId>`), or
      * printed to an interactive TTY with a WARN; a non-interactive stdout is refused unless
-     * `--force-stdout`. The secret never enters the receipt, the plan, or a log. When it cannot be
-     * delivered the resource is still recorded and the command exits [SecretIo.EXIT_NO_SECRET],
-     * naming `thoryn clients rotate-secret`.
+     * `--force-stdout`. The secret never enters the plan or a log. When it cannot be delivered the
+     * resource stays in place and the command exits [SecretIo.EXIT_NO_SECRET], naming
+     * `thoryn clients rotate-secret`. SSO-3715 — `--output json` prints the applied resources with their
+     * ids (`resources[]`: `{kind, name, id, environment, action}`); table output stays the default.
      */
     @Command(name = "apply", description = ["Converge the account to the provisioning file (a second run is a no-op)."], mixinStandardHelpOptions = true)
     internal class ApplySubcommand : FileOptions(), Callable<Int> {
-        @Option(names = ["--prune"], description = ["Remove owned resources the file no longer declares."])
+        @Option(names = ["--prune"], description = ["Remove the resources this identity OWNS that the file no longer declares, and revoke undeclared grants on the declared objects it may delete (never the owner tuple, a workspace userset or this identity itself)."])
         var prune: Boolean = false
 
         @Option(names = ["--confirm"], description = ["Workspace slug confirming production-plane removals (--prune)."])
@@ -404,10 +390,10 @@ class ProvisionCommand : Callable<Int> {
 
         override fun call(): Int {
             val format = CommandSupport.parseFormat(outputRaw) ?: return CommandSupport.EXIT_USAGE
-            val s = try { open() ?: return CommandSupport.EXIT_USAGE } catch (ex: ProvisionException) {
+            val file = try { open() ?: return CommandSupport.EXIT_USAGE } catch (ex: ProvisionException) {
                 System.err.println("Error: ${ex.message}"); return CommandSupport.EXIT_USAGE
             }
-            waitUsageError(s.file)?.let { System.err.println("Error: $it"); return CommandSupport.EXIT_USAGE }
+            waitUsageError(file)?.let { System.err.println("Error: $it"); return CommandSupport.EXIT_USAGE }
             val tokens = CommandSupport.readTokens() ?: return CommandSupport.EXIT_NOT_SIGNED_IN
             gateway = CommandSupport.resolveGateway(gateway, tokens)
             val engine = try {
@@ -422,17 +408,17 @@ class ProvisionCommand : Callable<Int> {
                 System.err.println("Error: ${ex.message}"); return CommandSupport.EXIT_USAGE
             }
             val plan = try {
-                engine.plan(s.file, s.receipt, prune)
+                engine.plan(file, prune)
             } catch (ex: Exception) {
                 return fail(ex, gateway, format)
             }
-            if (format == OutputFormat.TABLE) printPlan(plan, s.file)
+            if (format == OutputFormat.TABLE) printPlan(plan, file)
             // SSO-3659 — a plan with an ownership error is refused WHOLE, before anything is written or asked.
             if (plan.hasErrors) {
                 if (format != OutputFormat.TABLE) CommandSupport.emitValue(format, plan.toStructured(), "")
                 printPlanErrors(plan)
                 // SSO-3710 — the apply job's red check names its fix the same way the plan job's does.
-                writeFixRequest(fixRequestTarget(), plan, s.file, tokens, gateway)
+                writeFixRequest(fixRequestTarget(), plan, file, tokens, gateway)
                 System.err.println("Nothing was changed.")
                 return CommandSupport.EXIT_HTTP_ERROR
             }
@@ -450,18 +436,18 @@ class ProvisionCommand : Callable<Int> {
                 return CommandSupport.EXIT_OK
             }
             return try {
-                val result = engine.apply(s.file, s.receipt, plan, workspaceSlug(), confirm) { s.store.write(s.receiptPath, it) }
+                val result = engine.apply(file, plan, workspaceSlug(), confirm)
                 if (format == OutputFormat.TABLE) {
-                    println("Applied. ${result.resources.size} resource(s) owned. Receipt: ${s.receiptPath.path}")
+                    println("Applied. ${result.resources.size} resource(s) converged (${result.resources.count { it.action == ChangeAction.CREATE }} created, ${result.resources.count { it.action == ChangeAction.UPDATE }} updated); ids: --output json.")
                 } else if (!wait) {
-                    CommandSupport.emitValue(format, result, "")
+                    CommandSupport.emitValue(format, result.toStructured(), "")
                 }
-                // SSO-3113 — the resources exist and are owned, but a minted client secret was not surfaced.
-                // SSO-3659 — `undelivered_secrets`: raised AFTER the receipt is written; names each resource and its recovery.
+                // SSO-3113 — the resources exist, but a minted client secret was not surfaced.
+                // SSO-3659 — `undelivered_secrets`: raised AFTER everything is converged; names each resource and its recovery.
                 val lost = engine.undeliveredSecretDetails
                 if (lost.isNotEmpty()) {
                     System.err.println(
-                        "Error: ${ProvisionEngine.ERROR_UNDELIVERED_SECRETS} — every resource was converged and recorded in the receipt, but " +
+                        "Error: ${ProvisionEngine.ERROR_UNDELIVERED_SECRETS} — every resource was converged, but " +
                             "the client secret of ${lost.size} created application(s) could not be delivered:\n  " +
                             lost.joinToString("\n  ") { u ->
                                 "${u.resourceKey} (clientId ${u.clientId})" +
@@ -471,19 +457,19 @@ class ProvisionCommand : Callable<Int> {
                     )
                     return SecretIo.EXIT_NO_SECRET
                 }
-                if (wait) awaitDomain(gateway, tokens, format, result) else CommandSupport.EXIT_OK
+                if (wait) awaitDomain(gateway, tokens, format, result.toStructured()) else CommandSupport.EXIT_OK
             } catch (ex: ProvisionEngine.PublishTargetUnreachableException) {
-                // SSO-3668 — NOT a stopped apply: every resource was converged and is in the receipt; only the publish
-                // of an id did not land. The receipt is the source of the id for the by-hand command the error names.
+                // SSO-3668 — NOT a stopped apply: every resource was converged; only the publish of an id did not land.
+                // The apply output is the source of the id for the by-hand command the error names.
                 if (format == OutputFormat.TABLE) {
-                    println("Applied. ${ex.receipt.resources.size} resource(s) owned. Receipt: ${s.receiptPath.path}")
+                    println("Applied. ${ex.result.resources.size} resource(s) converged; ids: --output json.")
                 } else {
-                    CommandSupport.emitValue(format, ex.receipt, "")
+                    CommandSupport.emitValue(format, ex.result.toStructured(), "")
                 }
                 System.err.println("Error: ${ex.message}")
                 CommandSupport.EXIT_HTTP_ERROR
             } catch (ex: Exception) {
-                System.err.println("Apply stopped; the receipt at ${s.receiptPath.path} records what succeeded — fix the cause and re-run.")
+                System.err.println("Apply stopped; what succeeded is live on the platform (the ledger) — fix the cause and re-run, the next plan reads it.")
                 fail(ex, gateway, format)
             }
         }
@@ -509,7 +495,7 @@ class ProvisionCommand : Callable<Int> {
 
         /**
          * SSO-3414 — block until the workspace's custom domain reaches [waitUntil], verifying it every round.
-         * With `--output json|yaml` the ONE document printed is `{ "apply": <receipt or plan>, "customDomain": <status> }`.
+         * With `--output json|yaml` the ONE document printed is `{ "apply": <apply result or plan>, "customDomain": <status> }`.
          */
         private fun awaitDomain(gateway: String, tokens: Tokens, format: OutputFormat, applied: Any?): Int {
             val timeout = DomainWaiter.parseDuration(waitTimeout) ?: DomainWaiter.DEFAULT_TIMEOUT
@@ -538,15 +524,15 @@ class ProvisionCommand : Callable<Int> {
      * `thoryn provision import [--file] [--write]` — SSO-3659 (ADR 2026-10-13 §2): the inverse of `plan`,
      * bounded by the same relations. Lists what the signed-in identity may reach (`GET /api/v1/access/mine`,
      * `manager` then `viewer`) and renders each live resource the file does not yet declare as a `provision.yaml`
-     * entry — `manager` objects as OWNED (recorded `adopted: true` in the receipt, never deleted by destroy),
-     * `viewer` objects (and, SSO-3673, objects the platform says another repository OWNS) as `readOnly: true`.
-     * Nothing the identity has no relation to is listed, so nothing it has no relation to can be imported — the
-     * hub's rows stay the authority; `import` only writes the file and the receipt. Without `--write` it prints
-     * the entries it would add (stdout; notes and skipped objects on stderr) and changes nothing.
+     * entry — `manager` objects as entries the file converges, `viewer` objects (and, SSO-3673, objects the platform
+     * says another repository OWNS) as `readOnly: true`. Nothing the identity has no relation to is listed, so
+     * nothing it has no relation to can be imported — the hub's rows stay the authority; SSO-3715 — `import` writes
+     * the FILE only. Without `--write` it prints the entries it would add (stdout; notes and skipped objects on
+     * stderr) and changes nothing.
      */
-    @Command(name = "import", description = ["Render the live resources this identity may reach as provisioning-file entries; --write appends them and records the owned ones in the receipt."], mixinStandardHelpOptions = true)
+    @Command(name = "import", description = ["Render the live resources this identity may reach as provisioning-file entries; --write appends them to the file."], mixinStandardHelpOptions = true)
     internal class ImportSubcommand : FileOptions(), Callable<Int> {
-        @Option(names = ["--write"], description = ["Append the entries to the provisioning file (created when absent) and record the owned ones in its receipt. Default: print only."])
+        @Option(names = ["--write"], description = ["Append the entries to the provisioning file (created when absent). Default: print only."])
         var write: Boolean = false
 
         override fun call(): Int {
@@ -561,14 +547,11 @@ class ProvisionCommand : Callable<Int> {
                 System.err.println("Error: --write appends YAML; ${target.path} is a JSON file — run without --write and add the entries by hand.")
                 return CommandSupport.EXIT_USAGE
             }
-            val store = ProvisionReceiptStore()
-            val receiptPath = receipt ?: store.defaultPathFor(target)
             val tokens = CommandSupport.readTokens() ?: return CommandSupport.EXIT_NOT_SIGNED_IN
             gateway = CommandSupport.resolveGateway(gateway, tokens)
             return try {
-                val current = store.read(receiptPath)
                 val engine = engine(gateway, tokens, format = format)
-                val result = engine.import(existing, current)
+                val result = engine.import(existing)
                 val yaml = renderEntries(result.resources)
                 if (format == OutputFormat.TABLE) {
                     if (result.resources.isEmpty()) println("Nothing to import — every resource this identity may reach is already declared in ${target.path}.") else print(yaml)
@@ -586,21 +569,9 @@ class ProvisionCommand : Callable<Int> {
                     return CommandSupport.EXIT_OK
                 }
                 appendEntries(target, yaml, existing)
-                val owned = result.resources.mapNotNull { it.owned }
-                val reloaded = ProvisionFile.load(target)
-                store.write(
-                    receiptPath,
-                    ProvisionReceipt(
-                        file = ProvisionFileRef(reloaded.source, reloaded.digest),
-                        appliedAt = java.time.Instant.now().toString(),
-                        cliVersion = runCatching { VersionProvider.readVersion() }.getOrNull(),
-                        workspace = workspaceSlug() ?: current?.workspace,
-                        subject = subjectOf(tokens) ?: current?.subject,
-                        resources = current?.resources.orEmpty().filter { o -> owned.none { it.key == o.key } } + owned,
-                    ),
-                )
+                val readOnly = result.resources.count { it.resource.readOnly }
                 if (format == OutputFormat.TABLE) {
-                    println("Imported ${result.resources.size} entry(ies) into ${target.path}: ${owned.size} owned (adopted — never deleted by destroy), ${result.resources.size - owned.size} read-only. Receipt: ${receiptPath.path}")
+                    println("Imported ${result.resources.size} entry(ies) into ${target.path}: ${result.resources.size - readOnly} to converge, $readOnly read-only. Nothing else was written — the platform is the ledger.")
                 }
                 CommandSupport.EXIT_OK
             } catch (ex: Exception) {
@@ -639,8 +610,13 @@ class ProvisionCommand : Callable<Int> {
         }
     }
 
-    /** `thoryn provision destroy [--file|--receipt] [--confirm <ws>] [--yes]` — remove everything owned. */
-    @Command(name = "destroy", description = ["Remove every resource the provisioning file's receipt owns (child-first)."], mixinStandardHelpOptions = true)
+    /**
+     * `thoryn provision destroy [--file] [--confirm <ws>] [--yes]` — SSO-3715: remove what the file declares AND this
+     * identity may remove (the platform's `owner` relation decides; see [ProvisionEngine.planDestroy]), child-first.
+     * The destroy plan is printed first — `remove` rows, and `skip` rows (retained, not owned, left to a person,
+     * removed with their sandbox) each with the reason and the command a human would run.
+     */
+    @Command(name = "destroy", description = ["Remove the resources the provisioning file declares that this identity may remove (owner-gated; child-first; `retain: true` keeps one)."], mixinStandardHelpOptions = true)
     internal class DestroySubcommand : FileOptions(), Callable<Int> {
         @Option(names = ["--confirm"], description = ["Workspace slug confirming production-plane removals."])
         var confirm: String? = null
@@ -650,36 +626,56 @@ class ProvisionCommand : Callable<Int> {
 
         override fun call(): Int {
             val format = CommandSupport.parseFormat(outputRaw) ?: return CommandSupport.EXIT_USAGE
-            val (receiptPath, receipt) = try { openReceipt() ?: return CommandSupport.EXIT_USAGE } catch (ex: ProvisionException) {
+            val file = try { open() ?: return CommandSupport.EXIT_USAGE } catch (ex: ProvisionException) {
                 System.err.println("Error: ${ex.message}"); return CommandSupport.EXIT_USAGE
-            }
-            if (receipt == null || receipt.resources.isEmpty()) {
-                println("Nothing to destroy — no receipt at ${receiptPath.path} (or it owns no resources).")
-                return CommandSupport.EXIT_OK
             }
             val tokens = CommandSupport.readTokens() ?: return CommandSupport.EXIT_NOT_SIGNED_IN
             gateway = CommandSupport.resolveGateway(gateway, tokens)
-            val engine = engine(gateway, tokens)
-            val production = receipt.resources.any { ProvisionEngine.removable(it) && ProvisionEngine.onProductionPlane(it) }
-            if (production && confirm.isNullOrBlank()) {
+            val engine = engine(gateway, tokens, format = format)
+            val plan = try {
+                engine.planDestroy(file)
+            } catch (ex: Exception) {
+                return fail(ex, gateway, format)
+            }
+            if (format == OutputFormat.TABLE) {
+                println("Destroy — ${file.source} (${file.digest.take(19)}…)")
+                val w1 = (plan.changes.map { it.kind.length } + 4).max()
+                val w2 = (plan.changes.map { it.name.length } + 4).max()
+                println("  ${"KIND".padEnd(w1)}  ${"NAME".padEnd(w2)}  ACTION  REASON")
+                plan.changes.forEach { c -> println("  ${c.kind.padEnd(w1)}  ${c.name.padEnd(w2)}  ${c.action.name.lowercase().padEnd(6)}  ${c.reason}${c.liveId?.let { " (id $it)" } ?: ""}") }
+                plan.changes.filter { it.byHand != null }.forEach { c -> println("      ${c.kind} ${c.name}: by hand: ${c.byHand}") }
+                println("  ${plan.removes.size} to remove, ${plan.skips.size} left in place" + (if (plan.hasErrors) ", ${plan.errors.size} error(s)." else "."))
+            }
+            if (plan.hasErrors) {
+                if (format != OutputFormat.TABLE) CommandSupport.emitValue(format, plan.toStructured(), "")
+                printPlanErrors(plan)
+                System.err.println("Nothing was removed.")
+                return CommandSupport.EXIT_HTTP_ERROR
+            }
+            if (plan.removes.isEmpty()) {
+                if (format == OutputFormat.TABLE) println("Nothing to destroy — this identity may remove none of the declared resources (see the rows above).") else CommandSupport.emitValue(format, plan.toStructured(), "")
+                return CommandSupport.EXIT_OK
+            }
+            if (plan.removesOnProductionPlane && confirm.isNullOrBlank()) {
                 System.err.println("destroy would remove resources on the PRODUCTION plane; re-run with --confirm <workspace-slug>.")
                 return CommandSupport.EXIT_HTTP_ERROR
             }
-            println("Destroy — ${receipt.resources.size} owned resource(s) from ${receipt.file.path}:")
-            receipt.resources.forEach { println("  ${it.kind} ${it.name} (id ${it.id}${it.environment?.let { e -> ", env $e" } ?: ""})") }
-            if (!yes && !Prompt.confirm("Remove these resources now? This is irreversible.")) {
+            if (!yes && !Prompt.confirm("Remove these ${plan.removes.size} resource(s) now? This is irreversible.")) {
                 println("Aborted — nothing was removed.")
                 return CommandSupport.EXIT_OK
             }
             return try {
-                val store = ProvisionReceiptStore()
-                val outcome = engine.destroy(receipt, confirm) { store.write(receiptPath, it) }
-                if (outcome.remaining.resources.isEmpty()) store.delete(receiptPath)
+                val outcome = engine.destroy(plan, confirm)
                 if (outcome.failures.isEmpty()) {
-                    if (format == OutputFormat.TABLE) println("Destroyed. Nothing is owned any more.") else CommandSupport.emitValue(format, mapOf("destroyed" to true), "")
+                    if (format == OutputFormat.TABLE) {
+                        println("Destroyed ${outcome.removed.size} resource(s)." + (if (plan.skips.isNotEmpty()) " ${plan.skips.size} left in place (see the plan above)." else ""))
+                    } else {
+                        CommandSupport.emitValue(format, mapOf("destroyed" to true, "removed" to outcome.removed.map { it.toStructured() }, "skipped" to plan.skips.map { it.toStructured() }), "")
+                    }
                     CommandSupport.EXIT_OK
                 } else {
-                    System.err.println("${outcome.failures.size} resource(s) could not be removed and stay in the receipt: re-run to retry.")
+                    if (format != OutputFormat.TABLE) CommandSupport.emitValue(format, mapOf("destroyed" to false, "removed" to outcome.removed.map { it.toStructured() }, "failures" to outcome.failures), "")
+                    System.err.println("${outcome.failures.size} resource(s) could not be removed and stay live: re-run to retry.")
                     CommandSupport.EXIT_HTTP_ERROR
                 }
             } catch (ex: Exception) {

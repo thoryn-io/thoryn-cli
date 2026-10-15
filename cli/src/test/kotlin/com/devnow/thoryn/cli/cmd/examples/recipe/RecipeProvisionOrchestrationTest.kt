@@ -5,7 +5,6 @@ import com.devnow.thoryn.cli.cmd.CommandTestBase
 import com.devnow.thoryn.cli.cmd.examples.ExampleContext
 import com.devnow.thoryn.cli.cmd.examples.ExampleStateStore
 import com.devnow.thoryn.cli.cmd.provision.FakeProductApi
-import com.devnow.thoryn.provision.ProvisionReceiptStore
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.assertThatThrownBy
 import org.junit.jupiter.api.BeforeEach
@@ -107,16 +106,11 @@ class RecipeProvisionOrchestrationTest : CommandTestBase() {
         // The caller's OWN token throughout (workspace-less recipe) — no workspace create, no exchange.
         assertThat(server.requestCount).isGreaterThan(4)
 
-        // The provisioning receipt lives next to the example state, and carries no secret.
-        val receiptPath = stateStore.provisionReceiptPath("sandbox-demo").toFile()
-        assertThat(receiptPath).exists()
-        assertThat(receiptPath.readText()).doesNotContain("Demo-Pw1!")
-        val provisionReceipt = ProvisionReceiptStore().read(receiptPath)!!
-        assertThat(provisionReceipt.resources.map { it.key }).containsExactly("environment/sandbox", "application/rp", "user/demo", "loginMethods/loginMethods")
-        assertThat(provisionReceipt.workspace).isEqualTo("acme")
+        // SSO-3715 — nothing is written beside the example state: no provisioning receipt (the platform is the ledger).
+        assertThat(tempHome.resolve("examples-state").toFile().listFiles().orEmpty().map { it.name }).noneMatch { it.contains("receipt") }
 
         // The recipe's verify resolved {{provision.application.rp.clientId}} and passed.
-        val clientId = provisionReceipt.resources[1].id
+        val clientId = api.applications.single()["clientId"].toString()
         val receipt = ReceiptStore(dir = tempHome.resolve("receipts")).read("sandbox-demo")!!
         assertThat(receipt.verify).containsExactly(VerifyResult("applications.get", clientId, mapOf("status" to "active"), passed = true))
         // Every provisioned resource is on the recipe receipt (kind / id / non-secret attributes).
@@ -135,55 +129,54 @@ class RecipeProvisionOrchestrationTest : CommandTestBase() {
         assertThat(state.workspaceSlug).isEqualTo("acme")
         assertThat(console.toString()).contains("[provision] ./provision.yaml").contains("environment: demo-sbx")
 
-        // A second apply (fresh interpreter, same receipt) converges to a no-op: NO provisioning writes.
+        // A second apply (fresh interpreter, live state) converges to a no-op: NO provisioning writes.
         api.reset()
         RecipeInterpreter(ctx, r, trustPropagationBudgetMs = 2_000).setup()
         assertThat(api.provisioningWrites).isEmpty()
-        assertThat(console.toString()).contains("0 to create, 0 to update, 0 to adopt, 4 unchanged")
+        assertThat(console.toString()).contains("0 to create, 0 to update, 4 unchanged")
     }
 
     @Test
-    fun `teardown destroys everything the provisioning file created, child-first, and clears the receipts`() {
+    fun `teardown destroys what the provisioning file declares and the founder may remove, child-first, and clears the receipt`() {
         val ctx = context()
         val r = recipe(provisionedRecipe, provisionYaml)
         val example = RecipeExample(r, receiptStore = ReceiptStore(dir = tempHome.resolve("receipts")))
         assertThat(example.setup(ctx)).isEqualTo(0)
-        val owned = ProvisionReceiptStore().read(stateStore.provisionReceiptPath("sandbox-demo").toFile())!!.resources
+        val envId = api.environments.single()["id"]
+        val clientId = api.applications.single()["clientId"]
         api.reset()
 
         assertThat(example.teardown(ctx)).isEqualTo(0)
 
-        // Reverse creation order, the sandbox last (its hard-delete is confirmed by its OWN slug).
+        // SSO-3715 — planned live from the file: the founder manages the sandbox and the client and nobody owns them ⇒ the
+        // client first, then the sandbox (its hard-delete is confirmed by its OWN slug); the user and the sign-in policy are
+        // non-ownable kinds and go WITH the sandbox — the cascade, no call of their own.
         assertThat(api.provisioningWrites.map { it.method + " " + it.path }).containsExactly(
-            "DELETE /api/v1/login-methods",
-            "DELETE /api/v1/users/${owned[2].id}",
-            "DELETE /api/v1/applications/${owned[1].id}",
-            "DELETE /api/v1/environments/${owned[0].id}",
+            "DELETE /api/v1/applications/$clientId",
+            "DELETE /api/v1/environments/$envId",
         )
         assertThat(api.provisioningWrites.last().confirm).isEqualTo("demo-sbx")
         assertThat(api.environments).isEmpty()
         assertThat(api.applications).isEmpty()
-        assertThat(api.users).isEmpty()
-        assertThat(api.loginMethods).isEmpty()
-        // Nothing owned remains: provisioning receipt, recipe receipt and state are all gone.
-        assertThat(stateStore.provisionReceiptPath("sandbox-demo").toFile()).doesNotExist()
+        assertThat(console.toString()).contains("user demo: left in place — removed with its sandbox 'demo-sbx'")
+        // Nothing remains: recipe receipt and state are gone (there never was a provisioning receipt).
         assertThat(stateStore.read("sandbox-demo")).isNull()
         assertThat(ReceiptStore(dir = tempHome.resolve("receipts")).read("sandbox-demo")).isNull()
     }
 
     @Test
-    fun `a failed removal keeps the provisioning receipt and the example state for a retry`() {
+    fun `a failed removal keeps the example state for a retry`() {
         val ctx = context()
         val r = recipe(provisionedRecipe, provisionYaml)
         val example = RecipeExample(r, receiptStore = ReceiptStore(dir = tempHome.resolve("receipts")))
         assertThat(example.setup(ctx)).isEqualTo(0)
-        // Someone deleted the sandbox out of band → the environment hard-delete 404s.
-        api.environments.clear()
+        // The client's delete fails at the platform → the removal is reported, the state kept for a retry.
+        api.failingDeletes += "/api/v1/applications/"
 
         assertThat(example.teardown(ctx)).isNotEqualTo(0)
 
-        val remaining = ProvisionReceiptStore().read(stateStore.provisionReceiptPath("sandbox-demo").toFile())!!
-        assertThat(remaining.resources.map { it.kind }).containsExactly("environment")
+        assertThat(api.applications).hasSize(1) // the failed removal stays live …
+        assertThat(api.environments).isEmpty() // … while the sandbox still went (best-effort, child-first)
         assertThat(stateStore.read("sandbox-demo")).isNotNull
         assertThat(console.toString()).contains("re-run `thoryn examples teardown sandbox-demo`")
     }
@@ -241,12 +234,12 @@ class RecipeProvisionOrchestrationTest : CommandTestBase() {
             .isInstanceOf(RecipeException::class.java)
             .hasMessageContaining("demoPassword")
             .hasMessageContaining("not set")
-        // Fail-closed happened mid-apply: the environment + app are owned (receipt persisted), the user never created.
+        // Fail-closed happened mid-apply: the environment + app are live (the platform is the ledger), the user never created.
         assertThat(api.users).isEmpty()
-        assertThat(ProvisionReceiptStore().read(stateStore.provisionReceiptPath("sandbox-demo").toFile())!!.resources.map { it.kind })
-            .containsExactly("environment", "application")
+        assertThat(api.environments).hasSize(1)
+        assertThat(api.applications).hasSize(1)
 
-        // With the value in the process environment the same run converges (env + app adopted, user created).
+        // With the value in the process environment the same run converges (env + app match live, user created).
         api.reset()
         RecipeInterpreter(ctx, noParam, trustPropagationBudgetMs = 2_000, provisionEnv = { if (it == "demoPassword") "From-Env-1!" else null }).setup()
         assertThat(api.provisioningWrites.map { it.method + " " + it.path }).containsExactly("POST /api/v1/users", "PUT /api/v1/login-methods")
@@ -263,14 +256,12 @@ class RecipeProvisionOrchestrationTest : CommandTestBase() {
         assertThat(api.provisioningWrites.first { it.path == "/api/v1/users" }.body["password"]).isEqualTo("From-Env-2!")
 
         // Without the env var the default still applies (a local `examples apply`).
-        api.reset(); api.users.clear() // the sandbox + app are adopted; the user is created afresh
-        stateStore.provisionReceiptPath("sandbox-demo").toFile().delete()
+        api.reset(); api.users.clear() // the sandbox + app match live; the user is created afresh
         RecipeInterpreter(ctx, r, trustPropagationBudgetMs = 2_000, provisionEnv = { null }).setup()
         assertThat(api.provisioningWrites.first { it.path == "/api/v1/users" }.body["password"]).isEqualTo("Demo-Pw1!")
 
         // An explicit --set beats the env var; a non-secret param (envSlug) is overridable from the env too.
-        api.reset(); api.users.clear() // the sandbox + app are adopted; the user is created afresh
-        stateStore.provisionReceiptPath("sandbox-demo").toFile().delete()
+        api.reset(); api.users.clear() // the sandbox + app match live; the user is created afresh
         RecipeInterpreter(
             ctx, r, overrides = mapOf("demoPassword" to "From-Set-3!"), trustPropagationBudgetMs = 2_000,
             provisionEnv = { mapOf("demoPassword" to "From-Env-2!", "envSlug" to "not-this")[it] },

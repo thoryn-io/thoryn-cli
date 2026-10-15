@@ -3,10 +3,8 @@ package com.devnow.thoryn.cli.cmd.provision
 import com.devnow.thoryn.provision.ChangeAction
 import com.devnow.thoryn.provision.ProvisionEngine
 import com.devnow.thoryn.provision.ProvisionFile
-import com.devnow.thoryn.provision.ProvisionReceipt
-import com.devnow.thoryn.provision.ProvisionReceiptStore
+import com.devnow.thoryn.provision.ApplyResult
 import com.devnow.thoryn.provision.PublishTarget
-import com.devnow.thoryn.provision.PublishedOutput
 import com.devnow.thoryn.cli.api.ProductApiClient
 import com.devnow.thoryn.cli.auth.Tokens
 import com.devnow.thoryn.cli.cmd.CommandSupport
@@ -26,7 +24,7 @@ import java.io.PrintStream
  * and the CLI: an application's clientId is published through the [ProvisionEngine.OutputSink] AFTER the
  * resource is converged and recorded, on EVERY apply (an upsert); an unreachable target is
  * `publish_target_unreachable` raised after the client exists, naming the `gh variable set` to run by hand;
- * `plan` shows the pending publish and reaches no target; the receipt records what was published.
+ * `plan` shows the pending publish and reaches no target; SSO-3715 — the apply output carries the id, nothing is recorded.
  */
 class ProvisionPublishTest : CommandTestBase() {
 
@@ -88,7 +86,7 @@ class ProvisionPublishTest : CommandTestBase() {
     @Test
     fun `plan shows the pending publish as a line and reaches no target`() {
         val sink = RecordingSink()
-        val plan = engine(sink).plan(file, null, false)
+        val plan = engine(sink).plan(file, false)
         val change = plan.changes.single()
         assertThat(change.action).isEqualTo(ChangeAction.CREATE)
         assertThat(change.publishTo).containsExactly(target)
@@ -100,48 +98,41 @@ class ProvisionPublishTest : CommandTestBase() {
     }
 
     @Test
-    fun `apply publishes the clientId AFTER the client is converged and recorded in the receipt`() {
+    fun `apply publishes the clientId AFTER the client is converged`() {
         val console = ByteArrayOutputStream()
-        val persisted = mutableListOf<ProvisionReceipt>()
         val sink = RecordingSink()
         var clientsAtPublish: List<Any?> = emptyList()
-        var receiptIdsAtPublish: List<String> = emptyList()
         sink.onPublish = { value ->
             clientsAtPublish = api.applications.map { it["clientId"] }
-            receiptIdsAtPublish = persisted.lastOrNull()?.resources?.map { it.id }.orEmpty()
             assertThat(value).isNotBlank()
         }
         val e = engine(sink, console)
-        val receipt = e.apply(file, null, e.plan(file, null, false), "acme", null) { persisted += it }
+        val result = e.apply(file, e.plan(file, false), "acme", null)
 
-        val id = receipt.resources.single().id
+        val id = result.resources.single().id
         assertThat(sink.calls).containsExactly(target to id)
-        // Ordering: when the sink was called, the client already existed AND the receipt already carried its id.
+        // Ordering: when the sink was called, the client already existed.
         assertThat(clientsAtPublish).containsExactly(id)
-        assertThat(receiptIdsAtPublish).containsExactly(id)
-        // The receipt records what was published (where the id landed) — never a secret, there is none.
-        assertThat(receipt.resources.single().published).containsExactly(PublishedOutput("githubActionsVariable", "acme/billing-web", "production", "THORYN_PRODUCTION_CLIENT_ID"))
-        assertThat(jacksonObjectMapper().writeValueAsString(receipt)).contains("\"published\"").contains("THORYN_PRODUCTION_CLIENT_ID")
+        // The apply output carries the id (the one place a workflow reads it from) — never a secret, there is none.
+        assertThat(jacksonObjectMapper().writeValueAsString(result.toStructured())).contains("\"id\":\"$id\"").doesNotContain("published")
         assertThat(console.toString()).contains("published clientId=$id → githubActionsVariable acme/billing-web (environment production) THORYN_PRODUCTION_CLIENT_ID")
     }
 
     @Test
-    fun `an unreachable target is publish_target_unreachable AFTER the client exists and is in the receipt, naming the by-hand command`() {
+    fun `an unreachable target is publish_target_unreachable AFTER the client exists, naming the by-hand command`() {
         val console = ByteArrayOutputStream()
-        val persisted = mutableListOf<ProvisionReceipt>()
         val sink = RecordingSink { "repository acme/billing-web was not found" }
         val e = engine(sink, console)
-        val thrown = assertThatThrownBy { e.apply(file, null, e.plan(file, null, false), "acme", null) { persisted += it } }
+        val thrown = assertThatThrownBy { e.apply(file, e.plan(file, false), "acme", null) }
             .isInstanceOf(ProvisionEngine.PublishTargetUnreachableException::class.java)
             .hasMessageContaining(ProvisionEngine.ERROR_PUBLISH_UNREACHABLE)
             .hasMessageContaining("repository acme/billing-web was not found")
         // The client exists (converged before the publish was attempted) …
         val id = api.applications.single()["clientId"].toString()
-        // … the receipt records its id, with nothing recorded as published …
-        val last = persisted.last()
-        assertThat(last.resources.single().id).isEqualTo(id)
-        assertThat(last.resources.single().published).isEmpty()
-        // … and the error names the one command a human runs, with the id from the receipt.
+        // … the exception carries what was applied, id included …
+        val thrownResult = (thrown.actual() as ProvisionEngine.PublishTargetUnreachableException).result
+        assertThat(thrownResult.resources.single().id).isEqualTo(id)
+        // … and the error names the one command a human runs, with that id.
         thrown.hasMessageContaining("gh variable set THORYN_PRODUCTION_CLIENT_ID --body $id --repo acme/billing-web --env production")
         assertThat(console.toString()).contains("could not publish its clientId").contains("by hand: gh variable set THORYN_PRODUCTION_CLIENT_ID --body $id")
     }
@@ -150,22 +141,22 @@ class ProvisionPublishTest : CommandTestBase() {
     fun `a re-apply issues no product-api write but publishes again — an upsert on every apply`() {
         val sink = RecordingSink()
         val e = engine(sink)
-        val first = e.apply(file, null, e.plan(file, null, false), "acme", null) {}
+        val first = e.apply(file, e.plan(file, false), "acme", null)
         val id = first.resources.single().id
         api.reset()
-        val plan = e.plan(file, first, false)
+        val plan = e.plan(file, false)
         assertThat(plan.changes.single().action).isEqualTo(ChangeAction.NOOP)
         assertThat(plan.hasChanges).isTrue() // the pending publish is what apply still does
-        val second = e.apply(file, first, plan, "acme", null) {}
+        val second = e.apply(file, plan, "acme", null)
         assertThat(api.writes).isEmpty()
         assertThat(sink.calls).containsExactly(target to id, target to id)
-        assertThat(second.resources.single().published).hasSize(1)
+        assertThat(second.resources.single().id).isEqualTo(id)
     }
 
     @Test
     fun `an engine without a publisher fails loud on a target instead of skipping it`() {
         val e = engine(null)
-        assertThatThrownBy { e.apply(file, null, e.plan(file, null, false), "acme", null) {} }
+        assertThatThrownBy { e.apply(file, e.plan(file, false), "acme", null) }
             .isInstanceOf(ProvisionEngine.PublishTargetUnreachableException::class.java)
             .hasMessageContaining("no publisher is available")
         assertThat(api.applications).hasSize(1)
@@ -193,8 +184,7 @@ class ProvisionPublishTest : CommandTestBase() {
         val id = api.applications.single()["clientId"].toString()
         assertThat(gh.variables).containsEntry("acme/billing-web@production:THORYN_PRODUCTION_CLIENT_ID", id)
         assertThat(gh.environments).contains("acme/billing-web/production") // created when absent
-        val receipt = ProvisionReceiptStore().read(File(f.parentFile, "provision.receipt.json"))!!
-        assertThat(receipt.resources.single().published.single().name).isEqualTo("THORYN_PRODUCTION_CLIENT_ID")
+        assertThat(File(f.parentFile, "provision.receipt.json")).doesNotExist()
 
         // Re-apply: no product-api write, the variable is set again (upsert), the environment is not re-created.
         api.reset(); gh.calls.clear()
@@ -203,13 +193,16 @@ class ProvisionPublishTest : CommandTestBase() {
         assertThat(api.writes).isEmpty()
         assertThat(gh.invocations).contains("gh variable set THORYN_PRODUCTION_CLIENT_ID --body $id --repo acme/billing-web --env production").noneMatch { it.contains("--method PUT") }
 
-        // The gh account loses the repository: the client stays, the receipt stays, the exit is non-zero and names the fallback.
+        // The gh account loses the repository: the client stays, the exit is non-zero and names the fallback with the id.
         gh.repos.clear()
         val lost = runCli("provision", "apply", "--file", f.path, "--gateway", baseUrl(), "--yes")
         assertThat(lost.exit).isEqualTo(CommandSupport.EXIT_HTTP_ERROR).isNotEqualTo(0)
-        assertThat(lost.out).contains("Applied. 1 resource(s) owned.")
+        assertThat(lost.out).contains("Applied. 1 resource(s) converged")
         assertThat(lost.err).contains("publish_target_unreachable").contains("gh variable set THORYN_PRODUCTION_CLIENT_ID --body $id --repo acme/billing-web --env production").doesNotContain("Apply stopped")
         assertThat(api.applications).hasSize(1)
-        assertThat(ProvisionReceiptStore().read(File(f.parentFile, "provision.receipt.json"))!!.resources.single().id).isEqualTo(id)
+        // `--output json` with an unreachable target still prints the applied resources (the id a human needs for the fallback).
+        val lostJson = runCli("provision", "apply", "--file", f.path, "--gateway", baseUrl(), "--yes", "--output", "json")
+        assertThat(lostJson.exit).isEqualTo(CommandSupport.EXIT_HTTP_ERROR)
+        assertThat(lostJson.out).contains("\"id\" : \"$id\"")
     }
 }

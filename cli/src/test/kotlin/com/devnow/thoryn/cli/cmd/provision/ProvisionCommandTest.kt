@@ -1,6 +1,5 @@
 package com.devnow.thoryn.cli.cmd.provision
 
-import com.devnow.thoryn.provision.ProvisionReceiptStore
 import com.devnow.thoryn.cli.cmd.CommandTestBase
 import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.api.BeforeEach
@@ -14,8 +13,8 @@ import java.io.File
  * The load-bearing invariants: `plan` is read-only; `apply` creates environments first and targets
  * dependants at the created sandbox via `X-Thoryn-Environment`; a SECOND `apply` issues NO writes;
  * `destroy` removes child-first, confirms a sandbox hard-delete with its own slug, and REFUSES a
- * production-plane removal without `--confirm <workspace-slug>`; the receipt lives next to the file
- * and is removed once nothing is owned.
+ * production-plane removal without `--confirm <workspace-slug>`; SSO-3715 — nothing is written next to
+ * the file (no receipt), `--output json` carries the ids.
  */
 class ProvisionCommandTest : CommandTestBase() {
 
@@ -50,10 +49,10 @@ class ProvisionCommandTest : CommandTestBase() {
         val file = writeFile("provision.yaml", sandboxFile)
         val receipt = File(file.parentFile, "provision.receipt.json")
 
-        // plan: three creates, only GET traffic (live read-by-key), no receipt.
+        // plan: three creates, only GET traffic (live read-by-key).
         val plan = runCli("provision", "plan", "--file", file.path, "--gateway", baseUrl())
         assertThat(plan.exit).isEqualTo(0)
-        assertThat(plan.out).contains("environment").contains("create").contains("3 to create, 0 to update, 0 to adopt, 0 to remove, 0 unchanged")
+        assertThat(plan.out).contains("environment").contains("create").contains("3 to create, 0 to update, 0 to remove, 0 unchanged")
         assertThat(api.writes).isEmpty()
         assertThat(receipt).doesNotExist()
 
@@ -61,7 +60,7 @@ class ProvisionCommandTest : CommandTestBase() {
         val apply = runCli("provision", "apply", "--file", file.path, "--gateway", baseUrl(), "--yes")
         assertThat(apply.err).isEmpty()
         assertThat(apply.exit).isEqualTo(0)
-        assertThat(apply.out).contains("Applied. 3 resource(s) owned.")
+        assertThat(apply.out).contains("Applied. 3 resource(s) converged (3 created, 0 updated)")
         assertThat(paths()).containsExactly("POST /api/v1/environments", "POST /api/v1/applications", "POST /api/v1/users")
         assertThat(api.writes[0].env).isNull()
         assertThat(api.writes[0].body).containsEntry("slug", "ci-sbx").containsEntry("name", "CI sandbox")
@@ -69,31 +68,42 @@ class ProvisionCommandTest : CommandTestBase() {
         assertThat(api.writes[1].body).containsEntry("displayName", "RP")
         assertThat(api.writes[2].env).isEqualTo("ci-sbx")
 
-        // The receipt sits next to the file, records ids + env slugs, and is the ownership ledger.
-        assertThat(receipt).exists()
-        val recorded = ProvisionReceiptStore().read(receipt)!!
-        assertThat(recorded.file.digest).startsWith("sha256:")
-        assertThat(recorded.resources.map { it.key }).containsExactly("environment/ci", "application/rp", "user/tester")
-        assertThat(recorded.resources[0].attributes["slug"]).isEqualTo("ci-sbx")
-        assertThat(recorded.resources[1].environment).isEqualTo("ci-sbx")
-        val ids = recorded.resources.map { it.id }
+        // SSO-3715 — nothing beside the file: the platform is the ledger.
+        assertThat(receipt).doesNotExist()
+        assertThat(file.parentFile.listFiles()!!.map { it.name }).containsExactly("provision.yaml")
+        val ids = listOf(api.environments.single()["id"].toString(), api.applications.single()["clientId"].toString(), api.users.single()["id"].toString())
+        // `--output json` is where a workflow reads the ids from: one document, `resources[]` with kind / name / id / environment / action.
+        api.reset()
+        val json = runCli("provision", "apply", "--file", file.path, "--gateway", baseUrl(), "--yes", "--output", "json")
+        assertThat(json.exit).isEqualTo(0)
+        val doc = tools.jackson.databind.json.JsonMapper.builder().build().readTree(json.out)
+        val resources = doc["resources"].toList()
+        assertThat(resources.map { it["kind"].asString() + "/" + it["name"].asString() }).containsExactly("environment/ci", "application/rp", "user/tester")
+        assertThat(resources.map { it["id"].asString() }).isEqualTo(ids)
+        assertThat(doc["resources"][0]["environment"].asString()).isEqualTo("ci-sbx")
+        assertThat(doc["resources"][1]["environment"].asString()).isEqualTo("ci-sbx")
+        assertThat(resources.map { it["action"].asString() }).allMatch { it == "noop" }
+        assertThat(doc["summary"]["noop"].asInt()).isEqualTo(3)
+        assertThat(api.writes).isEmpty()
 
         // second apply: everything owned and matching → no writes at all.
         api.reset()
         val again = runCli("provision", "apply", "--file", file.path, "--gateway", baseUrl(), "--yes")
         assertThat(again.exit).isEqualTo(0)
-        assertThat(again.out).contains("0 to create, 0 to update, 0 to adopt, 0 to remove, 3 unchanged").contains("No changes.")
+        assertThat(again.out).contains("0 to create, 0 to update, 0 to remove, 3 unchanged").contains("No changes.")
         assertThat(api.writes).isEmpty()
 
-        // destroy: user + app first (reverse), then the sandbox, confirmed with its OWN slug.
+        // destroy (SSO-3715): the founder manages the client and the sandbox and nobody owns them ⇒ the app first, then
+        // the sandbox confirmed with its OWN slug; the user goes WITH its sandbox (a skip row says so — the cascade).
         val destroy = runCli("provision", "destroy", "--file", file.path, "--gateway", baseUrl(), "--yes")
         assertThat(destroy.err).isEmpty()
         assertThat(destroy.exit).isEqualTo(0)
-        assertThat(paths()).containsExactly("DELETE /api/v1/users/${ids[2]}", "DELETE /api/v1/applications/${ids[1]}", "DELETE /api/v1/environments/${ids[0]}")
+        assertThat(destroy.out).contains("skip    removed with its sandbox 'ci-sbx'").contains("2 to remove, 1 left in place")
+        assertThat(paths()).containsExactly("DELETE /api/v1/applications/${ids[1]}", "DELETE /api/v1/environments/${ids[0]}")
         assertThat(api.writes[0].env).isEqualTo("ci-sbx")
-        assertThat(api.writes[2].confirm).isEqualTo("ci-sbx")
+        assertThat(api.writes[1].confirm).isEqualTo("ci-sbx")
         assertThat(receipt).doesNotExist()
-        assertThat(destroy.out).contains("Destroyed. Nothing is owned any more.")
+        assertThat(destroy.out).contains("Destroyed 2 resource(s). 1 left in place")
     }
 
     @Test
@@ -130,26 +140,46 @@ class ProvisionCommandTest : CommandTestBase() {
     }
 
     @Test
-    fun `dropping a resource from the file is a skip until --prune removes it`() {
+    fun `a resource this identity OWNS and drops from the file is left alone until --prune removes it — the platform is the ledger`() {
+        // SSO-3715 — a `client:` identity (a repository's wi_) that may create here: creator-becomes-owner makes it the owner.
+        // The CLI derives the subject from the token (`client_id` with no distinct `sub`), exactly as product-api does.
+        api.caller = "client:repo"
+        val enc = java.util.Base64.getUrlEncoder().withoutPadding()
+        seedTokens(com.devnow.thoryn.cli.auth.Tokens(accessToken = enc.encodeToString("""{"alg":"none"}""".toByteArray()) + "." + enc.encodeToString("""{"sub":"repo","client_id":"repo","tnt":"${api.tenantId}"}""".toByteArray()) + ".sig"))
         val file = writeFile("provision.yaml", sandboxFile)
         assertThat(runCli("provision", "apply", "--file", file.path, "--gateway", baseUrl(), "--yes").exit).isEqualTo(0)
-        val userId = api.users.single()["id"]
+        val clientId = api.applications.single()["clientId"].toString()
+        assertThat(api.ownerOf("application:$clientId")).isEqualTo("client:repo")
         api.reset()
 
-        // Drop the user from the desired state.
-        file.writeText(sandboxFile.lines().takeWhile { !it.contains("kind: user") }.joinToString("\n"))
+        // Drop the client from the desired state: without --prune it is nowhere in the plan (no ledger of "declared once").
+        file.writeText(
+            """
+            apiVersion: thoryn.io/provision/v1
+            resources:
+              - kind: environment
+                name: ci
+                spec: { slug: ci-sbx, displayName: "CI sandbox" }
+              - kind: user
+                name: tester
+                environment: ci
+                spec: { email: tester@example.com, emailVerified: true }
+            """.trimIndent(),
+        )
         val plan = runCli("provision", "plan", "--file", file.path, "--gateway", baseUrl())
-        assertThat(plan.out).contains("skip").contains("re-run with --prune")
+        assertThat(plan.exit).isEqualTo(0)
+        assertThat(plan.out).doesNotContain(clientId).contains("0 to remove")
+        // With --prune: what the platform says this identity OWNS and the file does not declare is a removal.
         val prunePlan = runCli("provision", "plan", "--file", file.path, "--gateway", baseUrl(), "--prune")
-        assertThat(prunePlan.out).contains("remove").contains("1 to remove")
+        assertThat(prunePlan.out).contains(clientId).contains("remove").contains("owned by this identity").contains("1 to remove")
         assertThat(api.writes).isEmpty()
 
         val pruned = runCli("provision", "apply", "--file", file.path, "--gateway", baseUrl(), "--yes", "--prune")
         assertThat(pruned.err).isEmpty()
         assertThat(pruned.exit).isEqualTo(0)
-        assertThat(paths()).containsExactly("DELETE /api/v1/users/$userId")
-        val recorded = ProvisionReceiptStore().read(File(file.parentFile, "provision.receipt.json"))!!
-        assertThat(recorded.resources.map { it.key }).containsExactly("environment/ci", "application/rp")
+        assertThat(paths()).containsExactly("DELETE /api/v1/applications/$clientId")
+        assertThat(api.applications).isEmpty()
+        assertThat(File(file.parentFile, "provision.receipt.json")).doesNotExist()
     }
 
     @Test
@@ -179,9 +209,8 @@ class ProvisionCommandTest : CommandTestBase() {
         val secret = api.mintedSecrets.getValue(clientId)
         assertThat(refused.out).doesNotContain(secret)
         assertThat(refused.err).doesNotContain(secret).contains("thoryn clients rotate-secret $clientId")
-        val receipt = ProvisionReceiptStore().read(File(file.parentFile, "provision.receipt.json"))!!
-        assertThat(receipt.resources.map { it.key }).containsExactly("environment/ci", "application/ci-worker")
-        assertThat(File(file.parentFile, "provision.receipt.json").readText()).doesNotContain(secret)
+        assertThat(api.applications.map { it["displayName"] }).containsExactly("CI worker")
+        assertThat(File(file.parentFile, "provision.receipt.json")).doesNotExist()
 
         // A second confidential client, this time with --secret-file: delivered to the owner-only file, never stdout.
         file.appendText(
@@ -197,7 +226,7 @@ class ProvisionCommandTest : CommandTestBase() {
         assertThat(delivered.exit).isEqualTo(0)
         val reporterId = api.applications.last()["clientId"].toString()
         assertThat(secretFile.readText().trim()).isEqualTo(api.mintedSecrets.getValue(reporterId))
-        assertThat(delivered.out).doesNotContain(api.mintedSecrets.getValue(reporterId)).contains("Applied. 3 resource(s) owned.")
+        assertThat(delivered.out).doesNotContain(api.mintedSecrets.getValue(reporterId)).contains("Applied. 3 resource(s) converged (1 created, 0 updated)")
         assertThat(delivered.err).contains("written to").doesNotContain(api.mintedSecrets.getValue(reporterId))
     }
 
@@ -237,9 +266,8 @@ class ProvisionCommandTest : CommandTestBase() {
         assertThat(again.out).contains("No changes.")
         assertThat(api.writes).isEmpty()
 
-        // Without tenant:access.write the apply fails closed with the scope named (the sandbox stays owned).
-        // SSO-3119 — drop the grant out-of-band so the declared one is an ADD again; a grant this file
-        // does not own is never revoked, so a stale one alone would give the apply nothing to write.
+        // Without tenant:access.write the apply fails closed with the scope named (the sandbox stays).
+        // Drop the grant out-of-band so the declared one is an ADD again.
         api.grants.removeIf { it["object"] == "environment:$envId" }
         api.denyGrantWrites = true
         val denied = runCli("provision", "apply", "--file", file.path, "--gateway", baseUrl(), "--yes")
