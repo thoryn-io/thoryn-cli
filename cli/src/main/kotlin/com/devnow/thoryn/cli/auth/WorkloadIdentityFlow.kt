@@ -345,6 +345,10 @@ data class JobIdentity(
     val kubernetesNamespace: String? = null,
     /** SSO-3684 — a projected ServiceAccount token's `kubernetes.io.serviceaccount.name`. */
     val kubernetesServiceAccount: String? = null,
+    /** SSO-3710 — the GitHub Actions `run_id` claim (the workflow run the job belongs to), for a fix request's `run.id`. */
+    val runId: String? = null,
+    /** SSO-3710 — the GitHub Actions `sha` claim (the commit the run is for), for a fix request's `run.headSha`. */
+    val sha: String? = null,
 ) {
     /** SSO-3684 — true when the token is a Kubernetes ServiceAccount token (`sub` = `system:serviceaccount:…`). */
     val isKubernetes: Boolean get() = subject?.startsWith(KUBERNETES_SUBJECT_PREFIX) == true || kubernetesNamespace != null
@@ -375,6 +379,8 @@ data class JobIdentity(
                 runnerEnvironment = text("runner_environment"),
                 kubernetesNamespace = c["kubernetes.io"]?.get("namespace")?.takeUnless { it.isNull }?.asString()?.takeIf { it.isNotBlank() },
                 kubernetesServiceAccount = c["kubernetes.io"]?.get("serviceaccount")?.get("name")?.takeUnless { it.isNull }?.asString()?.takeIf { it.isNotBlank() },
+                runId = text("run_id"),
+                sha = text("sha"),
             )
         }
     }

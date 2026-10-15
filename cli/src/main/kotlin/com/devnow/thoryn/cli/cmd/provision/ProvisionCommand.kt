@@ -1,6 +1,7 @@
 package com.devnow.thoryn.cli.cmd.provision
 
 import com.devnow.thoryn.provision.ChangeAction
+import com.devnow.thoryn.provision.FixRequest
 import com.devnow.thoryn.provision.ImportedResource
 import com.devnow.thoryn.provision.ProvisionEngine
 import com.devnow.thoryn.provision.ProvisionException
@@ -106,6 +107,20 @@ class ProvisionCommand : Callable<Int> {
 
         @Option(names = ["--output"], description = ["Output format: json|yaml|table (default: table)."])
         var outputRaw: String? = null
+
+        /**
+         * SSO-3710 — where a RED plan writes its fix request (`thoryn-provision-request.json`): every `access_*` row that
+         * is a missing right, with the exact command a workspace admin runs; file-fix rows as notes. Opt-in; the env var
+         * `THORYN_FIX_REQUEST` is the same switch. Exit codes are unchanged — the request describes the failure, it is not one.
+         */
+        @Option(
+            names = ["--fix-request"],
+            description = ["SSO-3710 — write the fix request (missing rights + the exact `thoryn access grant` commands, schema fix-request.schema.json) to this file when the plan has an ownership error; a workflow uploads it as the `thoryn-provision-request` artifact. Env: THORYN_FIX_REQUEST."],
+        )
+        var fixRequest: File? = null
+
+        /** SSO-3710 — the fix-request file to write, from the flag or `THORYN_FIX_REQUEST`; null ⇒ none. */
+        fun fixRequestTarget(): java.nio.file.Path? = FixRequests.target(fixRequest)
 
         /** Resolve + load the file (or fail with a usage error) and locate its receipt. */
         fun open(): Session? {
@@ -214,6 +229,20 @@ class ProvisionCommand : Callable<Int> {
             if (!plan.hasErrors) return
             System.err.println("${plan.errors.size} resource(s) failed the ownership check — apply would refuse this plan:")
             plan.errors.forEach { c -> System.err.println("  ! ${c.kind} ${c.name}: ${c.reason}") }
+            // SSO-3710 — the rights behind those rows, as one copy-pasteable block: the SAME items (and the same `cli`
+            // strings) a `--fix-request` file carries, rendered by the one function the request is rendered with.
+            val (items, _) = FixRequest.fromPlan(plan)
+            if (items.isNotEmpty()) System.err.println(FixRequest.render(items))
+        }
+
+        /**
+         * SSO-3710 — write the plan's fix request when the caller asked for one ([FileOptions.fixRequestTarget]) and the
+         * plan is red. Never changes the exit code.
+         */
+        fun writeFixRequest(target: java.nio.file.Path?, plan: ProvisionPlan, file: ProvisionFile, tokens: Tokens, gateway: String) {
+            val path = target ?: return
+            val request = FixRequests.forPlan(plan, file, tokens, gateway) ?: return
+            FixRequests.write(request, path)
         }
 
         fun printPlan(plan: ProvisionPlan, file: ProvisionFile) {
@@ -271,9 +300,18 @@ class ProvisionCommand : Callable<Int> {
          * error is RED ([CommandSupport.EXIT_HTTP_ERROR]) whatever else it says, so a pull-request dry run fails
          * on a resource the repository does not own.
          */
-        fun renderPlan(plan: ProvisionPlan, file: ProvisionFile, format: OutputFormat): Int {
+        fun renderPlan(
+            plan: ProvisionPlan,
+            file: ProvisionFile,
+            format: OutputFormat,
+            /** SSO-3710 — the fix-request file to write on a red plan, with the session + gateway that resolve its trust. */
+            fixRequest: java.nio.file.Path? = null,
+            tokens: Tokens? = null,
+            gateway: String? = null,
+        ): Int {
             if (format == OutputFormat.TABLE) printPlan(plan, file) else CommandSupport.emitValue(format, plan.toStructured(), "")
             printPlanErrors(plan)
+            if (tokens != null && gateway != null) writeFixRequest(fixRequest, plan, file, tokens, gateway)
             return if (plan.hasErrors) CommandSupport.EXIT_HTTP_ERROR else CommandSupport.EXIT_OK
         }
 
@@ -315,7 +353,7 @@ class ProvisionCommand : Callable<Int> {
             gateway = CommandSupport.resolveGateway(gateway, tokens)
             return try {
                 val plan = engine(gateway, tokens, format = format).plan(s.file, s.receipt, prune)
-                renderPlan(plan, s.file, format)
+                renderPlan(plan, s.file, format, fixRequestTarget(), tokens, gateway)
             } catch (ex: Exception) {
                 fail(ex, gateway, format)
             }
@@ -393,6 +431,8 @@ class ProvisionCommand : Callable<Int> {
             if (plan.hasErrors) {
                 if (format != OutputFormat.TABLE) CommandSupport.emitValue(format, plan.toStructured(), "")
                 printPlanErrors(plan)
+                // SSO-3710 — the apply job's red check names its fix the same way the plan job's does.
+                writeFixRequest(fixRequestTarget(), plan, s.file, tokens, gateway)
                 System.err.println("Nothing was changed.")
                 return CommandSupport.EXIT_HTTP_ERROR
             }

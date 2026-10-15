@@ -1,0 +1,111 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://thoryn.io/schemas/provision/v1/fix-request.schema.json",
+  "title": "Thoryn provisioning fix request (thoryn-provision-request.json)",
+  "description": "SSO-3710 (epic SSO-3304; oauthy ADR 2026-10-15-missing-rights-fix-path-cli-and-web-consent §1) — the ONE file a red provisioning job writes (`thoryn login --connection --fix-request <file>` on an invalid_client refusal whose only local mismatch is the GitHub environment; `thoryn provision plan|apply --fix-request <file>` on a plan with access_* rows) and uploads as the run artifact `thoryn-provision-request`. It names every RIGHT the repository's identity is missing and the exact CLI command a WORKSPACE ADMIN runs to grant it. It is a HYPOTHESIS, never a credential: a consumer (the Thoryn GitHub App, SSO-3711/3712) takes repository ids, run id and head sha from GitHub's own workflow_run record and DISCARDS the copies carried here; it re-reads the declared .thoryn/ file at the run's head sha and matches the trust on its pins, never on `trust.name`. Nothing in this file grants anything. It carries no secret: ids, names, commands. The `cli` string of each item is the SAME text the CLI prints on stderr — one rendering, in the CLI.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "trust", "missing"],
+  "properties": {
+    "version": {
+      "description": "Schema version of this document.",
+      "const": 1
+    },
+    "cliVersion": {
+      "description": "The `thoryn` CLI that wrote the file (`thoryn --version`), or null when unknown.",
+      "type": ["string", "null"]
+    },
+    "repository": {
+      "description": "The repository the job ran for — from the job's OIDC claims (`repository`, `repository_id`, `repository_owner_id`) at sign-in, from the runner's `GITHUB_REPOSITORY*` variables at plan time. A HINT: the consumer binds to GitHub's record of the run, not to these.",
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "properties": {
+        "owner": { "type": ["string", "null"] },
+        "ownerId": { "type": ["integer", "null"] },
+        "repository": { "type": ["string", "null"] },
+        "repositoryId": { "type": ["integer", "null"] }
+      }
+    },
+    "run": {
+      "description": "The run (`GITHUB_RUN_ID`, `GITHUB_SHA`) and the GitHub environment the job declared (the OIDC token's `environment` claim). A HINT, rebound by the consumer.",
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": ["integer", "null"] },
+        "headSha": { "type": ["string", "null"] },
+        "jobEnvironment": { "type": ["string", "null"] }
+      }
+    },
+    "workspace": {
+      "description": "The workspace slug the identity signs in to (connection.json `workspace.slug`; the session's workspace at plan time).",
+      "type": ["string", "null"]
+    },
+    "file": {
+      "description": "`provision plan|apply` only: the provisioning file that was planned, as given, and its `sha256:` digest — so the consumer re-reads it at the run's head sha and drops any item naming an object the file does not declare. Null for a sign-in refusal.",
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": { "type": "string", "minLength": 1 },
+        "sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
+      }
+    },
+    "trust": {
+      "description": "The workload identity trust the identity presents. `clientId` is the trust's `wi_…` workload client (known from the connection or the session); `plane` the environment the trust lives in (`production` for the plane without one); `applyEnvironment` the GitHub environment the trust pins for apply when known; `name` and `id` only when the producer could resolve them (a refused sign-in holds no token, so both are null there; a plan session resolves them when it may list trusts). The consumer matches the trust on PINS against GitHub's record of the run — the name is a hint to disambiguate, never the key.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "plane", "applyEnvironment", "id", "clientId"],
+      "properties": {
+        "name": { "type": ["string", "null"] },
+        "plane": { "type": ["string", "null"] },
+        "applyEnvironment": { "type": ["string", "null"] },
+        "id": { "type": ["string", "null"] },
+        "clientId": { "type": ["string", "null"], "pattern": "^wi_[0-9a-f]+$" }
+      }
+    },
+    "missing": {
+      "description": "The rights that are missing, one item per refused row (or the one plan_profile item of a refused sign-in). Empty when every failed row is a file fix (see `notes`).",
+      "type": "array",
+      "items": { "$ref": "#/$defs/missingRight" }
+    },
+    "notes": {
+      "description": "Failed rows that are NOT a missing right — the FILE must change (a differing read-only reference, a trust the file cannot declare, a scope the identity does not hold, a create whose parent is the workspace) — so the request says so instead of staying silent.",
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  },
+  "$defs": {
+    "missingRight": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "object", "subject", "environment", "reason", "cli"],
+      "properties": {
+        "kind": {
+          "description": "The ADR's grantable set, nothing else: `plan_profile` — a plan profile on the trust for the environment the job ran in (`thoryn workload-identity trusts set-plan-profile`); `owner` — the platform owner relation on an EXISTING object the file declares (access_not_owned on a live id; access_read_only when the identity may only view a resource it is to own; access_owned_elsewhere — then with `cli` null, a dispute an admin decides); `manager` — on the parent `environment:<id>` of a refused create (never on the workspace); `viewer` — on an existing object declared `readOnly: true` the identity holds no relation on.",
+          "enum": ["plan_profile", "owner", "manager", "viewer"]
+        },
+        "object": {
+          "description": "The platform object: `application:<clientId>`, `environment:<id>`, `custom_domain:<workspaceId>`, …, or `trust:<name>` for a plan_profile when the trust is named; null when unknown.",
+          "type": ["string", "null"]
+        },
+        "subject": {
+          "description": "The identity to grant the right to — the session's `client:<wi_…>`; null for a plan_profile (set on the trust, not granted to a subject) or when the session token was opaque.",
+          "type": ["string", "null"]
+        },
+        "environment": {
+          "description": "plan_profile only: the GitHub environment the job ran in — the one the profile is for.",
+          "type": ["string", "null"]
+        },
+        "reason": {
+          "description": "Why the right is missing: the engine's row reason (`<code> — …`) or the sign-in's local finding. Names objects and environments, never a secret and never another repository's identity.",
+          "type": "string",
+          "minLength": 1
+        },
+        "cli": {
+          "description": "The exact command a workspace admin runs — the copy-pasteable block the check run relays verbatim and the CLI prints itself. `<trust-id>` where the producer could not resolve the id (`thoryn workload-identity trusts list` shows it); `<subject>` when the session token was opaque. Null for a dispute the CLI shows but never resolves (an object another repository owns).",
+          "type": ["string", "null"]
+        }
+      }
+    }
+  }
+}

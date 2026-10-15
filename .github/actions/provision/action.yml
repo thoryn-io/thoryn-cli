@@ -112,6 +112,18 @@ inputs:
     description: "Temurin JDK version used to run the released CLI jar."
     required: false
     default: "21"
+  fix-request:
+    description: >-
+      SSO-3710 (oauthy ADR 2026-10-15 §1) — where the CLI writes the FIX REQUEST (`thoryn-provision-request.json`):
+      every right the repository's identity is missing (a plan profile on its trust, `owner` on a declared resource,
+      `manager` on a parent environment) with the exact command a workspace admin runs. Written by `thoryn login
+      --connection` on a refused exchange whose only local mismatch is the GitHub environment, and by `thoryn provision
+      plan|apply` on a plan with an ownership error — through the env var THORYN_FIX_REQUEST (a release predating the
+      flag ignores it). Empty ⇒ `$RUNNER_TEMP/thoryn-provision-request.json`. The path is exposed as the `fix-request`
+      output; the CALLER uploads it (`actions/upload-artifact`, `if: failure()`, name `thoryn-provision-request`) for the
+      Thoryn GitHub App to relay onto the check run. Never a secret: ids, names, commands.
+    required: false
+    default: ""
 
 outputs:
   workspace-slug:
@@ -132,6 +144,12 @@ outputs:
   receipt:
     description: "Path of the secret-free provisioning receipt (<file-name>.receipt.json, next to the file)."
     value: ${{ steps.apply.outputs.receipt }}
+  fix-request:
+    description: >-
+      SSO-3710 — the path the CLI writes the fix request to when a step fails on a missing right (the `fix-request`
+      input, or `$RUNNER_TEMP/thoryn-provision-request.json`). Exists only after such a failure: upload it with
+      `actions/upload-artifact` (`if: failure()`, `if-no-files-found: ignore`, name `thoryn-provision-request`).
+    value: ${{ steps.fix-request.outputs.path }}
 
 runs:
   using: composite
@@ -170,6 +188,20 @@ runs:
         fi
         echo "Downloaded thoryn.jar ($(du -h thoryn.jar | cut -f1)) from release $tag."
 
+    # SSO-3710 — ONE path for the fix request, resolved once and read by the sign-in and the apply steps through the
+    # CLI's THORYN_FIX_REQUEST, and exposed as the `fix-request` output for the caller's upload step. The CLI writes it
+    # only when a step fails on a missing right; a release predating `--fix-request` ignores the variable.
+    - name: Resolve the fix-request path
+      id: fix-request
+      shell: bash
+      env:
+        FIX_REQUEST: ${{ inputs.fix-request }}
+      run: |
+        set -euo pipefail
+        path="${FIX_REQUEST:-$RUNNER_TEMP/thoryn-provision-request.json}"
+        echo "path=$path" >> "$GITHUB_OUTPUT"
+        echo "A failed sign-in or plan writes its fix request to $path (upload it as the thoryn-provision-request artifact)."
+
     # Sign in from the connection contract: the CLI derives the per-tenant issuer, the gateway and the
     # requested scopes from it, reads the secret from the env var the contract names, and stamps the
     # session (SSO-2827) so the later `provision` commands need no host flags.
@@ -178,6 +210,8 @@ runs:
       env:
         SECRET_ENV: ${{ inputs.secret-env }}
         SECRET_VALUE: ${{ inputs.client-secret }}
+        # SSO-3710 — where a refused workload-identity exchange writes its fix request (the CLI's `--fix-request`).
+        THORYN_FIX_REQUEST: ${{ steps.fix-request.outputs.path }}
         # SSO-3296 — `issuer` wins; `hub` is the retained alias. Both env names are exported so a
         # connection contract naming either one resolves.
         THORYN_ISSUER: ${{ inputs.issuer != '' && inputs.issuer || inputs.hub }}
@@ -225,6 +259,8 @@ runs:
         FILE: ${{ inputs.file }}
         CONNECTION: ${{ inputs.connection }}
         THORYN_CI_PLAINTEXT_TOKENS: "1"
+        # SSO-3710 — where a red plan / refused apply writes its fix request (the CLI's `--fix-request`).
+        THORYN_FIX_REQUEST: ${{ steps.fix-request.outputs.path }}
       run: |
         set -euo pipefail
         if [ ! -f "$FILE" ]; then

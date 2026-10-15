@@ -22,6 +22,9 @@ object FakeJobTokens {
         environment: String? = null,
         eventName: String = "push",
         runnerEnvironment: String = "github-hosted",
+        /** SSO-3710 — GitHub's `run_id` / `sha` claims (strings on the wire), for a fix request's `run`. */
+        runId: String = "38547022158",
+        sha: String = "0123456789abcdef0123456789abcdef01234567",
     ): Map<String, Any?> = buildMap {
         put("iss", WorkloadIdentityFlow.GITHUB_ACTIONS_ISSUER)
         put("aud", audience)
@@ -40,6 +43,8 @@ object FakeJobTokens {
         environment?.let { put("environment", it) }
         put("event_name", eventName)
         put("runner_environment", runnerEnvironment)
+        put("run_id", runId)
+        put("sha", sha)
         val now = System.currentTimeMillis() / 1000
         put("iat", now)
         put("exp", now + 300)

@@ -107,6 +107,8 @@ class LoginConnectionPlanProfileTest : CommandTestBase() {
         val stored = FileTokenStore().read()!!
         assertThat(stored.profile).isEqualTo(Tokens.PROFILE_PLAN)
         assertThat(stored.scope).isEqualTo("tenant:environments.read tenant:applications.read tenant:access.read")
+        // SSO-3710 — the job's environment rides on the session, so `provision plan --fix-request` can state the run's.
+        assertThat(stored.jobEnvironment).isEqualTo(planEnvironment)
 
         // The profile is part of the session's story: `login --status` and `whoami` both name it.
         val status = runCli("login", "--status")
