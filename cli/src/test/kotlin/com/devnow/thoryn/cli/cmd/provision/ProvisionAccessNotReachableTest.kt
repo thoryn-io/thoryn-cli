@@ -44,16 +44,16 @@ class ProvisionAccessNotReachableTest : CommandTestBase() {
         api.environmentClaimFilter = true
         api.seedEnvironment("forge", "Forge")
         api.seedApplication(null, "Forge oauth2-proxy", listOf("https://forge.example.com/oauth2/callback"), clientId = "forge-oauth2-proxy")
-        System.setProperty("GITHUB_REPOSITORY", "thoryn-io/thoryn-cicd")
-        System.setProperty("GITHUB_RUN_ID", "38751887466")
+        // SSO-3722 — the runner's context through the seam, never the real environment (CI's own GITHUB_* would leak in).
+        val runner = mapOf("GITHUB_REPOSITORY" to "thoryn-io/thoryn-cicd", "GITHUB_RUN_ID" to "38751887466")
+        FixRequests.environment = { key -> if (key.startsWith("GITHUB_")) runner[key] else com.devnow.thoryn.cli.auth.WorkloadIdentityFlow.runnerEnv(key) }
         dir = File(tempHome.toFile(), ".thoryn").apply { mkdirs() }
         session()
     }
 
     @AfterEach
     fun unmount() {
-        System.clearProperty("GITHUB_REPOSITORY")
-        System.clearProperty("GITHUB_RUN_ID")
+        FixRequests.resetEnvironmentForTest()
         System.clearProperty(FixRequest.CONSENT_URL_ENV)
     }
 

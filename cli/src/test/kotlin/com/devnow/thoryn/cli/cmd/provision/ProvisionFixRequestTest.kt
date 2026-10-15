@@ -35,7 +35,8 @@ class ProvisionFixRequestTest : CommandTestBase() {
     private lateinit var otherEnvId: String
     private lateinit var dir: File
 
-    private val runnerVars = mapOf(
+    /** The runner's GitHub context, as the SEAM answers it — never the real process environment (CI's own GITHUB_* would leak). */
+    private val runnerVars = mutableMapOf(
         "GITHUB_REPOSITORY" to "thoryn-io/thoryn-cli",
         "GITHUB_REPOSITORY_OWNER" to "thoryn-io",
         "GITHUB_REPOSITORY_OWNER_ID" to "229451779",
@@ -63,13 +64,14 @@ class ProvisionFixRequestTest : CommandTestBase() {
         api.seedGrant(subject, "manager", "environment:$envId")
         api.seedGrant(subject, "viewer", "application:shared")
         api.seedGrant("client:wi_other", "owner", "application:taken")
-        runnerVars.forEach { (k, v) -> System.setProperty(k, v) }
+        // SSO-3722 — every GITHUB_* read goes through the seam: this fixture's context, and nothing from the real environment.
+        FixRequests.environment = { key -> if (key.startsWith("GITHUB_")) runnerVars[key] else com.devnow.thoryn.cli.auth.WorkloadIdentityFlow.runnerEnv(key) }
         dir = File(tempHome.toFile(), ".thoryn").apply { mkdirs() }
     }
 
     @AfterEach
     fun unmount() {
-        runnerVars.keys.forEach { System.clearProperty(it) }
+        FixRequests.resetEnvironmentForTest()
         System.clearProperty(FixRequest.ENV)
         System.clearProperty(FixRequest.CONSENT_URL_ENV)
     }
@@ -94,7 +96,7 @@ class ProvisionFixRequestTest : CommandTestBase() {
     fun `without a run id — not a GitHub Actions run — no link is built even with THORYN_CONSENT_URL`() {
         session()
         System.setProperty(FixRequest.CONSENT_URL_ENV, "https://app.thoryn.io")
-        System.clearProperty("GITHUB_RUN_ID")
+        runnerVars.remove("GITHUB_RUN_ID")
         val out = File(tempHome.toFile(), "thoryn-provision-request.json")
 
         val (_, _, err) = runCli("provision", "plan", "--file", file(redFile).path, "--gateway", baseUrl(), "--fix-request", out.path)

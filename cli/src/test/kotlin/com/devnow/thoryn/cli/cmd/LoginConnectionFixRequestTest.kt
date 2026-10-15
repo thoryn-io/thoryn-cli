@@ -38,11 +38,18 @@ class LoginConnectionFixRequestTest : CommandTestBase() {
         WorkloadIdentityPlatform.actAsRunner(baseUrl())
         CommandSupport.resetSessionHintForTest()
         platform.tokenResponses += WorkloadIdentityPlatform.json(401, """{"error":"invalid_client"}""")
+        // SSO-3722 — a refused sign-in binds the link to the JOB TOKEN's claims; the runner's GITHUB_* (always set on
+        // GitHub's own runner) are answered by this seam, not the real environment.
+        runnerContext.clear()
+        com.devnow.thoryn.cli.cmd.provision.FixRequests.environment = { key -> if (key.startsWith("GITHUB_")) runnerContext[key] else com.devnow.thoryn.cli.auth.WorkloadIdentityFlow.runnerEnv(key) }
     }
+
+    private val runnerContext = mutableMapOf<String, String>()
 
     @AfterEach
     fun unmount() {
         WorkloadIdentityPlatform.leaveRunner()
+        com.devnow.thoryn.cli.cmd.provision.FixRequests.resetEnvironmentForTest()
         System.clearProperty(FixRequest.ENV)
         System.clearProperty(FixRequest.CONSENT_URL_ENV)
     }
@@ -236,6 +243,21 @@ class LoginConnectionFixRequestTest : CommandTestBase() {
         val doc = request(out)
         assertThat(doc["options"]["consentUrl"].asString()).isEqualTo(link)
         assertThat(doc["options"]["cli"].asString()).isEqualTo(expectedCommandBody(doc))
+    }
+
+    @Test
+    fun `the job token's claims win over the runner's GITHUB_RUN_ID and GITHUB_REPOSITORY when both exist`() {
+        jobIn(planEnvironment)
+        System.setProperty(FixRequest.CONSENT_URL_ENV, "https://app.thoryn.io")
+        runnerContext["GITHUB_REPOSITORY"] = "someone-else/another-repo"
+        runnerContext["GITHUB_RUN_ID"] = "999"
+        val out = tempHome.resolve("thoryn-provision-request.json")
+
+        val (_, _, err) = runCli("login", "--connection", writeConnection().toString(), "--fix-request", out.toString())
+
+        val link = "https://app.thoryn.io/github/consent/run/thoryn-io/thoryn-cli/38547022158"
+        assertThat(err).contains("${FixRequest.OPTION_BROWSER_HEADING} $link").doesNotContain("another-repo").doesNotContain("/999")
+        assertThat(request(out)["options"]["consentUrl"].asString()).isEqualTo(link)
     }
 
     @Test

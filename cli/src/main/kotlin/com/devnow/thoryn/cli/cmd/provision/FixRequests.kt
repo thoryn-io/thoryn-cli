@@ -28,20 +28,38 @@ internal object FixRequests {
     /** The scope a session needs to resolve its own trust's name and id (`GET /api/v1/workload-identity/trusts`). */
     const val SCOPE_TRUSTS_READ: String = "tenant:workload-identity.read"
 
+    /**
+     * SSO-3722 — the ONE seam every environment read here goes through (the runner's `GITHUB_*` context, [FixRequest.ENV],
+     * [FixRequest.CONSENT_URL_ENV]): a `-D` property first, then the process environment ([WorkloadIdentityFlow.runnerEnv]).
+     * Tests replace it (the `TokenStoreFactory.environment` pattern) — on GitHub's own runner `GITHUB_RUN_ID` /
+     * `GITHUB_REPOSITORY` are ALWAYS set, so a fixture that only cleared a property still saw the real run (thoryn-cli#136,
+     * run 38758043749). Never read `System.getenv` directly in this file.
+     */
+    @Volatile
+    internal var environment: (String) -> String? = WorkloadIdentityFlow::runnerEnv
+
+    internal fun resetEnvironmentForTest() {
+        environment = WorkloadIdentityFlow::runnerEnv
+    }
+
+    private fun env(name: String): String? = environment(name)?.takeIf { it.isNotBlank() }
+
     /** The file to write: the flag, else [FixRequest.ENV] (a `-D` property first — tests — then the environment), else none. */
-    fun target(flag: File?): Path? = flag?.toPath() ?: WorkloadIdentityFlow.runnerEnv(FixRequest.ENV)?.let { Path.of(it) }
+    fun target(flag: File?): Path? = flag?.toPath() ?: env(FixRequest.ENV)?.let { Path.of(it) }
 
     /**
      * SSO-3723 — "Option 2, in the browser": the consent link for THIS run, from the configured base URL
      * ([FixRequest.CONSENT_URL_ENV], set by the reusable workflow from `consent-url` / `.thoryn/workflow.yaml`
      * `consentUrl` — configuration, never guessed from the issuer) and the job's own GitHub context: the repository
-     * (`GITHUB_REPOSITORY`, or the job token's `repository` claim) and the run (`GITHUB_RUN_ID`, or the token's `run_id`).
-     * Null when the base URL is unset or this is not a GitHub Actions run — the log then says how to get a link.
+     * (the job token's `repository` claim, else `GITHUB_REPOSITORY`) and the run (the token's `run_id`, else `GITHUB_RUN_ID`).
+     * **Precedence is the token's claims first** — they are the run the hub actually judged — and the runner's variables
+     * only as the fallback when the sign-in holds no token (a plan). Null when the base URL is unset or this is not a
+     * GitHub Actions run — the log then says how to get a link.
      */
     fun consentUrl(identity: JobIdentity? = null): String? {
-        val base = WorkloadIdentityFlow.runnerEnv(FixRequest.CONSENT_URL_ENV) ?: return null
-        val repository = WorkloadIdentityFlow.runnerEnv("GITHUB_REPOSITORY") ?: identity?.repository ?: return null
-        val runId = WorkloadIdentityFlow.runnerEnv("GITHUB_RUN_ID")?.toLongOrNull() ?: identity?.runId?.toLongOrNull() ?: return null
+        val base = env(FixRequest.CONSENT_URL_ENV) ?: return null
+        val repository = identity?.repository ?: env("GITHUB_REPOSITORY") ?: return null
+        val runId = identity?.runId?.toLongOrNull() ?: env("GITHUB_RUN_ID")?.toLongOrNull() ?: return null
         val owner = repository.substringBefore('/', "").takeIf { it.isNotEmpty() } ?: return null
         val name = repository.substringAfter('/', "").takeIf { it.isNotEmpty() } ?: return null
         return FixRequest.consentUrl(base, owner, name, runId)
@@ -53,10 +71,10 @@ internal object FixRequests {
      * outside a runner. A hint: the consumer rebinds to GitHub's record of the run.
      */
     fun runnerRepository(): FixRequest.Repository? {
-        val full = WorkloadIdentityFlow.runnerEnv("GITHUB_REPOSITORY")
-        val owner = WorkloadIdentityFlow.runnerEnv("GITHUB_REPOSITORY_OWNER") ?: full?.substringBefore('/', "")?.takeIf { it.isNotEmpty() }
-        val ownerId = WorkloadIdentityFlow.runnerEnv("GITHUB_REPOSITORY_OWNER_ID")?.toLongOrNull()
-        val repositoryId = WorkloadIdentityFlow.runnerEnv("GITHUB_REPOSITORY_ID")?.toLongOrNull()
+        val full = env("GITHUB_REPOSITORY")
+        val owner = env("GITHUB_REPOSITORY_OWNER") ?: full?.substringBefore('/', "")?.takeIf { it.isNotEmpty() }
+        val ownerId = env("GITHUB_REPOSITORY_OWNER_ID")?.toLongOrNull()
+        val repositoryId = env("GITHUB_REPOSITORY_ID")?.toLongOrNull()
         val name = full?.substringAfter('/', "")?.takeIf { it.isNotEmpty() }
         if (owner == null && ownerId == null && name == null && repositoryId == null) return null
         return FixRequest.Repository(owner, ownerId, name, repositoryId)
@@ -64,8 +82,8 @@ internal object FixRequests {
 
     /** The run as the runner states it (`GITHUB_RUN_ID`, `GITHUB_SHA`) plus the session's recorded job environment. */
     fun runnerRun(jobEnvironment: String?): FixRequest.Run? {
-        val id = WorkloadIdentityFlow.runnerEnv("GITHUB_RUN_ID")?.toLongOrNull()
-        val sha = WorkloadIdentityFlow.runnerEnv("GITHUB_SHA")
+        val id = env("GITHUB_RUN_ID")?.toLongOrNull()
+        val sha = env("GITHUB_SHA")
         if (id == null && sha == null && jobEnvironment == null) return null
         return FixRequest.Run(id, sha, jobEnvironment)
     }
