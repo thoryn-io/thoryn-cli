@@ -1,7 +1,7 @@
 package com.devnow.thoryn.cli.cmd.provision
 
 import com.devnow.thoryn.cli.cmd.provision.CiIdentityFixture.E2E_WORKFLOW_PATH
-import com.devnow.thoryn.cli.cmd.provision.CiIdentityFixture.PROVISIONING_WORKFLOW_PATH
+import com.devnow.thoryn.cli.cmd.provision.CiIdentityFixture.REUSABLE_WORKFLOW_PATH
 import com.devnow.thoryn.cli.cmd.provision.CiIdentityFixture.PROVISION_ACTION_PATH
 import com.devnow.thoryn.cli.cmd.provision.CiIdentityFixture.locate
 import com.devnow.thoryn.provision.FixRequest
@@ -12,8 +12,9 @@ import tools.jackson.dataformat.yaml.YAMLMapper
 
 /**
  * SSO-3710 (oauthy ADR 2026-10-15 §1, decision 2 of its open questions: "the dogfood workflows get the artifact upload
- * step NOW; the composite Action follows") — holds the two dogfood workflows and the composite Action to the fix-request
- * contract the Thoryn GitHub App consumes (SSO-3711):
+ * step NOW; the composite Action follows") — holds the REUSABLE provisioning workflow (SSO-3719: the App-dispatched stub
+ * calls it, so it is where the jobs live), the manual e2e workflow and the composite Action to the fix-request contract
+ * the Thoryn GitHub App consumes (SSO-3711):
  *
  *  - every job that signs in or plans asks the CLI for the request through [FixRequest.ENV] — the ENV spelling, not
  *    the flag, because the pinned release ([CiIdentityFixture.CLI_RELEASE]) predates `--fix-request` and must keep
@@ -28,7 +29,7 @@ import tools.jackson.dataformat.yaml.YAMLMapper
 class CiFixRequestConformanceTest {
 
     private val yaml = YAMLMapper.builder().build()
-    private val provisioningText = locate(PROVISIONING_WORKFLOW_PATH).readText()
+    private val provisioningText = locate(REUSABLE_WORKFLOW_PATH).readText()
     private val provisioning: JsonNode = yaml.readTree(provisioningText)
     private val e2eText = locate(E2E_WORKFLOW_PATH).readText()
     private val e2e: JsonNode = yaml.readTree(e2eText)
@@ -41,7 +42,7 @@ class CiFixRequestConformanceTest {
     private fun assertUploadStep(step: JsonNode, expectedPath: String) {
         assertThat(step["uses"].asString()).matches("^actions/upload-artifact@[0-9a-f]{40}$")
         assertThat(step["uses"].asString()).isEqualTo("actions/upload-artifact@$UPLOAD_ARTIFACT_SHA")
-        assertThat(step["if"].asString()).isEqualTo("failure()")
+        assertThat(step["if"].asString()).startsWith("failure()")
         val with = step["with"]
         assertThat(with["name"].asString()).isEqualTo(FixRequest.ARTIFACT_NAME)
         assertThat(with["path"].asString()).isEqualTo(expectedPath)
@@ -52,7 +53,7 @@ class CiFixRequestConformanceTest {
     private fun uploadStep(job: JsonNode): JsonNode = job.steps().single { it["uses"]?.asString()?.startsWith("actions/upload-artifact@") == true }
 
     @Test
-    fun `the App-dispatched plan job asks for the request through THORYN_FIX_REQUEST and uploads it on failure`() {
+    fun `the reusable plan job asks for the request through THORYN_FIX_REQUEST and uploads it on failure`() {
         val plan = provisioning["jobs"]["plan"]
         val planStep = plan.steps().single { it["run"]?.asString()?.contains("provision plan") == true }
         val requestPath = "\${{ runner.temp }}/${FixRequest.FILE_NAME}"
@@ -66,16 +67,19 @@ class CiFixRequestConformanceTest {
     }
 
     @Test
-    fun `the App-dispatched apply job uploads the path the Action exposes, before the receipt pull request`() {
+    fun `the reusable apply job asks for the request on its apply step, uploads it on failure, and ends at Applied — no receipt pull request`() {
         val apply = provisioning["jobs"]["apply"]
         val steps = apply.steps()
-        val action = steps.single { it["uses"]?.asString()?.contains("/.github/actions/provision@") == true }
-        assertThat(action["id"].asString()).isEqualTo("apply-thoryn")
+        val applyStep = steps.single { it["run"]?.asString()?.contains("provision apply") == true }
+        val requestPath = "\${{ runner.temp }}/${FixRequest.FILE_NAME}"
+        assertThat(applyStep["env"][FixRequest.ENV].asString()).isEqualTo(requestPath)
+        assertThat(applyStep["run"].asString()).contains("login --connection").doesNotContain("--fix-request")
         val upload = uploadStep(apply)
-        assertUploadStep(upload, "\${{ steps.apply-thoryn.outputs.fix-request }}")
-        assertThat(steps.indexOf(upload)).isGreaterThan(steps.indexOf(action))
-        assertThat(steps.indexOf(upload)).isLessThan(steps.size - 1)
-        assertThat(steps.last()["run"].asString()).contains("gh pr create")
+        assertUploadStep(upload, requestPath)
+        assertThat(steps.indexOf(upload)).isGreaterThan(steps.indexOf(applyStep))
+        // SSO-3717 — the job ends at "Applied": nothing is written back, the platform is the ledger.
+        assertThat(steps.last()["name"].asString()).isEqualTo("Applied")
+        assertThat(provisioningText).doesNotContain("gh pr create")
     }
 
     @Test

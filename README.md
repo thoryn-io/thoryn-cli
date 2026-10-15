@@ -315,6 +315,11 @@ thoryn provision import  [--file <path>] [--write]                       # SSO-3
                                              # ⇒ the client is still recorded, exit 65, `thoryn clients rotate-secret <id>` named. A resource's
                                              # `grants:` block is converged with it (see "Least-privilege access grants").
 thoryn provision destroy [--file <path>] [--confirm <ws>] [--yes] # remove what the file declares AND this identity may remove (owner-gated), child-first; prints the destroy plan first
+thoryn provision workflow check [--file <stub>] [--config <.thoryn/workflow.yaml>] [--root <dir>] [--output json]
+                                             # SSO-3719 — lint the App-dispatched STUB (.github/workflows/thoryn-provisioning.yml) and .thoryn/workflow.yaml
+                                             # against the provisioning workflow contract: every rule PASS/FAIL with its fix + the EFFECTIVE configuration;
+                                             # exit 0 / 4. The reusable workflow runs it (--output json) and acts on its `config`. See "Configure the
+                                             # provisioning workflow" below.
 
 # Least-privilege access grants (SSO-3113, epic SSO-3108) — who may manage / view which resource.
 # Thin wrappers over product-api /api/v1/access (the SSO-3112 contract). Subjects: member:<sub> | client:<clientId>;
@@ -1657,7 +1662,7 @@ consumer takes them from GitHub's own record of the run and discards the body's 
 ```
 
 In a workflow, set the variable on the step that signs in and plans, and upload the file on failure (the
-dogfood `thoryn-provisioning.yml` and the composite Action's `fix-request` input / output are the examples):
+reusable `provisioning.yml` (SSO-3719) and the composite Action's `fix-request` input / output are the examples):
 
 ```yaml
       - name: Plan
@@ -1675,6 +1680,145 @@ dogfood `thoryn-provisioning.yml` and the composite Action's `fix-request` input
           if-no-files-found: ignore
           retention-days: 7
 ```
+
+### Configure the provisioning workflow — the stub, its inputs, `.thoryn/workflow.yaml` (SSO-3719, epic SSO-3304)
+
+The Thoryn GitHub App plans every pull request that touches `.thoryn/` and applies every push to the default branch
+by dispatching **one workflow file in your repository**: `.github/workflows/thoryn-provisioning.yml`. Since SSO-3719
+that file is a **stub** — it forwards the App's inputs to the reusable workflow
+`thoryn-io/thoryn-cli/.github/workflows/provisioning.yml`, which does everything else. **You configure the workflow;
+you never write one.** Every variation a repository legitimately needs is either an **input** of the reusable workflow
+(the stub's `with:` block — the job shape) or a key of the committed **`.thoryn/workflow.yaml`** (what the jobs do at
+run time). Both are validated by one command, which also prints the configuration the jobs will run with:
+
+```bash
+thoryn provision workflow check            # the stub + .thoryn/workflow.yaml, every rule PASS/FAIL with its fix; exit 0 / 4
+thoryn provision workflow check --output json   # what the reusable workflow itself reads: rules, effective inputs, `config`
+```
+
+**Why there is no script hook.** A workflow file stays in your repository for exactly two reasons the App cannot take
+over: the job's own GitHub **OIDC token is your repository's identity** (Thoryn never holds a credential to your
+workspace), and the job's GitHub **environment is the review gate** (a required reviewer approves the apply before any
+write-capable token can be minted — enforced by GitHub and the hub, not by the App). Both must stay inside the reusable
+workflow, where the contract can hold them: a hand-edited job could move the sign-in out of the reviewed environment, or
+pass a secret, and nothing would notice. So the stub carries no steps, and `.thoryn/workflow.yaml` refuses any key it
+does not know. **When configuration is not enough, that is a product gap — tell us, we add the knob for everyone**
+(the way `runs-on`, `timeout-minutes` and `files` below exist), and nobody writes shell into a CI identity.
+
+#### The stub
+
+```yaml
+# .github/workflows/thoryn-provisioning.yml — dispatched by the Thoryn GitHub App; lint: thoryn provision workflow check
+name: Thoryn provisioning
+run-name: "Thoryn provisioning ${{ inputs.mode }} ${{ inputs.head_sha }} check-run:${{ inputs.check_run_id }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:         { description: "plan or apply", required: true, type: choice, options: [plan, apply] }
+      head_sha:     { description: "The commit to plan or apply", required: true, type: string }
+      check_run_id: { description: "The App's check run", required: true, type: string }
+      pr_number:    { description: "The pull request (plan only)", required: false, type: string, default: "" }
+
+concurrency:
+  group: thoryn-provisioning-${{ inputs.mode }}
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  # thoryn-provisioning: apply-job
+  provisioning:
+    uses: thoryn-io/thoryn-cli/.github/workflows/provisioning.yml@cli-v0.36.0
+    permissions:
+      id-token: write      # mints the identity (the job's own OIDC token)
+      checks: write        # completes the App's check run
+      contents: read       # reads the checkout — nothing is ever written back
+    with:
+      mode: ${{ inputs.mode }}
+      head_sha: ${{ inputs.head_sha }}
+      check_run_id: ${{ inputs.check_run_id }}
+      pr_number: ${{ inputs.pr_number }}
+      plan-environment: acme-production-plan     # UNPROTECTED — the trust's plan profile is keyed on it
+      apply-environment: acme-production         # REVIEWED — required reviewers; the trust pins it
+```
+
+The two environments are **yours**: a called job's `environment:` resolves against the calling repository, so your
+required reviewers hold the apply and your trust's plan profile makes the plan read-only (one `connection.json`, one
+identity — the hub reads the job token's `environment` claim). The `# thoryn-provisioning: apply-job` line is how the App
+knows the workflow applies; the `run-name` is how it finds the run. Pin `uses:` to a `cli-v*` release (≥ cli-v0.36.0):
+the same pin selects the CLI the jobs run (`job.workflow_ref`), so there is no second version to keep in step.
+
+#### Inputs — the stub's `with:` block
+
+| Input | Default | What it does |
+|---|---|---|
+| `mode`, `head_sha`, `check_run_id`, `pr_number` | — | forwarded verbatim as `${{ inputs.<name> }}`; the App's dispatch inputs |
+| `plan-environment` | required | the unprotected GitHub environment the plan job runs in |
+| `apply-environment` | required | the reviewed GitHub environment the apply job runs in |
+| `issuer` | `https://auth.thoryn.io` | the platform base issuer (`THORYN_ISSUER` / `THORYN_HUB`); `https://auth.stg.thoryn.org` on staging |
+| `cli-version` | the release `uses:` is pinned to | a `cli-v*` tag to run instead (≥ cli-v0.36.0) |
+| `runs-on` | `ubuntu-latest` | a runner label, or a JSON array of labels for a **self-hosted** pool: `'["self-hosted", "linux", "x64"]'` (the runner needs bash, gh, jq, curl; Java is set up). A trust pinned "GitHub-hosted runners only" refuses a self-hosted job's token — that pin is yours to change on the trust |
+| `timeout-minutes` | `30` | each job's timeout |
+| `config` | `.thoryn/workflow.yaml` | where the run-time configuration lives |
+
+#### Run-time configuration — `.thoryn/workflow.yaml`
+
+Committed beside your provisioning files; absent ⇒ the defaults below; schema
+`cli/src/main/resources/examples/workflow.schema.json`. **Unknown keys are refused, by name.**
+
+| Key | Default | What it does |
+|---|---|---|
+| `apiVersion` | required | `thoryn.io/workflow/v1` |
+| `files[]` | `[{file: .thoryn/provision.yaml, connection: .thoryn/connection.json}]` | **one or many** provisioning files, planned and applied in order, each signed in with its own connection (`connection` defaults to the `connection.json` beside the file — the layout `thoryn project init` and the App seed) |
+| `env` | `{}` | extra environment variables for the CLI: **`THORYN_*` names only** (the CLI's own variables, and the `{{env.NAME}}` placeholders a provisioning file reads — SSO-3430), never one the workflow sets itself (`THORYN_ISSUER`, `THORYN_HUB`, `THORYN_FIX_REQUEST`, `THORYN_CI_PLAINTEXT_TOKENS`), never credential-shaped (`*_SECRET`, `*_PASSWORD`, `*_TOKEN`, `*_KEY` — this file is committed plaintext). Values are exported, never evaluated |
+| `fixRequest` | `true` | upload the SSO-3710 fix request (`thoryn-provision-request`) when a job is red on a missing right, so the App names the fix on the check run |
+| `apply.prune` | `false` | pass `--prune`: remove owned resources the file no longer declares |
+| `apply.destroy` | `false` | run `thoryn provision destroy` after a successful apply — an ephemeral fixture (an e2e sandbox) |
+| `apply.confirm` | `""` | the workspace slug confirming production-plane removals (the SSO-2413 gate) |
+| `provider` | `github_actions` | the forge whose job token is the identity — see the gap below |
+
+Removals are **never on by default**; a plan never removes anything whatever the file says (the plan profile's scopes
+are read-only by construction).
+
+Two files — a production file and a sandbox file — each with its own connection, planned on every pull request and
+applied on `main`:
+
+```yaml
+# .thoryn/workflow.yaml
+apiVersion: thoryn.io/workflow/v1
+files:
+  - file: .thoryn/environments/production/provision.yaml     # connection.json beside it
+  - file: .thoryn/environments/sandbox/provision.yaml
+env:
+  THORYN_ENVIRONMENT: sandbox        # serves `environment: "{{env.THORYN_ENVIRONMENT}}"` in the sandbox file
+```
+
+A self-hosted pool with a longer timeout — in the stub's `with:`:
+
+```yaml
+    with:
+      # … the forwarded four and the two environments …
+      runs-on: '["self-hosted", "linux", "x64"]'
+      timeout-minutes: 60
+```
+
+**What the check prints** is the contract, rule by rule (`dispatch.*` — what the App needs; `stub.*` — the stub;
+`config.*` — the file), then the effective inputs and configuration. A hand-written workflow with its own jobs is
+reported as **not the supported shape**: the check still says what the App would need from it (`custom.jobs`), but
+Thoryn does not promote or support it; a `uses:` of any other reusable workflow cannot be verified at all.
+
+**Recorded gaps (not knobs, by design — tell us if you need them):**
+
+- **Forgejo.** `provider: forgejo` is refused: a Forgejo workload identity trust exists on the hub (oauthy ADR 2026-10-13
+  Amendment 3), but `thoryn login --connection` cannot exchange a Forgejo job token yet, and the App dispatches GitHub
+  workflows only. Until then a Forgejo pipeline is a `client_credentials` connection, outside this workflow.
+- **A step of your own** (a notification, an extra verification, a different CLI) is not configuration. The composite
+  Action `.github/actions/provision` and the raw CLI still exist for the manual path (`provision-e2e.yml` is the
+  example), but the App-dispatched workflow is the stub, full stop.
+
+The contract itself — what the App sends, what the reusable workflow satisfies — is `docs/provisioning-workflow-contract.md`
+(internal; pinned in code by `ProvisioningWorkflowContract`, enforced by the same engine the check runs).
 
 ## Secret-safety (SSO-1552)
 
@@ -2372,8 +2516,8 @@ The Action:
    (the `fix-request` input, default `$RUNNER_TEMP/thoryn-provision-request.json`), hands it to the
    sign-in and the apply steps through `THORYN_FIX_REQUEST`, and exposes it as the `fix-request`
    output. The **caller** uploads it — `actions/upload-artifact`, `if: failure()`, name
-   `thoryn-provision-request`, `if-no-files-found: ignore` — as `provision-e2e.yml` and
-   `thoryn-provisioning.yml` do; see "A red check names its fix" above.
+   `thoryn-provision-request`, `if-no-files-found: ignore` — as `provision-e2e.yml` and the reusable
+   `provisioning.yml` do; see "A red check names its fix" above.
 
 The demo caller is `.github/workflows/provision-e2e.yml` (manual `workflow_dispatch`).
 

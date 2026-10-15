@@ -1,0 +1,13 @@
+# SSO-3719 — run-time configuration of the reusable provisioning workflow this repository's stub calls
+# (.github/workflows/thoryn-provisioning.yml → thoryn-io/thoryn-cli/.github/workflows/provisioning.yml).
+# Schema: cli/src/main/resources/examples/workflow.schema.json; lint: `thoryn provision workflow check`.
+# These are the defaults, written out: one file, its connection beside it, the fix request uploaded on a red job,
+# no removals. Unknown keys are refused — a knob that is not here is a product gap to report, not a script to write.
+apiVersion: thoryn.io/workflow/v1
+files:
+  - file: .thoryn/provision.yaml
+    connection: .thoryn/connection.json
+fixRequest: true
+apply:
+  prune: false
+  destroy: false

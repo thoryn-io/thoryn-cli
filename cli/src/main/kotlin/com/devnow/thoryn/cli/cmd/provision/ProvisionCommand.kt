@@ -86,13 +86,15 @@ import java.util.concurrent.Callable
         ProvisionCommand.ApplySubcommand::class,
         ProvisionCommand.ImportSubcommand::class,
         ProvisionCommand.DestroySubcommand::class,
+        // SSO-3719 — `thoryn provision workflow check`: the stub + .thoryn/workflow.yaml against the workflow contract.
+        com.devnow.thoryn.cli.cmd.provision.workflow.ProvisionWorkflowCommand::class,
     ],
 )
 class ProvisionCommand : Callable<Int> {
 
     override fun call(): Int {
         System.err.println("Usage: thoryn provision <subcommand>")
-        System.err.println("Subcommands: plan, apply, import, destroy")
+        System.err.println("Subcommands: plan, apply, import, destroy, workflow")
         return CommandSupport.EXIT_USAGE
     }
 

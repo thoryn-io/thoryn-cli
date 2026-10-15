@@ -97,7 +97,7 @@ class CiTrustsFileConformanceTest {
     fun `no committed thoryn file and no workflow mentions the retired two-trust shape`() {
         val root = repositoryRoot()
         val thoryn = java.io.File(root, ".thoryn").listFiles { f -> f.isFile && !f.name.endsWith(".receipt.json") }!!.toList()
-        val files = thoryn + listOf(PROVISIONING_WORKFLOW_PATH, E2E_WORKFLOW_PATH, PROVISION_ACTION_PATH).map { java.io.File(root, it) }
+        val files = thoryn + listOf(PROVISIONING_WORKFLOW_PATH, CiIdentityFixture.REUSABLE_WORKFLOW_PATH, E2E_WORKFLOW_PATH, PROVISION_ACTION_PATH).map { java.io.File(root, it) }
         assertThat(files).hasSizeGreaterThanOrEqualTo(7)
         files.forEach { f ->
             val text = f.readText()

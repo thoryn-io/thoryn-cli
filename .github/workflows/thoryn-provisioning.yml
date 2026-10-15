@@ -1,43 +1,9 @@
-# Thoryn provisioning — dispatched by the Thoryn GitHub App (oauthy SSO-3660 / SSO-3665), hand-adapted for this
-# repository, which is not a starter-generated project (SSO-3697, parent SSO-3659 — the loop thoryn-cicd proved).
-#
-# The App never holds a credential to the `thoryn` workspace. On a pull request that changes .thoryn/ it opens
-# a "Thoryn provisioning plan" check run and dispatches this workflow with mode=plan; on a push to main it opens
-# "Thoryn provisioning apply" and dispatches mode=apply. Each job signs in as THIS repository's own workload
-# identity (.thoryn/connection.json — no secret) and the hub enforces the trust's pins. The manual path,
-# provision-e2e.yml (apply + confinement assertions + destroy on a dispatch), stays beside this one.
-#
-# WHY TWO ENVIRONMENTS, ONE IDENTITY. .thoryn/provision.yaml declares PRODUCTION-PLANE resources (the CLI's own
-# login client `cli`, the `cli-ci` sandbox whose parent is the workspace), so even the plan needs a production-plane
-# token, and a production trust must be pinned to a GitHub environment. A dispatched run executes on the default
-# branch for BOTH modes (the ref the token carries is refs/heads/main either way), so the GitHub environment is
-# the only thing that separates them (oauthy converge ADR 2026-10-13, Amendment 5):
-#   * `thoryn-provision-e2e-plan` — no reviewers. The plan job runs here.
-#   * `thoryn-provision-e2e`      — required reviewers; the `thoryn-cli-ci` trust is pinned to it. GitHub holds the
-#                                   apply job for a reviewer before any token can be minted.
-# BOTH jobs sign in with the SAME connection.json — the ONE trust `thoryn-cli-ci` (SSO-3705; SSO-3699 option B,
-# product owner 2026-10-14; oauthy ADR 2026-10-14-plan-identity-and-resource-ownership). What makes the plan read-only
-# is the trust's PLAN PROFILE on the hub (SSO-3700/SSO-3701, deployed; declared on the trust by SSO-3704 in
-# .thoryn/trusts.provision.yaml): the hub reads the `environment` claim of the job's own OIDC token — a job in the
-# `-plan` environment is minted the READ scopes only (tenant:environments.read tenant:applications.read
-# tenant:access.read), a job in the reviewed environment the write scopes, a job in neither is refused at the
-# exchange. `thoryn login --connection` (cli-v0.34.0, SSO-3702) requests no scope outside the apply environment, so
-# the plan job never asks for a write. No second trust, no second wi_ client, no second connection file, nothing to
-# paste. Until the Thoryn GitHub App is installed on this repository nothing dispatches this workflow (operator
-# steps in .thoryn/README.md).
-# The App completes its check run from this run's conclusion (the run-name carries the check-run id).
-# Removals are never automated: the apply step is destroy: "false", and nothing here passes --prune.
-#
-# A RED CHECK NAMES ITS FIX (SSO-3710; oauthy ADR 2026-10-15-missing-rights-fix-path-cli-and-web-consent §1). Both jobs
-# ask the CLI for a FIX REQUEST — `thoryn-provision-request.json`: every right this repository's identity is missing
-# (a plan profile on the trust, `owner` on a declared resource, `manager` on a parent environment) with the exact CLI
-# command a workspace admin runs — and upload it as the run artifact `thoryn-provision-request` when the job fails. The
-# App reads that artifact on `workflow_run.completed` and puts two options on the check run: the commands, or a web
-# consent a workspace admin approves. The request is asked for through the env var THORYN_FIX_REQUEST, not the flag:
-# the pinned release below predates `--fix-request` and ignores the variable, so the upload step simply finds no file
-# (`if-no-files-found: ignore`) until the pin moves to a release that writes it — nothing breaks either way.
-#
-# Every `inputs.*` value reaches a shell only through `env:` (the template-injection rule, oauthy SSO-3635).
+# Thoryn provisioning — the STUB the Thoryn GitHub App dispatches (SSO-3719; oauthy SSO-3660 / SSO-3665). It only
+# forwards the App's inputs to the reusable workflow: `.thoryn/workflow.yaml` holds the run-time configuration (files,
+# env, fixRequest, apply toggles), the `with:` block the job shape. Lint both: `thoryn provision workflow check`.
+# The App never holds a credential to the `thoryn` workspace: each called job signs in as THIS repository's own
+# workload identity (.thoryn/connection.json) in an environment of THIS repository — the unprotected `-plan` one for
+# a read-only plan on every pull request, the reviewed one (required reviewers) for the apply on main.
 name: Thoryn provisioning
 run-name: "Thoryn provisioning ${{ inputs.mode }} ${{ inputs.head_sha }} check-run:${{ inputs.check_run_id }}"
 
@@ -69,113 +35,19 @@ concurrency:
 
 permissions: {}
 
-env:
-  THORYN_CLI_RELEASE: cli-v0.35.0
-  # The platform base issuer the connection contract derives the thoryn workspace's issuer from.
-  THORYN_ISSUER: https://auth.stg.thoryn.org
-  THORYN_HUB: https://auth.stg.thoryn.org
-  # Headless runner, no OS keychain: the CLI's documented CI token store (an ephemeral file on this runner).
-  THORYN_CI_PLAINTEXT_TOKENS: "1"
-
 jobs:
-  plan:
-    if: inputs.mode == 'plan'
-    runs-on: ubuntu-latest
-    # The UNPROTECTED plan environment (see the header): the trust's plan profile is keyed on it, so the hub mints a
-    # job here the read-only scopes from the OIDC token's environment claim. No reviewers — a plan runs on every PR.
-    environment: thoryn-provision-e2e-plan
+  # thoryn-provisioning: apply-job
+  provisioning:
+    uses: thoryn-io/thoryn-cli/.github/workflows/provisioning.yml@cli-v0.36.0
     permissions:
       id-token: write
       checks: write
       contents: read
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.head_sha }}
-      - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: "21"
-      - name: Download the released thoryn CLI
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          gh release download "$THORYN_CLI_RELEASE" --repo thoryn-io/thoryn-cli --pattern thoryn.jar --dir .
-      - name: Plan .thoryn/provision.yaml as this repository (production plane, the one identity's plan profile)
-        env:
-          # SSO-3710 — where `login --connection` / `provision plan` write the fix request (the CLI's `--fix-request`).
-          THORYN_FIX_REQUEST: ${{ runner.temp }}/thoryn-provision-request.json
-        run: |
-          set -euo pipefail
-          java -jar thoryn.jar login --connection ".thoryn/connection.json"
-          { echo '## Thoryn provisioning plan: .thoryn/provision.yaml'; echo; echo '<pre>'; } >> "$GITHUB_STEP_SUMMARY"
-          java -jar thoryn.jar provision plan --file ".thoryn/provision.yaml" | tee -a "$GITHUB_STEP_SUMMARY"
-          echo '</pre>' >> "$GITHUB_STEP_SUMMARY"
-      # SSO-3710 — the fix request, for the App to relay onto the check run. Only a failed job has one to upload.
-      - name: Upload the fix request
-        if: failure()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: thoryn-provision-request
-          path: ${{ runner.temp }}/thoryn-provision-request.json
-          if-no-files-found: ignore
-          retention-days: 7
-
-  # thoryn-provisioning: apply-job
-  apply:
-    if: inputs.mode == 'apply'
-    runs-on: ubuntu-latest
-    # The reviewed environment: a required reviewer approves this run before it starts, and the hub mints the
-    # write-capable production token only for a job in this environment.
-    environment: thoryn-provision-e2e
-    permissions:
-      id-token: write
-      checks: write
-      contents: write
-      pull-requests: write
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.head_sha }}
-      - name: Apply .thoryn/provision.yaml as this repository (production plane)
-        id: apply-thoryn
-        uses: thoryn-io/thoryn-cli/.github/actions/provision@cli-v0.35.0
-        with:
-          connection: .thoryn/connection.json
-          file: .thoryn/provision.yaml
-          issuer: https://auth.stg.thoryn.org
-          cli-version: cli-v0.35.0
-          destroy: "false"
-      # SSO-3710 — the Action asks the CLI for the fix request (THORYN_FIX_REQUEST) and exposes where it would be.
-      - name: Upload the fix request
-        if: failure()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: thoryn-provision-request
-          path: ${{ steps.apply-thoryn.outputs.fix-request }}
-          if-no-files-found: ignore
-          retention-days: 7
-      - name: Open the receipt pull request
-        env:
-          GH_TOKEN: ${{ github.token }}
-          HEAD_SHA: ${{ inputs.head_sha }}
-          DEFAULT_BRANCH: main
-        run: |
-          set -euo pipefail
-          short="${HEAD_SHA:0:7}"
-          branch="thoryn/receipt-$short"
-          git config user.name "thoryn-provisioning[bot]"
-          git config user.email "provisioning@thoryn.io"
-          git add -- ':(glob).thoryn/**/*.receipt.json'
-          if git diff --cached --quiet; then
-            echo "The receipt is unchanged: nothing to open." >> "$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
-          git checkout -b "$branch"
-          git commit -m "chore(thoryn): provisioning receipt for $short"
-          git push origin "$branch"
-          gh pr create --head "$branch" --base "$DEFAULT_BRANCH" \
-            --title "Thoryn provisioning receipt for $short" \
-            --body "Applied .thoryn/ as pushed in $short, as this repository's own workload identity in the reviewed thoryn-provision-e2e environment. Merging keeps the receipt beside the file it records. Nothing was removed." \
-            | tee -a "$GITHUB_STEP_SUMMARY"
+    with:
+      mode: ${{ inputs.mode }}
+      head_sha: ${{ inputs.head_sha }}
+      check_run_id: ${{ inputs.check_run_id }}
+      pr_number: ${{ inputs.pr_number }}
+      plan-environment: thoryn-provision-e2e-plan
+      apply-environment: thoryn-provision-e2e
+      issuer: https://auth.stg.thoryn.org
