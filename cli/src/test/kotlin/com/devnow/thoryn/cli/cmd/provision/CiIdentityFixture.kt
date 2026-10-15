@@ -29,10 +29,14 @@ internal object CiIdentityFixture {
     const val CONNECTION_PATH = ".thoryn/connection.json"
     const val E2E_WORKFLOW_PATH = ".github/workflows/provision-e2e.yml"
 
-    /** SSO-3697 — the founder-applied trusts file and the App-dispatched workflow. */
+    /** SSO-3697 — the founder-applied trusts file and the App-dispatched workflow (since SSO-3719 a STUB calling [REUSABLE_WORKFLOW_PATH]). */
     const val TRUSTS_PROVISION_PATH = ".thoryn/trusts.provision.yaml"
     const val PROVISIONING_WORKFLOW_PATH = ".github/workflows/thoryn-provisioning.yml"
     const val PROVISION_ACTION_PATH = ".github/actions/provision/action.yml"
+
+    /** SSO-3719 — the reusable workflow every stub calls (`on: workflow_call`), and the stub's committed run-time configuration. */
+    const val REUSABLE_WORKFLOW_PATH = ".github/workflows/provisioning.yml"
+    const val WORKFLOW_CONFIG_PATH = ".thoryn/workflow.yaml"
 
     /**
      * SSO-3704 — the two-trust shape's residue (SSO-3699 option B retired it): a second connection file, the second trust's
@@ -47,7 +51,7 @@ internal object CiIdentityFixture {
      * none may carry a paste-me placeholder, because there is nothing left to paste. A placeholder is a `wi_` followed
      * by anything but a hex digit (`wi_PASTE_…`, `wi_…`, `<wi_…>`), or a shouting marker word.
      */
-    val THORYN_DATA_FILES = listOf(PROVISION_PATH, CONNECTION_PATH, TRUSTS_PROVISION_PATH)
+    val THORYN_DATA_FILES = listOf(PROVISION_PATH, CONNECTION_PATH, TRUSTS_PROVISION_PATH, WORKFLOW_CONFIG_PATH)
     val PLACEHOLDER_PATTERN = Regex("wi_[^0-9a-f\\s\"'`]|PASTE|PLACEHOLDER|CHANGE_ME")
 
     /** The non-comment lines of a YAML/JSON data file (a line whose first non-blank character is `#` is prose). */
@@ -78,13 +82,13 @@ internal object CiIdentityFixture {
     const val AUDIENCE = "https://thoryn.auth.stg.thoryn.org"
 
     /**
-     * The thoryn-cli release the App-dispatched workflow pins — its composite Action and `thoryn.jar`. At least
-     * cli-v0.35.0: the first release that writes the fix request the App relays into a red check run (SSO-3710).
-     * cli-v0.34.0 was the first whose `thoryn login --connection` picks the profile from the job's own OIDC
-     * `environment` claim (SSO-3702) — an older CLI in the `-plan` environment would request the six write scopes and
-     * be refused by the plan profile's ceiling.
+     * The thoryn-cli release the App-dispatched STUB pins the reusable workflow to (`uses: …/provisioning.yml@<release>`);
+     * the reusable workflow then runs the `thoryn.jar` of that same release (`job.workflow_ref`). At least cli-v0.36.0: the
+     * first release that ships the reusable workflow and `thoryn provision workflow check` (SSO-3719), on top of
+     * cli-v0.35.0's fix request (SSO-3710) and cli-v0.34.0's plan-profile sign-in (SSO-3702). The tag is cut FROM the merge
+     * that lands the reusable workflow, so the first App dispatch after that merge needs the tag to exist.
      */
-    const val CLI_RELEASE = "cli-v0.35.0"
+    const val CLI_RELEASE = "cli-v0.36.0"
 
     /** The platform base issuer the workflow provisions against (the connection derives the workspace issuer from it). */
     const val PLATFORM_ISSUER = "https://auth.stg.thoryn.org"

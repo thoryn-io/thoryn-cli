@@ -1,0 +1,311 @@
+# Thoryn provisioning — the REUSABLE workflow every repository's stub calls (SSO-3719, epic SSO-3304; oauthy converge
+# ADR 2026-10-13 Amendments 1, 5–7). Contract: docs/provisioning-workflow-contract.md (v1), pinned in code by
+# `ProvisioningWorkflowContract` and linted by `thoryn provision workflow check`.
+#
+# WHY A WORKFLOW FILE STAYS AT ALL. The job's own GitHub OIDC token IS the repository's identity, and the job's GitHub
+# ENVIRONMENT is the review gate the hub pins — neither can move into the Thoryn GitHub App, which never holds a Thoryn
+# credential. Everything else moved out of the customer's repository into this file. What a repository keeps is a
+# ~25-line STUB (`.github/workflows/thoryn-provisioning.yml`): the App's `workflow_dispatch` inputs and one job that
+# `uses:` this workflow at a cli-v* release. Every legitimate variation is an INPUT below (the stub's `with:`) or a key
+# of the committed `.thoryn/workflow.yaml` this workflow reads at run time (`thoryn provision workflow check --output
+# json`: files + connections, env vars, fixRequest, apply toggles). There is no script hook: the identity and the gate
+# live here, and a knob that is not expressible as configuration is a product gap to record, not a job to hand-edit.
+#
+# THE TWO ENVIRONMENTS RESOLVE AGAINST THE CALLER. A called job's `environment:` is looked up in the CALLING repository
+# — so the caller's required reviewers still hold the apply job before any token can be minted, and the plan job's
+# environment claim still selects the trust's read-only plan profile at the hub (Amendment 5/6). A dispatched run
+# executes on the default branch in BOTH modes, so the environment is the only pin separating "may read" from "may
+# write": pass an UNPROTECTED `plan-environment` and a REVIEWED `apply-environment`.
+#
+# NO RECEIPT, NOTHING WRITTEN BACK (SSO-3717; ADR 2026-10-15-platform-is-the-ledger): the apply job ends at "Applied"
+# and holds no write permission on the repository. Removals are never automated unless `.thoryn/workflow.yaml` says so
+# (`apply.prune` / `apply.destroy`, both false by default). A red job uploads the SSO-3710 FIX REQUEST artifact
+# (`thoryn-provision-request`) for the App to relay onto the check run.
+#
+# RUNNERS. `runs-on` is an input (a label, or a JSON array of labels for a self-hosted pool). A runner needs bash, gh,
+# jq and curl; Java is set up by the job. Note that a trust pinned "GitHub-hosted runners only" refuses a self-hosted
+# job's token at the exchange — the pin is the customer's, on their trust.
+#
+# CLI VERSION. `cli-version` empty ⇒ the release THIS file was called at: `job.workflow_ref` names the workflow file that
+# defines the current job WITH its ref — for a called job the reusable workflow, e.g.
+# `thoryn-io/thoryn-cli/.github/workflows/provisioning.yml@refs/tags/cli-v0.36.0` (`github.workflow_ref` names the
+# CALLER's stub instead) — so a stub pinned `@cli-v0.36.0` runs cli-v0.36.0 with no second pin to keep in step. A
+# ref that is not a cli-v* tag (a stub pinned `@main` or a sha) falls back to the latest cli-v* release, with a notice.
+#
+# Every `inputs.*` / `github.*` value reaches a shell only through `env:` (the template-injection rule, oauthy SSO-3635).
+name: Thoryn provisioning (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      mode:
+        description: "plan (pull request, read-only) or apply (default branch, reviewed) — forwarded from the App's dispatch input"
+        required: true
+        type: string
+      head_sha:
+        description: "The commit to plan or apply — forwarded"
+        required: true
+        type: string
+      check_run_id:
+        description: "The Thoryn GitHub App check run this run reports to — forwarded"
+        required: true
+        type: string
+      pr_number:
+        description: "The pull request (plan only) — forwarded"
+        required: false
+        type: string
+        default: ""
+      plan-environment:
+        description: "The UNPROTECTED GitHub environment the plan job runs in (the trust's plan profile is keyed on it)"
+        required: true
+        type: string
+      apply-environment:
+        description: "The REVIEWED GitHub environment the apply job runs in (required reviewers; the trust pins it)"
+        required: true
+        type: string
+      issuer:
+        description: "Platform base issuer the connection contract derives the workspace issuer from (THORYN_ISSUER / THORYN_HUB)"
+        required: false
+        type: string
+        default: "https://auth.thoryn.io"
+      cli-version:
+        description: "A cli-v* release to run. Empty: the release tagged at this workflow's own commit, else the latest"
+        required: false
+        type: string
+        default: ""
+      runs-on:
+        description: "Runner label, or a JSON array of labels for a self-hosted pool (needs bash, gh, jq, curl)"
+        required: false
+        type: string
+        default: "ubuntu-latest"
+      timeout-minutes:
+        description: "Job timeout in minutes, each job"
+        required: false
+        type: number
+        default: 30
+      config:
+        description: "Path of the committed run-time configuration (files, env, fixRequest, apply toggles)"
+        required: false
+        type: string
+        default: ".thoryn/workflow.yaml"
+
+env:
+  # The platform base issuer the connection contract derives the workspace's issuer from (both documented spellings).
+  THORYN_ISSUER: ${{ inputs.issuer }}
+  THORYN_HUB: ${{ inputs.issuer }}
+  # Headless runner, no OS keychain: the CLI's documented CI token store (an ephemeral file on this runner).
+  THORYN_CI_PLAINTEXT_TOKENS: "1"
+
+jobs:
+  plan:
+    if: inputs.mode == 'plan'
+    runs-on: ${{ startsWith(inputs.runs-on, '[') && fromJSON(inputs.runs-on) || inputs.runs-on }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    # The CALLER's unprotected plan environment: the hub mints a job here the read-only scopes from the OIDC token's
+    # environment claim. No reviewers — a plan runs on every pull request.
+    environment: ${{ inputs.plan-environment }}
+    permissions:
+      id-token: write
+      checks: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.head_sha }}
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Download the released thoryn CLI
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CLI_VERSION: ${{ inputs.cli-version }}
+          # The whole (small, secret-free) job context: its `workflow_ref` names THIS file with the ref it was called at.
+          JOB_CONTEXT: ${{ toJSON(job) }}
+        run: |
+          set -euo pipefail
+          tag="$CLI_VERSION"
+          if [ -z "$tag" ]; then
+            # The release this reusable workflow was called at: job.workflow_ref = <owner>/<repo>/<path>@<ref>.
+            job_ref="$(jq -r '.workflow_ref // empty' <<<"$JOB_CONTEXT")"
+            case "${job_ref##*@}" in refs/tags/cli-v*) tag="${job_ref##*@refs/tags/}" ;; esac
+          fi
+          if [ -z "$tag" ]; then
+            tag="$(gh release list --repo thoryn-io/thoryn-cli --limit 40 --json tagName -q '.[].tagName' | grep '^cli-v' | head -1)"
+            echo "::notice::the reusable workflow was called at '${job_ref:-an unknown ref}', not a cli-v* release tag; running the latest release $tag — pin the stub's uses: to a cli-v* tag."
+          fi
+          echo "Using thoryn CLI release $tag"
+          gh release download "$tag" --repo thoryn-io/thoryn-cli --pattern thoryn.jar --dir .
+          # This workflow reads .thoryn/workflow.yaml through the CLI; a release predating it cannot.
+          java -jar thoryn.jar provision workflow --help >/dev/null 2>&1 || {
+            echo "::error::release $tag predates 'thoryn provision workflow check' — set cli-version to cli-v0.36.0 or newer (or leave it empty)." >&2; exit 1; }
+      - name: Check the stub and read .thoryn/workflow.yaml
+        id: config
+        env:
+          MODE: ${{ inputs.mode }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          CONFIG: ${{ inputs.config }}
+        run: |
+          set -euo pipefail
+          case "$MODE" in plan|apply) ;; *) echo "::error::mode must be plan or apply (was '$MODE')" >&2; exit 1 ;; esac
+          # github.workflow_ref is the CALLER's workflow: <owner>/<repo>/<path>@<ref> — the stub the App dispatched.
+          stub="${WORKFLOW_REF#*/*/}"; stub="${stub%@*}"
+          report="$RUNNER_TEMP/thoryn-workflow.json"
+          if ! java -jar thoryn.jar provision workflow check --file "$stub" --config "$CONFIG" --output json > "$report"; then
+            java -jar thoryn.jar provision workflow check --file "$stub" --config "$CONFIG" | tee -a "$GITHUB_STEP_SUMMARY" || true
+            echo "::error::the provisioning workflow stub or $CONFIG does not satisfy the contract — the rules above name each fix." >&2
+            exit 1
+          fi
+          { echo "fix-request=$(jq -r '.config.fixRequest' "$report")"; echo "destroy=$(jq -r '.config.apply.destroy' "$report")"; } >> "$GITHUB_OUTPUT"
+          echo "Configuration ($(jq -r '.config.source // "built-in defaults"' "$report")): $(jq -r '[.config.files[].file] | join(", ")' "$report")"
+      - name: Plan every configured file as this repository (the one identity's plan profile)
+        env:
+          # SSO-3710 — where `login --connection` / `provision plan` write the fix request (the CLI's `--fix-request`).
+          THORYN_FIX_REQUEST: ${{ runner.temp }}/thoryn-provision-request.json
+        run: |
+          set -euo pipefail
+          report="$RUNNER_TEMP/thoryn-workflow.json"
+          # env: allow-listed THORYN_* names from the config, EXPORTED (never evaluated); the CLI already refused anything else.
+          while IFS=$'\t' read -r name value; do
+            [ -n "$name" ] || continue
+            [[ "$name" =~ ^THORYN_[A-Z0-9_]+$ ]] || { echo "::error::refusing environment variable '$name'" >&2; exit 1; }
+            export "$name=$value"
+          done < <(jq -r '.config.env | to_entries[] | [.key, (.value | tostring)] | @tsv' "$report")
+          while read -r entry; do
+            file="$(jq -r '.file' <<<"$entry")"; connection="$(jq -r '.connection' <<<"$entry")"
+            java -jar thoryn.jar login --connection "$connection"
+            { echo "## Thoryn provisioning plan: $file"; echo; echo '<pre>'; } >> "$GITHUB_STEP_SUMMARY"
+            java -jar thoryn.jar provision plan --file "$file" | tee -a "$GITHUB_STEP_SUMMARY"
+            echo '</pre>' >> "$GITHUB_STEP_SUMMARY"
+          done < <(jq -c '.config.files[]' "$report")
+      # SSO-3710 — the fix request, for the App to relay onto the check run. Only a failed job has one to upload.
+      - name: Upload the fix request
+        if: failure() && steps.config.outputs.fix-request == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: thoryn-provision-request
+          path: ${{ runner.temp }}/thoryn-provision-request.json
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # thoryn-provisioning: apply-job
+  apply:
+    if: inputs.mode == 'apply'
+    runs-on: ${{ startsWith(inputs.runs-on, '[') && fromJSON(inputs.runs-on) || inputs.runs-on }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    # The CALLER's reviewed environment: a required reviewer approves this run before it starts, and the hub mints the
+    # write-capable token only for a job in this environment.
+    environment: ${{ inputs.apply-environment }}
+    # Read-only on the repository: the job converges the platform and commits nothing back (SSO-3717).
+    permissions:
+      id-token: write
+      checks: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.head_sha }}
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Download the released thoryn CLI
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CLI_VERSION: ${{ inputs.cli-version }}
+          # The whole (small, secret-free) job context: its `workflow_ref` names THIS file with the ref it was called at.
+          JOB_CONTEXT: ${{ toJSON(job) }}
+        run: |
+          set -euo pipefail
+          tag="$CLI_VERSION"
+          if [ -z "$tag" ]; then
+            # The release this reusable workflow was called at: job.workflow_ref = <owner>/<repo>/<path>@<ref>.
+            job_ref="$(jq -r '.workflow_ref // empty' <<<"$JOB_CONTEXT")"
+            case "${job_ref##*@}" in refs/tags/cli-v*) tag="${job_ref##*@refs/tags/}" ;; esac
+          fi
+          if [ -z "$tag" ]; then
+            tag="$(gh release list --repo thoryn-io/thoryn-cli --limit 40 --json tagName -q '.[].tagName' | grep '^cli-v' | head -1)"
+            echo "::notice::the reusable workflow was called at '${job_ref:-an unknown ref}', not a cli-v* release tag; running the latest release $tag — pin the stub's uses: to a cli-v* tag."
+          fi
+          echo "Using thoryn CLI release $tag"
+          gh release download "$tag" --repo thoryn-io/thoryn-cli --pattern thoryn.jar --dir .
+          java -jar thoryn.jar provision workflow --help >/dev/null 2>&1 || {
+            echo "::error::release $tag predates 'thoryn provision workflow check' — set cli-version to cli-v0.36.0 or newer (or leave it empty)." >&2; exit 1; }
+      - name: Check the stub and read .thoryn/workflow.yaml
+        id: config
+        env:
+          MODE: ${{ inputs.mode }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          CONFIG: ${{ inputs.config }}
+        run: |
+          set -euo pipefail
+          case "$MODE" in plan|apply) ;; *) echo "::error::mode must be plan or apply (was '$MODE')" >&2; exit 1 ;; esac
+          stub="${WORKFLOW_REF#*/*/}"; stub="${stub%@*}"
+          report="$RUNNER_TEMP/thoryn-workflow.json"
+          if ! java -jar thoryn.jar provision workflow check --file "$stub" --config "$CONFIG" --output json > "$report"; then
+            java -jar thoryn.jar provision workflow check --file "$stub" --config "$CONFIG" | tee -a "$GITHUB_STEP_SUMMARY" || true
+            echo "::error::the provisioning workflow stub or $CONFIG does not satisfy the contract — the rules above name each fix." >&2
+            exit 1
+          fi
+          { echo "fix-request=$(jq -r '.config.fixRequest' "$report")"; echo "destroy=$(jq -r '.config.apply.destroy' "$report")"; } >> "$GITHUB_OUTPUT"
+          echo "Configuration ($(jq -r '.config.source // "built-in defaults"' "$report")): $(jq -r '[.config.files[].file] | join(", ")' "$report")"
+      - name: Apply every configured file as this repository (reviewed environment)
+        env:
+          # SSO-3710 — where `login --connection` / `provision apply` write the fix request (the CLI's `--fix-request`).
+          THORYN_FIX_REQUEST: ${{ runner.temp }}/thoryn-provision-request.json
+        run: |
+          set -euo pipefail
+          report="$RUNNER_TEMP/thoryn-workflow.json"
+          while IFS=$'\t' read -r name value; do
+            [ -n "$name" ] || continue
+            [[ "$name" =~ ^THORYN_[A-Z0-9_]+$ ]] || { echo "::error::refusing environment variable '$name'" >&2; exit 1; }
+            export "$name=$value"
+          done < <(jq -r '.config.env | to_entries[] | [.key, (.value | tostring)] | @tsv' "$report")
+          prune="$(jq -r '.config.apply.prune' "$report")"
+          confirm="$(jq -r '.config.apply.confirm' "$report")"
+          while read -r entry; do
+            file="$(jq -r '.file' <<<"$entry")"; connection="$(jq -r '.connection' <<<"$entry")"
+            java -jar thoryn.jar login --connection "$connection"
+            args=(provision apply --file "$file" --yes)
+            # Removals only when the committed configuration says so (both false by default): --prune drops what the
+            # file no longer declares; a production-plane removal additionally needs the workspace slug (SSO-2413).
+            if [ "$prune" = "true" ]; then args+=(--prune); fi
+            if [ -n "$confirm" ]; then args+=(--confirm "$confirm"); fi
+            { echo "## Applied: $file"; echo; echo '<pre>'; } >> "$GITHUB_STEP_SUMMARY"
+            java -jar thoryn.jar "${args[@]}" | tee -a "$GITHUB_STEP_SUMMARY"
+            echo '</pre>' >> "$GITHUB_STEP_SUMMARY"
+          done < <(jq -c '.config.files[]' "$report")
+      # `apply.destroy: true` in .thoryn/workflow.yaml — an ephemeral fixture (an e2e sandbox) is torn down after it was
+      # converged. Never the default: a repository's standing resources are kept.
+      - name: Destroy what the files own (apply.destroy is true)
+        if: steps.config.outputs.destroy == 'true'
+        run: |
+          set -euo pipefail
+          report="$RUNNER_TEMP/thoryn-workflow.json"
+          confirm="$(jq -r '.config.apply.confirm' "$report")"
+          while read -r entry; do
+            file="$(jq -r '.file' <<<"$entry")"; connection="$(jq -r '.connection' <<<"$entry")"
+            java -jar thoryn.jar login --connection "$connection"
+            args=(provision destroy --file "$file" --yes)
+            if [ -n "$confirm" ]; then args+=(--confirm "$confirm"); fi
+            java -jar thoryn.jar "${args[@]}" | tee -a "$GITHUB_STEP_SUMMARY"
+          done < <(jq -c '.config.files[] ' "$report")
+      - name: Upload the fix request
+        if: failure() && steps.config.outputs.fix-request == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: thoryn-provision-request
+          path: ${{ runner.temp }}/thoryn-provision-request.json
+          if-no-files-found: ignore
+          retention-days: 7
+      - name: Applied
+        env:
+          APPLY_ENVIRONMENT: ${{ inputs.apply-environment }}
+        run: |
+          set -euo pipefail
+          report="$RUNNER_TEMP/thoryn-workflow.json"
+          {
+            echo "## Applied"; echo
+            echo "Applied $(jq -r '.config.files | length' "$report") provisioning file(s) as this repository's own workload identity in the reviewed environment \`$APPLY_ENVIRONMENT\`."
+            echo "Nothing is committed back: the platform is the ledger (what this repository owns is the \`owner\` relation Thoryn holds). Removals ran only as .thoryn/workflow.yaml configured them (prune=$(jq -r '.config.apply.prune' "$report"), destroy=$(jq -r '.config.apply.destroy' "$report"))."
+          } >> "$GITHUB_STEP_SUMMARY"

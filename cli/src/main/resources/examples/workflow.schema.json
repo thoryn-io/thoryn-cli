@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://thoryn.io/examples/workflow.schema.json",
+  "title": "Thoryn provisioning workflow configuration",
+  "description": "SSO-3719 (epic SSO-3304) — `.thoryn/workflow.yaml`: the RUN-TIME configuration of the reusable provisioning workflow thoryn-io/thoryn-cli/.github/workflows/provisioning.yml. The stub a repository keeps (`.github/workflows/thoryn-provisioning.yml`) carries the JOB-SHAPE knobs as `with:` inputs (environments, runner, issuer, cli-version, timeout); this file carries what the jobs do at run time. Committed, DATA, validated by `thoryn provision workflow check`. Unknown keys are refused: a knob that is not here is a product gap to report, never a script to write — the identity (the job's OIDC token) and the review gate (the job's GitHub environment) must stay inside the reusable workflow.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["apiVersion"],
+  "properties": {
+    "apiVersion": { "const": "thoryn.io/workflow/v1" },
+    "provider": {
+      "description": "The forge whose job token is the repository's identity. `github_actions` only today: a Forgejo trust exists on the hub (oauthy converge ADR Amendment 3) but `thoryn login --connection` cannot exchange a Forgejo job token yet — a recorded product gap.",
+      "type": "string",
+      "enum": ["github_actions"],
+      "default": "github_actions"
+    },
+    "files": {
+      "description": "The provisioning files to plan (on a pull request) and apply (on the default branch), in order — one or many: a production file and sandbox files. Default: .thoryn/provision.yaml with .thoryn/connection.json.",
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["file"],
+        "properties": {
+          "file": { "description": "Relative path of a thoryn.io/provision/v1 file.", "type": "string", "pattern": "^(?!/)[A-Za-z0-9_./@-]{1,512}$" },
+          "connection": { "description": "Relative path of the connection contract that signs in for this file. Default: connection.json beside the file (the layout the Thoryn GitHub App seeds).", "type": "string", "pattern": "^(?!/)[A-Za-z0-9_./@-]{1,512}$" }
+        }
+      }
+    },
+    "env": {
+      "description": "Extra environment variables for the CLI — ALLOW-LISTED NAMES ONLY: THORYN_* (the CLI's own variables and the {{env.NAME}} placeholders a provisioning file reads), not one the reusable workflow sets itself (THORYN_ISSUER, THORYN_HUB, THORYN_FIX_REQUEST, THORYN_CI_PLAINTEXT_TOKENS, …), never credential-shaped (*_SECRET, *_PASSWORD, *_TOKEN, *_KEY). Values are exported to the CLI's steps, never evaluated as shell.",
+      "type": "object",
+      "propertyNames": { "pattern": "^THORYN_[A-Z0-9_]{1,120}$" },
+      "additionalProperties": { "type": ["string", "number", "boolean"], "maxLength": 1024 }
+    },
+    "fixRequest": {
+      "description": "Upload the SSO-3710 fix request (`thoryn-provision-request`) when a job is red on a missing right, so the Thoryn GitHub App can name the fix on the check run.",
+      "type": "boolean",
+      "default": true
+    },
+    "apply": {
+      "description": "Apply-time toggles. Removals are NEVER on by default.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "prune": { "description": "Pass --prune: remove owned resources the file no longer declares.", "type": "boolean", "default": false },
+        "destroy": { "description": "Run `thoryn provision destroy` after a successful apply (an ephemeral fixture, e.g. an e2e sandbox).", "type": "boolean", "default": false },
+        "confirm": { "description": "The workspace slug confirming production-plane removals (the SSO-2413 gate); empty when nothing on the production plane is ever removed.", "type": "string", "pattern": "^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)?$", "default": "" }
+      }
+    }
+  }
+}

@@ -9,8 +9,9 @@ the same two files and the same commands.
 | `connection.json` | **who I am** — the `thoryn` workspace and the **workload identity trust** CI signs in under: the trust's `wi_…` client id, its audience, its GitHub pins and the exact scope set. No secret, no env var naming one (SSO-3690) | `cli/src/main/resources/examples/connection.schema.json` (SSO-2948) | `thoryn login --connection .thoryn/connection.json` |
 | `provision.yaml` | **what I own** — the desired state: the CLI's own login client `cli` in the `thoryn` workspace (SSO-3104; this repository's CI identity is its platform `owner`, SSO-3697), plus a sandbox environment `cli-ci` — whose one grant makes the CI identity its `manager` — with a public loopback OAuth client inside it | `engine/src/main/resources/provision/provision.schema.json` (SSO-3088) | `thoryn provision plan / apply / destroy --file .thoryn/provision.yaml` |
 | `trusts.provision.yaml` | **the one trust, declared** (SSO-3689 `kind: workloadIdentityTrust`; SSO-3697 / SSO-3705 / SSO-3704) — `thoryn-cli-ci`, adopted, production plane, with its two profiles: the reviewed apply environment and the **plan profile** `spec.plan` keyed on `thoryn-provision-e2e-plan` (read-only by construction). Applied by a **founder**, never by CI: a production-plane trust is reached through the workspace, and a file cannot declare its own bootstrap trust | the provision schema | `thoryn provision plan / apply --file .thoryn/trusts.provision.yaml` (founder session) |
-| `provision.receipt.json` | the **ownership ledger** of `provision.yaml` — committed since SSO-3697: the App's apply job opens it as a receipt pull request | written by the engine | — |
+| `provision.receipt.json` | the **ownership ledger** of `provision.yaml` — committed since SSO-3697, when the App's apply job opened it as a receipt pull request; since SSO-3717 / SSO-3719 the apply job opens none and since SSO-3715 (#132) the engine writes no receipt at all (the platform is the ledger, oauthy ADR 2026-10-15) — the committed copy is a leftover to delete | written by the engine | — |
 | _(run artifact, never committed)_ `thoryn-provision-request` | the **fix request** (SSO-3710): when a job is red on a missing RIGHT — the trust's plan profile, `owner` on a declared resource, `manager` on a parent environment — the CLI writes `thoryn-provision-request.json` naming each right and the exact command a workspace admin runs; the workflows upload it `if: failure()` and the Thoryn GitHub App relays it onto the check run (two options: the commands, or a web consent — oauthy SSO-3711/3712) | `engine/src/main/resources/provision/fix-request.schema.json` | `thoryn login --connection --fix-request <path>` · `thoryn provision plan\|apply --fix-request <path>` (env `THORYN_FIX_REQUEST`) |
+| `workflow.yaml` | **how the App-dispatched workflow runs** (SSO-3719): the run-time configuration the reusable workflow `thoryn-io/thoryn-cli/.github/workflows/provisioning.yml` reads — which provisioning files with which connections (one or many), `THORYN_*` env vars for the CLI, whether to upload the fix request, the apply toggles (`prune` / `destroy`, never on by default). This repository's copy states the defaults. Unknown keys are refused: a knob that is not there is a product gap, not a script | `cli/src/main/resources/examples/workflow.schema.json` | `thoryn provision workflow check` |
 
 The provisioning Action (`.github/actions/provision`) runs, in order:
 
@@ -177,11 +178,24 @@ for plan and apply (SSO-3699 option B, product owner 2026-10-14 — oauthy ADR
 `2026-10-14-plan-identity-and-resource-ownership.md`). The manual `provision-e2e` dispatch stays as the manual path
 (apply, confinement assertions, destroy).
 
+**The workflow is a stub (SSO-3719).** `.github/workflows/thoryn-provisioning.yml` is ~25 lines: the App's four
+`workflow_dispatch` inputs, the `run-name` carrying the check-run id, `permissions: {}`, the `# thoryn-provisioning:
+apply-job` marker, and ONE job that `uses:` the **reusable workflow this repository ships** —
+`thoryn-io/thoryn-cli/.github/workflows/provisioning.yml@cli-v0.36.0` — with the two environments
+(`thoryn-provision-e2e-plan`, `thoryn-provision-e2e`) and the staging issuer as `with:` inputs. What the jobs do at run time
+is `.thoryn/workflow.yaml` (this repository's copy spells out the defaults). Both are linted by `thoryn provision workflow
+check`, which the reusable workflow itself runs first in every job. The pin selects the CLI too: the called job reads
+`job.workflow_ref` and downloads the `thoryn.jar` of that release, so there is no second version to keep in step. **To
+change how this repository provisions, edit the stub's `with:` or `workflow.yaml` — never the jobs**; a knob that is
+missing is a product gap (README "Configure the provisioning workflow"). The same stub is what a customer repository
+keeps; the full contract between the App and the reusable workflow is `docs/provisioning-workflow-contract.md`.
+
 **The developer story.**
 
 1. You open a pull request that changes anything under `.thoryn/`. The Thoryn GitHub App opens a **"Thoryn
    provisioning plan"** check run and dispatches `.github/workflows/thoryn-provisioning.yml` with `mode=plan`
-   (the PR head as `head_sha`; the run-name carries `check-run:<id>`). The `plan` job runs in the unprotected
+   (the PR head as `head_sha`; the run-name carries `check-run:<id>`). The stub calls the reusable workflow, whose
+   `plan` job — in THIS repository's run, under this repository's environments — runs in the unprotected
    GitHub environment **`thoryn-provision-e2e-plan`** and signs in with the **same `connection.json`** as the
    apply — the one trust `thoryn-cli-ci`. What makes that sign-in read-only is the trust's **plan profile** on
    the hub (SSO-3700/SSO-3701; declared as `spec.plan` in `trusts.provision.yaml`, SSO-3704): the hub reads the
@@ -195,10 +209,10 @@ for plan and apply (SSO-3699 option B, product owner 2026-10-14 — oauthy ADR
 2. The PR is reviewed and merged. The App opens **"Thoryn provisioning apply"** and dispatches `mode=apply`.
    The `apply` job (`# thoryn-provisioning: apply-job`) runs in the **reviewed** environment
    **`thoryn-provision-e2e`**: GitHub holds it for a required reviewer *before* any token can be minted. It
-   signs in as `thoryn-cli-ci` through the composite Action pinned to `cli-v0.34.0` (`destroy: "false"` — never
-   `--prune`, never `destroy` from automation), is minted the trust's six write-capable scopes, converges the file,
-   and opens a **receipt pull request** (`thoryn/receipt-<sha7>`) carrying `.thoryn/provision.receipt.json`. Merging
-   it keeps the ledger beside the file it records.
+   signs in as `thoryn-cli-ci` with the `thoryn.jar` of the release the stub pins (`cli-v0.36.0`; `--prune` and
+   `destroy` only if `.thoryn/workflow.yaml` says so — it does not), is minted the trust's six write-capable scopes,
+   converges the file, and ends at **Applied**. Nothing is written back and no receipt pull request is opened
+   (SSO-3717; oauthy ADR 2026-10-15 — the platform is the ledger): the job holds `contents: read` only.
 3. A dispatched run executes on `main` in **both** modes (the OIDC `ref` is `refs/heads/main` either way), so
    the GitHub **environment is the only pin** separating "may read" from "may write" — and it separates two
    *profiles of one trust*, not two trusts: the plan profile can carry only `.read` scopes
@@ -267,8 +281,8 @@ thoryn access revoke client:wi_10a7b379c79f7d1353f5798d viewer application:cli
 #          `application/cli`, `environment/ci`, `application/loopback-rp` without an error — the `application/cli`
 #          row included (the owner is the one planning it);
 #       2. merge it: the App dispatches `mode=apply`, GitHub HOLDS the run in `thoryn-provision-e2e` for a required
-#          reviewer; approve it — the job signs in with the write scopes, converges, and opens the receipt PR
-#          `thoryn/receipt-<sha7>`; merge that too;
+#          reviewer; approve it — the job signs in with the write scopes, converges, and its summary ends at
+#          "Applied" (no receipt pull request — the platform is the ledger, SSO-3717);
 #       3. `thoryn audit list` shows wi_10a7… as the actor of both runs, the exchange rows naming
 #          `profile=plan environment=thoryn-provision-e2e-plan` and `profile=apply environment=thoryn-provision-e2e`.
 #     provision-e2e (the manual path) needs none of (a)–(d): dispatch it on main — expected green.

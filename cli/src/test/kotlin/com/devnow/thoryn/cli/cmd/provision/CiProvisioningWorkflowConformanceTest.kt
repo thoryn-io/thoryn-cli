@@ -4,125 +4,112 @@ import com.devnow.thoryn.cli.cmd.connection.Connection
 import com.devnow.thoryn.cli.cmd.provision.CiIdentityFixture.CONNECTION_PATH
 import com.devnow.thoryn.cli.cmd.provision.CiIdentityFixture.PROVISIONING_WORKFLOW_PATH
 import com.devnow.thoryn.cli.cmd.provision.CiIdentityFixture.PROVISION_PATH
+import com.devnow.thoryn.cli.cmd.provision.CiIdentityFixture.REUSABLE_WORKFLOW_PATH
+import com.devnow.thoryn.cli.cmd.provision.CiIdentityFixture.WORKFLOW_CONFIG_PATH
 import com.devnow.thoryn.cli.cmd.provision.CiIdentityFixture.locate
+import com.devnow.thoryn.cli.cmd.provision.CiIdentityFixture.repositoryRoot
+import com.devnow.thoryn.cli.cmd.provision.workflow.ProvisioningWorkflowContract
+import com.devnow.thoryn.cli.cmd.provision.workflow.WorkflowCheck
+import com.devnow.thoryn.cli.cmd.provision.workflow.WorkflowConfig
 import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.api.Test
 import tools.jackson.databind.JsonNode
 import tools.jackson.dataformat.yaml.YAMLMapper
 
 /**
- * SSO-3697 / SSO-3705 (parent SSO-3659) — holds `.github/workflows/thoryn-provisioning.yml` to the Thoryn GitHub
- * App's dispatch contract (oauthy `ThorynFiles.kt`, SSO-3660 / SSO-3665; the hand-adapted template is
- * thoryn-cicd's) and to Amendment 5's two-environment shape with ONE identity (SSO-3699 option B):
+ * SSO-3697 / SSO-3705 / SSO-3719 (parent SSO-3659, epic SSO-3304) — holds THIS repository's App-dispatched workflow to
+ * the provisioning workflow contract through the SAME rule engine `thoryn provision workflow check` runs
+ * ([WorkflowCheck] over [ProvisioningWorkflowContract] — one source), plus the pins only this repository knows:
  *
- *  - `workflow_dispatch` with exactly the inputs the App sends (`mode`, `head_sha`, `check_run_id`, `pr_number`),
- *    a `run-name` carrying `check-run:<id>` (how the App finds the run to complete its check), concurrency per
- *    mode, and `permissions: {}` at the top (each job declares its own);
- *  - a `plan` job in the UNPROTECTED plan environment with `id-token: write`, `checks: write`, `contents: read` —
- *    exactly — that checks out `inputs.head_sha`, downloads `thoryn.jar` from the pinned release, signs in with
- *    the ONE connection contract (`connection.json` — the hub's plan profile makes that sign-in read-only in this
- *    environment) and plans the provisioning file; never a second contract;
- *  - an `apply` job, announced by the `# thoryn-provisioning: apply-job` marker the App looks for before dispatching
- *    `apply`, in the REVIEWED environment with `id-token: write`, `checks: write`, `contents: write`,
- *    `pull-requests: write` — exactly — running the composite Action pinned to the release with the same
- *    connection, `destroy: "false"`, and then the receipt pull request;
- *  - no secret anywhere, and no `${{ }}` inside a `run:` block (the template-injection rule, oauthy SSO-3635).
+ *  - `.github/workflows/thoryn-provisioning.yml` is the SUPPORTED shape — a STUB: the App's four `workflow_dispatch`
+ *    inputs, the `run-name` carrying `check-run:<id>`, concurrency per mode, `permissions: {}` at the top, the apply-job
+ *    marker, and ONE job that `uses:` the reusable workflow at [CiIdentityFixture.CLI_RELEASE] with the two environments
+ *    (the unprotected `-plan` one and the reviewed one `connection.json` pins — Amendment 5's shape with ONE identity,
+ *    SSO-3699 option B), the staging issuer, and `id-token: write`, `checks: write`, `contents: read`;
+ *  - `.github/workflows/provisioning.yml` — the reusable workflow — passes the called-side rules, declares exactly the
+ *    contract's inputs, carries the apply-job marker, writes nothing back (SSO-3717: no receipt pull request), and runs
+ *    nothing but the pinned release's own `thoryn.jar`;
+ *  - `.thoryn/workflow.yaml` is valid, names exactly `provision.yaml` + `connection.json`, and switches no removal on.
  */
 class CiProvisioningWorkflowConformanceTest {
 
-    private val workflowFile = locate(PROVISIONING_WORKFLOW_PATH)
-    private val text = workflowFile.readText()
-    private val workflow: JsonNode = YAMLMapper.builder().build().readTree(text)
-    private val plan: JsonNode get() = workflow["jobs"]["plan"]
-    private val apply: JsonNode get() = workflow["jobs"]["apply"]
+    private val root = repositoryRoot()
+    private val stubFile = locate(PROVISIONING_WORKFLOW_PATH)
+    private val stubText = stubFile.readText()
+    private val stub: JsonNode = YAMLMapper.builder().build().readTree(stubText)
     private val connection: Connection = Connection.load(locate(CONNECTION_PATH))
-
-    private fun JsonNode.keys(): Set<String> = properties().map { it.key }.toSet()
-    private fun JsonNode.steps(): List<JsonNode> = this["steps"].toList()
-    private fun JsonNode.permissions(): Map<String, String> = this["permissions"].properties().associate { it.key to it.value.asString() }
+    private val report = WorkflowCheck.evaluate(stubText, PROVISIONING_WORKFLOW_PATH, root = root)
 
     @Test
-    fun `the workflow is dispatched by the App with exactly its four inputs, a run-name carrying the check-run id, concurrency per mode and no top-level permissions`() {
-        assertThat(workflow["name"].asString()).isEqualTo("Thoryn provisioning")
-        assertThat(workflow["run-name"].asString()).contains("check-run:\${{ inputs.check_run_id }}")
-        val on = workflow["on"]
-        assertThat(on.keys()).containsExactly("workflow_dispatch")
-        val inputs = on["workflow_dispatch"]["inputs"]
-        assertThat(inputs.keys()).containsExactlyInAnyOrder("mode", "head_sha", "check_run_id", "pr_number")
-        val modes: List<String> = inputs["mode"]["options"].toList().map { it.asString() }
-        assertThat(modes).containsExactly("plan", "apply")
-        listOf("mode", "head_sha", "check_run_id").forEach { assertThat(inputs[it]["required"].asBoolean()).withFailMessage("input %s is required", it).isTrue() }
-        assertThat(inputs["pr_number"]["required"].asBoolean()).isFalse()
-        assertThat(workflow["concurrency"]["group"].asString()).isEqualTo("thoryn-provisioning-\${{ inputs.mode }}")
-        assertThat(workflow["concurrency"]["cancel-in-progress"].asBoolean()).isFalse()
-        // `permissions: {}` at the top — every job declares exactly what it needs.
-        assertThat(workflow["permissions"].isObject() && workflow["permissions"].isEmpty).withFailMessage("top-level permissions must be {}").isTrue()
-        assertThat(workflow["jobs"].keys()).containsExactly("plan", "apply")
-        assertThat(workflow["env"]["THORYN_CLI_RELEASE"].asString()).isEqualTo(CiIdentityFixture.CLI_RELEASE)
-        assertThat(workflow["env"]["THORYN_ISSUER"].asString()).isEqualTo(CiIdentityFixture.PLATFORM_ISSUER)
+    fun `the App-dispatched workflow is the supported shape and passes every rule of the contract`() {
+        assertThat(report.shape).isEqualTo(WorkflowCheck.Shape.STUB)
+        assertThat(report.rules.filter { it.failed }).withFailMessage("%s", report.rules.filter { it.failed }).isEmpty()
+        assertThat(report.ok).isTrue()
+        assertThat(stub["name"].asString()).isEqualTo("Thoryn provisioning")
+        // ~25 lines of YAML: everything else lives in the reusable workflow and .thoryn/workflow.yaml.
+        assertThat(stubText.lines().count { it.isNotBlank() && !it.trimStart().startsWith("#") }).isLessThanOrEqualTo(45)
     }
 
     @Test
-    fun `the plan job runs in the UNPROTECTED plan environment with read permissions only and plans the file as the ONE identity`() {
-        assertThat(plan["if"].asString()).isEqualTo("inputs.mode == 'plan'")
-        // The environment IS the read/write separation (Amendment 5): the hub's plan profile keys on it, so it must be
-        // the `-plan` one, never the reviewed environment the trust pins for apply.
-        assertThat(plan["environment"].asString()).isEqualTo(CiIdentityFixture.PLAN_GITHUB_ENVIRONMENT)
-        assertThat(plan["environment"].asString()).isNotEqualTo(connection.github!!.environment)
-        assertThat(plan.permissions()).isEqualTo(mapOf("id-token" to "write", "checks" to "write", "contents" to "read"))
-        val steps = plan.steps()
-        assertThat(steps.first()["uses"].asString()).startsWith("actions/checkout@")
-        assertThat(steps.first()["with"]["ref"].asString()).isEqualTo("\${{ inputs.head_sha }}")
-        val runs = steps.mapNotNull { it["run"]?.asString() }
-        assertThat(runs).anyMatch { it.contains("gh release download \"\$THORYN_CLI_RELEASE\" --repo thoryn-io/thoryn-cli --pattern thoryn.jar") }
-        val planStep = runs.single { it.contains("provision plan") }
-        // SSO-3705 — ONE identity: the plan signs in with the same contract as the apply; there is no plan contract.
-        assertThat(planStep).contains("login --connection \"$CONNECTION_PATH\"")
-        assertThat(text).doesNotContain("connection.plan.json")
-        assertThat(planStep).contains("provision plan --file \"$PROVISION_PATH\"")
-        assertThat(planStep).contains("GITHUB_STEP_SUMMARY")
-        assertThat(planStep).doesNotContain("provision apply").doesNotContain("provision destroy")
+    fun `the stub pins the reusable workflow to the release, the two environments connection json implies, and the staging issuer`() {
+        val job = stub["jobs"].properties().single().value
+        assertThat(job["uses"].asString()).isEqualTo("${ProvisioningWorkflowContract.REUSABLE_WORKFLOW}@${CiIdentityFixture.CLI_RELEASE}")
+        assertThat(ProvisioningWorkflowContract.isAtLeastMinimumRelease(CiIdentityFixture.CLI_RELEASE)).isTrue()
+        val inputs = report.inputs!!
+        // The environment IS the read/write separation (Amendment 5): the hub's plan profile keys on the `-plan` one, the
+        // trust pins the reviewed one — never the same, and the apply one is what connection.json declares.
+        assertThat(inputs["plan-environment"]).isEqualTo(CiIdentityFixture.PLAN_GITHUB_ENVIRONMENT)
+        assertThat(inputs["apply-environment"]).isEqualTo(CiIdentityFixture.GITHUB_ENVIRONMENT)
+        assertThat(inputs["apply-environment"]).isEqualTo(connection.github!!.environment)
+        assertThat(inputs["plan-environment"]).isNotEqualTo(connection.github!!.environment)
+        assertThat(inputs["issuer"]).isEqualTo(CiIdentityFixture.PLATFORM_ISSUER)
+        // Not pinned twice: the reusable workflow runs the release it was called at.
+        assertThat(inputs["cli-version"]).isEmpty()
+        assertThat(inputs["runs-on"]).isEqualTo("ubuntu-latest") // the trust pins GitHub-hosted runners
+        ProvisioningWorkflowContract.DISPATCH_INPUTS.keys.forEach { assertThat(inputs[it]).isEqualTo(ProvisioningWorkflowContract.forwarded(it)) }
     }
 
     @Test
-    fun `the apply job carries the App's marker, runs in the REVIEWED environment with the write permissions exactly, applies through the pinned Action without destroy and opens the receipt pull request`() {
-        // The App dispatches `apply` only when this marker is present.
+    fun `the committed workflow yaml names exactly provision yaml with its connection and switches no removal on`() {
+        val config = WorkflowConfig.load(locate(WORKFLOW_CONFIG_PATH))
+        assertThat(report.config!!.source).isEqualTo(WORKFLOW_CONFIG_PATH)
+        assertThat(config.files).containsExactly(WorkflowConfig.FileEntry(PROVISION_PATH, CONNECTION_PATH))
+        assertThat(config.env).isEmpty()
+        assertThat(config.fixRequest).isTrue()
+        assertThat(config.prune).isFalse()
+        assertThat(config.destroy).isFalse()
+        assertThat(config.confirm).isNull()
+        // SSO-3705 — ONE identity: there is no plan contract anywhere.
+        assertThat(stubText).doesNotContain("connection.plan.json")
+    }
+
+    @Test
+    fun `the reusable workflow passes the called-side rules, runs only the pinned release, and writes nothing back`() {
+        val file = locate(REUSABLE_WORKFLOW_PATH)
+        val text = file.readText()
+        val reusable = WorkflowCheck.evaluate(text, REUSABLE_WORKFLOW_PATH, root = root)
+        assertThat(reusable.shape).isEqualTo(WorkflowCheck.Shape.REUSABLE)
+        assertThat(reusable.rules.filter { it.failed }).withFailMessage("%s", reusable.rules.filter { it.failed }).isEmpty()
+        val doc = YAMLMapper.builder().build().readTree(text)
+        assertThat(doc["jobs"].propertyNames().toList()).containsExactly("plan", "apply")
+        // The App dispatches `apply` only when it sees this marker; the stub carries it, and so does the job it points at.
         assertThat(text).containsPattern("(?m)^\\s*# thoryn-provisioning: apply-job\\s*$")
-        assertThat(apply["if"].asString()).isEqualTo("inputs.mode == 'apply'")
-        assertThat(apply["environment"].asString()).isEqualTo(CiIdentityFixture.GITHUB_ENVIRONMENT)
-        assertThat(apply["environment"].asString()).isEqualTo(connection.github!!.environment)
-        assertThat(apply.permissions()).isEqualTo(mapOf("id-token" to "write", "checks" to "write", "contents" to "write", "pull-requests" to "write"))
-        val steps = apply.steps()
-        assertThat(steps.first()["uses"].asString()).startsWith("actions/checkout@")
-        assertThat(steps.first()["with"]["ref"].asString()).isEqualTo("\${{ inputs.head_sha }}")
-        val action = steps.single { it["uses"]?.asString()?.contains("/.github/actions/provision@") == true }
-        assertThat(action["uses"].asString()).isEqualTo("thoryn-io/thoryn-cli/.github/actions/provision@${CiIdentityFixture.CLI_RELEASE}")
-        val with = action["with"]
-        assertThat(with["connection"].asString()).isEqualTo(CONNECTION_PATH)
-        assertThat(with["file"].asString()).isEqualTo(PROVISION_PATH)
-        assertThat(with["issuer"].asString()).isEqualTo(CiIdentityFixture.PLATFORM_ISSUER)
-        assertThat(with["cli-version"].asString()).isEqualTo(CiIdentityFixture.CLI_RELEASE)
-        // Removals are never automated: destroy off, and nothing passes --prune.
-        assertThat(with["destroy"].asString()).isEqualTo("false")
-        assertThat(with.keys()).doesNotContain("client-secret")
-        (plan.steps() + apply.steps()).forEach { step ->
-            step["run"]?.asString()?.let { assertThat(it).doesNotContain("--prune").doesNotContain("provision destroy") }
-            step["with"]?.properties()?.forEach { assertThat(it.value.asString()).doesNotContain("--prune") }
+        assertThat(stubText).containsPattern("(?m)^\\s*# thoryn-provisioning: apply-job\\s*$")
+        // No receipt pull request, no write permission (SSO-3717 / ADR 2026-10-15 platform-is-the-ledger).
+        assertThat(text).doesNotContain("gh pr create").doesNotContain("receipt pull request").doesNotContain("contents: write").doesNotContain("pull-requests")
+        // The CLI it runs is the release it was called at (job.workflow_ref), never a hardcoded tag.
+        assertThat(text).doesNotContain("THORYN_CLI_RELEASE").doesNotContain("/.github/actions/provision@").doesNotContain("cli-version: cli-v")
+            .contains("job_ref").contains("refs/tags/cli-v*")
+        assertThat(text).contains("gh release download \"\$tag\" --repo thoryn-io/thoryn-cli --pattern thoryn.jar")
+        // The one identity signs in from the configured connection for every file; nothing is pruned or destroyed outside the config's toggles.
+        listOf("plan", "apply").forEach { job ->
+            val runs = doc["jobs"][job]["steps"].toList().mapNotNull { it["run"]?.asString() }
+            assertThat(runs).anyMatch { it.contains("login --connection \"\$connection\"") }
+            assertThat(runs).anyMatch { it.contains("provision $job --file \"\$file\"") }
         }
-        val receipt = steps.last()
-        assertThat(receipt["run"].asString()).contains("git add -- ':(glob).thoryn/**/*.receipt.json'")
-        assertThat(receipt["run"].asString()).contains("thoryn/receipt-\$short")
-        assertThat(receipt["run"].asString()).contains("gh pr create")
-        assertThat(receipt["env"]["HEAD_SHA"].asString()).isEqualTo("\${{ inputs.head_sha }}")
-    }
-
-    @Test
-    fun `the workflow injects no secret and interpolates no expression into a run block`() {
-        assertThat(text).doesNotContain("secrets.")
-        assertThat(text).doesNotContain("THORYN_CLI_CI_CLIENT_SECRET")
-        // SSO-3635: a `${{ }}` inside `run:` lands in the shell's SOURCE; every value reaches a script through `env:`.
-        (plan.steps() + apply.steps()).mapNotNull { it["run"]?.asString() }.forEach { run ->
-            assertThat(run).withFailMessage("a run block interpolates an expression:\n%s", run).doesNotContain("\${{")
-        }
+        val applyRuns = doc["jobs"]["apply"]["steps"].toList().mapNotNull { it["run"]?.asString() }.joinToString("\n")
+        assertThat(applyRuns).contains("if [ \"\$prune\" = \"true\" ]; then args+=(--prune); fi")
+        val destroy = doc["jobs"]["apply"]["steps"].toList().single { it["run"]?.asString()?.contains("provision destroy") == true }
+        assertThat(destroy["if"].asString()).isEqualTo("steps.config.outputs.destroy == 'true'")
     }
 }
