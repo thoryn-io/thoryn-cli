@@ -107,7 +107,8 @@ data class FixRequest(
     }
 
     /**
-     * One missing right. [objectRef] is the platform object (`application:cli`, `environment:<id>`, `trust:<name>`),
+     * One missing right. [objectRef] is the platform object (`application:cli`, `environment:<id>`, `trust:<id>`, or
+     * `trust:<name>` for a trust named by its name — a plan profile, or SSO-3774 a trust the identity cannot see),
      * [subject] the identity to grant it to (`client:<wi_>`; null for a plan profile, which is set on the trust),
      * [environment] the GitHub environment a [Kind.PLAN_PROFILE] is for, [reason] the engine's row reason or the
      * sign-in's finding, and [cli] the command a workspace admin runs — null when the right is a DISPUTE the CLI
@@ -244,6 +245,29 @@ data class FixRequest(
         fun manager(subject: String?, parentRef: String, reason: String): MissingRight =
             MissingRight(Kind.MANAGER, parentRef, subject, null, reason, grantCommand(subject, AccessRefs.RELATION_MANAGER, parentRef))
 
+        /**
+         * SSO-3774 (oauthy ADR 2026-10-16 §4) — a right on a workload-identity trust this identity cannot SEE, so it names
+         * the trust by NAME: [objectRef] `trust:<name>` (the file's resource name, which is the trust's name on the API and
+         * unique in the file; the consumer re-reads the file for its plane and resolves the name to the id as the admin,
+         * as it does for a plan profile). [cli] carries [TRUST_ID_PLACEHOLDER] — `thoryn workload-identity trusts list`
+         * (with `--environment <slug>` for a sandbox) shows the id. A visible trust is named by id instead ([owner]).
+         */
+        fun byName(kind: Kind, subject: String?, trustName: String, plane: String?, reason: String): MissingRight {
+            val relation = when (kind) {
+                Kind.OWNER -> AccessRefs.RELATION_OWNER
+                Kind.VIEWER -> AccessRefs.RELATION_VIEWER
+                Kind.MANAGER -> AccessRefs.RELATION_MANAGER
+                Kind.PLAN_PROFILE -> throw IllegalArgumentException("a plan profile is not a relation")
+            }
+            val where = plane?.takeIf { it != "production" }?.let { " --environment $it" } ?: ""
+            return MissingRight(
+                kind, "${AccessRefs.OBJECT_TYPE_TRUST}:$trustName", subject, null,
+                "$reason; the trust is named here by its NAME '$trustName' in ${plane?.takeIf { it != "production" }?.let { "environment '$it'" } ?: "the production plane"} " +
+                    "(`$LIST_TRUSTS_COMMAND$where` shows its id)",
+                grantCommand(subject, relation, "${AccessRefs.OBJECT_TYPE_TRUST}:$TRUST_ID_PLACEHOLDER"),
+            )
+        }
+
         /** A `readOnly: true` reference the identity holds no relation on: `viewer`. */
         fun viewer(subject: String?, objectRef: String, reason: String): MissingRight =
             MissingRight(Kind.VIEWER, objectRef, subject, null, reason, grantCommand(subject, AccessRefs.RELATION_VIEWER, objectRef))
@@ -253,7 +277,9 @@ data class FixRequest(
          * `ERROR` row (a file fix, a trust the file cannot declare, a scope the identity does not hold) is a note.
          */
         fun fromPlan(plan: ProvisionPlan): Pair<List<MissingRight>, List<String>> {
-            val items = plan.errors.mapNotNull { it.fix }
+            // SSO-3774 — one right, one item: a trust the identity cannot see is refused on its own row AND on every
+            // application naming it, with the same right; the request asks for it once (the first row's reason).
+            val items = plan.errors.mapNotNull { it.fix }.distinctBy { listOf(it.kind, it.objectRef, it.subject, it.environment) }
             val notes = plan.errors.filter { it.fix == null }.map { "${it.kind} ${it.name}: ${it.fixNote ?: it.reason}" }
             return items to notes
         }
@@ -285,7 +311,7 @@ data class FixRequest(
                 when {
                     item.cli != null -> {
                         appendLine("      ${item.cli}")
-                        if (item.cli.contains(TRUST_ID_PLACEHOLDER)) appendLine("      ($TRUST_ID_PLACEHOLDER: `$LIST_TRUSTS_COMMAND` shows the trust pinned to this repository and its id)")
+                        if (item.cli.contains(TRUST_ID_PLACEHOLDER)) appendLine("      ($TRUST_ID_PLACEHOLDER: `$LIST_TRUSTS_COMMAND` shows each trust with its id and pins — the one named above, or the one pinned to this repository)")
                     }
                     else -> appendLine("      (no command runs for you: an admin decides — declare it `readOnly: true`, or move the ownership as the reason says)")
                 }

@@ -78,6 +78,15 @@ internal class FakeProductApi : Dispatcher() {
     var trustNameTakenOnce = false
     /** The page size the trusts list uses (cursor = the offset), so a test can exercise the engine's paging. */
     var trustPageSize = 50
+    /**
+     * SSO-3774 — model product-api AFTER oauthy S1 (SSO-3772, ADR 2026-10-16 §1): a trust is the platform object
+     * `trust:<id>` — ownable (creator-becomes-owner for a `client:` creator; `owner` rendered on the response), contained in
+     * its plane (`manager = this ∪ owner ∪ parent.manager`) — its reads / delete / plan-profile gated on the trust OR its
+     * plane, the list FILTERED to the trusts the caller reaches (404 only when it reaches nothing in the plane), and a
+     * binding needing `manager` on the trust (I4, SSO-3773). Off ⇒ the platform before S1: `trust` is an unknown type
+     * (`400 invalid_type` on `/access/check` and `/access/mine`) and a trust is reached through its plane only.
+     */
+    var trustObjects = true
     // ── SSO-3413 / SSO-3414 — the workspace's ONE custom domain (product-api /api/v1/custom-domain) ──
     /** Custom domains enabled for the workspace (the operator entitlement). */
     var domainEntitled = true
@@ -237,8 +246,14 @@ internal class FakeProductApi : Dispatcher() {
         val seg = route.removePrefix("/api/v1/workload-identity/trusts").trim('/')
         // Environment managers write, viewers read; anyone else (and an unknown plane) is answered 404.
         if (env != null && environments.none { it["slug"] == env }) return problem(404, "environment_not_found")
-        if (!holds(planeRef(env), if (method == "GET") "viewer" else "manager")) return problem(404, "environment_not_found")
-        val visible = trusts.filter { it["_env"] == env }
+        val plane = planeRef(env)
+        val inPlane = trusts.filter { it["_env"] == env }
+        // SSO-3774 (S1) — reach on the TRUST unions with reach on its plane; a caller that reaches nothing in the plane is 404.
+        fun may(t: Map<String, Any?>, relation: String) = holds(plane, relation) || (trustObjects && holds("trust:${t["id"]}", relation))
+        val visible = inPlane.filter { may(it, "viewer") }
+        val creating = seg.isEmpty() && method == "POST"
+        if (creating && !holds(plane, "manager")) return problem(404, "environment_not_found")
+        if (!creating && !holds(plane, "viewer") && visible.isEmpty()) return problem(404, "environment_not_found")
         return when {
             seg.isEmpty() && method == "GET" -> {
                 val q = query(path)
@@ -246,12 +261,12 @@ internal class FakeProductApi : Dispatcher() {
                 val size = q["limit"]?.toIntOrNull() ?: trustPageSize
                 val page = visible.drop(offset).take(size)
                 val next = (offset + size).takeIf { it < visible.size }?.toString()
-                json(200, mapOf("data" to page.map { public(it) }, "pagination" to mapOf("cursor" to next, "hasMore" to (next != null), "total" to visible.size)))
+                json(200, mapOf("data" to page.map { trustView(it) }, "pagination" to mapOf("cursor" to next, "hasMore" to (next != null), "total" to visible.size)))
             }
             seg.isEmpty() && method == "POST" -> createTrust(env, b)
             // SSO-3702 (product-api SSO-3701) — the ONE additive mutation: `POST …/{id}/plan-profile`.
             seg.endsWith("/plan-profile") && method == "POST" -> {
-                val t = visible.firstOrNull { it["id"] == seg.removeSuffix("/plan-profile") } ?: return problem(404, "workload_identity_trust_not_found")
+                val t = visible.firstOrNull { it["id"] == seg.removeSuffix("/plan-profile") && may(it, "manager") } ?: return problem(404, "workload_identity_trust_not_found")
                 if (t["plan"] != null) return problem(409, "plan_profile_already_set")
                 @Suppress("UNCHECKED_CAST")
                 val github = t["github"] as? Map<String, Any?>
@@ -260,14 +275,16 @@ internal class FakeProductApi : Dispatcher() {
                 @Suppress("UNCHECKED_CAST")
                 t["plan"] = plan as Map<String, Any?>
                 t["subjectPatterns"] = listOfNotNull((t["subjectPatterns"] as? List<*>)?.firstOrNull()?.toString(), "^repo:\\Q${github?.get("owner")}/${github?.get("repository")}\\E:environment:\\Q${plan["environment"]}\\E$")
-                json(200, public(t))
+                json(200, trustView(t))
             }
-            method == "GET" -> visible.firstOrNull { it["id"] == seg }?.let { json(200, public(it)) } ?: problem(404, "workload_identity_trust_not_found")
+            method == "GET" -> visible.firstOrNull { it["id"] == seg }?.let { json(200, trustView(it)) } ?: problem(404, "workload_identity_trust_not_found")
             method == "DELETE" -> {
-                val t = visible.firstOrNull { it["id"] == seg } ?: return problem(404, "workload_identity_trust_not_found")
+                val t = visible.firstOrNull { it["id"] == seg && may(it, "manager") } ?: return problem(404, "workload_identity_trust_not_found")
                 // The production plane's destructive-action guard (SSO-2413): the workspace slug in X-Thoryn-Confirm.
                 if (env == null && confirm.isNullOrBlank()) return problem(428, "production_confirmation_required")
-                trusts.remove(t); MockResponse().setResponseCode(204)
+                // SSO-3689 — delete is refused while a login client is bound (hub `409 federated_trust_in_use`).
+                if (applications.any { it["federatedTrust"] == t["id"] }) return problem(409, "federated_trust_in_use")
+                trusts.remove(t); grants.removeIf { it["object"] == "trust:${t["id"]}" }; MockResponse().setResponseCode(204)
             }
             else -> problem(405, "method")
         }
@@ -317,7 +334,9 @@ internal class FakeProductApi : Dispatcher() {
             trustNameTakenOnce = false
             return problem(409, "workload_identity_trust_name_taken")
         }
-        return json(201, public(trusts.first { it["id"] == id }))
+        // SSO-3774 (S1) — creator-becomes-owner for a `client:` creator, rendered on the create response.
+        if (trustObjects) creatorBecomesOwner("trust:$id")
+        return json(201, trustView(trusts.first { it["id"] == id }))
     }
 
     /**
@@ -357,10 +376,13 @@ internal class FakeProductApi : Dispatcher() {
 
     // ── SSO-3667 / SSO-3673 — the platform `owner` relation (one subject per application / environment) ──
 
-    private val ownableTypes = setOf("application", "environment")
+    private val ownableTypes: Set<String> get() = if (trustObjects) setOf("application", "environment", "trust") else setOf("application", "environment")
 
     /** The one `owner` subject of [objectRef], or null. */
     fun ownerOf(objectRef: String): String? = grants.firstOrNull { it["object"] == objectRef && it["relation"] == "owner" }?.get("subject") as String?
+
+    /** SSO-3774 — a trust as product-api renders it: `owner: { subject } | null` after S1, no `owner` field before it. */
+    private fun trustView(rec: Map<String, Any?>): Map<String, Any?> = if (trustObjects) withOwner(rec, "trust:${rec["id"]}") else public(rec)
 
     /** Render a resource the way product-api does since SSO-3667: `owner: { subject } | null` (applications; environments ahead of product-api's EnvironmentResponse). */
     private fun withOwner(rec: Map<String, Any?>, objectRef: String): Map<String, Any?> =
@@ -385,6 +407,7 @@ internal class FakeProductApi : Dispatcher() {
         "login_methods" -> loginMethods.keys.map { "login_methods:${it ?: "production"}" }
         "login_flow" -> activeFlow.keys.map { "login_flow:${it ?: "production"}" }
         "custom_domain" -> if (domainHost != null) listOf("custom_domain:$tenantId") else emptyList()
+        "trust" -> if (trustObjects) trusts.map { "trust:${it["id"]}" } else emptyList()
         else -> emptyList()
     }
 
@@ -398,6 +421,7 @@ internal class FakeProductApi : Dispatcher() {
             "application" -> envRef(applications.firstOrNull { it["clientId"] == id }?.get("_env") as String?)
             "user" -> envRef(users.firstOrNull { it["id"] == id }?.get("_env") as String?)
             "federation_member" -> envRef(federationMembers.firstOrNull { it["id"] == id }?.get("_env") as String?)
+            "trust" -> envRef(trusts.firstOrNull { it["id"] == id }?.get("_env") as String?)
             else -> envRef(id.takeIf { it != "production" })
         }
     }
@@ -454,7 +478,7 @@ internal class FakeProductApi : Dispatcher() {
     private val KEY_LOCATION_FIELDS = setOf("jwks", "jwksUri")
 
     /** SSO-3689 — `FederatedAssertionBindingValidator` in miniature: a `federatedTrust` must be the id of a trust of THIS plane (`400 federated_trust_not_found`); the method needs the binding and refuses a key. */
-    private fun federatedBindingProblem(b: Map<String, Any?>, env: String?): MockResponse? {
+    private fun federatedBindingProblem(b: Map<String, Any?>, env: String?, previous: Any? = null): MockResponse? {
         val methods = (b["clientAuthenticationMethods"] as? List<*>)?.map { it.toString() }
         val federated = methods?.contains("federated_assertion") == true
         val trust = b["federatedTrust"] as? String
@@ -463,6 +487,8 @@ internal class FakeProductApi : Dispatcher() {
         if (b["jwks"] != null || b["jwksUri"] != null) return problem(400, "federated_assertion_no_secret_or_key")
         if (trust == null) return problem(400, "federated_trust_required")
         if (trusts.none { it["id"] == trust && it["_env"] == env }) return problem(400, "federated_trust_not_found")
+        // SSO-3773 (I4) — setting or CHANGING a binding needs `manager` on the trust (its plane's before S1); the same opaque 400.
+        if (trust != previous && !holds(if (trustObjects) "trust:$trust" else planeRef(env), "manager")) return problem(400, "federated_trust_not_found")
         return null
     }
 
@@ -542,7 +568,7 @@ internal class FakeProductApi : Dispatcher() {
                 val a = applications.firstOrNull { it["clientId"] == seg[1] && visible(it, env) } ?: return problem(404, "not_found")
                 when (method) {
                     "GET" -> json(200, withOwner(a, "application:${seg[1]}"))
-                    "PATCH" -> { federatedBindingProblem(b, env)?.let { return it }; a.putAll(b); json(200, withOwner(a, "application:${seg[1]}")) }
+                    "PATCH" -> { federatedBindingProblem(b, env, a["federatedTrust"])?.let { return it }; a.putAll(b); json(200, withOwner(a, "application:${seg[1]}")) }
                     "DELETE" -> { applications.remove(a); MockResponse().setResponseCode(204) }
                     else -> problem(405, "method")
                 }
@@ -664,6 +690,7 @@ internal class FakeProductApi : Dispatcher() {
                 val q = query(path)
                 // SSO-3659 — the caller's OWN reach, computed from the grants (relation defaults to manager, as product-api's does).
                 val type = q["type"] ?: return problem(400, "invalid_type")
+                if (type == "trust" && !trustObjects) return problem(400, "invalid_type")
                 mineReads += "$type ${q["relation"] ?: "manager"}"
                 json(200, mapOf("data" to reach(type, q["relation"] ?: "manager")))
             }
@@ -674,6 +701,7 @@ internal class FakeProductApi : Dispatcher() {
                 val ref = (b["object"] as? String)?.takeIf { it.contains(':') } ?: return problem(400, "invalid_object")
                 val relation = (b["relation"] as? String) ?: return problem(400, "invalid_relation")
                 if (relation !in setOf("manager", "viewer", "owner")) return problem(400, "invalid_relation")
+                if (ref.substringBefore(':') == "trust" && !trustObjects) return problem(400, "invalid_type")
                 if (relation == "owner" && ref.substringBefore(':') !in ownableTypes) return problem(400, "invalid_relation")
                 checks += Check(ref, relation)
                 val allowed = objectsOf(ref.substringBefore(':')).contains(ref) && holds(ref, relation)

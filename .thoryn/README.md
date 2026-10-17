@@ -115,11 +115,20 @@ What confines the trust's client (unchanged in shape from `cli-ci`):
 
 The trust is a real product resource, created once through the product — never seeded. It is **declared
 in `.thoryn/trusts.provision.yaml`** (SSO-3689's `kind: workloadIdentityTrust`, adopted by name) — a file a
-**founder** applies, not `provision.yaml`, for two structural reasons the engine enforces: a production-plane
-trust is reached through the **workspace** (`ProvisionEngine.gateTrust` — converging or adopting it needs
-`manager` on the workspace, which the confined CI identity must never hold), and a file cannot declare the
-trust its own identity signs in with (`workload_identity_trust_is_self`). In `provision.yaml` the trust is
-only *referenced* — by the grant subject and by `connection.json`.
+**founder** applies, not `provision.yaml`, for two structural reasons the engine enforces: a file cannot
+declare the trust its own identity signs in with (`workload_identity_trust_is_self` — and, since oauthy SSO-3772,
+the platform refuses `owner` / `manager` on a trust to that trust's own `wi_`: I6 `trust_self_management`), and a
+production-plane trust is **created by a person** (SSO-3774, oauthy ADR `2026-10-16-repository-owned-workload-identity-trusts`
+Q2 — the engine refuses a production trust create from CI, `workload_identity_trust_production_needs_person`).
+In `provision.yaml` the trust is only *referenced* — by the grant subject and by `connection.json`.
+
+**Other trusts CAN be converged from CI (SSO-3774).** A trust is a platform object, `trust:<id>`, with one
+`owner`. A trust another workload signs in with — e.g. the Kubernetes trust of an application this repository
+owns — is created once by a founder, who then hands it over with
+`thoryn access grant client:wi_10a7b379c79f7d1353f5798d owner trust:<id>` (or approves the same right on the
+consent screen); from then on the CI identity converges it from its file like an owned application
+(`ProvisionEngine.gateTrust`: the relation on the trust unioned with its plane's), and `--prune` removes it once
+the file no longer declares it.
 
 ### A founder creates the trust once
 

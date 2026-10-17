@@ -297,7 +297,9 @@ data class RemovalOutcome(val removed: List<AppliedResource>, val failures: List
  *    created, or granted) is never enough for automation to delete;
  *  - a **`member:` identity** (a person) removes what it **manages and nobody owns** — people cannot own, and
  *    an owned resource belongs to its repository ("owned by a repository — change its file");
- *  - **non-ownable kinds** (`user`, `federationMember`, the singletons, a `workloadIdentityTrust`) are removed
+ *  - SSO-3774 — a **`workloadIdentityTrust`** (`trust:<id>`, ownable since oauthy S1) is removed by the `client:`
+ *    identity that OWNS it, on any plane; otherwise it follows the non-ownable rule below (a person never owns one);
+ *  - **non-ownable kinds** (`user`, `federationMember`, the singletons) are removed
  *    WITH their sandbox — when the caller may delete the declared parent environment (the hard-delete
  *    cascades them) — and are never removed on the production plane by `destroy` / `--prune`: left in place,
  *    reported with the explicit command ([PlannedChange.byHand]);
@@ -523,6 +525,8 @@ class ProvisionEngine(
      */
     fun plan(file: ProvisionFile, prune: Boolean): ProvisionPlan {
         trustLists.clear()
+        trustVerdicts.clear()
+        trustsHidden.clear()
         val changes = mutableListOf<PlannedChange>()
         // Environment slugs known so far (live), so dependants can be probed in the right plane.
         val envSlugs = mutableMapOf<String, String>()
@@ -532,6 +536,8 @@ class ProvisionEngine(
             // SSO-3659 — the ownership gate sits between the live lookup and everything that would write:
             // a resource that fails it plans no grants (its object may not even be visible to this identity).
             val change = gate(r, probe(r, file, envSlugs), file, envSlugs, slug, reach)
+                // SSO-3774 — a trust's verdict is what an application naming it (planned after every trust) reads.
+                .also { c -> if (r.kind == ProvisionFile.KIND_WORKLOAD_IDENTITY_TRUST) trustVerdicts[r.name] = c }
                 .let { c -> if (c.action == ChangeAction.ERROR || c.readOnly) c else planGrants(r, c, slug, prune, file, envSlugs, reach) }
                 // SSO-3668 — a resource that will be converged publishes its id afterwards (every apply); shown, never done, by plan.
                 .let { c -> if (c.action == ChangeAction.ERROR || c.readOnly || r.publishTo.isEmpty()) c else c.copy(publishTo = r.publishTo, reason = c.reason + "; publishes its id to ${r.publishTo.size} target(s)") }
@@ -549,7 +555,7 @@ class ProvisionEngine(
 
     /**
      * SSO-3715 (ADR 2026-10-15 §1 / §5) — what `--prune` removes besides grants: every `application` /
-     * `environment` the platform lists this identity as OWNER of (`GET /api/v1/access/mine?relation=owner`) that
+     * `environment` (and, SSO-3774, `trust`) the platform lists this identity as OWNER of (`GET /api/v1/access/mine?relation=owner`) that
      * the file does not declare. The platform is the ledger of what a repository owns, so "owned but no longer
      * declared" needs no receipt. A `member:` identity owns nothing (people are managers, never owners), so
      * nothing undeclared can be attributed to its file — reported as one note. Children first, environments last.
@@ -585,6 +591,27 @@ class ProvisionEngine(
                 PlannedChange(ProvisionFile.KIND_ENVIRONMENT, node.str("slug") ?: id, ChangeAction.REMOVE, "owned by this identity (the platform's `owner` relation) and not declared in the file (--prune); its contents go with it", liveId = id, attributes = buildMap { node.str("slug")?.let { put("slug", it) } }, owner = subject)
             }
         }
+        // SSO-3774 (ADR 2026-10-16 §4) — the workload-identity trusts this identity OWNS (`trust:<id>`, S1) that the file no
+        // longer declares. A platform that predates trust objects lists none, so nothing is pruned there.
+        val declaredTrusts = declared.filter { it.kind == ProvisionFile.KIND_WORKLOAD_IDENTITY_TRUST }.mapNotNull { it.liveId }.toSet()
+        val ownClientId = subject.substringAfter(':')
+        reach.ids(OBJECT_TYPE_TRUST, RELATION_OWNER).filter { it == decodePlatformId(it) && it !in declaredTrusts }.sorted().forEach { id ->
+            // The plane it lives in: the first whose (filtered) list carries it — the engine needs the header to delete it.
+            val located = (listOf<String?>(null) + sandboxSlugs).firstNotNullOfOrNull { plane -> fetchOrNull { trustsOf(plane) }?.firstOrNull { it.str("id") == id }?.let { plane to it } }
+            rows += when {
+                located == null -> PlannedChange(ProvisionFile.KIND_WORKLOAD_IDENTITY_TRUST, id, ChangeAction.SKIP, "owned by this identity on the platform but not readable in any environment — left in place", liveId = id)
+                // I6 makes this unreachable on the platform; the engine still never removes the trust it signs in with.
+                located.second.str("clientId") == ownClientId -> PlannedChange(ProvisionFile.KIND_WORKLOAD_IDENTITY_TRUST, located.second.str("name") ?: id, ChangeAction.SKIP, "the trust this identity itself signs in with — never removed by the file it applies", liveId = id, environment = located.first)
+                else -> {
+                    val view = trustView(located.second)
+                    PlannedChange(
+                        ProvisionFile.KIND_WORKLOAD_IDENTITY_TRUST, located.second.str("name") ?: id, ChangeAction.REMOVE,
+                        "owned by this identity (the platform's `owner` relation on trust:$id) and not declared in the file (--prune); its wi_ workload client stops authenticating at once",
+                        liveId = id, environment = located.first, attributes = trustAttributes(view), owner = subject, trust = view,
+                    )
+                }
+            }
+        }
         return orderForRemove(rows)
     }
 
@@ -616,6 +643,12 @@ class ProvisionEngine(
         // SSO-3689 — `federatedTrust` names a trust; the API takes its id, so the name is resolved (same environment) first.
         if (r.kind == ProvisionFile.KIND_APPLICATION) {
             federatedTrustRef(r, file, slug, atApply = false)?.let { ref ->
+                // SSO-3774 — a trust this file declares that this identity cannot see is a missing RIGHT (`access_not_reachable`,
+                // `owner` on the trust by name), never the misleading "not found".
+                ref.fix?.let { fix ->
+                    val row = PlannedChange(r.kind, r.name, ChangeAction.ERROR, ref.error ?: "", resource = r, environment = slug)
+                    return refuse(r, row, ERROR_NOT_REACHABLE, Access.NONE, "${ref.error} (${FixRequest.hint(fix)})", fix = fix)
+                }
                 ref.error?.let { why -> return PlannedChange(r.kind, r.name, ChangeAction.ERROR, "$ERROR_FEDERATED_TRUST_NOT_FOUND — $why", resource = r, error = ERROR_FEDERATED_TRUST_NOT_FOUND) }
                 desired = desired + (ProvisionFile.SPEC_FEDERATED_TRUST to (ref.id ?: "${ref.name} $PENDING_TRUST_MARKER"))
             }
@@ -759,10 +792,52 @@ class ProvisionEngine(
                     .mapNotNull { n -> n.takeIf { it.isString }?.asString()?.takeIf { it.startsWith("$type:") }?.substringAfter(':') }
                     .flatMap { listOf(it, decodePlatformId(it)) }
                     .toSet()
+                    .also { if (type == OBJECT_TYPE_TRUST) trustObjectsKnown = true }
             } catch (ex: ProductApiException) {
-                throw accessFailure(ex)
+                // SSO-3774 — a platform that predates trust objects answers `400 invalid_type` for `trust`: it lists none.
+                if (type == OBJECT_TYPE_TRUST && isUnknownTrustType(ex)) emptySet<String>().also { trustObjectsKnown = false } else throw accessFailure(ex)
             }
         }
+
+        /**
+         * SSO-3774 (oauthy ADR 2026-10-16 §1, story S1 SSO-3772) — whether the platform knows `trust:<id>` as an object.
+         * Null until asked; `false` once a check / listing on a trust answered `400` (a product-api from before S1, whose
+         * grammar has no such type). The engine then gates a trust by its PLANE, exactly as before S1.
+         */
+        private var trustObjectsKnown: Boolean? = null
+
+        private fun isUnknownTrustType(ex: ProductApiException): Boolean = ex.httpStatus == 400 && !ex.isInsufficientScope
+
+        /** [holds] on a `trust:<id>`, or null when the platform predates trust objects (see [trustObjectsKnown]). */
+        private fun trustHolds(ref: String, relation: String): Boolean? {
+            if (trustObjectsKnown == false) return null
+            checks[ref to relation]?.let { return it.allowed }
+            return try {
+                clients(null).checkAccess(ref, relation).also { checks[ref to relation] = it; trustObjectsKnown = true }.allowed
+            } catch (ex: ProductApiException) {
+                if (isUnknownTrustType(ex)) null.also { trustObjectsKnown = false } else throw accessFailure(ex)
+            }
+        }
+
+        /**
+         * SSO-3774 — the relation held on the TRUST object itself (`manager` ⊇ owner ∪ parent.manager on the model), or null
+         * when the platform predates trust objects. The caller unions it with the plane's relation (ADR §1 / §5: a trust whose
+         * parent edge is not stored yet is still reached through its environment).
+         */
+        fun onTrust(ref: String): Access? = when (trustHolds(ref, RELATION_MANAGER)) {
+            null -> null
+            true -> Access.MANAGER
+            false -> if (trustHolds(ref, RELATION_VIEWER) == true) Access.VIEWER else Access.NONE
+        }
+
+        /** SSO-3774 — whether THIS identity is the `owner` of the trust (`false` on a platform that predates trust objects). */
+        fun ownsTrust(ref: String): Boolean = trustHolds(ref, RELATION_OWNER) == true
+
+        /**
+         * SSO-3774 — whether the platform knows `trust:<id>` objects, asked (once, by listing this identity's trusts) only when
+         * no trust has been checked yet: what decides whether a trust this identity cannot see may exist anyway.
+         */
+        fun trustObjectsSupported(): Boolean = trustObjectsKnown ?: run { ids(OBJECT_TYPE_TRUST, RELATION_VIEWER); trustObjectsKnown ?: true }
 
         /** The relation held on `type:id` — `manager` implies `viewer`, so the stronger one is asked first. */
         fun on(ref: String): Access = when {
@@ -811,9 +886,16 @@ class ProvisionEngine(
      */
     private fun gate(r: ProvisionResource, change: PlannedChange, file: ProvisionFile, envSlugs: Map<String, String>, slug: String?, reach: Reach): PlannedChange {
         if (change.action == ChangeAction.ERROR) return change
-        // SSO-3689 — a trust has no platform object of its own: its reach IS its environment's (the API writes for
-        // environment managers, reads for viewers, answers 404 to anyone else), so the gate asks about the parent.
+        // SSO-3774 (oauthy ADR 2026-10-16 §4) — a trust is a platform object of its own (`trust:<id>`, S1 SSO-3772), gated
+        // per object like an application; its own gate keeps the plane rules a trust still has (create, the pre-S1 platform).
         if (r.kind == ProvisionFile.KIND_WORKLOAD_IDENTITY_TRUST) return gateTrust(r, change, file, envSlugs, slug, reach)
+        val gated = gateObject(r, change, file, envSlugs, slug, reach)
+        // SSO-3774 (ADR 2026-10-16 I4) — an application this identity may converge may still not BIND a trust it does not manage.
+        return if (r.kind == ProvisionFile.KIND_APPLICATION && gated.action != ChangeAction.ERROR && !gated.readOnly) gateBinding(r, gated, slug, reach) else gated
+    }
+
+    /** The per-object verdict of [gate] for every kind but a trust. */
+    private fun gateObject(r: ProvisionResource, change: PlannedChange, file: ProvisionFile, envSlugs: Map<String, String>, slug: String?, reach: Reach): PlannedChange {
         val liveId = change.liveId
         if (liveId != null) {
             val ref = objectRef(r.kind, liveId, slug)
@@ -899,47 +981,150 @@ class ProvisionEngine(
         }
 
     /**
-     * SSO-3689 — the ownership gate for a `workloadIdentityTrust`: the relation this identity holds on the trust's
-     * ENVIRONMENT (the workspace for the production plane) — `manager` ⇒ converge, `viewer` ⇒ only a matching
-     * `readOnly: true` reference, none ⇒ `access_not_owned`; a create needs `manager` on that parent. The platform
-     * re-checks every write, so this can never admit a write the API would refuse.
+     * SSO-3774 (oauthy ADR 2026-10-16 §1 / §4) — the ownership gate for a `workloadIdentityTrust`, asked PER OBJECT like
+     * [gateObject] asks for an application. A live trust is gated on the relation held on `trust:<id>` UNIONED with the
+     * relation held on its plane (the environment, the workspace for the production plane): the model's containment
+     * already folds `parent.manager` into the trust, and the union keeps an existing trust whose parent edge the
+     * platform has not stored yet (ADR §5) reachable by everyone who reaches its plane. `manager` ⇒ converge (unless the
+     * response's `owner` names another repository: `access_owned_elsewhere`); `viewer` ⇒ only a matching `readOnly: true`
+     * reference; none ⇒ `access_not_owned`, each with the right on the trust itself as its fix (`owner trust:<id>`).
+     *
+     * A CREATE keeps the plane rule — `manager` on the environment, the workspace note on production — plus the PERSON
+     * rule of ADR §3 / Q2: a production-plane trust is created by a person, once, so a `client:` identity (CI) is refused
+     * with the founder's command ([ERROR_TRUST_PRODUCTION_PERSON]); when that identity cannot see the whole plane, the
+     * trust may exist and be invisible to it, so the row is `access_not_reachable` with `owner` on the trust by NAME.
+     *
+     * A platform that predates trust objects (product-api before S1 answers `400 invalid_type` for `trust:`) is gated by
+     * the plane alone, exactly as before ([gateTrustByPlane]). The platform re-checks every write either way.
      */
     private fun gateTrust(r: ProvisionResource, change: PlannedChange, file: ProvisionFile, envSlugs: Map<String, String>, slug: String?, reach: Reach): PlannedChange {
         val parent = parentRef(r, file, envSlugs, slug, reach)
-        val access = when {
-            parent == null -> Access.MANAGER // the environment is created by this very apply: creator-becomes-manager covers both
-            reach.managesParent(parent) -> Access.MANAGER
-            reach.holds(parent, RELATION_VIEWER) -> Access.VIEWER
-            else -> Access.NONE
-        }
-        val where = parent ?: "its environment (created by this apply)"
-        if (change.liveId != null) {
-            return when (access) {
-                // SSO-3710 — a trust has no object of its own, so the right is `manager` on its PARENT environment (a note
-                // when that parent is the workspace: a confined identity must never manage the workspace).
+        val plane = planeAccess(parent, reach)
+        val liveId = change.liveId
+        if (liveId != null) {
+            val ref = objectRef(r.kind, liveId, slug)
+            val direct = reach.onTrust(ref) ?: return gateTrustByPlane(r, change, parent, plane)
+            return when (val access = stronger(direct, plane)) {
                 Access.NONE -> {
-                    val why = "this identity holds no relation on $where — a trust is reached through its environment, so it is not visible to it"
-                    refuseOnParent(r, change, ERROR_NOT_OWNED, access, parent, why)
+                    val why = "this identity holds no relation on $ref (nor on its plane) — the trust is not visible to it and cannot be imported or converged"
+                    val fix = if (r.readOnly) FixRequest.viewer(subject, ref, why) else FixRequest.owner(subject, ref, why)
+                    refuse(r, change, ERROR_NOT_OWNED, access, "$why (${FixRequest.hint(fix)})", fix = fix)
                 }
                 Access.VIEWER -> if (!r.readOnly) {
-                    refuseOnParent(r, change, ERROR_READ_ONLY, access, parent, "this identity may only VIEW $where — declare the trust `readOnly: true` to depend on it without owning it, or manage its environment")
+                    val why = "this identity may only VIEW $ref — declare the trust `readOnly: true` to depend on it without owning it, or own it"
+                    val fix = FixRequest.owner(subject, ref, why)
+                    refuse(r, change, ERROR_READ_ONLY, access, "$why (${FixRequest.hint(fix)})", fix = fix)
                 } else {
                     reference(change, access)
                 }
-                Access.MANAGER -> if (r.readOnly) reference(change, access) else change.copy(access = access.label)
+                Access.MANAGER -> when {
+                    r.readOnly -> reference(change, access)
+                    // The response renders the trust's `owner` (S1); another subject owns it ⇒ another repository's trust.
+                    change.owner != null && !reach.ownsTrust(ref) -> {
+                        val why = "$ref is owned by another repository (the platform's `owner` relation) — one repository owns a trust; " +
+                            "declare it `readOnly: true` here to depend on it, or have a workspace admin move the ownership " +
+                            "(`thoryn access revoke <current-owner> owner $ref`, then `${FixRequest.grantCommand(FixRequest.SUBJECT_PLACEHOLDER, RELATION_OWNER, ref)}`)"
+                        refuse(r, change, ERROR_OWNED_ELSEWHERE, access, why, fix = FixRequest.ownedElsewhere(subject, ref, why))
+                    }
+                    else -> change.copy(access = access.label)
+                }
             }
         }
+        val production = r.environment == null || slug == PRODUCTION_ENV_SLUG
+        // Not visible to this identity: the plane is not fully readable to it, and the platform filters the list (S1), so
+        // "absent" may be "present, but nothing held on it". Then the right that reveals it is a right on the trust.
+        val hidden = plane == Access.NONE && parent != null && reach.trustObjectsSupported()
+        if (hidden) trustsHidden += r.name
         if (r.readOnly) {
+            if (hidden) {
+                val why = "no trust named '${r.name}' is visible to this identity in ${planeLabel(slug)} — a read-only reference must exist; if it does, this identity holds no relation on it"
+                val fix = FixRequest.byName(FixRequest.Kind.VIEWER, subject, r.name, slug, why)
+                return refuse(r, change, ERROR_NOT_REACHABLE, Access.NONE, "$why (${FixRequest.hint(fix)})", fix = fix)
+            }
             return refuse(
                 r, change, ERROR_READ_ONLY, null,
                 "declared `readOnly: true` but nothing matches it live — a read-only reference is never created; declare it without `readOnly` to own it",
                 fixNote = FILE_FIX_NOTE,
             )
         }
-        return if (access == Access.MANAGER) {
-            change.copy(access = access.label)
+        if (production && subject?.startsWith("client:") == true) {
+            val note = productionTrustPersonNote(subject, r.name)
+            if (hidden) {
+                val why = "no trust named '${r.name}' is visible to this identity on the production plane: either it exists and this identity holds no " +
+                    "relation on it, or it does not exist yet — and a production trust is created by a person, never by this file from CI ($note)"
+                val fix = FixRequest.byName(FixRequest.Kind.OWNER, subject, r.name, slug, why)
+                return refuse(r, change, ERROR_NOT_REACHABLE, Access.NONE, "$why (if it exists: ${FixRequest.hint(fix)})", fix = fix)
+            }
+            return refuse(r, change, ERROR_TRUST_PRODUCTION_PERSON, null, "creating a ${r.kind} on the PRODUCTION plane is a person's act, never this CI identity's ($note)", fixNote = note)
+        }
+        return if (plane == Access.MANAGER) {
+            change.copy(access = Access.MANAGER.label)
         } else {
-            refuseOnParent(r, change, ERROR_NOT_OWNED, null, parent, "creating a ${r.kind} here requires `manager` on its environment $where, which this identity does not hold")
+            refuseOnParent(r, change, ERROR_NOT_OWNED, null, parent, "creating a ${r.kind} here requires `manager` on its environment ${parent ?: "its environment (created by this apply)"}, which this identity does not hold")
+        }
+    }
+
+    /** The pre-S1 gate of a live trust: the relation on its PLANE only (a platform without `trust:` objects reaches a trust through it). */
+    private fun gateTrustByPlane(r: ProvisionResource, change: PlannedChange, parent: String?, access: Access): PlannedChange {
+        val where = parent ?: "its environment (created by this apply)"
+        return when (access) {
+            // The right is `manager` on its PARENT environment (a note when that parent is the workspace: a confined identity
+            // must never manage the workspace).
+            Access.NONE -> refuseOnParent(r, change, ERROR_NOT_OWNED, access, parent, "this identity holds no relation on $where — this platform reaches a trust through its environment, so it is not visible to it")
+            Access.VIEWER -> if (!r.readOnly) {
+                refuseOnParent(r, change, ERROR_READ_ONLY, access, parent, "this identity may only VIEW $where — declare the trust `readOnly: true` to depend on it without owning it, or manage its environment")
+            } else {
+                reference(change, access)
+            }
+            Access.MANAGER -> if (r.readOnly) reference(change, access) else change.copy(access = access.label)
+        }
+    }
+
+    /** The relation held on a trust's PLANE: `manager` when the plane is created by this apply ([parent] null). */
+    private fun planeAccess(parent: String?, reach: Reach): Access = when {
+        parent == null -> Access.MANAGER // the environment is created by this very apply: creator-becomes-manager covers both
+        reach.managesParent(parent) -> Access.MANAGER
+        reach.holds(parent, RELATION_VIEWER) -> Access.VIEWER
+        else -> Access.NONE
+    }
+
+    private fun stronger(a: Access, b: Access): Access = if (a.ordinal <= b.ordinal) a else b
+
+    /** The plane object of a resource living in [slug]: the workspace for the production plane, else `environment:<id>`. */
+    private fun planeParentRef(slug: String?, reach: Reach): String {
+        val workspace = "$OBJECT_TYPE_WORKSPACE:${workspaceId ?: "(this workspace)"}"
+        if (slug == null || slug == PRODUCTION_ENV_SLUG) return workspace
+        return reach.environmentId(slug)?.let { objectRef(ProvisionFile.KIND_ENVIRONMENT, it, null) } ?: workspace
+    }
+
+    /**
+     * SSO-3774 (oauthy ADR 2026-10-16 I4; product-api SSO-3773) — binding a login client to a trust needs `manager` on the
+     * TRUST as well as on the application, checked where the platform checks it: when the binding is SET (a create) or
+     * CHANGED (an update whose diff names `federatedTrust`) — an unchanged binding is never re-checked. The platform answers
+     * a refused binding with the same opaque `400 federated_trust_not_found` as an unknown trust; the plan says why instead,
+     * with the right that fixes it (`owner trust:<id>`), or — when another repository owns the trust — the dispute.
+     * A trust this apply creates is the creator's to bind (creator-becomes-manager); a trust the identity cannot see is the
+     * `access_not_reachable` row [federatedTrustRef] already made.
+     */
+    private fun gateBinding(r: ProvisionResource, change: PlannedChange, slug: String?, reach: Reach): PlannedChange {
+        val name = r.spec[ProvisionFile.SPEC_FEDERATED_TRUST]?.toString()?.trim()?.takeIf { it.isNotEmpty() } ?: return change
+        val sets = change.action == ChangeAction.CREATE || (change.action == ChangeAction.UPDATE && ProvisionFile.SPEC_FEDERATED_TRUST in change.diff)
+        if (!sets) return change
+        val node = fetchOrNull { trustsOf(slug) }?.firstOrNull { it.str("name") == name } ?: return change
+        val id = node.str("id") ?: return change
+        val ref = objectRef(ProvisionFile.KIND_WORKLOAD_IDENTITY_TRUST, id, slug)
+        val plane = planeAccess(planeParentRef(slug, reach), reach)
+        if (stronger(reach.onTrust(ref) ?: Access.NONE, plane) == Access.MANAGER) return change
+        val appAccess = Access.entries.firstOrNull { it.label == change.access }
+        val why = "binding ${r.key} to trust '$name' ($ref) requires `manager` on the trust, which this identity does not hold — the platform refuses " +
+            "a binding to a trust its caller does not manage (answered as `$ERROR_FEDERATED_TRUST_NOT_FOUND`)"
+        return if (ProvisionApi.ownerOf(node) != null) {
+            val dispute = "$why; $ref is owned by another repository — bind a trust this repository owns, or have a workspace admin move the ownership " +
+                "(`thoryn access revoke <current-owner> owner $ref`, then `${FixRequest.grantCommand(FixRequest.SUBJECT_PLACEHOLDER, RELATION_OWNER, ref)}`)"
+            refuse(r, change, ERROR_OWNED_ELSEWHERE, appAccess, dispute, fix = FixRequest.ownedElsewhere(subject, ref, dispute))
+        } else {
+            val fix = FixRequest.owner(subject, ref, why)
+            refuse(r, change, ERROR_NOT_OWNED, appAccess, "$why (${FixRequest.hint(fix)})", fix = fix)
         }
     }
 
@@ -1014,8 +1199,22 @@ class ProvisionEngine(
                 }
             }
         }
-        // Non-ownable: with the sandbox, never on the production plane.
+        // SSO-3774 (oauthy ADR 2026-10-16 §4) — a trust is ownable since S1: the `client:` identity that OWNS it removes it, on
+        // any plane (production behind `--confirm`). A person never owns one, so a person's destroy keeps the rule below.
         val byHand = removeByHand(r.kind, id, plane, null)
+        if (r.kind == ProvisionFile.KIND_WORKLOAD_IDENTITY_TRUST && subjectType == "client") {
+            val ref = objectRef(r.kind, id, plane)
+            if (reach.ownsTrust(ref)) return RemovalVerdict.ALLOWED
+            if (plane == null || plane == PRODUCTION_ENV_SLUG) {
+                return RemovalVerdict(
+                    false,
+                    if (change.owner != null) "$ref is owned by another repository (the platform's `owner` relation) — change its file; a workspace admin moves ownership with `thoryn access revoke <current-owner> owner $ref`"
+                    else "a ${r.kind} on the PRODUCTION plane is removed by destroy / --prune only by the repository that OWNS it, and $ref is not owned by this identity — left in place",
+                    byHand,
+                )
+            }
+        }
+        // Non-ownable: with the sandbox, never on the production plane.
         if (plane == null || plane == PRODUCTION_ENV_SLUG) {
             return RemovalVerdict(false, "a ${r.kind} on the PRODUCTION plane is never removed by destroy / --prune — left in place", byHand)
         }
@@ -1277,8 +1476,10 @@ class ProvisionEngine(
             if (view.state == CustomDomainView.NONE) return@forEach
             add(ProvisionFile.KIND_CUSTOM_DOMAIN, ProvisionFile.KIND_CUSTOM_DOMAIN, null, null, id, access, linkedMapOf("host" to host))
         }
-        // SSO-3689 — workload-identity trusts: no access object of their own, so reach is the PLANE's (the workspace
-        // for production, the environment for a sandbox); the API lists them only for a viewer or better.
+        // SSO-3689 / SSO-3774 — workload-identity trusts: the API lists a plane's trusts filtered to what this identity reaches
+        // (S1: the trusts it holds a relation on, every trust of a plane it views); each is rendered with the relation held on
+        // `trust:<id>` UNIONED with the plane's (the plane alone on a platform that predates trust objects), and `readOnly`
+        // when that is only `viewer` or the response's `owner` names another repository.
         fun planeAccess(plane: String?): Access = when {
             plane == null && reach.managesWorkspace() -> Access.MANAGER
             plane == null -> if (workspaceId != null && reach.holds("$OBJECT_TYPE_WORKSPACE:$workspaceId", RELATION_VIEWER)) Access.VIEWER else Access.NONE
@@ -1286,12 +1487,15 @@ class ProvisionEngine(
         }
         val ownClientId = subject?.takeIf { it.startsWith("client:") }?.substringAfter(':')
         (listOf<String?>(null) + sandboxSlugs).forEach { plane ->
-            val access = planeAccess(plane)
-            if (access == Access.NONE) return@forEach
+            val onPlane = planeAccess(plane)
+            // A plane this identity reaches nothing in answers 404 — nothing to import there.
             val trusts = fetchOrNull { trustsOf(plane) } ?: return@forEach
             trusts.forEach { n ->
                 val name = n.str("name") ?: return@forEach
                 val id = n.str("id") ?: return@forEach
+                val ref = objectRef(ProvisionFile.KIND_WORKLOAD_IDENTITY_TRUST, id, plane)
+                val access = stronger(reach.onTrust(ref) ?: Access.NONE, onPlane)
+                if (access == Access.NONE) return@forEach
                 val envField = environmentField(plane)
                 if (declared.any { it.kind == ProvisionFile.KIND_WORKLOAD_IDENTITY_TRUST && it.name == name && (it.environment == envField || it.environment == plane) }) return@forEach
                 // The structural limit: the identity applying a file cannot declare its OWN bootstrap trust.
@@ -1305,8 +1509,11 @@ class ProvisionEngine(
                     return@forEach
                 }
                 val (spec, note) = trustSpecOf(n, production = plane == null)
-                val resource = ProvisionResource(ProvisionFile.KIND_WORKLOAD_IDENTITY_TRUST, name, envField, spec, readOnly = access == Access.VIEWER)
-                out += ImportedResource(resource, id, access, note)
+                val owner = ProvisionApi.ownerOf(n)
+                val ownedElsewhere = access == Access.MANAGER && owner != null && !reach.ownsTrust(ref)
+                val resource = ProvisionResource(ProvisionFile.KIND_WORKLOAD_IDENTITY_TRUST, name, envField, spec, readOnly = access == Access.VIEWER || ownedElsewhere)
+                val ownerNote = if (ownedElsewhere) "owned by another repository (the platform's `owner` relation) — imported as a read-only reference" else null
+                out += ImportedResource(resource, id, access, listOfNotNull(ownerNote, note).joinToString("; ").ifEmpty { null })
             }
         }
         return ImportResult(out, skipped)
@@ -1997,6 +2204,15 @@ class ProvisionEngine(
     /** Every trust of one plane, listed once per pass (cleared by [plan] / [apply], and after a write to that plane). */
     private val trustLists = HashMap<String?, List<JsonNode>>()
 
+    /** SSO-3774 — each declared trust's verdict in the current [plan], read when an application names it (trusts plan first). */
+    private val trustVerdicts = HashMap<String, PlannedChange>()
+
+    /**
+     * SSO-3774 — declared trusts that matched nothing live while this identity cannot read their whole plane on a platform
+     * that filters the trust list (S1): absent, OR present and invisible to it. Cleared with [trustVerdicts].
+     */
+    private val trustsHidden = HashSet<String>()
+
     /** `GET /api/v1/workload-identity/trusts` of one plane, every page. A plane this identity cannot read answers 404 — the caller treats that as "none visible". */
     private fun trustsOf(slug: String?, fresh: Boolean = false): List<JsonNode> {
         if (!fresh) trustLists[slug]?.let { return it }
@@ -2028,7 +2244,10 @@ class ProvisionEngine(
             throw ProvisionException("${r.key}: could not read live state (${ex.message})")
         }
         if (node == null) {
-            val notHeld = scopesNotHeld(desired)
+            // SSO-3774 — a production-plane create from CI is refused by the gate (a person's act, or a trust it cannot see):
+            // the scope ceiling of a create that will not happen would only hide that verdict.
+            val ciOnProduction = (r.environment == null || slug == PRODUCTION_ENV_SLUG) && subject?.startsWith("client:") == true
+            val notHeld = if (ciOnProduction) emptyList() else scopesNotHeld(desired)
             if (notHeld.isNotEmpty()) {
                 return PlannedChange(
                     r.kind, r.name, ChangeAction.ERROR,
@@ -2043,6 +2262,8 @@ class ProvisionEngine(
         val view = trustView(node)
         val attributes = trustAttributes(view)
         val clientId = node.str("clientId")
+        // SSO-3774 — the platform `owner` of the trust as its response renders it (S1; absent on an older platform).
+        val owner = ProvisionApi.ownerOf(node)
         if (clientId != null && subject == "client:$clientId") {
             return PlannedChange(
                 r.kind, r.name, ChangeAction.ERROR,
@@ -2062,7 +2283,7 @@ class ProvisionEngine(
                 r.kind, r.name, ChangeAction.UPDATE,
                 "exists — adds the plan profile (GitHub environment '${(desired[ProvisionFile.TRUST_PLAN] as? Map<*, *>)?.get("environment")}', read-only scopes) " +
                     "through the one additive set-plan-profile call; the wi_ workload client ${clientId ?: ""} stays".replace("  ", " "),
-                resource = r, liveId = id, environment = slug, attributes = attributes, diff = diff, trust = view, retain = r.retain,
+                resource = r, liveId = id, environment = slug, attributes = attributes, diff = diff, trust = view, retain = r.retain, owner = owner,
             )
             planOnly -> PlannedChange(
                 r.kind, r.name, ChangeAction.ERROR,
@@ -2070,13 +2291,22 @@ class ProvisionEngine(
                     "declare what is live, or re-create the trust (`thoryn workload-identity trusts delete $id${slug?.let { " --environment $it" } ?: ""}`, then re-apply — a new wi_ client, re-paste it)",
                 resource = r, liveId = id, environment = slug, attributes = attributes, diff = diff, error = ERROR_TRUST_IMMUTABLE, trust = view,
             )
+            // SSO-3774 (oauthy ADR 2026-10-16 §6, I7) — the engine never mutates a pin; on the production plane the only route to
+            // a new pin set is a NEW trust, and creating that is a person's act (a human approves every production pin set).
             diff.isNotEmpty() -> PlannedChange(
                 r.kind, r.name, ChangeAction.ERROR,
                 "$ERROR_TRUST_IMMUTABLE — ${diff.size} declared field(s) differ from the live trust (${diff.keys.joinToString(", ")}); a trust's pins and scopes are immutable on the hub: " +
-                    "declare what is live, or delete it (`thoryn workload-identity trusts delete $id${slug?.let { " --environment $it" } ?: ""}`) and re-apply to re-create it",
+                    if (slug == null || slug == PRODUCTION_ENV_SLUG) {
+                        "declare what is live. On the PRODUCTION plane a changed pin set is a NEW trust, and a new production trust is created by a PERSON, never by this file " +
+                            "from CI: a workspace admin reviews the new pins, creates the trust (declare it under a new name and apply the file signed in as themselves), " +
+                            "and grants the owning repository `owner` on it; then rebind the client and delete the old trust (`thoryn workload-identity trusts delete $id --confirm <workspace-slug>`)"
+                    } else {
+                        "declare what is live, or delete it (`thoryn workload-identity trusts delete $id --environment $slug`) and re-apply to re-create it"
+                    },
                 resource = r, liveId = id, environment = slug, attributes = attributes, diff = diff, error = ERROR_TRUST_IMMUTABLE, trust = view,
+                fixNote = if (slug == null || slug == PRODUCTION_ENV_SLUG) "a change to the file, not a missing right: a production trust's pins never change in place — declare what is live; a new pin set is a new trust a person creates" else null,
             )
-            else -> PlannedChange(r.kind, r.name, ChangeAction.NOOP, "exists and matches", resource = r, liveId = id, environment = slug, attributes = attributes, trust = view, retain = r.retain)
+            else -> PlannedChange(r.kind, r.name, ChangeAction.NOOP, "exists and matches", resource = r, liveId = id, environment = slug, attributes = attributes, trust = view, retain = r.retain, owner = owner)
         }
     }
 
@@ -2246,7 +2476,7 @@ class ProvisionEngine(
                     val view = trustView(live)
                     out.println("  = workloadIdentityTrust ${r.name}: the name was taken by a matching trust meanwhile — converged (id ${view["id"]}, clientId ${view["clientId"]})")
                     printTrustConnection(view)
-                    return AppliedResource(r.kind, r.name, view["id"].toString(), slug, trustAttributes(view), action = ChangeAction.NOOP)
+                    return AppliedResource(r.kind, r.name, view["id"].toString(), slug, trustAttributes(view), owner = ProvisionApi.ownerOf(live), action = ChangeAction.NOOP)
                 }
                 // SSO-3702 — the racing writer created it WITHOUT the declared plan profile: the additive mutation still applies.
                 if (live != null && diff!!.keys.all { it.startsWith(PLAN_FIELD_PREFIX) } && live[ProvisionFile.TRUST_PLAN]?.takeIf { it.isObject && it.str("environment") != null } == null) {
@@ -2266,7 +2496,8 @@ class ProvisionEngine(
         val id = view["id"]?.toString() ?: throw ProvisionException("${r.key}: the trust create returned no id")
         out.println("  + workloadIdentityTrust ${r.name}: id=$id clientId=${view["clientId"]} audience=${view["audience"]}${slug?.let { " env=$it" } ?: ""}")
         printTrustConnection(view)
-        return AppliedResource(r.kind, r.name, id, slug, trustAttributes(view), action = ChangeAction.CREATE)
+        // SSO-3774 — creator-becomes-owner for a `client:` creator (S1), as the create response reports it.
+        return AppliedResource(r.kind, r.name, id, slug, trustAttributes(view), owner = ProvisionApi.ownerOf(resp), action = ChangeAction.CREATE)
     }
 
     /** The trust service's refusals, each with what to do next (the same guidance `thoryn workload-identity trusts create` gives). */
@@ -2309,14 +2540,23 @@ class ProvisionEngine(
 
     // ── secret-less clients (SSO-3689): the application's `federatedTrust` NAME → id, inline `jwks` → the API's string ──
 
-    /** How a declared `federatedTrust` name resolved: to a live [id], to a trust this apply creates first ([pending]), or to an [error]. */
-    private class TrustRef(val name: String, val id: String?, val pending: Boolean, val error: String?)
+    /**
+     * How a declared `federatedTrust` name resolved: to a live [id], to a trust this apply creates first ([pending]), or to an
+     * [error] — with [fix] when the error is a missing RIGHT (SSO-3774: a trust this file declares that the identity cannot see).
+     */
+    private class TrustRef(val name: String, val id: String?, val pending: Boolean, val error: String?, val fix: FixRequest.MissingRight? = null)
 
     /**
      * Resolve `spec.federatedTrust` (a NAME) in the application's OWN plane: a trust of that name declared in this file
      * for another environment is refused (a login client binds a trust of its own environment — the hub checks the
      * same); a live trust gives its id; one declared here but not live yet is pending at plan time (created first by
      * `apply`); anything else is `federated_trust_not_found`.
+     *
+     * SSO-3774 (oauthy ADR 2026-10-16 §4) — on a platform that filters the trust list by reach (S1), "not live" may be
+     * "not visible". A trust declared HERE whose own row is red while this identity cannot read its whole plane
+     * ([trustsHidden]) is therefore `access_not_reachable`, its fix `owner` on the trust by NAME in its plane (the consent
+     * page resolves the name to the id as the admin) — never the misleading "not found". A declared trust whose row is red
+     * for another reason will not be created by this apply, and says so.
      */
     private fun federatedTrustRef(r: ProvisionResource, file: ProvisionFile?, slug: String?, atApply: Boolean): TrustRef? {
         val name = r.spec[ProvisionFile.SPEC_FEDERATED_TRUST]?.toString()?.trim()?.takeIf { it.isNotEmpty() } ?: return null
@@ -2329,10 +2569,18 @@ class ProvisionEngine(
         } catch (ex: ProductApiException) {
             throw ProvisionException("${r.key}: could not list the trusts of ${planeLabel(slug)} to resolve spec.federatedTrust '$name' (${ex.message})")
         }
+        val verdict = trustVerdicts[name]
         return when {
             live != null -> TrustRef(name, live.str("id"), false, null)
-            declared != null && !atApply -> TrustRef(name, null, true, null)
-            else -> TrustRef(name, null, false, "no workloadIdentityTrust named '$name' in ${planeLabel(slug)} — declare it in this file (same environment) or create it first; the trust must exist before the client is written")
+            declared != null && !atApply && (verdict == null || verdict.action != ChangeAction.ERROR) -> TrustRef(name, null, true, null)
+            declared != null && !atApply && name in trustsHidden -> {
+                val why = "trust '$name' is declared in this file for ${planeLabel(slug)} but is not visible to this identity — it holds no relation on it " +
+                    "(the platform lists a trust only to who reaches it), so ${r.key} cannot resolve spec.${ProvisionFile.SPEC_FEDERATED_TRUST}"
+                TrustRef(name, null, false, why, fix = FixRequest.byName(FixRequest.Kind.OWNER, subject, name, slug, why))
+            }
+            declared != null && !atApply -> TrustRef(name, null, false, "trust '$name' is declared in this file but its own row is red (${verdict?.error}) — it will not be created by this apply, so the client cannot be bound to it")
+            else -> TrustRef(name, null, false, "no workloadIdentityTrust named '$name' in ${planeLabel(slug)} is visible to this identity — declare it in this file (same environment) or create it first " +
+                "(the trust must exist before the client is written); a trust another identity owns is listed only to who holds a relation on it")
         }
     }
 
@@ -2501,7 +2749,11 @@ class ProvisionEngine(
         const val FILE_FIX_NOTE_AMBIGUOUS = "a change to the file, not a missing right: declare `clientId` so the converge key names exactly one live resource"
         /** SSO-3715 — the destroy / prune plan's reason for a `retain: true` resource. */
         const val RETAINED = "retained by the file (`retain: true`) — never removed by destroy / --prune"
-        /** SSO-3715 — the kinds the platform model defines `owner` on; every other kind is removed with its sandbox or by hand. */
+        /**
+         * SSO-3715 — the kinds whose removal follows the generic owner rule ([mayRemove]); every other kind is removed with its
+         * sandbox or by hand. SSO-3774: a trust is ownable on the platform too, but keeps its own rule (owner ⇒ removed by its
+         * `client:` owner; a person's destroy never removes a production trust) — so it is deliberately not listed here.
+         */
         val OWNABLE_KINDS: Set<String> = setOf(ProvisionFile.KIND_APPLICATION, ProvisionFile.KIND_ENVIRONMENT)
         /** No relation on the resource, or no `manager` on the parent a create needs. */
         const val ERROR_NOT_OWNED = "access_not_owned"
@@ -2553,6 +2805,19 @@ class ProvisionEngine(
         const val ERROR_SCOPE_NOT_GRANTABLE = "scope_not_grantable"
         /** `spec.federatedTrust` names no trust of the application's environment (missing, or declared for another one). */
         const val ERROR_FEDERATED_TRUST_NOT_FOUND = "federated_trust_not_found"
+        /**
+         * SSO-3774 (oauthy ADR 2026-10-16 §3, Q2) — a `client:` identity (CI) would CREATE a production-plane trust: that is a
+         * person's act, once (a human approves every production pin set at creation); the row's note is the founder's
+         * command ([productionTrustPersonNote]). Not a grantable right — "no trust creation" is outside the consentable set.
+         */
+        const val ERROR_TRUST_PRODUCTION_PERSON = "workload_identity_trust_production_needs_person"
+
+        /** SSO-3774 — what a person runs instead of CI creating a production trust: apply the file once as themselves, then grant `owner`. */
+        fun productionTrustPersonNote(subject: String?, trustName: String): String =
+            "not a grantable right: a production-plane workload identity trust is created by a PERSON, once — every production pin set is approved by a " +
+                "human at creation. A workspace admin applies this file signed in as themselves (`thoryn login`, then `thoryn provision apply --file <this file>`), " +
+                "then grants this identity `owner` on the trust it created (`${FixRequest.grantCommand(subject, RELATION_OWNER, "$OBJECT_TYPE_TRUST:${FixRequest.TRUST_ID_PLACEHOLDER}")}`; " +
+                "`${FixRequest.LIST_TRUSTS_COMMAND}` shows the id of '$trustName'); this file converges it from then on"
         /** The declared trust's workload client IS the applying identity: a file cannot declare its own bootstrap trust. */
         const val ERROR_TRUST_IS_SELF = "workload_identity_trust_is_self"
         /** The plan's wording of the ceiling the hub enforces on every trust create. */
@@ -2627,6 +2892,12 @@ class ProvisionEngine(
         const val OBJECT_TYPE_LOGIN_FLOW = "login_flow"
         const val OBJECT_TYPE_LOGIN_METHODS = "login_methods"
         const val OBJECT_TYPE_CUSTOM_DOMAIN = "custom_domain"
+        /**
+         * SSO-3774 (oauthy ADR 2026-10-16 §1, Q4) — a workload-identity trust as a platform object, `trust:<hub-trust-uuid>`:
+         * ownable (one `owner`, a `client:`), contained in its environment. ONE constant, so S1's fallback name
+         * (`workload_identity_trust`, should a tenant model already declare `trust`) is a one-line change.
+         */
+        const val OBJECT_TYPE_TRUST = AccessRefs.OBJECT_TYPE_TRUST
 
         /**
          * A platform id as `/api/v1/access/mine` renders it is percent-encoded (`@`, `#`, whitespace — the
@@ -2678,6 +2949,8 @@ class ProvisionEngine(
                 ProvisionFile.KIND_LOGIN_METHODS -> "login_methods:$envSlug"
                 // SSO-3413 — the workspace-level singleton; its id IS the workspace id (`tnt`).
                 ProvisionFile.KIND_CUSTOM_DOMAIN -> "custom_domain:$id"
+                // SSO-3774 — the hub's trust UUID (stable, unique, needs no escaping).
+                ProvisionFile.KIND_WORKLOAD_IDENTITY_TRUST -> "$OBJECT_TYPE_TRUST:$id"
                 else -> throw ProvisionException("$kind: no access object type for this kind")
             }
         }

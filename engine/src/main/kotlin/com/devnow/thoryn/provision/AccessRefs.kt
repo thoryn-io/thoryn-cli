@@ -7,11 +7,18 @@ package com.devnow.thoryn.provision
  * engine's `grants:` converge (SSO-3662: moved here so the library owns the grammar it validates with).
  *
  * SSO-3667 / SSO-3673 — [RELATION_OWNER] is what the ACCESS API grants (a workspace admin, on an
- * `application` / `environment`, at most one subject per object, implied into `manager`). It is
+ * `application` / `environment` / `trust` (SSO-3774), at most one subject per object, implied into `manager`). It is
  * deliberately NOT in `ProvisionFile.GRANT_RELATIONS`: a provisioning file cannot claim ownership by
  * writing YAML (ADR 2026-10-13 platform-owner-relation-and-forward-check, open question 3 → decided).
  */
 object AccessRefs {
+    /**
+     * SSO-3774 (oauthy ADR 2026-10-16 §1, Q4) — the platform type of a workload-identity trust: ownable, contained in its
+     * environment, addressed by the hub's trust UUID. A workspace admin hands a repository its trust with
+     * `thoryn access grant client:<wi_…> owner trust:<id>`.
+     */
+    const val OBJECT_TYPE_TRUST: String = "trust"
+
     const val SCOPE_READ: String = "tenant:access.read"
     const val SCOPE_WRITE: String = "tenant:access.write"
 
@@ -22,6 +29,8 @@ object AccessRefs {
         "email_provider", "login_theme", "login_flow", "login_methods",
         // SSO-3434 — the workspace's custom-domain singleton (SSO-3413), `custom_domain:<tenantId>`.
         "custom_domain",
+        // SSO-3774 — a workload-identity trust, `trust:<hub-trust-uuid>` (oauthy ADR 2026-10-16, story S1 SSO-3772).
+        OBJECT_TYPE_TRUST,
     )
 
     const val RELATION_MANAGER: String = "manager"
@@ -33,7 +42,7 @@ object AccessRefs {
     val RELATIONS: Set<String> = setOf(RELATION_MANAGER, RELATION_VIEWER, RELATION_OWNER)
 
     /** SSO-3667 — the object types the platform model defines `owner` on (`PlatformObjectTypes.OWNABLE`). */
-    val OWNABLE_TYPES: Set<String> = setOf("application", "environment")
+    val OWNABLE_TYPES: Set<String> = setOf("application", "environment", OBJECT_TYPE_TRUST)
 
     val REF_PATTERN: Regex = Regex("^([a-z_]+):(\\S+)$")
 

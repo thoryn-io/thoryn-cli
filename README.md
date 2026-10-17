@@ -326,7 +326,9 @@ thoryn provision workflow check [--file <stub>] [--config <.thoryn/workflow.yaml
 # Thin wrappers over product-api /api/v1/access (the SSO-3112 contract). Subjects: member:<sub> | client:<clientId>;
 # objects: workspace:<tenantId> | environment:<id> | application:<clientId> | user:<id> | federation_member:<id> |
 # email_provider:<envSlug> | login_theme:<envSlug> | login_flow:<envSlug> | login_methods:<envSlug> |
-# custom_domain:<tenantId> (SSO-3413 — how a workspace admin lets ONE machine client manage the custom domain); relations: manager | viewer.
+# custom_domain:<tenantId> (SSO-3413 — how a workspace admin lets ONE machine client manage the custom domain) |
+# trust:<trustId> (SSO-3774 — a workload-identity trust; `owner trust:<id>` hands a repository the trust its app signs in with);
+# relations: manager | viewer | owner (owner: a workspace admin, one client: per application / environment / trust).
 # Scopes: tenant:access.read (list, mine) / tenant:access.write (grant, revoke).
 thoryn access grant  <subject> <relation> <object>   # POST   /api/v1/access/grants  (idempotent: 201, or 200 when it already exists)
 thoryn access revoke <subject> <relation> <object>   # DELETE /api/v1/access/grants  (grant identified in the JSON body; 204)
@@ -1414,7 +1416,13 @@ resources:
   a missing `federatedTrust` is `federated_trust_required`, and a `federatedTrust` without the method is
   `federated_trust_without_method`. A trust that is missing, or declared in this file for ANOTHER
   environment, is the plan error **`federated_trust_not_found`** (a login client binds a trust of its own
-  environment; the hub checks the same); `apply` refuses the plan before writing.
+  environment; the hub checks the same); `apply` refuses the plan before writing. **SSO-3774:** a trust this
+  file DECLARES that the identity cannot see (the platform lists a trust only to who reaches it) is
+  **`access_not_reachable`** instead, with `owner` on the trust by name as its fix; and **binding** a client to a
+  trust (on a create, or an update that changes `federatedTrust`) needs `manager` on the TRUST as well — a
+  trust the identity only views is `access_not_owned` (fix: `owner trust:<id>`), one another repository owns
+  is `access_owned_elsewhere` (product-api SSO-3773 answers both as the opaque `federated_trust_not_found`;
+  the plan says why).
 - **No secret is minted or expected** for a `private_key_jwt` / `federated_assertion` client (the API answers
   `clientSecret: null`): `plan` prints no "will be minted", nothing reaches `--secret-file` or a sink, and a
   `secretSink:` next to such methods is `secret_sink_without_secret_method` — a sink is legal only when the
@@ -1484,10 +1492,14 @@ What `thoryn provision` does with it:
   create converges onto the matching trust, as `project init` does. **There is no update:** a trust's pins and
   scopes are immutable on the hub, so a declared field that differs from the live trust is the plan error
   **`workload_identity_trust_immutable`**, naming the fix — declare what is live, or
-  `thoryn workload-identity trusts delete <id>` and re-apply to re-create it. A trust has no platform
-  object of its own, so `destroy` removes it only **with its sandbox** (when the identity may remove the
-  declared parent environment — the hard-delete cascades); on the production plane it is never removed by
-  `destroy` / `--prune` and the plan names `thoryn workload-identity trusts delete <id> --yes --confirm …`.
+  `thoryn workload-identity trusts delete <id>` and re-apply to re-create it. **On the production plane a
+  changed pin set is a NEW trust, which a person creates** (SSO-3774; below): the engine never mutates a pin,
+  and the plan says so. **Removal (SSO-3774):** the `client:` identity that **owns** a trust (`trust:<id>`)
+  removes it with `destroy`, and `--prune` removes the owned trusts the file no longer declares — on the
+  production plane behind `--confirm`, exactly like an owned application. Otherwise `destroy` removes a trust
+  only **with its sandbox** (when the identity may remove the declared parent environment — the hard-delete
+  cascades); a production trust it does not own (and any production trust, for a person) is never removed
+  by `destroy` / `--prune` and the plan names `thoryn workload-identity trusts delete <id> --yes --confirm …`.
 - **The one additive exception — `plan:` (SSO-3702).** A `github_actions` trust's plan profile is compared
   like a pin (`plan.environment`; `plan.scopes` only when the file lists them — a derived declaration
   matches whatever the hub derived), with one exception: a **declared profile on a live trust that has
@@ -1520,14 +1532,33 @@ What `thoryn provision` does with it:
   source (`/var/run/secrets/tokens/thoryn/token`, the projected ServiceAccount token) and the cluster pins.
   For a `forgejo` trust `provider` is left out (the contract validates `github_actions` and `kubernetes`
   today; a Forgejo job presents its own Actions token as the `client_assertion`).
-- **Ownership is the environment's.** A trust has no platform object of its own: the API writes for an
-  environment's managers, reads for its viewers and answers 404 to anyone else — so the gate asks about
-  the parent (`environment:<id>`, or the workspace for the production plane): `manager` ⇒ converge,
-  `viewer` ⇒ only a matching `readOnly: true` reference, none ⇒ `access_not_owned`. A trust cannot carry
-  `grants:`, `publishTo:` or `secretSink:`.
-- **`import`** renders every trust of a plane the identity may reach (`github` / `forgejo` /
-  `kubernetes` pins, `scopes`, `confirmProduction` on the production plane) — as an entry the file
-  converges, `readOnly: true` for a viewer. Inline Kubernetes keys are not rendered by the API: the entry carries a
+- **Ownership is asked per trust (SSO-3774; oauthy ADR `2026-10-16-repository-owned-workload-identity-trusts`).**
+  A trust is a platform object of its own, **`trust:<id>`** (the hub's trust UUID): ownable (one `owner`, a
+  `client:`, set by a workspace admin — `thoryn access grant client:<wi_…> owner trust:<id>` — or by
+  creator-becomes-owner when CI creates it in a sandbox), contained in its environment. The gate asks the
+  relation on `trust:<id>` **unioned with** the relation on its plane (`environment:<id>`, the workspace for the
+  production plane — so every environment manager and workspace admin keeps managing every trust of the plane,
+  and an existing trust whose parent edge is not stored yet stays reachable): `manager` ⇒ converge, unless the
+  response's `owner` names another repository (`access_owned_elsewhere`, naming no subject); `viewer` ⇒ only a
+  matching `readOnly: true` reference (`access_read_only` otherwise, fix `owner trust:<id>`); none ⇒
+  `access_not_owned`. A repository confined below the workspace therefore converges exactly the trusts it owns.
+  A trust the identity cannot see — the platform lists only what it reaches — plans as a create; if the file
+  declares it on a plane this identity cannot fully read it is **`access_not_reachable`** with `owner` (or
+  `viewer` for a `readOnly` reference) on the trust **by name** — `trust:<name>` in the fix request, `trust:<trust-id>`
+  in the command (`thoryn workload-identity trusts list` shows the id; the consent page resolves the name as
+  the admin). A trust cannot carry `grants:`, `publishTo:` or `secretSink:`.
+- **A production trust is created by a person, once (SSO-3774, ADR Q2).** A `client:` identity (CI) never
+  creates a trust on the production plane — even one that could: the plan row is
+  **`workload_identity_trust_production_needs_person`**, a note (never a grantable right: "no trust creation" is
+  outside the consentable set) carrying the founder's command — apply this file signed in as yourself, then
+  `thoryn access grant <subject> owner trust:<trust-id>`. From then on CI converges it. Sandbox trusts are the
+  repository's to create where it manages the environment.
+- **A platform without trust objects** (product-api before oauthy S1) answers `400` for `trust:`: the engine
+  falls back to the plane alone — the gate, `import` and the fixes of before (`manager` on the environment) — and
+  prunes no trust.
+- **`import`** renders every trust it can see (`github` / `forgejo` / `kubernetes` pins, `scopes`,
+  `confirmProduction` on the production plane) — as an entry the file converges when it manages it, `readOnly:
+  true` for a viewer or a trust another repository owns. Inline Kubernetes keys are not rendered by the API: the entry carries a
   note to add `spec.kubernetes.jwks` by hand (`kubectl get --raw /openid/v1/jwks`).
 
 **The structural limit — a file cannot declare its OWN bootstrap trust.** The identity that applies a
@@ -1679,6 +1710,8 @@ The audited refusals and what their Option 1 says:
 | `access_not_owned`, `access_read_only` (a resource to own) | `thoryn access grant client:<wi_> owner <object>` |
 | `access_not_owned` on a create | `thoryn access grant client:<wi_> manager environment:<id>`; a workspace parent is a note (never granted to a repository identity) |
 | `access_not_reachable` (404 on the live read) | `owner application:<clientId>` for a fixed `clientId`; `manager environment:<slug>` for a declared environment; a workspace note on the production plane without a fixed id |
+| `access_not_reachable` (a declared trust the identity cannot see — SSO-3774) | `thoryn access grant client:<wi_> owner trust:<trust-id>` (item object `trust:<name>`; `viewer` for a `readOnly` reference); asked ONCE even when the trust's row and the application naming it both need it |
+| `workload_identity_trust_production_needs_person` | a note: a workspace admin applies the file as themselves, then `thoryn access grant client:<wi_> owner trust:<trust-id>` |
 | `access_owned_elsewhere` | no command runs for you: declare it `readOnly: true`, or an admin moves the ownership (the reason carries revoke-then-grant) |
 | `access_read_only` (a differing reference), `converge_key_ambiguous`, `workload_identity_trust_immutable` / `_is_self`, `scope_not_grantable`, `federated_trust_not_found` | a line naming the file edit (align the reference, declare `clientId`, declare what is live or delete the trust, drop the scope / the resource) |
 | a refused or deferred removal (destroy / `--prune`) | the `by hand:` command on the plan row | Per oauthy ADR `2026-10-15-missing-rights-fix-path-cli-and-web-consent.md` §1 the job
