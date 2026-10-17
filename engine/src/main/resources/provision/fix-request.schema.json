@@ -64,7 +64,7 @@
       }
     },
     "missing": {
-      "description": "The rights that are missing, one item per refused row (or the one plan_profile item of a refused sign-in). Empty when every failed row is a file fix (see `notes`).",
+      "description": "The rights that are missing, one item per refused row (or the one plan_profile item of a refused sign-in); SSO-3774 — one item per RIGHT: rows that need the same kind on the same object for the same subject (a declared trust the identity cannot see, and every application naming it) are one item, with the first row's reason. Empty when every failed row is a file fix (see `notes`).",
       "type": "array",
       "items": { "$ref": "#/$defs/missingRight" }
     },
@@ -91,11 +91,11 @@
       "required": ["kind", "object", "subject", "environment", "reason", "cli"],
       "properties": {
         "kind": {
-          "description": "The ADR's grantable set, nothing else: `plan_profile` — a plan profile on the trust for the environment the job ran in (`thoryn workload-identity trusts set-plan-profile`); `owner` — the platform owner relation on an EXISTING object the file declares (access_not_owned on a live id; access_read_only when the identity may only view a resource it is to own; access_owned_elsewhere — then with `cli` null, a dispute an admin decides); `manager` — on the parent `environment:<id>` of a refused create (never on the workspace); `viewer` — on an existing object declared `readOnly: true` the identity holds no relation on.",
+          "description": "The ADR's grantable set, nothing else: `plan_profile` — a plan profile on the trust for the environment the job ran in (`thoryn workload-identity trusts set-plan-profile`); `owner` — the platform owner relation on an EXISTING object the file declares (access_not_owned on a live id; access_read_only when the identity may only view a resource it is to own; access_owned_elsewhere — then with `cli` null, a dispute an admin decides; SSO-3774: access_not_reachable on a declared workload-identity trust the identity cannot see, named `trust:<name>`); `manager` — on the parent `environment:<id>` of a refused create (never on the workspace); `viewer` — on an existing object declared `readOnly: true` the identity holds no relation on.",
           "enum": ["plan_profile", "owner", "manager", "viewer"]
         },
         "object": {
-          "description": "The platform object: `application:<clientId>`, `environment:<id>`, `custom_domain:<workspaceId>`, …, or `trust:<name>` for a plan_profile when the trust is named; null when unknown.",
+          "description": "The platform object: `application:<clientId>`, `environment:<id>`, `custom_domain:<workspaceId>`, `trust:<trust-uuid>` (SSO-3774 — a workload-identity trust the identity can see, oauthy ADR 2026-10-16), …, or `trust:<name>` for a trust named by its NAME: a plan_profile when the trust is named, and (SSO-3774) an owner / viewer on a trust the file DECLARES that the identity cannot see — the name is the file's resource name (unique in the file, the trust's name on the API); the consumer re-reads the file at the head sha for the trust's plane and resolves the name to the id as the admin. A `trust:` value that parses as a UUID is an id; anything else is a name. Null when unknown.",
           "type": ["string", "null"]
         },
         "subject": {
@@ -112,7 +112,7 @@
           "minLength": 1
         },
         "cli": {
-          "description": "The exact command a workspace admin runs — the copy-pasteable block the check run relays verbatim and the CLI prints itself. `<trust-id>` where the producer could not resolve the id (`thoryn workload-identity trusts list` shows it); `<subject>` when the session token was opaque. Null for a dispute the CLI shows but never resolves (an object another repository owns).",
+          "description": "The exact command a workspace admin runs — the copy-pasteable block the check run relays verbatim and the CLI prints itself. `<trust-id>` where the producer could not resolve the id (`thoryn workload-identity trusts list` shows it) — always so for an item whose object is `trust:<name>`; `<subject>` when the session token was opaque. Null for a dispute the CLI shows but never resolves (an object another repository owns).",
           "type": ["string", "null"]
         }
       }

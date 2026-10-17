@@ -276,7 +276,7 @@ class ProvisionWorkloadIdentityTrustTest : CommandTestBase() {
     }
 
     @Test
-    fun `the ownership gate is the environment's — no relation is access_not_owned, viewer only a readOnly reference, and a repository's own bootstrap trust is refused`() {
+    fun `the ownership gate reaches a trust through its environment — viewer only a readOnly reference, a production create by CI is refused, and a repository's own bootstrap trust is refused`() {
         api.callerIsAdmin = false
         api.caller = "client:repo"
         val envId = api.seedEnvironment("ci-sbx")
@@ -293,12 +293,14 @@ class ProvisionWorkloadIdentityTrustTest : CommandTestBase() {
                 spec: { provider: github_actions, github: { repository: acme/billing }, scopes: [tenant:applications.read] }
         """
         assertThat(engine(subject = "client:repo").plan(file(mine), false).changes.single().action).isEqualTo(ChangeAction.CREATE)
-        // The production plane: this identity does not manage the workspace.
+        // The production plane: this identity does not reach the workspace, so a trust there may exist and be invisible to it —
+        // and creating one is a person's act anyway (SSO-3774; ADR 2026-10-16 Q2): access_not_reachable, `owner` on it by name.
         val production = file(mine.replace("                environment: ci-sbx\n", "").replace("scopes: [tenant:applications.read] }", "scopes: [tenant:applications.read], confirmProduction: true }").replace("repository: acme/billing }", "repository: acme/billing, environment: production }"))
         val refused = engine(subject = "client:repo").plan(production, false).changes.single()
         assertThat(refused.action).isEqualTo(ChangeAction.ERROR)
-        assertThat(refused.error).isEqualTo(ProvisionEngine.ERROR_NOT_OWNED)
-        assertThat(refused.reason).contains("requires `manager` on its environment workspace:${api.tenantId}")
+        assertThat(refused.error).isEqualTo(ProvisionEngine.ERROR_NOT_REACHABLE)
+        assertThat(refused.reason).contains("a production trust is created by a person")
+        assertThat(refused.fix!!.objectRef).isEqualTo("trust:billing-ci")
         // Viewer on the environment: only a matching readOnly reference, never a write.
         val viewed = file(
             """

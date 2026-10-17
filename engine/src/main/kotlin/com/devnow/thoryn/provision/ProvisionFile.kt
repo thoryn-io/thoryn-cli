@@ -812,7 +812,7 @@ class ProvisionFile private constructor(
          */
         private fun validateWorkloadIdentityTrust(spec: JsonNode, r: JsonNode, where: String, v: MutableList<String>) {
             rejectUnknownKeys(spec, TRUST_SPEC_KEYS, "$where spec", v)
-            if (r["grants"]?.takeIf { !it.isNull } != null) v += "$where a $KIND_WORKLOAD_IDENTITY_TRUST has no access object of its own (reach is its environment's) — it cannot carry 'grants'"
+            if (r["grants"]?.takeIf { !it.isNull } != null) v += "$where a $KIND_WORKLOAD_IDENTITY_TRUST's grants are not converged from a file — it cannot carry 'grants' (SSO-3774: its `owner` is a workspace admin's grant, `thoryn access grant <subject> owner trust:<id>`; manager / viewer are delegated with `thoryn access grant`)"
             val provider = spec["provider"]?.takeIf { it.isTextual() }?.asString()?.trim()
             if (provider != null && provider !in TRUST_PROVIDERS) v += "$where spec.provider: $ERR_UNSUPPORTED_PROVIDER — '$provider' must be one of ${TRUST_PROVIDERS.joinToString(", ")}"
             spec[TRUST_SCOPES]?.takeIf { it.isArray() }?.toList()?.let { scopes ->
