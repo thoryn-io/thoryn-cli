@@ -153,7 +153,7 @@ class ProvisionSecretlessSchemaTest {
         val rules = schema["\$defs"]["resource"]["allOf"].toList()
         val federated = rules.first { it["if"]["properties"]?.get("spec")?.get("properties")?.get("clientAuthenticationMethods")?.get("contains")?.get("const")?.asString() == "federated_assertion" }
         assertThat(federated["then"]["properties"]["spec"]["required"].toList().map { it.asString() }).containsExactly("federatedTrust")
-        assertThat(federated["then"]["properties"]["spec"]["properties"]["grantTypes"]["items"]["enum"].toList().map { it.asString() }.toSet()).isEqualTo(ProvisionFile.FEDERATED_GRANT_TYPES)
+        assertThat(federated["then"]["properties"]["spec"]["properties"]["grantTypes"]["items"]["enum"].toList().map { it.asString() }.toSet()).isEqualTo(ProvisionFile.FEDERATED_GRANT_TYPES + ProvisionFile.GRANT_TOKEN_EXCHANGE) // SSO-3767 — with allowTokenExchange: true
         assertThat(federated["then"]["properties"]["spec"]["properties"]["clientAuthenticationMethods"]["maxItems"].asInt()).isEqualTo(1)
         assertThat(federated["then"]["not"]["required"].toList().map { it.asString() }).containsExactly("secretSink")
         assertThat(rules).anyMatch { it["if"]["properties"]?.get("spec")?.get("properties")?.get("clientAuthenticationMethods")?.get("contains")?.get("const")?.asString() == "private_key_jwt" && it["then"]["properties"]["spec"]["anyOf"].size() == 2 }

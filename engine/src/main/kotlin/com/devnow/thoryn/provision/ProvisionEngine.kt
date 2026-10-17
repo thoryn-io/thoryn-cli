@@ -891,7 +891,36 @@ class ProvisionEngine(
         if (r.kind == ProvisionFile.KIND_WORKLOAD_IDENTITY_TRUST) return gateTrust(r, change, file, envSlugs, slug, reach)
         val gated = gateObject(r, change, file, envSlugs, slug, reach)
         // SSO-3774 (ADR 2026-10-16 I4) — an application this identity may converge may still not BIND a trust it does not manage.
-        return if (r.kind == ProvisionFile.KIND_APPLICATION && gated.action != ChangeAction.ERROR && !gated.readOnly) gateBinding(r, gated, slug, reach) else gated
+        if (r.kind != ProvisionFile.KIND_APPLICATION || gated.action == ChangeAction.ERROR || gated.readOnly) return gated
+        val bound = gateBinding(r, gated, slug, reach)
+        // SSO-3767 — nor turn token exchange ON without reach on its environment.
+        return if (bound.action == ChangeAction.ERROR) bound else gateTokenExchange(r, bound, file, envSlugs, slug, reach)
+    }
+
+    /**
+     * SSO-3767 (oauthy SSO-3758) — turning `allowTokenExchange` ON for an EXISTING application needs `manager` on its
+     * environment (the workspace on the production plane): the reach that may create an application there, so an identity
+     * that manages one application — a repository's CI identity that owns it — cannot widen it into a token minter for its
+     * users. product-api refuses that PATCH with `403 token_exchange_not_grantable`; the plan says so first, with the right
+     * that fixes it (`manager` on the environment — a grantable item; on the production plane a note: the workspace's
+     * `manager` is never granted to a repository identity). Asked only when the update TURNS IT ON (the diff names the field
+     * and the file says `true`): turning it off, omitting it, or re-declaring the stored value is never refused, and a create
+     * already needs `manager` on the parent ([gateObject]).
+     */
+    private fun gateTokenExchange(r: ProvisionResource, change: PlannedChange, file: ProvisionFile, envSlugs: Map<String, String>, slug: String?, reach: Reach): PlannedChange {
+        if (change.action != ChangeAction.UPDATE || ProvisionFile.SPEC_ALLOW_TOKEN_EXCHANGE !in change.diff) return change
+        if (!coerceBool(r.spec[ProvisionFile.SPEC_ALLOW_TOKEN_EXCHANGE])) return change
+        val parent = parentRef(r, file, envSlugs, slug, reach) ?: return change
+        if (reach.managesParent(parent)) return change
+        val appAccess = Access.entries.firstOrNull { it.label == change.access }
+        val why = "turning ${ProvisionFile.SPEC_ALLOW_TOKEN_EXCHANGE} on for ${r.key} requires `manager` on its environment $parent — the reach that may create an " +
+            "application there; managing the application alone is not enough (product-api answers `403 ${ProvisionFile.ERR_TOKEN_EXCHANGE_NOT_GRANTABLE}`)"
+        return if (parent.startsWith("$OBJECT_TYPE_WORKSPACE:")) {
+            refuse(r, change, ProvisionFile.ERR_TOKEN_EXCHANGE_NOT_GRANTABLE, appAccess, "$why ($TOKEN_EXCHANGE_WORKSPACE_NOTE)", fixNote = TOKEN_EXCHANGE_WORKSPACE_NOTE)
+        } else {
+            val fix = FixRequest.manager(subject, parent, why)
+            refuse(r, change, ProvisionFile.ERR_TOKEN_EXCHANGE_NOT_GRANTABLE, appAccess, "$why (${FixRequest.hint(fix)})", fix = fix)
+        }
     }
 
     /** The per-object verdict of [gate] for every kind but a trust. */
@@ -1655,7 +1684,11 @@ class ProvisionEngine(
                 // bound trust are read from the response. SSO-3715 — the key location (`jwksUri` / `jwks`) is NOT rendered by
                 // the API (SSO-3716) and there is no receipt to remember it by, so it is never diffed: sent on create, re-sent
                 // with every update ([applicationBody]).
-                val fields = listOf("displayName", "redirectUris", "postLogoutRedirectUris", "scopes", "grantTypes", ProvisionFile.SPEC_CLIENT_AUTHENTICATION_METHODS, ProvisionFile.SPEC_FEDERATED_TRUST)
+                // SSO-3766 / SSO-3767 / SSO-3770 — the token-exchange, authorization-detail-type and session-lifetime settings
+                // converge the same way: read from the response, diffed only when DECLARED (an omitted one keeps the live value;
+                // `allowedAuthorizationDetailTypes: []` is declared, and clears).
+                val fields = listOf("displayName", "redirectUris", "postLogoutRedirectUris", "scopes", "grantTypes", ProvisionFile.SPEC_CLIENT_AUTHENTICATION_METHODS, ProvisionFile.SPEC_FEDERATED_TRUST) +
+                    ProvisionFile.APPLICATION_SETTING_FIELDS
                 val live = n.toMap(fields)
                 val want = desired.filterKeys { it in fields }
                 val id = n.str("clientId") ?: n.str("client_id") ?: ""
@@ -1760,7 +1793,11 @@ class ProvisionEngine(
 
     private fun createApplication(r: ProvisionResource, file: ProvisionFile, applied: List<AppliedResource>, spec: Map<String, Any?>): Created {
         val slug = targetSlug(r, file, applied)
-        val resp = clients(slug).createApplication(applicationBody(r, spec, slug))
+        val resp = try {
+            clients(slug).createApplication(applicationBody(r, spec, slug))
+        } catch (ex: ProductApiException) {
+            throw applicationSettingFailure(r, ex, slug) ?: ex
+        }
         val id = resp.str("clientId") ?: resp.str("client_id") ?: throw ProvisionException("${r.key}: the application create returned no clientId")
         // SSO-3113 — the ONE server-minted secret goes to a sink and NOWHERE else: never a field, the plan, the console,
         // or a log. The response node is not retained. SSO-3659 — it is handed back to [apply], which delivers it only
@@ -1829,7 +1866,11 @@ class ProvisionEngine(
             ProvisionFile.KIND_APPLICATION -> {
                 // SSO-3715 — the key location rides on every update (idempotent): the API cannot tell us whether it changed.
                 val keyLocation = spec.filterKeys { it in KEY_LOCATION_FIELDS }
-                clients(slug).updateApplication(id, applicationBody(r, changed + keyLocation, slug))
+                try {
+                    clients(slug).updateApplication(id, applicationBody(r, changed + keyLocation, slug))
+                } catch (ex: ProductApiException) {
+                    throw applicationSettingFailure(r, ex, slug) ?: ex
+                }
                 out.println("  ~ application ${r.name}: updated ${change.diff.keys}${if (keyLocation.isNotEmpty()) " + key location" else ""} (clientId $id)")
                 base.copy(attributes = applicationAttributes(spec))
             }
@@ -2584,6 +2625,65 @@ class ProvisionEngine(
         }
     }
 
+    /**
+     * SSO-3766 / SSO-3767 / SSO-3770 — product-api's refusals of the application settings, each with what to do next; null
+     * for any other failure (it keeps its own rendering). Without this a `403 token_exchange_not_grantable` would read as a
+     * missing SCOPE (every 403 does, [ProductApiException.isInsufficientScope]) and send the reader to `thoryn login --scope`.
+     * The one refusal a RIGHT fixes — `token_exchange_not_grantable`, which the plan gate predicts but a race or an older
+     * reach answer can still meet — ends with the same "To fix" block a red plan prints; the others are file edits.
+     */
+    private fun applicationSettingFailure(r: ProvisionResource, ex: ProductApiException, slug: String?): ProvisionException? {
+        val extension = { name: String -> problemExtension(ex, name) }
+        val detail = ex.errorDescription?.takeIf { it.isNotBlank() && it != ex.errorCode }?.let { " (the API said: $it)" } ?: ""
+        val head = "${r.key}: ${ex.errorCode} — "
+        val message = when (ex.errorCode) {
+            ProvisionFile.ERR_TOKEN_EXCHANGE_NOT_GRANTABLE -> {
+                val parent = runCatching { planeParentRef(slug, Reach()) }.getOrElse { "$OBJECT_TYPE_WORKSPACE:${workspaceId ?: "(this workspace)"}" }
+                val why = "turning ${ProvisionFile.SPEC_ALLOW_TOKEN_EXCHANGE} on requires `manager` on the application's environment $parent " +
+                    "(the reach that may create an application there); managing the application alone is not enough"
+                val toFix = if (parent.startsWith("$OBJECT_TYPE_WORKSPACE:")) {
+                    FixRequest.render(emptyList(), listOf("${r.kind} ${r.name}: $TOKEN_EXCHANGE_WORKSPACE_NOTE"))
+                } else {
+                    FixRequest.render(listOf(FixRequest.manager(subject, parent, "${ProvisionFile.ERR_TOKEN_EXCHANGE_NOT_GRANTABLE} — $why")))
+                }
+                "$why.\n$toFix"
+            }
+            ProvisionFile.ERR_TOKEN_EXCHANGE_REQUIRES_CONFIDENTIAL_CLIENT ->
+                "${ProvisionFile.SPEC_ALLOW_TOKEN_EXCHANGE}: true needs a client that authenticates (a secret, private_key_jwt or federated_assertion); " +
+                    "a public client cannot hold it, and a client that holds it cannot be made public — fix spec.clientType / spec.clientAuthenticationMethods, or drop the setting$detail"
+            ProvisionFile.ERR_TOKEN_EXCHANGE_GRANT_REQUIRED ->
+                "${ProvisionFile.SPEC_ALLOW_TOKEN_EXCHANGE}: true needs '${ProvisionFile.GRANT_TOKEN_EXCHANGE}' among the application's grant types — add it to spec.grantTypes$detail"
+            ProvisionFile.ERR_UNSUPPORTED_AUTHORIZATION_DETAILS_TYPE ->
+                "an entry of spec.${ProvisionFile.SPEC_ALLOWED_AUTHORIZATION_DETAIL_TYPES} is not a type the authorization server supports (its discovery " +
+                    "document's authorization_details_types_supported, plus ${ProvisionFile.AUTHORIZATION_DETAILS_TYPE_ACCESS_GRANT}) — check the spelling, one type per entry$detail"
+            ProvisionFile.ERR_AUTHORIZATION_DETAILS_TYPE_NOT_PERMITTED ->
+                "'${ProvisionFile.AUTHORIZATION_DETAILS_TYPE_ACCESS_GRANT}' may be declared only for applications of the platform home workspace (thoryn) — " +
+                    "remove it from spec.${ProvisionFile.SPEC_ALLOWED_AUTHORIZATION_DETAIL_TYPES}; no grant changes this"
+            ProvisionFile.ERR_SESSION_LIFETIME_REQUIRES_SLIDING_WINDOW ->
+                "spec.${ProvisionFile.SPEC_REFRESH_TOKEN_ABSOLUTE_MAX_TTL_SECONDS} applies only with ${ProvisionFile.SPEC_REFRESH_TOKEN_SLIDING_WINDOW}: true — declare the window with it$detail"
+            ProvisionFile.ERR_SESSION_LIFETIME_BELOW_REFRESH_TTL ->
+                "spec.${ProvisionFile.SPEC_REFRESH_TOKEN_ABSOLUTE_MAX_TTL_SECONDS} is shorter than the application's refresh-token TTL (refreshTokenTtlSeconds, after this change): " +
+                    "the first refresh token would outlive the session — raise the absolute lifetime or lower the TTL$detail"
+            ProvisionFile.ERR_TOKEN_TTL_OUT_OF_RANGE -> {
+                val field = extension("field") ?: "a token lifetime"
+                val bounds = listOfNotNull(extension("min"), extension("max")).takeIf { it.size == 2 }?.joinToString(" – ")?.let { " ($it seconds)" } ?: ""
+                "spec.$field is outside the platform bounds$bounds$detail"
+            }
+            ProvisionFile.ERR_SESSION_EXCEEDS_TENANT_POLICY -> {
+                val max = extension("max")?.let { " of $it seconds" } ?: ""
+                "spec.${ProvisionFile.SPEC_REFRESH_TOKEN_ABSOLUTE_MAX_TTL_SECONDS} (or the 90-day default the sliding window turns on) is longer than the environment's " +
+                    "refresh-token lifetime cap$max (refreshClipSeconds of its authentication policy) — lower it to the cap or below, or raise the policy cap"
+            }
+            else -> return null
+        }
+        return ProvisionException(head + message)
+    }
+
+    /** A member of an RFC 9457 problem body (`field`, `min`, `max`, …), as text; null when absent or unparseable. */
+    private fun problemExtension(ex: ProductApiException, name: String): String? = runCatching {
+        json.readTree(ex.rawBody)[name]?.takeIf { it.isNumber || it.isTextual }?.asString()?.takeIf { it.isNotBlank() }
+    }.getOrNull()
+
     /** The application body the API takes: `federatedTrust` as the trust id, an inline `jwks` as its JSON text. */
     private fun applicationBody(r: ProvisionResource, spec: Map<String, Any?>, slug: String?): Map<String, Any?> {
         val body = LinkedHashMap(spec)
@@ -2778,6 +2878,14 @@ class ProvisionEngine(
          * consentable right (ADR 2026-10-15 §3) — a confined repository identity must not manage the workspace; a workspace
          * admin creates the production-plane resource and grants this identity `owner` on it, or the file declares it `readOnly`.
          */
+        /**
+         * SSO-3767 — why a production-plane `token_exchange_not_grantable` has no item: the right that fixes it is `manager` on
+         * the WORKSPACE, which a repository identity is never granted. A person with that standing applies the file instead.
+         */
+        const val TOKEN_EXCHANGE_WORKSPACE_NOTE = "not a grantable right: turning token exchange on for a production-plane application needs `manager` on the " +
+            "workspace, which is never granted to a repository identity — a workspace admin applies this file from their own session " +
+            "(or drop `allowTokenExchange: true` from the file)"
+
         const val WORKSPACE_PARENT_NOTE = "not a grantable right: `manager` on the workspace is never granted to a repository identity — a workspace admin creates it, then grants this identity `owner` on it (or declare it `readOnly: true`)"
 
         /**

@@ -265,6 +265,46 @@ class ProvisionFile private constructor(
         const val ERR_SECRET_SINK_WITHOUT_SECRET = "secret_sink_without_secret_method"
         const val ERR_INVALID_JWKS = "invalid_jwks"
 
+        // ── SSO-3766 / SSO-3767 / SSO-3770 — application settings the applications API took on (oauthy SSO-3758 / 3759 / 3762) ──
+
+        /** SSO-3767 — RFC 8693 token exchange for this application (product-api `allowTokenExchange`, default `false`). */
+        const val SPEC_ALLOW_TOKEN_EXCHANGE = "allowTokenExchange"
+        /** SSO-3766 — the RFC 9396 `authorization_details` types the application may send (default `[]`; PATCH replaces, `[]` clears). */
+        const val SPEC_ALLOWED_AUTHORIZATION_DETAIL_TYPES = "allowedAuthorizationDetailTypes"
+        /** SSO-3770 — cap the session at [SPEC_REFRESH_TOKEN_ABSOLUTE_MAX_TTL_SECONDS] counted from sign-in (default `false`). */
+        const val SPEC_REFRESH_TOKEN_SLIDING_WINDOW = "refreshTokenSlidingWindow"
+        /** SSO-3770 — the absolute session lifetime in seconds (default 7 776 000 = 90 d); needs the sliding window. */
+        const val SPEC_REFRESH_TOKEN_ABSOLUTE_MAX_TTL_SECONDS = "refreshTokenAbsoluteMaxTtlSeconds"
+        /** The sliding refresh-token TTL the absolute lifetime must not undercut (sent on create; not converged today). */
+        const val SPEC_REFRESH_TOKEN_TTL_SECONDS = "refreshTokenTtlSeconds"
+        /** The four settings, in the order a plan lists them — each converged on UPDATE, an omitted one keeps the live value. */
+        val APPLICATION_SETTING_FIELDS: List<String> = listOf(
+            SPEC_ALLOW_TOKEN_EXCHANGE, SPEC_ALLOWED_AUTHORIZATION_DETAIL_TYPES, SPEC_REFRESH_TOKEN_SLIDING_WINDOW, SPEC_REFRESH_TOKEN_ABSOLUTE_MAX_TTL_SECONDS,
+        )
+        /** The RFC 8693 grant an application must register to hold [SPEC_ALLOW_TOKEN_EXCHANGE]. */
+        const val GRANT_TOKEN_EXCHANGE = "urn:ietf:params:oauth:grant-type:token-exchange"
+        /** product-api's absolute-session bounds (`AdvancedClientSettingsValidator.ABSOLUTE_SESSION_MIN/MAX_SECONDS`): 1 h – 90 d. */
+        const val ABSOLUTE_SESSION_MIN_SECONDS = 3_600L
+        const val ABSOLUTE_SESSION_MAX_SECONDS = 7_776_000L
+        /** The hub's own RFC 9396 type — permitted only for applications of the platform HOME workspace (`thoryn`). */
+        const val AUTHORIZATION_DETAILS_TYPE_ACCESS_GRANT = "thoryn_access_grant"
+        /** One RFC 9396 type per entry: a non-empty token without whitespace (the server decides which are supported). */
+        val AUTHORIZATION_DETAILS_TYPE_PATTERN = Regex("^\\S+$")
+        // product-api's codes for these settings, mirrored so a file is refused with the vocabulary the API answers with.
+        const val ERR_TOKEN_EXCHANGE_REQUIRES_CONFIDENTIAL_CLIENT = "token_exchange_requires_confidential_client"
+        const val ERR_TOKEN_EXCHANGE_GRANT_REQUIRED = "token_exchange_grant_required"
+        /** API-only (403): turning the setting ON needs `manager` on the application's environment — the plan gate predicts it. */
+        const val ERR_TOKEN_EXCHANGE_NOT_GRANTABLE = "token_exchange_not_grantable"
+        /** API-only (400): a type the authorization server does not support (its discovery list, plus [AUTHORIZATION_DETAILS_TYPE_ACCESS_GRANT]). */
+        const val ERR_UNSUPPORTED_AUTHORIZATION_DETAILS_TYPE = "unsupported_authorization_details_type"
+        /** API-only (403): [AUTHORIZATION_DETAILS_TYPE_ACCESS_GRANT] outside the platform home workspace. */
+        const val ERR_AUTHORIZATION_DETAILS_TYPE_NOT_PERMITTED = "authorization_details_type_not_permitted"
+        const val ERR_SESSION_LIFETIME_REQUIRES_SLIDING_WINDOW = "session_lifetime_requires_sliding_window"
+        const val ERR_SESSION_LIFETIME_BELOW_REFRESH_TTL = "session_lifetime_below_refresh_ttl"
+        const val ERR_TOKEN_TTL_OUT_OF_RANGE = "token_ttl_out_of_range"
+        /** API-only (400): longer than the environment authentication policy's `refreshClipSeconds` (the cap rides in `max`). */
+        const val ERR_SESSION_EXCEEDS_TENANT_POLICY = "session_exceeds_tenant_policy"
+
         // ── SSO-3689 — `workloadIdentityTrust` ──
 
         const val PROVIDER_GITHUB_ACTIONS = "github_actions"
@@ -600,6 +640,8 @@ class ProvisionFile private constructor(
                 }
                 // SSO-3689 — how an application authenticates: the credential ladder's rungs, mirrored client-side.
                 if (kind == KIND_APPLICATION) validateApplicationAuth(spec, r, where, v)
+                // SSO-3766 / SSO-3767 / SSO-3770 — token exchange, authorization detail types, session lifetime.
+                if (kind == KIND_APPLICATION) validateApplicationSettings(spec, where, v)
                 // SSO-3689 — a workload-identity trust: the provider's pins, the scope grammar, the production rules.
                 if (kind == KIND_WORKLOAD_IDENTITY_TRUST) validateWorkloadIdentityTrust(spec, r, where, v)
             }
@@ -766,14 +808,82 @@ class ProvisionFile private constructor(
             if (spec[SPEC_CLIENT_TYPE]?.takeIf { it.isTextual() }?.asString()?.trim().equals(CLIENT_TYPE_PUBLIC, ignoreCase = true)) {
                 v += "$where $ERR_FEDERATED_ONLY_METHOD — a public client (clientType: $CLIENT_TYPE_PUBLIC) authenticates with '$METHOD_NONE'; a federated login client is confidential — its platform token is the credential"
             }
-            spec[SPEC_GRANT_TYPES]?.takeIf { it.isArray() }?.toList()?.map { it.asString().trim() }?.filter { it.isNotEmpty() && it !in FEDERATED_GRANT_TYPES }?.takeIf { it.isNotEmpty() }?.let { bad ->
-                v += "$where $ERR_FEDERATED_GRANT_NOT_ALLOWED — a federated login client may register only ${FEDERATED_GRANT_TYPES.joinToString(", ")} (not ${bad.joinToString(", ")}); for client_credentials use the trust's own wi_ workload client"
+            // SSO-3767 (oauthy 2026-10-16 amendment of decision 2) — plus the token-exchange grant when `allowTokenExchange: true`.
+            val exchanging = spec[SPEC_ALLOW_TOKEN_EXCHANGE]?.takeIf { it.isBoolean() }?.asBoolean() == true
+            val allowedGrants = if (exchanging) FEDERATED_GRANT_TYPES + GRANT_TOKEN_EXCHANGE else FEDERATED_GRANT_TYPES
+            spec[SPEC_GRANT_TYPES]?.takeIf { it.isArray() }?.toList()?.map { it.asString().trim() }?.filter { it.isNotEmpty() && it !in allowedGrants }?.takeIf { it.isNotEmpty() }?.let { bad ->
+                v += if (bad == listOf(GRANT_TOKEN_EXCHANGE)) {
+                    "$where $ERR_FEDERATED_GRANT_NOT_ALLOWED — a federated login client registers the token-exchange grant only together with $SPEC_ALLOW_TOKEN_EXCHANGE: true; declare both, or drop the grant"
+                } else {
+                    "$where $ERR_FEDERATED_GRANT_NOT_ALLOWED — a federated login client may register only ${allowedGrants.joinToString(", ")} (not ${bad.joinToString(", ")}); for client_credentials use the trust's own wi_ workload client"
+                }
             }
             if (spec[SPEC_REQUIRE_PROOF_KEY]?.takeIf { it.isBoolean() }?.asBoolean() == false) {
                 v += "$where $ERR_FEDERATED_PKCE_REQUIRED — $SPEC_REQUIRE_PROOF_KEY cannot be false for a federated login client; PKCE (RFC 7636) stays mandatory"
             }
             if (hasKey) v += "$where $ERR_FEDERATED_NO_SECRET_OR_KEY — a federated login client registers no $SPEC_JWKS / $SPEC_JWKS_URI; its platform token is the credential"
             if (trust == null) v += "$where $ERR_FEDERATED_TRUST_REQUIRED — spec.$SPEC_FEDERATED_TRUST (the NAME of a $KIND_WORKLOAD_IDENTITY_TRUST in the same environment) is required for a federated login client"
+        }
+
+        /**
+         * SSO-3766 / SSO-3767 / SSO-3770 — the application settings the schema also pins, with product-api's own codes (the
+         * ones a file alone can decide; the rest are the API's, mapped at apply):
+         *  - `allowTokenExchange` (boolean): when `true`, the client authenticates (never `clientType: public` / method
+         *    `none` — [ERR_TOKEN_EXCHANGE_REQUIRES_CONFIDENTIAL_CLIENT]) and declares the token-exchange grant in `grantTypes`
+         *    ([ERR_TOKEN_EXCHANGE_GRANT_REQUIRED]). WHO may turn it on (`manager` on the environment) is the plan gate's.
+         *  - `allowedAuthorizationDetailTypes` (list): distinct, one type per entry; `[]` is legal (it clears). Which types
+         *    are SUPPORTED, and `thoryn_access_grant`'s home-workspace rule, are the server's.
+         *  - `refreshTokenSlidingWindow` (boolean) / `refreshTokenAbsoluteMaxTtlSeconds` (integer 3 600 – 7 776 000,
+         *    [ERR_TOKEN_TTL_OUT_OF_RANGE]): the absolute lifetime is declared WITH `refreshTokenSlidingWindow: true`
+         *    ([ERR_SESSION_LIFETIME_REQUIRES_SLIDING_WINDOW] — a file says what the session is, it does not lean on the live
+         *    window) and is at least a declared `refreshTokenTtlSeconds` ([ERR_SESSION_LIFETIME_BELOW_REFRESH_TTL]).
+         */
+        private fun validateApplicationSettings(spec: JsonNode, where: String, v: MutableList<String>) {
+            fun present(field: String): JsonNode? = spec[field]?.takeIf { !it.isNull }
+            listOf(SPEC_ALLOW_TOKEN_EXCHANGE, SPEC_REFRESH_TOKEN_SLIDING_WINDOW).forEach { f ->
+                present(f)?.takeIf { !it.isBoolean() }?.let { v += "$where spec.$f must be true or false" }
+            }
+            present(SPEC_ALLOWED_AUTHORIZATION_DETAIL_TYPES)?.let { types ->
+                if (!types.isArray()) {
+                    v += "$where spec.$SPEC_ALLOWED_AUTHORIZATION_DETAIL_TYPES must be a list of RFC 9396 types ([] clears it; omit it to keep the live list)"
+                } else {
+                    val raw = types.toList()
+                    raw.forEachIndexed { i, t ->
+                        if (!t.isTextual() || !AUTHORIZATION_DETAILS_TYPE_PATTERN.matches(t.asString())) {
+                            v += "$where spec.$SPEC_ALLOWED_AUTHORIZATION_DETAIL_TYPES[$i] must be ONE authorization-details type (a non-empty name without spaces, e.g. openid_credential)"
+                        }
+                    }
+                    val names = raw.filter { it.isTextual() }.map { it.asString() }
+                    if (names.size != names.distinct().size) v += "$where spec.$SPEC_ALLOWED_AUTHORIZATION_DETAIL_TYPES lists a type twice"
+                }
+            }
+            val sliding = present(SPEC_REFRESH_TOKEN_SLIDING_WINDOW)?.takeIf { it.isBoolean() }?.asBoolean()
+            present(SPEC_REFRESH_TOKEN_ABSOLUTE_MAX_TTL_SECONDS)?.let { abs ->
+                if (!abs.isIntegralNumber()) {
+                    v += "$where spec.$SPEC_REFRESH_TOKEN_ABSOLUTE_MAX_TTL_SECONDS must be a whole number of seconds"
+                    return@let
+                }
+                val seconds = abs.asLong()
+                if (seconds !in ABSOLUTE_SESSION_MIN_SECONDS..ABSOLUTE_SESSION_MAX_SECONDS) {
+                    v += "$where spec.$SPEC_REFRESH_TOKEN_ABSOLUTE_MAX_TTL_SECONDS: $ERR_TOKEN_TTL_OUT_OF_RANGE — $seconds is outside $ABSOLUTE_SESSION_MIN_SECONDS – $ABSOLUTE_SESSION_MAX_SECONDS (1 h – 90 d)"
+                }
+                if (sliding != true) {
+                    v += "$where $ERR_SESSION_LIFETIME_REQUIRES_SLIDING_WINDOW — spec.$SPEC_REFRESH_TOKEN_ABSOLUTE_MAX_TTL_SECONDS applies only with spec.$SPEC_REFRESH_TOKEN_SLIDING_WINDOW: true; declare the window with it"
+                }
+                present(SPEC_REFRESH_TOKEN_TTL_SECONDS)?.takeIf { it.isIntegralNumber() }?.asLong()?.takeIf { seconds < it }?.let { ttl ->
+                    v += "$where $ERR_SESSION_LIFETIME_BELOW_REFRESH_TTL — spec.$SPEC_REFRESH_TOKEN_ABSOLUTE_MAX_TTL_SECONDS ($seconds) is shorter than spec.$SPEC_REFRESH_TOKEN_TTL_SECONDS ($ttl): the first refresh token would outlive the session"
+                }
+            }
+            if (present(SPEC_ALLOW_TOKEN_EXCHANGE)?.takeIf { it.isBoolean() }?.asBoolean() != true) return
+            val methods = present(SPEC_CLIENT_AUTHENTICATION_METHODS)?.takeIf { it.isArray() }?.toList()?.map { it.asString().trim() }
+            val public = spec[SPEC_CLIENT_TYPE]?.takeIf { it.isTextual() }?.asString()?.trim().equals(CLIENT_TYPE_PUBLIC, ignoreCase = true)
+            if (public || methods?.contains(METHOD_NONE) == true) {
+                v += "$where $ERR_TOKEN_EXCHANGE_REQUIRES_CONFIDENTIAL_CLIENT — $SPEC_ALLOW_TOKEN_EXCHANGE: true needs a client that authenticates ($METHOD_CLIENT_SECRET_BASIC, $METHOD_PRIVATE_KEY_JWT or $METHOD_FEDERATED_ASSERTION); a public client ('$METHOD_NONE') cannot hold it"
+            }
+            val grants = present(SPEC_GRANT_TYPES)?.takeIf { it.isArray() }?.toList()?.map { it.asString().trim() }
+            if (grants == null || GRANT_TOKEN_EXCHANGE !in grants) {
+                v += "$where $ERR_TOKEN_EXCHANGE_GRANT_REQUIRED — $SPEC_ALLOW_TOKEN_EXCHANGE: true needs '$GRANT_TOKEN_EXCHANGE' among spec.$SPEC_GRANT_TYPES"
+            }
         }
 
         /**
