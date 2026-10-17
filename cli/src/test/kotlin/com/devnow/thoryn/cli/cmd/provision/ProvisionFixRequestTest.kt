@@ -84,12 +84,24 @@ class ProvisionFixRequestTest : CommandTestBase() {
         System.setProperty(FixRequest.CONSENT_URL_ENV, "https://app.thoryn.io")
         val out = File(tempHome.toFile(), "thoryn-provision-request.json")
 
-        val (exit, _, err) = runCli("provision", "plan", "--file", file(redFile).path, "--gateway", baseUrl(), "--fix-request", out.path)
+        val (exit, stdout, err) = runCli("provision", "plan", "--file", file(redFile).path, "--gateway", baseUrl(), "--fix-request", out.path)
 
         assertThat(exit).isEqualTo(CommandSupport.EXIT_HTTP_ERROR)
         val link = "https://app.thoryn.io/github/consent/run/thoryn-io/thoryn-cli/38547022158"
         assertThat(err).contains("${FixRequest.OPTION_BROWSER_HEADING} $link")
-        assertThat(request(out)["options"]["consentUrl"].asString()).isEqualTo(link)
+        val doc = request(out)
+        assertThat(doc["options"]["consentUrl"].asString()).isEqualTo(link)
+        // SSO-3738 — one consent flow, two entry points: Option 1 is the approve command for THIS run, in the log and the
+        // request alike, and no raw grant line is printed anywhere (not in the To fix block, the error rows or the plan).
+        val approve = "thoryn access approve thoryn-io/thoryn-cli/38547022158"
+        assertThat(doc["options"]["cli"].asString()).isEqualTo(approve)
+        assertThat(err).contains("${FixRequest.OPTION_CLI_HEADING}\n      $approve\n").contains(FixRequest.APPROVE_HINT)
+        // (The dispute's revoke-then-grant guidance names `<subject>` / `<current-owner>` placeholders, never a runnable grant.)
+        assertThat(err).doesNotContain("thoryn access grant client:").doesNotContain(FixRequest.CHECK_EACH_LINE_WARNING)
+        assertThat(err).contains("(no command runs for you: an admin decides")
+        assertThat(stdout).doesNotContain("thoryn access grant client:")
+        // The items still carry their commands as data.
+        assertThat(doc["missing"].toList().mapNotNull { it["cli"]?.takeUnless { n -> n.isNull }?.asString() }).anyMatch { it.startsWith("thoryn access grant") }
     }
 
     @Test
@@ -201,6 +213,8 @@ class ProvisionFixRequestTest : CommandTestBase() {
         // The terminal and the file say the same thing: every `cli` the file carries is printed, verbatim.
         doc["missing"].forEach { item -> item["cli"]?.takeUnless { it.isNull }?.let { assertThat(err).contains(it.asString()) } }
         assertThat(err).contains(FixRequest.OPTION_CLI_HEADING).contains("${FixRequest.OPTION_BROWSER_HEADING} ${FixRequest.NO_CONSENT_LINK_LINE}")
+        // SSO-3738 — without web consent the raw commands are printed under the check-each-line warning; no approve command.
+        assertThat(err).contains("${FixRequest.OPTION_CLI_HEADING}\n  ${FixRequest.CHECK_EACH_LINE_WARNING}").doesNotContain("thoryn access approve")
         // SSO-3722 — the file-fix note is in the SAME block (every red row ends with its fix), and the request's options match.
         assertThat(err).contains("  - user prod-user: ")
         assertThat(doc["options"]["cli"].asString()).contains("thoryn access grant $subject owner application:cli").contains("user prod-user: ")

@@ -309,6 +309,7 @@ thoryn examples share    <name> [--output <file>]   # SSO-2876 — export the se
 thoryn provision plan    [--file <path>] [--prune] [--fix-request <path>]  # read-only: what apply would create / remove (+ grant changes, pending publishes); exit 1 on an ownership error
                                              # SSO-3710 — --fix-request (env THORYN_FIX_REQUEST): a red plan also writes thoryn-provision-request.json — every missing RIGHT
                                              # (owner / manager / viewer) with the exact `thoryn access grant` command a workspace admin runs; a workflow uploads it
+                                             # SSO-3738 — with web consent the log's Option 1 is `thoryn access approve <owner>/<repo>/<run_id>`, not the raw lines
 thoryn provision apply   [--file <path>] [--prune] [--confirm <ws>] [--yes] [--fix-request <path>] \
                          [--secret-file <path>] [--force-stdout] [--force] \
                          [--wait [--wait-until ACTIVE|VERIFIED] [--wait-timeout 15m] [--wait-interval 20s]]
@@ -339,6 +340,10 @@ thoryn access grant  <subject> <relation> <object>   # POST   /api/v1/access/gra
 thoryn access revoke <subject> <relation> <object>   # DELETE /api/v1/access/grants  (grant identified in the JSON body; 204)
 thoryn access list   [--object <ref>] [--subject <ref>]   # GET /api/v1/access/grants?object=…|subject=…
 thoryn access mine   [--type <objectType>] [--relation <relation>]   # GET /api/v1/access/mine — the objects YOU hold a relation on
+# SSO-3738 — Option 1 of a red provisioning check: open Thoryn's consent for the rights that run asks for. No API call,
+# grants nothing itself; a workspace admin approves on the hub's consent screen (see "thoryn access approve" below).
+thoryn access approve <owner>/<repository>/<run_id> [--consent-url <base>] [--no-browser]
+thoryn access approve https://starters.<your Thoryn domain>/github/consent/run/<owner>/<repository>/<run_id>
 
 # Custom domain (SSO-3303, epic SSO-3290) — serve the workspace's sign-in (and its token issuer) on a host
 # you own, e.g. auth.acme.com. One per workspace; workspace admins, and machine clients an admin granted
@@ -1749,22 +1754,48 @@ state" before the gate) — and the person reading it needs a path.
 
 ```text
 To fix — Option 1, with the CLI (a workspace admin):
+      thoryn access approve thoryn-io/thoryn-cicd/38751887466
+  It opens the same approval as Option 2 — Thoryn's consent screen, which lists the rights below; nothing is granted until a workspace admin approves there. The command grants nothing itself.
   - owner on application:forge-oauth2-proxy for client:wi_10a7…: access_not_reachable — the live read of … was answered HTTP 404 (unknown_environment): …
-      thoryn access grant client:wi_10a7b379c79f7d1353f5798d owner application:forge-oauth2-proxy
 To fix — Option 2, in the browser: https://app.thoryn.io/github/consent/run/thoryn-io/thoryn-cicd/38751887466
 ```
 
-Option 1 lists every missing **right** with its exact command and every **file / job edit** as a line (a
-`connection.json` that names no apply environment, a job without `environment:`, a trust to re-create with the
-job's own pins, a read-only reference that differs). Option 2 is the Thoryn GitHub App's web consent for **this
+**One consent flow, two entry points (SSO-3738).** When the run has a consent link, Option 1 is
+`thoryn access approve <owner>/<repository>/<run_id>` — the CLI entry point to the **same** hub consent the
+Option-2 link opens ([`thoryn access approve`](#thoryn-access-approve--the-cli-entry-point-to-the-consent)). The
+rights are listed so the reader knows what the consent screen will show, but their raw grant commands are **not**
+printed: the consent re-checks each one (the pin-matched trust, the objects declared at the head commit, no owner
+on an owned object, no manager on the workspace) and yields a token that can write only what was approved; a line
+pasted from a CI log into an admin shell would get none of that. File and job edits follow under *The file must
+change too*, because neither option makes them. A dispute (an object another repository owns) is shown and never
+asked for.
+
+**Without web consent** (no consent link — no `consentUrl` configured, or outside a GitHub Actions run) Option 1 is
+the raw commands, under the warning *Check each line before running it: these commands were written by the run that
+failed, and without web consent nothing has verified them against the repository's trust or its .thoryn/ file.*:
+
+```text
+To fix — Option 1, with the CLI (a workspace admin):
+  Check each line before running it: these commands were written by the run that failed, and without web consent nothing has verified them against the repository's trust or its .thoryn/ file.
+  - owner on application:forge-oauth2-proxy for client:wi_10a7…: access_not_reachable — …
+      thoryn access grant client:wi_10a7b379c79f7d1353f5798d owner application:forge-oauth2-proxy
+To fix — Option 2, in the browser: Run through the Thoryn GitHub App to get a browser link.
+```
+
+Every **file / job edit** is a line either way (a `connection.json` that names no apply environment, a job without
+`environment:`, a trust to re-create with the job's own pins, a read-only reference that differs). With a consent,
+the refused plan rows say *a workspace admin approves it on Thoryn's consent screen* where they otherwise quote the
+grant command. Option 2 is the Thoryn GitHub App's web consent for **this
 run**, resolvable by run — `<consentUrl>/github/consent/run/<owner>/<repository>/<run_id>` from the job's own
 `GITHUB_REPOSITORY` / `GITHUB_RUN_ID` (the opaque consent id the App mints after the run is unknowable to the
 job). The base URL is **configuration** (`.thoryn/workflow.yaml` `consentUrl`, or the reusable workflow's
 `consent-url` input, reaching the CLI as `THORYN_CONSENT_URL`), never guessed from the issuer; unset, or outside
 a GitHub Actions run, the line reads `Run through the Thoryn GitHub App to get a browser link.` The fix request
-carries the same two as `options.cli` / `options.consentUrl`, so the check-run summary and the log never disagree.
+carries the same two as `options.cli` / `options.consentUrl`: with a consent, `options.cli` is exactly
+`thoryn access approve <owner>/<repository>/<run_id>`; without one, it is the warned Option-1 body.
 
-The audited refusals and what their Option 1 says:
+The audited refusals and what their Option 1 says **without web consent** (with a consent, every row whose fix is a
+right reads `thoryn access approve <owner>/<repository>/<run_id>` instead; file edits are unchanged):
 
 | Refusal | Option 1 |
 |---|---|
@@ -1788,8 +1819,9 @@ The audited refusals and what their Option 1 says:
 writes **one file**, `thoryn-provision-request.json` (schema
 `engine/src/main/resources/provision/fix-request.schema.json`), and the workflow uploads it as the run
 artifact **`thoryn-provision-request`**. The Thoryn GitHub App reads that artifact and puts two options on
-the failed check run: the CLI commands, verbatim, or a web consent a workspace admin approves (oauthy
-SSO-3711 / SSO-3712).
+the failed check run, both leading to the hub's own consent screen (oauthy SSO-3737 / SSO-3755): `thoryn access
+approve <owner>/<repository>/<run_id>` and the by-run consent link. Only where web consent is disabled does it relay
+the request's raw commands, under *Check each line before running it*.
 
 Both producers take the same opt-in `--fix-request <path>` (or the env var `THORYN_FIX_REQUEST` — the
 spelling a workflow uses, because a release that predates the flag ignores a variable and refuses a flag);
@@ -1816,10 +1848,12 @@ exit codes are unchanged, and the request is never a credential — ids, names, 
   and id are resolved only when the session may list trusts (`tenant:workload-identity.read`); a plan-profile
   session names its `wi_` client only.
 
-**One rendering.** The `cli` string of every item is the same text the CLI prints on stderr (the row
-reasons quote it; the `To fix — Option 1, with the CLI (a workspace admin):` block lists it with the notes),
-`options.cli` is that block's body and `options.consentUrl` the Option 2 link — so the check run and the
-terminal never disagree. The binding fields the file carries — `repository`, `run` — are hints: a consumer
+**One rendering.** The `cli` string of every item is the same text the CLI prints on stderr when there is no web
+consent (the row reasons quote it; the `To fix — Option 1, with the CLI (a workspace admin):` block lists it with the
+notes, under the check-each-line warning), and `options.cli` is that block's body. With a consent link (SSO-3738)
+`options.cli` is exactly `thoryn access approve <owner>/<repository>/<run_id>` and `options.consentUrl` the Option 2
+link; each item keeps its own `cli` as data. The document's shape is unchanged — `version` stays `1`: only what
+`options.cli` holds moved, and the App does not read it (it renders its own two options from the run). The binding fields the file carries — `repository`, `run` — are hints: a consumer
 takes them from GitHub's own record of the run and discards the body's copy.
 
 ```json
@@ -1832,7 +1866,7 @@ takes them from GitHub's own record of the run and discards the body's copy.
                  "reason": "access_not_owned — this identity holds no relation on application:cli — …",
                  "cli": "thoryn access grant client:wi_10a7b379c79f7d1353f5798d owner application:cli" } ],
   "notes": [],
-  "options": { "cli": "  - owner on application:cli for client:wi_10a7…: access_not_owned — …\n      thoryn access grant client:wi_10a7b379c79f7d1353f5798d owner application:cli",
+  "options": { "cli": "thoryn access approve thoryn-io/thoryn-cli/38547022158",
                "consentUrl": "https://app.thoryn.io/github/consent/run/thoryn-io/thoryn-cli/38547022158" } }
 ```
 
@@ -1856,6 +1890,57 @@ reusable `provisioning.yml` (SSO-3719) and the composite Action's `fix-request` 
           if-no-files-found: ignore
           retention-days: 7
 ```
+
+### `thoryn access approve` — the CLI entry point to the consent
+
+SSO-3738 (oauthy ADR `2026-10-15-missing-rights-fix-path-cli-and-web-consent.md`, amendment and As built SSO-3737 /
+SSO-3755). A red provisioning check names its fix in two options that lead to **one** approval — the hub's own
+consent screen. Option 1 is this command; Option 2 is the link. A workspace admin runs:
+
+```bash
+thoryn access approve thoryn-io/thoryn-cicd/38751887466
+# or, the link from the check run or the job log:
+thoryn access approve https://starters.stg.thoryn.org/github/consent/run/thoryn-io/thoryn-cicd/38751887466
+```
+
+**It grants nothing.** It builds the run's by-run consent address,
+`<base>/github/consent/run/<owner>/<repository>/<run_id>`, and opens it in your browser; with no browser
+(`--no-browser`, `THORYN_NO_BROWSER=1`, an SSH session) it prints the address to open on any device — the same
+pattern as `thoryn login`. It makes no API call and follows no redirect itself: the browser goes to the Thoryn
+GitHub App's starters service, which rebuilds the request from GitHub's own record of the run and redirects to the
+hub, which signs you in and shows each right. Nothing is written until you approve there, and then only with a token
+that carries exactly the approved items. Which workspace, which rights and whether you may grant them are decided
+there, not by the CLI.
+
+**How the consent base URL is resolved**, first match wins:
+
+1. a **consent URL** passed as the argument — it names its own base;
+2. **`--consent-url <base>`** (`https://starters.<your Thoryn domain>`);
+3. the **`consentUrl` of `.thoryn/workflow.yaml`** — the nearest one from the working directory up to the
+   repository root, so running it inside the repository uses the address the job's own log printed;
+4. **derived from your signed-in platform**: `https://starters.<platform domain>`, where the platform domain is the
+   session's base issuer without its host label (`https://auth.stg.thoryn.org` ⇒ `https://starters.stg.thoryn.org`).
+   A local hub, an IP address or a custom domain names no platform domain, so nothing is derived.
+
+With none of them the command stops and names the two ways to pass the address. The line `(consent address from …)`
+under the address says which source was used.
+
+**Strict input.** `<owner>/<repository>/<run_id>` follows GitHub's grammar: an account name of letters, digits and
+`-` (not starting with `-`), a repository name of letters, digits, `.`, `_` and `-` (never `.` or `..`), and a
+positive run id. A consent URL must be `https://`, a DNS host, an optional port, an optional plain path prefix, and
+end in exactly `/github/consent/run/<owner>/<repository>/<run_id>` — no user-info, query, fragment, percent-encoding,
+backslash, whitespace or dot segment. The address handed to the browser is rebuilt from the validated parts, never
+the string as typed. Anything else exits `64` and opens nothing.
+
+| Error | Cause | Fix |
+|---|---|---|
+| `… is not <owner>/<repository>/<run_id>` / `… is not a GitHub Actions run id` | The argument is not the run reference the check run prints. | Copy it from the check run, or pass the consent link. |
+| `… is not an https:// consent URL` / `… is not a consent URL` | An `http://` link, or one with a query, fragment, user-info or extra path. | Pass the link exactly as the check run shows it. |
+| `--consent-url … is a full consent link` | The whole link was passed as the base. | Pass it as the argument instead. |
+| `no consent address for …` | No argument URL, no flag, no `consentUrl` in the repository, and the session names no platform domain (or you are not signed in). | Pass the link, or `--consent-url https://starters.<your Thoryn domain>`, or `thoryn login`. |
+
+`thoryn access grant` stays as the expert command, unchanged; the raw grant lines it would take are printed in a job
+log only when the deployment has no web consent, under *Check each line before running it*.
 
 ### Configure the provisioning workflow — the stub, its inputs, `.thoryn/workflow.yaml` (SSO-3719, epic SSO-3304)
 
@@ -1937,7 +2022,7 @@ the same pin selects the CLI the jobs run (`job.workflow_ref`), so there is no s
 | `runs-on` | `ubuntu-latest` | a runner label, or a JSON array of labels for a **self-hosted** pool: `'["self-hosted", "linux", "x64"]'` (the runner needs bash, gh, jq, curl; Java is set up). A trust pinned "GitHub-hosted runners only" refuses a self-hosted job's token — that pin is yours to change on the trust |
 | `timeout-minutes` | `30` | each job's timeout |
 | `config` | `.thoryn/workflow.yaml` | where the run-time configuration lives |
-| `consent-url` | `""` | SSO-3723 — base URL of the Thoryn GitHub App's browser consent (`THORYN_CONSENT_URL`): a red job's `To fix — Option 2, in the browser:` becomes `<url>/github/consent/run/<owner>/<repo>/<run_id>`. Empty ⇒ `.thoryn/workflow.yaml` `consentUrl`, else the commands alone |
+| `consent-url` | `""` | SSO-3723 — base URL of the Thoryn GitHub App's browser consent (`THORYN_CONSENT_URL`): a red job's `To fix — Option 2, in the browser:` becomes `<url>/github/consent/run/<owner>/<repo>/<run_id>` and Option 1 `thoryn access approve <owner>/<repo>/<run_id>` (SSO-3738). Empty ⇒ `.thoryn/workflow.yaml` `consentUrl`, else the raw commands alone, under *Check each line before running it* |
 
 #### Run-time configuration — `.thoryn/workflow.yaml`
 
@@ -1950,7 +2035,7 @@ Committed beside your provisioning files; absent ⇒ the defaults below; schema
 | `files[]` | `[{file: .thoryn/provision.yaml, connection: .thoryn/connection.json}]` | **one or many** provisioning files, planned and applied in order, each signed in with its own connection (`connection` defaults to the `connection.json` beside the file — the layout `thoryn project init` and the App seed) |
 | `env` | `{}` | extra environment variables for the CLI: **`THORYN_*` names only** (the CLI's own variables, and the `{{env.NAME}}` placeholders a provisioning file reads — SSO-3430), never one the workflow sets itself (`THORYN_ISSUER`, `THORYN_HUB`, `THORYN_FIX_REQUEST`, `THORYN_CONSENT_URL`, `THORYN_CI_PLAINTEXT_TOKENS`), never credential-shaped (`*_SECRET`, `*_PASSWORD`, `*_TOKEN`, `*_KEY` — this file is committed plaintext). Values are exported, never evaluated |
 | `fixRequest` | `true` | upload the SSO-3710 fix request (`thoryn-provision-request`) when a job is red on a missing right, so the App names the fix on the check run |
-| `consentUrl` | `""` | SSO-3723 — the base URL of the App's browser consent, exported to the CLI as `THORYN_CONSENT_URL` when the `consent-url` input is empty; every `To fix` block then carries `Option 2, in the browser: <consentUrl>/github/consent/run/<owner>/<repository>/<run_id>` and the fix request `options.consentUrl`. `https://`, no query or fragment. Configuration — never guessed from the issuer |
+| `consentUrl` | `""` | SSO-3723 — the base URL of the App's browser consent, exported to the CLI as `THORYN_CONSENT_URL` when the `consent-url` input is empty; every `To fix` block then carries `Option 2, in the browser: <consentUrl>/github/consent/run/<owner>/<repository>/<run_id>` and the fix request `options.consentUrl`, and Option 1 becomes `thoryn access approve <owner>/<repository>/<run_id>` (SSO-3738; the raw grant lines are printed only without it). `https://`, no query or fragment. Configuration — never guessed from the issuer |
 | `apply.prune` | `false` | pass `--prune`: remove owned resources the file no longer declares |
 | `apply.destroy` | `false` | run `thoryn provision destroy` after a successful apply — an ephemeral fixture (an e2e sandbox) |
 | `apply.confirm` | `""` | the workspace slug confirming production-plane removals (the SSO-2413 gate) |
