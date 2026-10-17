@@ -1553,9 +1553,14 @@ What `thoryn provision` does with it:
   outside the consentable set) carrying the founder's command — apply this file signed in as yourself, then
   `thoryn access grant <subject> owner trust:<trust-id>`. From then on CI converges it. Sandbox trusts are the
   repository's to create where it manages the environment.
-- **A platform without trust objects** (product-api before oauthy S1) answers `400` for `trust:`: the engine
-  falls back to the plane alone — the gate, `import` and the fixes of before (`manager` on the environment) — and
-  prunes no trust.
+- **A platform without trust objects** (product-api before oauthy S1) answers `400 invalid_type` for `trust:` on
+  `/access/check` and `/access/mine` (that is what the engine detects, once), an opaque `404 not_found` for a grant
+  naming `trust:`, and renders no `owner` field on a trust (absent, read as no owner): the engine falls back to the
+  plane alone — the gate, `import` and the fixes of before (`manager` on the environment) — and prunes no trust.
+- **`thoryn access grant … trust:<id>`** explains its two refusals on stderr: `400 trust_self_management` (oauthy
+  I6 — the subject is that trust's OWN `wi_` client; no identity owns or manages the trust it signs in with: grant the
+  repository identity that converges it), and a `404` (not a trust of this workspace — or a platform before trust
+  objects, where a trust is reached through `manager environment:<id>`).
 - **`import`** renders every trust it can see (`github` / `forgejo` / `kubernetes` pins, `scopes`,
   `confirmProduction` on the production plane) — as an entry the file converges when it manages it, `readOnly:
   true` for a viewer or a trust another repository owns. Inline Kubernetes keys are not rendered by the API: the entry carries a

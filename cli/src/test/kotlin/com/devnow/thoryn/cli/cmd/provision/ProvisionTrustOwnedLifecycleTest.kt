@@ -188,11 +188,16 @@ class ProvisionTrustOwnedLifecycleTest : CommandTestBase() {
         api.trustObjects = false
         val sbx = api.seedEnvironment("ci-sbx")
         api.seedGrant(repo, "manager", "environment:$sbx")
-        api.seedTrust("ci-sbx", "pr-ci", pins = mapOf("owner" to "acme", "repository" to "pr"))
+        val legacyId = api.seedTrust("ci-sbx", "pr-ci", pins = mapOf("owner" to "acme", "repository" to "pr"))
+        // oauthy PR #4151 — before S1 the trust response carries NO `owner` field (absent, not null); a stray owner tuple in
+        // the store is invisible, so the plane manager converges it and nothing reads as another repository's.
+        api.seedGrant(other, "owner", "trust:$legacyId")
         val sandbox = file("apiVersion: thoryn.io/provision/v1\nresources:\n  - { kind: workloadIdentityTrust, name: pr-ci, environment: ci-sbx, spec: { provider: github_actions, github: { repository: acme/pr }, scopes: [tenant:applications.read] } }")
         val row = engine().plan(sandbox, true).changes.first()
         assertThat(row.action).isEqualTo(ChangeAction.NOOP)
         assertThat(row.access).isEqualTo(Access.MANAGER.label)
+        assertThat(row.owner).isNull()
+        assertThat(row.trust).doesNotContainKey("owner")
 
         // A production create from CI: no trust object to name, so the person's rule alone — never an owner-by-name item.
         val production = engine().plan(file(starters.lines().takeWhile { !it.contains("kind: application") }.joinToString("\n")), false).changes.single()

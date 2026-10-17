@@ -667,7 +667,15 @@ internal class FakeProductApi : Dispatcher() {
                 // Only `client:` refs are checked — the fake carries no membership registry, so a
                 // `member:` subject is taken on trust.
                 val subjectRef = b["subject"].toString()
-                if (subjectRef.startsWith("client:") && applications.none { it["clientId"] == subjectRef.removePrefix("client:") }) {
+                val objectRef = b["object"].toString()
+                if (objectRef.startsWith("trust:")) {
+                    // oauthy PR #4151 — before S1 a grant naming `trust:` is the opaque 404 not_found (only mine / check say invalid_type).
+                    if (!trustObjects) return problem(404, "not_found")
+                    val trust = trusts.firstOrNull { "trust:${it["id"]}" == objectRef } ?: return problem(404, "not_found")
+                    // I6 — no identity owns or manages the trust it signs in with.
+                    if (b["relation"] in setOf("owner", "manager") && subjectRef == "client:${trust["clientId"]}") return problem(400, "trust_self_management")
+                }
+                if (subjectRef.startsWith("client:") && trusts.none { "client:${it["clientId"]}" == subjectRef } && applications.none { it["clientId"] == subjectRef.removePrefix("client:") }) {
                     return problem(404, "not_found")
                 }
                 val existing = grants.firstOrNull { it["subject"] == b["subject"] && it["relation"] == b["relation"] && it["object"] == b["object"] }

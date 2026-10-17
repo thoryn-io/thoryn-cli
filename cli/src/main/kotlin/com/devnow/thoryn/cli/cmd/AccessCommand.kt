@@ -3,6 +3,7 @@ package com.devnow.thoryn.cli.cmd
 import com.devnow.thoryn.cli.api.ProductApiException
 import com.devnow.thoryn.cli.config.ThorynConfig
 import com.devnow.thoryn.provision.AccessRefs
+import com.devnow.thoryn.provision.FixRequest
 import picocli.CommandLine.Command
 import picocli.CommandLine.Option
 import picocli.CommandLine.Parameters
@@ -25,7 +26,8 @@ import java.util.concurrent.Callable
  *  - subjects: `member:<sub>`, `client:<clientId>`
  *  - objects:  `workspace:<tenantId>`, `environment:<id>`, `application:<clientId>`, `user:<id>`,
  *              `federation_member:<id>`, `email_provider:<envSlug>`, `login_theme:<envSlug>`,
- *              `login_flow:<envSlug>`, `login_methods:<envSlug>`, `custom_domain:<tenantId>` (SSO-3434)
+ *              `login_flow:<envSlug>`, `login_methods:<envSlug>`, `custom_domain:<tenantId>` (SSO-3434),
+ *              `trust:<trustId>` (SSO-3774 — a workload-identity trust; ownable since oauthy SSO-3772)
  *  - relations: `manager`, `viewer`, and (SSO-3667 / SSO-3673) `owner` — the ONE owning workload identity of an
  *    `application` / `environment`, grantable and revocable by a workspace admin only; a second owner is
  *    `409 owner_already_set`. `owner` is deliberately not accepted in a provisioning file's `grants:`.
@@ -89,6 +91,7 @@ class AccessCommand : Callable<Int> {
                 CommandSupport.emitRecord(format, grant, ::grantFields)
                 CommandSupport.EXIT_OK
             } catch (ex: ProductApiException) {
+                trustRefusalHint(s, rel, o, ex)?.let { System.err.println(it) }
                 CommandSupport.renderError(format, ex, requiredScope = SCOPE_WRITE)
             } catch (ex: Exception) {
                 CommandSupport.renderRequestFailure(ex, gateway)
@@ -131,6 +134,7 @@ class AccessCommand : Callable<Int> {
                 )
                 CommandSupport.EXIT_OK
             } catch (ex: ProductApiException) {
+                trustRefusalHint(s, rel, o, ex)?.let { System.err.println(it) }
                 CommandSupport.renderError(format, ex, requiredScope = SCOPE_WRITE)
             } catch (ex: Exception) {
                 CommandSupport.renderRequestFailure(ex, gateway)
@@ -248,6 +252,33 @@ class AccessCommand : Callable<Int> {
             "object" to node["object"]?.asString(),
             "createdAt" to node["createdAt"]?.asString(),
         )
+
+        /** SSO-3774 — product-api's I6 refusal (oauthy ADR 2026-10-16): `owner` / `manager` on a trust for that trust's OWN `wi_`. */
+        const val ERROR_TRUST_SELF_MANAGEMENT: String = "trust_self_management"
+
+        /**
+         * SSO-3774 — what to do when a grant / revoke on a `trust:<id>` is refused, printed on stderr above the error (so a
+         * `--output json` stdout stays one document), or null when the refusal is not one of these:
+         *  - `400 trust_self_management` (oauthy S1 I6): no identity may own or manage the trust it SIGNS IN WITH — the
+         *    subject is that trust's own `wi_` client. Grant the right to the repository identity that converges the trust.
+         *  - `404` on a `trust:` object: the trust is not in this workspace — or the platform predates trust objects (a
+         *    product-api before oauthy S1 answers a grant naming `trust:` with an opaque `404 not_found`; there a trust is
+         *    reached through its environment, `manager environment:<id>`).
+         */
+        fun trustRefusalHint(subject: String, relation: String, objectRef: String, ex: ProductApiException): String? {
+            if (!objectRef.startsWith("${AccessRefs.OBJECT_TYPE_TRUST}:")) return null
+            return when {
+                ex.errorCode == ERROR_TRUST_SELF_MANAGEMENT ->
+                    "Refused ($ERROR_TRUST_SELF_MANAGEMENT): $subject is the workload client of $objectRef itself, and no identity may own or manage the trust " +
+                        "it signs in with (oauthy ADR 2026-10-16 I6) — it could re-pin the identity it signs in as. Grant `$relation` on $objectRef to the " +
+                        "repository identity that converges this trust (its own, different `wi_` client), never to the trust's own."
+                ex.httpStatus == 404 ->
+                    "Not found: $objectRef is not a trust of this workspace (`${FixRequest.LIST_TRUSTS_COMMAND}` shows the ids — add `--environment <slug>` for a " +
+                        "sandbox), or this platform predates trust objects (oauthy SSO-3772) — there a trust is reached through its environment: " +
+                        "`thoryn access grant $subject manager environment:<id>`."
+                else -> null
+            }
+        }
 
         /** A human-readable violation for a subject ref, or null when it conforms. */
         fun validateSubject(raw: String): String? = AccessRefs.validateSubject(raw)
