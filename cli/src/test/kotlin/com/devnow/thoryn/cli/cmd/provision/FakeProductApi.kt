@@ -87,6 +87,15 @@ internal class FakeProductApi : Dispatcher() {
      * (`400 invalid_type` on `/access/check` and `/access/mine`) and a trust is reached through its plane only.
      */
     var trustObjects = true
+    // ── SSO-3766 / SSO-3767 / SSO-3770 — the application settings product-api validates (oauthy SSO-3758 / 3759 / 3762) ──
+    /** The workspace is the platform HOME (`thoryn`): only then may an application list `thoryn_access_grant`. */
+    var homeWorkspace = false
+    /** The authorization server's supported RFC 9396 types (discovery), plus the hub's own `thoryn_access_grant`. */
+    var supportedAuthorizationDetailTypes = setOf("openid_credential", "thoryn_access_grant")
+    /** Per environment (null ⇒ production): the authentication policy's `refreshClipSeconds` — the cap on a sliding session. */
+    val refreshClipSeconds = mutableMapOf<String?, Long>()
+    /** The NEXT application create / update is refused with this `(status, errorCode, extensions)` — a code the file cannot reach. */
+    var nextApplicationWriteProblem: Triple<Int, String, Map<String, Any?>>? = null
     // ── SSO-3413 / SSO-3414 — the workspace's ONE custom domain (product-api /api/v1/custom-domain) ──
     /** Custom domains enabled for the workspace (the operator entitlement). */
     var domainEntitled = true
@@ -467,8 +476,8 @@ internal class FakeProductApi : Dispatcher() {
     private fun json(status: Int, value: Any?): MockResponse =
         MockResponse().setResponseCode(status).setHeader("Content-Type", "application/json").setBody(mapper.writeValueAsString(value))
 
-    private fun problem(status: Int, code: String): MockResponse =
-        json(status, mapOf("type" to "about:blank", "status" to status, "title" to code, "errorCode" to code, "detail" to code))
+    private fun problem(status: Int, code: String, extensions: Map<String, Any?> = emptyMap()): MockResponse =
+        json(status, mapOf("type" to "about:blank", "status" to status, "title" to code, "errorCode" to code, "detail" to code) + extensions)
 
     private fun visible(rec: Map<String, Any?>, env: String?) = rec["_env"] == env
 
@@ -491,6 +500,47 @@ internal class FakeProductApi : Dispatcher() {
         if (trust != previous && !holds(if (trustObjects) "trust:$trust" else planeRef(env), "manager")) return problem(400, "federated_trust_not_found")
         return null
     }
+
+    /**
+     * SSO-3766 / SSO-3767 / SSO-3770 — `ApplicationsService` + `AdvancedClientSettingsValidator` in miniature, checked against
+     * the state the application WILL have ([previous] + the body): the absolute session bounds, the sliding-window coherence,
+     * the workspace cap; the supported / permitted authorization-detail types; token exchange needs an authenticating client
+     * and the grant, and turning it ON on an existing application needs `manager` on its plane (`403`).
+     */
+    private fun applicationSettingsProblem(b: Map<String, Any?>, env: String?, previous: Map<String, Any?>? = null): MockResponse? {
+        nextApplicationWriteProblem?.let { (status, code, extensions) -> nextApplicationWriteProblem = null; return problem(status, code, extensions) }
+        val merged = (previous.orEmpty() + b)
+        fun long(v: Any?): Long? = (v as? Number)?.toLong()
+        long(b["refreshTokenAbsoluteMaxTtlSeconds"])?.let { if (it !in 3_600L..7_776_000L) return problem(400, "token_ttl_out_of_range", mapOf("field" to "refreshTokenAbsoluteMaxTtlSeconds", "min" to 3_600, "max" to 7_776_000)) }
+        val sliding = merged["refreshTokenSlidingWindow"] == true
+        val absolute = long(merged["refreshTokenAbsoluteMaxTtlSeconds"]) ?: 7_776_000L
+        if (b["refreshTokenAbsoluteMaxTtlSeconds"] != null && !sliding) return problem(400, "session_lifetime_requires_sliding_window")
+        if (sliding && absolute < (long(merged["refreshTokenTtlSeconds"]) ?: 3_600L)) return problem(400, "session_lifetime_below_refresh_ttl")
+        val clip = refreshClipSeconds[env]
+        if (sliding && clip != null && absolute > clip && (b["refreshTokenSlidingWindow"] != null || b["refreshTokenAbsoluteMaxTtlSeconds"] != null)) {
+            return problem(400, "session_exceeds_tenant_policy", mapOf("max" to clip))
+        }
+        (b["allowedAuthorizationDetailTypes"] as? List<*>)?.map { it.toString() }?.let { types ->
+            if (types.any { it !in supportedAuthorizationDetailTypes }) return problem(400, "unsupported_authorization_details_type")
+            if ("thoryn_access_grant" in types && !homeWorkspace) return problem(403, "authorization_details_type_not_permitted")
+        }
+        if (merged["allowTokenExchange"] == true) {
+            val methods = (merged["clientAuthenticationMethods"] as? List<*>)?.map { it.toString() }
+            if (merged["clientType"] == "public" || methods?.contains("none") == true) return problem(400, "token_exchange_requires_confidential_client")
+            if ((merged["grantTypes"] as? List<*>)?.contains("urn:ietf:params:oauth:grant-type:token-exchange") != true) return problem(400, "token_exchange_grant_required")
+            if (previous != null && previous["allowTokenExchange"] != true && b["allowTokenExchange"] == true && !holds(planeRef(env), "manager")) {
+                return problem(403, "token_exchange_not_grantable")
+            }
+        }
+        return null
+    }
+
+    /** SSO-3766 / SSO-3767 / SSO-3770 — product-api renders every setting on every application response, defaults included. */
+    private fun applicationView(a: Map<String, Any?>): Map<String, Any?> =
+        mapOf<String, Any?>(
+            "allowTokenExchange" to false, "allowedAuthorizationDetailTypes" to emptyList<String>(),
+            "refreshTokenSlidingWindow" to false, "refreshTokenAbsoluteMaxTtlSeconds" to 7_776_000L,
+        ) + withOwner(a, "application:${a["clientId"]}")
 
     /**
      * SSO-3722 — "reach into a plane" as product-api's filter sees it: any relation on the plane itself (held or
@@ -541,7 +591,7 @@ internal class FakeProductApi : Dispatcher() {
                 environments.remove(e); MockResponse().setResponseCode(204)
             }
             // ── applications ──
-            route == "/api/v1/applications" && method == "GET" -> json(200, mapOf("data" to applications.filter { visible(it, env) }.map { withOwner(it, "application:${it["clientId"]}") }))
+            route == "/api/v1/applications" && method == "GET" -> json(200, mapOf("data" to applications.filter { visible(it, env) }.map { applicationView(it) }))
             route == "/api/v1/applications" && method == "POST" -> {
                 // SSO-3104 / SSO-3119 — product-api honours a REQUESTED `clientId` (that is how the
                 // committed file pins `cli` / `cli-ci`); only an absent one is allocated. The fake used
@@ -550,12 +600,13 @@ internal class FakeProductApi : Dispatcher() {
                 val id = (b["clientId"] as? String)?.takeIf { it.isNotBlank() } ?: "app-${++seq}"
                 if (applications.any { it["clientId"] == id }) return problem(409, "client_id_taken")
                 federatedBindingProblem(b, env)?.let { return it }
+                applicationSettingsProblem(b, env)?.let { return it }
                 applications += (b + mapOf("clientId" to id, "status" to "active", "_env" to env)).toMutableMap()
                 // SSO-3667 — a `client:` creator becomes the application's owner (rendered on the create response).
                 creatorBecomesOwner("application:$id")
                 // SSO-3113 — a CONFIDENTIAL client's one-shot secret rides ONLY on the create response (never on a later
                 // GET). product-api's `clientType` defaults to confidential, so only an explicit `public` is secret-less.
-                val response = withOwner(applications.last(), "application:$id").toMutableMap()
+                val response = applicationView(applications.last()).toMutableMap()
                 // SSO-3689 — a secret is minted only for a secret-bearing method (product-api defaults to client_secret_basic).
                 if (b["clientType"] != "public" && mintsSecret(b)) {
                     val secret = "minted-secret-$id"
@@ -567,8 +618,12 @@ internal class FakeProductApi : Dispatcher() {
             seg[0] == "applications" && seg.size == 2 -> {
                 val a = applications.firstOrNull { it["clientId"] == seg[1] && visible(it, env) } ?: return problem(404, "not_found")
                 when (method) {
-                    "GET" -> json(200, withOwner(a, "application:${seg[1]}"))
-                    "PATCH" -> { federatedBindingProblem(b, env, a["federatedTrust"])?.let { return it }; a.putAll(b); json(200, withOwner(a, "application:${seg[1]}")) }
+                    "GET" -> json(200, applicationView(a))
+                    "PATCH" -> {
+                        federatedBindingProblem(b, env, a["federatedTrust"])?.let { return it }
+                        applicationSettingsProblem(b, env, a)?.let { return it }
+                        a.putAll(b); json(200, applicationView(a))
+                    }
                     "DELETE" -> { applications.remove(a); MockResponse().setResponseCode(204) }
                     else -> problem(405, "method")
                 }

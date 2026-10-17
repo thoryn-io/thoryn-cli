@@ -39,6 +39,16 @@ SSO-3690 none lives in the repository's GitHub settings either: `connection.json
 `passwordEnv` / `{{env.NAME}}` in `provision.yaml`, or `auth.secretEnv` in a `client_credentials`
 connection).
 
+**Application settings (SSO-3766 / SSO-3767 / SSO-3770).** An `application` in a provisioning file may also declare
+`allowTokenExchange`, `allowedAuthorizationDetailTypes` and the session lifetime (`refreshTokenSlidingWindow` +
+`refreshTokenAbsoluteMaxTtlSeconds`) — see the top-level README, "Application settings". This repository's files declare
+none of them, and an omitted setting keeps the live value, so the `cli` client and the sandbox's loopback client are
+unchanged by them. Both are public clients, which cannot hold `allowTokenExchange` anyway
+(`token_exchange_requires_confidential_client`). For a confidential client this file might declare later: the CI
+identity's `manager` on the sandbox `cli-ci` is exactly the reach that may turn token exchange on there, while on the
+production plane it could not (that needs the workspace's `manager`, never granted to a repository identity — the plan
+row `token_exchange_not_grantable` carries a note, not a grant).
+
 ## The CLI's own login client lives here too (SSO-3104)
 
 `thoryn login --workspace <slug>` signs in with the public PKCE client **`cli`**, which this file

@@ -301,6 +301,11 @@ thoryn examples share    <name> [--output <file>]   # SSO-2876 — export the se
 # converged by name (also on the API's 409), never updated in place (workload_identity_trust_immutable), removed only
 # with its sandbox; the plan shows the wi_ client + audience; apply PRINTS the consumer's connection.json, never
 # writes it. See "Secretless clients" and "Declaring a workload-identity trust" below.
+# SSO-3766 / SSO-3767 / SSO-3770 (oauthy SSO-3759 / SSO-3758 / SSO-3762): an application also declares
+# `allowedAuthorizationDetailTypes` (RFC 9396; a set — the list replaces, [] clears), `allowTokenExchange` (RFC 8693;
+# turning it ON needs `manager` on the environment — else the red row token_exchange_not_grantable naming that
+# right) and the session lifetime `refreshTokenSlidingWindow` + `refreshTokenAbsoluteMaxTtlSeconds`. Converged on
+# update; an omitted setting keeps the live value. See "Application settings" below.
 thoryn provision plan    [--file <path>] [--prune] [--fix-request <path>]  # read-only: what apply would create / remove (+ grant changes, pending publishes); exit 1 on an ownership error
                                              # SSO-3710 — --fix-request (env THORYN_FIX_REQUEST): a red plan also writes thoryn-provision-request.json — every missing RIGHT
                                              # (owner / manager / viewer) with the exact `thoryn access grant` command a workspace admin runs; a workflow uploads it
@@ -1411,7 +1416,8 @@ resources:
   product-api's `FederatedAssertionBindingValidator` answer the same tokens): it is the ONLY method
   (`federated_assertion_only_method`, also for `clientType: public` — a public client authenticates with
   `none`), grants beyond `authorization_code` / `refresh_token` are `federated_assertion_grant_not_allowed`
-  (a workload that needs `client_credentials` uses the trust's own `wi_…` client), `requireProofKey: false`
+  (a workload that needs `client_credentials` uses the trust's own `wi_…` client; SSO-3767: the RFC 8693
+  token-exchange grant is allowed only together with `allowTokenExchange: true` — see "Application settings"), `requireProofKey: false`
   is `federated_assertion_pkce_required`, a `jwks` / `jwksUri` is `federated_assertion_no_secret_or_key`,
   a missing `federatedTrust` is `federated_trust_required`, and a `federatedTrust` without the method is
   `federated_trust_without_method`. A trust that is missing, or declared in this file for ANOTHER
@@ -1439,6 +1445,65 @@ resources:
   a client may bind a trust the same file declares; the plan shows the pending binding as
   `federatedTrust: (unset) → billing-pods (created by this apply)`. Removal is child-first: clients before
   the trust they bind.
+
+### Application settings — token exchange, authorization detail types, session lifetime (SSO-3766, SSO-3767, SSO-3770)
+
+Three settings of an application are on the product API (oauthy, 2026-10-17) and declarable on a
+`kind: application`. Each is sent on create, read back from the live application and **converged on update**
+with exactly the fields that differ. **An omitted setting keeps whatever the platform holds** — the file only
+changes what it declares. `--prune` is unchanged: it removes resources, never a setting.
+
+```yaml
+resources:
+  - kind: application
+    name: portal
+    environment: staging
+    spec:
+      clientId: acme-portal
+      displayName: "Acme Portal"
+      redirectUris: ["https://app.acme.example/login/oauth2/code/thoryn"]
+      grantTypes: [authorization_code, refresh_token, "urn:ietf:params:oauth:grant-type:token-exchange"]
+      # SSO-3767 — RFC 8693 token exchange (downscope a user's token, or enter another workspace the user belongs to).
+      allowTokenExchange: true
+      # SSO-3766 — the RFC 9396 authorization_details types the application may send at /oauth2/par and /oauth2/authorize.
+      allowedAuthorizationDetailTypes: [openid_credential]
+      # SSO-3770 — a 1 h idle window that ends 8 h after sign-in, however active the session is.
+      refreshTokenTtlSeconds: 3600
+      refreshTokenSlidingWindow: true
+      refreshTokenAbsoluteMaxTtlSeconds: 28800
+```
+
+| Setting | Type, default | Converged as | Refused in the file (exit 2, before any read) | Refused by the API (at apply) |
+|---|---|---|---|---|
+| `allowTokenExchange` | boolean, `false` | a value | `token_exchange_requires_confidential_client` (`clientType: public` or method `none`), `token_exchange_grant_required` (the token-exchange grant is not in `grantTypes`) | `token_exchange_not_grantable` (403) — **predicted by the plan**, see below |
+| `allowedAuthorizationDetailTypes` | list of strings, `[]` | a **set**: order is not drift; the declared list replaces the live one; `[]` clears it | not a list, an entry with a space (one type per entry), a duplicate | `unsupported_authorization_details_type` (400 — not in the server's discovery `authorization_details_types_supported`, plus `thoryn_access_grant`); `authorization_details_type_not_permitted` (403 — `thoryn_access_grant` outside the `thoryn` home workspace; no grant changes this) |
+| `refreshTokenSlidingWindow` | boolean, `false` | a value | — | — |
+| `refreshTokenAbsoluteMaxTtlSeconds` | integer seconds, 3600 – 7776000; live default 7776000 | a value | `token_ttl_out_of_range`; `session_lifetime_requires_sliding_window` (declared without `refreshTokenSlidingWindow: true` — the file states the session, it does not lean on the live window); `session_lifetime_below_refresh_ttl` (shorter than a declared `refreshTokenTtlSeconds`) | `session_lifetime_below_refresh_ttl` (shorter than the LIVE refresh TTL); `session_exceeds_tenant_policy` (longer than the environment authentication policy's `refreshClipSeconds` — the cap is named in the error) |
+
+**Who may turn token exchange on.** With the setting on, an application that holds a user's token can obtain
+fresh tokens for that user, including in other workspaces the user belongs to — a decision about the
+environment. So turning it **on** for an existing application needs `manager` on the application's
+**environment** (the workspace on the production plane); managing — even owning — the application is not
+enough. `plan` asks before anything is written: the row is red with `token_exchange_not_grantable`, and the
+"To fix" block (and `--fix-request`) names the right:
+
+```text
+1 resource(s) failed the ownership check — apply would refuse this plan:
+  ! application portal: token_exchange_not_grantable — turning allowTokenExchange on for application/portal requires `manager` on its environment environment:env-1 — …
+To fix — Option 1, with the CLI (a workspace admin):
+  - manager on environment:env-1 for client:wi_…: token_exchange_not_grantable — …
+      thoryn access grant client:wi_… manager environment:env-1
+```
+
+On the production plane the right is `manager` on the workspace, which is never granted to a repository
+identity: the row carries a note instead — a workspace admin applies the file from their own session, or the
+file drops the setting. **Turning it off, omitting it, or re-declaring the value the application already holds
+is never refused.** A `federated_assertion` client may register the token-exchange grant too, only together
+with `allowTokenExchange: true` (`federated_assertion_grant_not_allowed` otherwise).
+
+**A refusal at apply names the resource, the code and the change** (`Error: application/portal:
+session_exceeds_tenant_policy — … cap of 86400 seconds …`), never the "Required scope" hint a bare `403` would
+otherwise print. Everything converged before it stays live; fix the cause and re-run.
 
 ### Declaring a workload-identity trust — `kind: workloadIdentityTrust` (SSO-3689)
 
