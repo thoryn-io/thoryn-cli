@@ -16,7 +16,9 @@ import java.nio.file.Path
  * mismatch is the GitHub environment (the trust has no plan profile for the environment the job runs in — a
  * [Kind.PLAN_PROFILE] item), and `thoryn provision plan` / `apply --fix-request` on a plan with `access_*` rows
  * ([fromPlan]: [Kind.OWNER] on an existing object the subject does not own, [Kind.MANAGER] on the parent environment
- * of a refused create, [Kind.VIEWER] for a `readOnly` reference refused for no relation). Rows that are FILE fixes —
+ * of a refused create, [Kind.VIEWER] for a `readOnly` reference refused for no relation, and — SSO-3792, oauthy ADR
+ * `2026-10-17-consent-approved-application-creation-slots.md` §6 — [Kind.CREATOR], a creation slot for a declared
+ * production application with a fixed `clientId` that this identity cannot see and may not create). Rows that are FILE fixes —
  * `access_read_only` on a differing file, `workload_identity_trust_is_self` / `_immutable`, `scope_not_grantable` —
  * produce no item; they are listed under [notes] so the request says so.
  *
@@ -99,7 +101,17 @@ data class FixRequest(
         /** `manager` on the parent environment of a resource the file would create. */
         MANAGER("manager"),
         /** `viewer` on an existing object the file declares `readOnly: true`. */
-        VIEWER("viewer");
+        VIEWER("viewer"),
+
+        /**
+         * SSO-3792 (oauthy ADR 2026-10-17 §6, decision D3) — a CREATION SLOT: a workspace admin approves that this identity
+         * creates ONE named application (`application:<clientId>`) on ONE plane ([MissingRight.environment], the plane's
+         * slug), once, within 30 days (`thoryn access reserve`). Emitted only for an application the file declares with a
+         * fixed `clientId`, on the PRODUCTION plane, that this identity cannot see and may not create — where `owner` would
+         * name a thing that may not exist (SSO-3787) and `manager` on the workspace is never granted. Sandboxes keep
+         * [MANAGER] on their environment. Not a relation: the slot API writes it, never `access grant`.
+         */
+        CREATOR("creator");
 
         companion object {
             fun of(wire: String?): Kind? = entries.firstOrNull { it.wire == wire }
@@ -110,7 +122,8 @@ data class FixRequest(
      * One missing right. [objectRef] is the platform object (`application:cli`, `environment:<id>`, `trust:<id>`, or
      * `trust:<name>` for a trust named by its name — a plan profile, or SSO-3774 a trust the identity cannot see),
      * [subject] the identity to grant it to (`client:<wi_>`; null for a plan profile, which is set on the trust),
-     * [environment] the GitHub environment a [Kind.PLAN_PROFILE] is for, [reason] the engine's row reason or the
+     * [environment] the GitHub environment a [Kind.PLAN_PROFILE] is for — or, on a [Kind.CREATOR] item (SSO-3792), the
+     * THORYN plane slug the application is to be created in (`production`), [reason] the engine's row reason or the
      * sign-in's finding, and [cli] the command a workspace admin runs — null when the right is a DISPUTE the CLI
      * shows but never resolves (an object another repository owns: the admin decides, the Owner ADR's
      * revoke-then-grant is in the reason).
@@ -210,6 +223,30 @@ data class FixRequest(
         fun grantCommand(subject: String?, relation: String, objectRef: String): String =
             "thoryn access grant ${subject ?: SUBJECT_PLACEHOLDER} $relation $objectRef"
 
+        /**
+         * SSO-3792 — `thoryn access reserve <subject> application:<id> --environment <plane>`: THE spelling of a creation
+         * slot, for the prose and the JSON alike. The plane is always spelled out, `production` included: it is half of
+         * what the admin approves (the command defaults to `production` when it is omitted).
+         */
+        fun reserveCommand(subject: String?, clientId: String, plane: String): String =
+            "thoryn access reserve ${subject ?: SUBJECT_PLACEHOLDER} ${applicationRef(clientId)} --environment $plane"
+
+        /**
+         * SSO-3792 — `application:<platform id>` as product-api's access surface spells an application: the client id with
+         * `%` / `@` / `#` / whitespace percent-encoded (oauthy `PlatformRefs.encodeId`); an ordinary client id is unchanged.
+         */
+        fun applicationRef(clientId: String): String = "application:" + buildString {
+            clientId.forEach { c ->
+                when {
+                    c == '%' -> append("%25")
+                    c == '@' -> append("%40")
+                    c == '#' -> append("%23")
+                    c.isWhitespace() -> c.toString().toByteArray(Charsets.UTF_8).forEach { b -> append('%').append("%02X".format(b.toInt() and 0xff)) }
+                    else -> append(c)
+                }
+            }
+        }
+
         /** `thoryn workload-identity trusts set-plan-profile <id> --plan-environment <env>` — the plan profile's one additive call. */
         fun setPlanProfileCommand(trustId: String?, planEnvironment: String): String =
             "thoryn workload-identity trusts set-plan-profile ${trustId ?: TRUST_ID_PLACEHOLDER} --plan-environment $planEnvironment"
@@ -258,6 +295,7 @@ data class FixRequest(
                 Kind.VIEWER -> AccessRefs.RELATION_VIEWER
                 Kind.MANAGER -> AccessRefs.RELATION_MANAGER
                 Kind.PLAN_PROFILE -> throw IllegalArgumentException("a plan profile is not a relation")
+                Kind.CREATOR -> throw IllegalArgumentException("a creation slot names an application, never a trust")
             }
             val where = plane?.takeIf { it != "production" }?.let { " --environment $it" } ?: ""
             return MissingRight(
@@ -267,6 +305,14 @@ data class FixRequest(
                 grantCommand(subject, relation, "${AccessRefs.OBJECT_TYPE_TRUST}:$TRUST_ID_PLACEHOLDER"),
             )
         }
+
+        /**
+         * SSO-3792 (oauthy ADR 2026-10-17 §6) — a declared application with a fixed [clientId] on [plane] that this identity
+         * cannot see and may not create: a creation slot a workspace admin approves (`thoryn access reserve …`). Replaces
+         * the `owner` item on an application that may not exist (SSO-3787) and the workspace note on the production plane.
+         */
+        fun creator(subject: String?, clientId: String, plane: String, reason: String): MissingRight =
+            MissingRight(Kind.CREATOR, applicationRef(clientId), subject, plane, reason, reserveCommand(subject, clientId, plane))
 
         /** A `readOnly: true` reference the identity holds no relation on: `viewer`. */
         fun viewer(subject: String?, objectRef: String, reason: String): MissingRight =
@@ -306,7 +352,11 @@ data class FixRequest(
         /** The body of Option 1 — the items then the notes, without the heading (the request's `options.cli`). */
         fun renderOption1Body(items: List<MissingRight>, notes: List<String> = emptyList()): String = buildString {
             items.forEach { item ->
-                val target = item.objectRef ?: item.environment?.let { "GitHub environment '$it'" } ?: "(unknown object)"
+                val target = when {
+                    // SSO-3792 — a creation slot names its plane: the admin approves the name AND where it is created.
+                    item.kind == Kind.CREATOR -> "${item.objectRef ?: "(unknown object)"} in ${item.environment ?: "production"}"
+                    else -> item.objectRef ?: item.environment?.let { "GitHub environment '$it'" } ?: "(unknown object)"
+                }
                 appendLine("  - ${item.kind.wire} on $target" + (item.subject?.let { " for $it" } ?: "") + ": ${item.reason}")
                 when {
                     item.cli != null -> {
@@ -320,6 +370,8 @@ data class FixRequest(
         }.trimEnd()
 
         /** The prose hint the engine appends to a row's reason for a right it can name — the same [MissingRight.cli]. */
-        fun hint(item: MissingRight): String = item.cli?.let { "a workspace admin grants it with `$it`" } ?: ""
+        fun hint(item: MissingRight): String = item.cli?.let {
+            if (item.kind == Kind.CREATOR) "a workspace admin approves its creation with `$it` (or on the consent screen)" else "a workspace admin grants it with `$it`"
+        } ?: ""
     }
 }

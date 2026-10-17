@@ -23,9 +23,14 @@ import java.util.Base64
  * 404-not-403 rule), so a brand-new repository identity with no relation on anything gets it on its very first read.
  *
  * The engine now treats that 404 as the missing-rights shape: a red row `access_not_reachable` whose fix is the exact
- * right — `owner` on the application the file declares by a fixed `clientId`, `manager` on a declared environment the
- * identity cannot see, a note when the parent is the workspace — rendered in the one "To fix" block and written to the
- * fix request (kind owner / manager, `cli` filled) so the App's check run offers consent.
+ * right — `manager` on a declared environment the identity cannot see, a note when the parent is the workspace —
+ * rendered in the one "To fix" block and written to the fix request (`cli` filled) so the App's check run offers consent.
+ *
+ * SSO-3792 (absorbs SSO-3787; oauthy ADR 2026-10-17 §6) — a production application the file declares by a fixed
+ * `clientId` is NO LONGER asked for as `owner`: a confined identity cannot tell absent from invisible, and `owner` on an
+ * application that does not exist is the right PR 34's consent offered and product-api refused (`not_found`). It is a
+ * creation slot (`creator`, `thoryn access reserve`); for an application that turns out to exist, the orchestrator's
+ * callback answers `application_exists` with a follow-up `owner` consent (decision D1). See [ProvisionCreationSlotTest].
  */
 class ProvisionAccessNotReachableTest : CommandTestBase() {
 
@@ -85,7 +90,7 @@ class ProvisionAccessNotReachableTest : CommandTestBase() {
     """
 
     @Test
-    fun `a 404 on the first live read is a red access_not_reachable row with the owner grant as its fix — not "could not read live state"`() {
+    fun `a 404 on the first live read is a red access_not_reachable row with a creation slot as its fix — not "could not read live state", never owner`() {
         val out = File(tempHome.toFile(), "thoryn-provision-request.json")
 
         val (exit, stdout, err) = runCli("provision", "plan", "--file", file(fixedIdOnProduction).path, "--gateway", baseUrl(), "--fix-request", out.path)
@@ -94,22 +99,24 @@ class ProvisionAccessNotReachableTest : CommandTestBase() {
         assertThat(err).doesNotContain("could not read live state")
         assertThat(stdout).contains("application").contains("forge-oauth2-proxy").contains("error")
             .contains("${ProvisionEngine.ERROR_NOT_REACHABLE} — the live read of application/forge-oauth2-proxy in the production plane was answered HTTP 404 (unknown_environment)")
-        val grant = "thoryn access grant $subject owner application:forge-oauth2-proxy"
+        val reserve = "thoryn access reserve $subject application:forge-oauth2-proxy --environment production"
         assertThat(err)
             .contains("1 resource(s) failed the ownership check")
             .contains(FixRequest.OPTION_CLI_HEADING)
-            .contains("  - owner on application:forge-oauth2-proxy for $subject: ${ProvisionEngine.ERROR_NOT_REACHABLE} — ")
-            .contains("\n      $grant\n")
+            .contains("  - creator on application:forge-oauth2-proxy in production for $subject: ${ProvisionEngine.ERROR_NOT_REACHABLE} — ")
+            .contains("\n      $reserve\n")
             .contains("${FixRequest.OPTION_BROWSER_HEADING} ${FixRequest.NO_CONSENT_LINK_LINE}")
+            .doesNotContain("owner application:forge-oauth2-proxy")
         val doc = request(out)
         val item = doc["missing"].single()
-        assertThat(item["kind"].asString()).isEqualTo("owner")
+        assertThat(item["kind"].asString()).isEqualTo("creator")
         assertThat(item["object"].asString()).isEqualTo("application:forge-oauth2-proxy")
         assertThat(item["subject"].asString()).isEqualTo(subject)
-        assertThat(item["cli"].asString()).isEqualTo(grant)
+        assertThat(item["environment"].asString()).isEqualTo("production")
+        assertThat(item["cli"].asString()).isEqualTo(reserve)
         assertThat(item["reason"].asString()).startsWith("${ProvisionEngine.ERROR_NOT_REACHABLE} — ").contains("clientId: forge-oauth2-proxy")
         assertThat(doc["notes"].isEmpty).isTrue()
-        assertThat(doc["options"]["cli"].asString()).contains(grant)
+        assertThat(doc["options"]["cli"].asString()).contains(reserve)
         assertThat(api.writes).isEmpty()
     }
 
@@ -156,7 +163,7 @@ class ProvisionAccessNotReachableTest : CommandTestBase() {
         val link = "https://app.thoryn.io/github/consent/run/thoryn-io/thoryn-cicd/38751887466"
         assertThat(err).contains("${FixRequest.OPTION_BROWSER_HEADING} $link").contains("Nothing was changed.")
         assertThat(request(out)["options"]["consentUrl"].asString()).isEqualTo(link)
-        assertThat(request(out)["missing"].single()["kind"].asString()).isEqualTo("owner")
+        assertThat(request(out)["missing"].single()["kind"].asString()).isEqualTo("creator")
         assertThat(api.writes).isEmpty()
     }
 

@@ -554,6 +554,22 @@ class ProductApiClient(
         return get("/api/v1/access/mine$query")
     }
 
+    // ── Application creation slots (SSO-3792; product-api SSO-3789, oauthy ADR 2026-10-17 §2) ──
+    // A workspace admin approves that ONE workload identity creates ONE named application on ONE plane, once, within
+    // 30 days. Workspace-level (the plane is a body field), so no X-Thoryn-Environment dependency.
+
+    /** `GET /api/v1/access/application-slots` — ListEnvelope of `{object, subject, environment, createdAt, expiresAt, expired}`. */
+    override fun listApplicationSlots(): JsonNode =
+        get("/api/v1/access/application-slots")
+
+    /** `POST /api/v1/access/application-slots` `{subject, object, environment}` — 201 reserved, 200 the same reservation already held. */
+    fun reserveApplicationSlot(subjectRef: String, objectRef: String, environment: String): JsonNode =
+        post("/api/v1/access/application-slots", linkedMapOf("subject" to subjectRef, "object" to objectRef, "environment" to environment))
+
+    /** `DELETE /api/v1/access/application-slots/{clientId}` — 204; the holder releases, a workspace admin revokes. */
+    fun releaseApplicationSlot(clientId: String): Unit =
+        deleteNoContent("/api/v1/access/application-slots/${encode(clientId)}")
+
     private fun grantBody(subjectRef: String, relation: String, objectRef: String): Map<String, Any?> =
         linkedMapOf("subject" to subjectRef, "relation" to relation, "object" to objectRef)
 

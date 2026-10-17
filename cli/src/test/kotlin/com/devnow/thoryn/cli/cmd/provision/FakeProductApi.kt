@@ -118,6 +118,94 @@ internal class FakeProductApi : Dispatcher() {
     private var readsSinceVerified = 0
     private var lastCheckReason: String? = null
 
+    // ── SSO-3792 — application creation slots (product-api SSO-3789, oauthy ADR 2026-10-17 §2 / §3) ──
+    /**
+     * The slots: `clientId`, `subject` (the holder), `_env` (the plane; null ⇒ production), `createdAt`, `expired`. A slot
+     * lets its holder create exactly that client id on exactly that plane, once ([applicationCreateGate]); any create of
+     * the name sweeps it.
+     */
+    val slots = mutableListOf<MutableMap<String, Any?>>()
+    /** False ⇒ product-api before SSO-3789: every `/api/v1/access/application-slots` call is the router's `404`. */
+    var slotsSupported = true
+    /** Every `GET /api/v1/access/application-slots` (a READ the engine makes at most once per plan). */
+    var slotReads = 0
+    /**
+     * A listing that carries EVERY holder's slots to a non-admin too (product-api filters to the caller's own; this models a
+     * listing that does not), so a test can show the engine never takes another identity's slot as its own.
+     */
+    var slotListingUnfiltered = false
+    /** Race fixture: an admin releases every slot between the plan and the apply's create (the create then misses the gate). */
+    var releaseSlotsBeforeCreate = false
+
+    fun seedSlot(clientId: String, subject: String, env: String? = null, expired: Boolean = false) {
+        slots += mutableMapOf("clientId" to clientId, "subject" to subject, "_env" to env, "createdAt" to if (expired) "2026-08-01T00:00:00Z" else "2026-10-17T00:00:00Z", "expired" to expired)
+    }
+
+    private fun slotView(slot: Map<String, Any?>): Map<String, Any?> = linkedMapOf(
+        "object" to "application:${slot["clientId"]}",
+        "subject" to slot["subject"],
+        "environment" to (slot["_env"] ?: "production"),
+        "createdAt" to slot["createdAt"],
+        "expiresAt" to if (slot["expired"] == true) "2026-08-31T00:00:00Z" else "2026-11-16T00:00:00Z",
+        "expired" to slot["expired"],
+    )
+
+    /** product-api's `ApplicationSlotController` + `ApplicationSlotService` in miniature. */
+    private fun applicationSlots(method: String, route: String, b: Map<String, Any?>): MockResponse {
+        if (!slotsSupported) return problem(404, "no_route:$method $route")
+        val admin = callerIsAdmin || direct("workspace:$tenantId", "admin")
+        val seg = route.removePrefix("/api/v1/access/application-slots").trim('/')
+        return when {
+            seg.isEmpty() && method == "GET" -> {
+                if (denyGrantReads) return problem(403, "insufficient_scope")
+                slotReads++
+                json(200, mapOf("data" to slots.filter { admin || slotListingUnfiltered || it["subject"] == caller }.map { slotView(it) }, "pagination" to mapOf("total" to slots.size, "nextCursor" to null)))
+            }
+            seg.isEmpty() && method == "POST" -> {
+                if (denyGrantWrites) return problem(403, "insufficient_scope")
+                val subject = (b["subject"] as? String)?.takeIf { it.startsWith("client:") } ?: return problem(400, "invalid_subject")
+                val clientId = (b["object"] as? String)?.takeIf { it.startsWith("application:") }?.removePrefix("application:") ?: return problem(400, "invalid_object")
+                val envSlug = (b["environment"] as? String)?.takeIf { it.isNotBlank() } ?: return problem(400, "invalid_environment")
+                if (!admin) return problem(404, "not_found")
+                if (envSlug != "production" && environments.none { it["slug"] == envSlug }) return problem(404, "not_found")
+                if (trusts.none { "client:${it["clientId"]}" == subject }) return problem(404, "not_found")
+                if (clientId in setOf("thoryn-cli", "self-service-bff")) return problem(409, "reserved_client_id")
+                if (applications.any { it["clientId"] == clientId }) return problem(409, "application_exists")
+                val plane = envSlug.takeIf { it != "production" }
+                val held = slots.firstOrNull { it["clientId"] == clientId }
+                if (held != null && held["expired"] != true) {
+                    if (held["subject"] == subject && held["_env"] == plane) return json(200, slotView(held))
+                    if (held["subject"] != subject) return problem(409, "application_slot_held")
+                }
+                held?.let { slots.remove(it) }
+                seedSlot(clientId, subject, plane)
+                json(201, slotView(slots.last()))
+            }
+            method == "DELETE" -> {
+                if (denyGrantWrites) return problem(403, "insufficient_scope")
+                val slot = slots.firstOrNull { it["clientId"] == seg } ?: return problem(404, "not_found")
+                if (slot["subject"] != caller && !admin) return problem(404, "not_found")
+                slots.remove(slot); MockResponse().setResponseCode(204)
+            }
+            else -> problem(405, "method")
+        }
+    }
+
+    /**
+     * SSO-3792 — `ApplicationsService.create`'s gate (`whenCreatorOrSlot`): `manager` on the plane, OR an unexpired slot the
+     * caller holds for exactly this client id on exactly this plane — claimed (removed) before the create. Answers the
+     * refusing response, or null to proceed. A slot never includes turning token exchange on (`403`, slot kept).
+     */
+    private fun applicationCreateGate(id: String, explicit: Boolean, env: String?, b: Map<String, Any?>): MockResponse? {
+        if (releaseSlotsBeforeCreate) slots.clear()
+        if (holds(planeRef(env), "manager")) return null
+        val slot = slots.firstOrNull { explicit && it["clientId"] == id && it["subject"] == caller && it["_env"] == env && it["expired"] != true }
+            ?: return problem(404, "not_found")
+        if (b["allowTokenExchange"] == true) return problem(403, "token_exchange_not_grantable")
+        slots.remove(slot)
+        return null
+    }
+
     fun customDomainStatus(): Map<String, Any?> {
         val host = domainHost
         val records = if (host == null) emptyList() else listOf(
@@ -549,6 +637,8 @@ internal class FakeProductApi : Dispatcher() {
     private fun reaches(env: String?): Boolean {
         val plane = planeRef(env)
         if (holds(plane, "viewer")) return true
+        // SSO-3792 — a slot is CONTAINED in its plane (`viewer = owner ∪ parent.viewer`): its holder may select the plane.
+        if (slots.any { it["subject"] == caller && it["_env"] == env }) return true
         return grants.any { it["subject"] == caller && parentOf(it["object"].toString()) == plane }
     }
 
@@ -597,11 +687,15 @@ internal class FakeProductApi : Dispatcher() {
                 // committed file pins `cli` / `cli-ci`); only an absent one is allocated. The fake used
                 // to overwrite it unconditionally, which hid both the fixed-id create and the grant that
                 // names it as a subject.
-                val id = (b["clientId"] as? String)?.takeIf { it.isNotBlank() } ?: "app-${++seq}"
+                val explicit = (b["clientId"] as? String)?.takeIf { it.isNotBlank() }
+                val id = explicit ?: "app-${++seq}"
+                applicationCreateGate(id, explicit != null, env, b)?.let { return it }
                 if (applications.any { it["clientId"] == id }) return problem(409, "client_id_taken")
                 federatedBindingProblem(b, env)?.let { return it }
                 applicationSettingsProblem(b, env)?.let { return it }
                 applications += (b + mapOf("clientId" to id, "status" to "active", "_env" to env)).toMutableMap()
+                // SSO-3792 — any creation of the name sweeps its slot (a slot never outlives the creation of its name).
+                slots.removeIf { it["clientId"] == id }
                 // SSO-3667 — a `client:` creator becomes the application's owner (rendered on the create response).
                 creatorBecomesOwner("application:$id")
                 // SSO-3113 — a CONFIDENTIAL client's one-shot secret rides ONLY on the create response (never on a later
@@ -770,6 +864,8 @@ internal class FakeProductApi : Dispatcher() {
                 val allowed = objectsOf(ref.substringBefore(':')).contains(ref) && holds(ref, relation)
                 json(200, mapOf("allowed" to allowed, "resolvedVia" to if (allowed) resolvedVia(ref, relation) else null))
             }
+            // ── application creation slots (SSO-3792; product-api SSO-3789) ──
+            route.startsWith("/api/v1/access/application-slots") -> applicationSlots(method, route, b)
             // ── custom domain (SSO-3413 / SSO-3414) ──
             route.startsWith("/api/v1/custom-domain") -> customDomain(method, route, b)
             // ── workload-identity trusts (SSO-3689) ──
