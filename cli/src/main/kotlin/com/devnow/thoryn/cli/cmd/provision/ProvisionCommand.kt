@@ -210,12 +210,15 @@ class ProvisionCommand : Callable<Int> {
         fun printPlanErrors(plan: ProvisionPlan) {
             if (!plan.hasErrors) return
             System.err.println("${plan.errors.size} resource(s) failed the ownership check — apply would refuse this plan:")
-            plan.errors.forEach { c -> System.err.println("  ! ${c.kind} ${c.name}: ${c.reason}") }
             // SSO-3710 / SSO-3722 — the fix behind those rows, as ONE "To fix" block in two options: the SAME items (and the
             // same `cli` strings) and the same notes a `--fix-request` file carries, rendered by the one function the request
             // is rendered with; the browser option is the run's consent link when the workflow configured one (SSO-3723).
+            // SSO-3738 — with a consent, Option 1 is `thoryn access approve` and no row prints a raw grant line.
             val (items, notes) = FixRequest.fromPlan(plan)
-            FixRequest.render(items, notes, FixRequests.consentUrl()).takeIf { it.isNotEmpty() }?.let { System.err.println(it) }
+            val consentUrl = FixRequests.consentUrl()
+            val approving = FixRequest.approveRun(items, consentUrl) != null
+            plan.errors.forEach { c -> System.err.println("  ! ${c.kind} ${c.name}: ${FixRequest.reasonForDisplay(c.reason, c.fix, approving)}") }
+            FixRequest.render(items, notes, consentUrl).takeIf { it.isNotEmpty() }?.let { System.err.println(it) }
         }
 
         /**
@@ -233,8 +236,10 @@ class ProvisionCommand : Callable<Int> {
             val w1 = (plan.changes.map { it.kind.length } + 4).max()
             val w2 = (plan.changes.map { it.name.length } + 4).max()
             println("  ${"KIND".padEnd(w1)}  ${"NAME".padEnd(w2)}  ACTION  REASON")
+            // SSO-3738 — with a consent for this run, a refused row's inline grant command reads "approve it" instead.
+            val approving = plan.hasErrors && FixRequest.approveRun(FixRequest.fromPlan(plan).first, FixRequests.consentUrl()) != null
             plan.changes.forEach { c ->
-                println("  ${c.kind.padEnd(w1)}  ${c.name.padEnd(w2)}  ${c.action.name.lowercase().padEnd(6)}  ${c.reason}")
+                println("  ${c.kind.padEnd(w1)}  ${c.name.padEnd(w2)}  ${c.action.name.lowercase().padEnd(6)}  ${FixRequest.reasonForDisplay(c.reason, c.fix, approving)}")
             }
             // SSO-3715 — a refused / deferred removal names the command a person runs instead.
             plan.changes.filter { it.byHand != null }.forEach { c -> println("      ${c.kind} ${c.name}: by hand: ${c.byHand}") }

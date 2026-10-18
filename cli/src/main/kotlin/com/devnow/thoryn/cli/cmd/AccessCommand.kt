@@ -37,6 +37,8 @@ import java.util.concurrent.Callable
  *  - `revoke <subject> <relation> <object>` — DELETE /api/v1/access/grants (body-identified; 204)
  *  - `list [--object …] [--subject …]`      — GET    /api/v1/access/grants?object=…|subject=… (ListEnvelope, `data`)
  *  - `mine [--type …] [--relation …]`       — GET    /api/v1/access/mine?type=…&relation=… (`{ data: [ "<type>:<id>" ] }`)
+ *  - `approve <owner>/<repo>/<run_id> | <consent URL>` — SSO-3738: opens the hub consent for a red provisioning run's
+ *    missing rights in the browser (or prints its address); no API call, grants nothing itself ([AccessApprove])
  *
  * The same grammar backs the `grants:` block of a provisioning file (`thoryn provision apply`
  * converges grants per resource — see `ProvisionFile`).
@@ -50,13 +52,14 @@ import java.util.concurrent.Callable
         AccessCommand.RevokeSubcommand::class,
         AccessCommand.ListSubcommand::class,
         AccessCommand.MineSubcommand::class,
+        AccessCommand.ApproveSubcommand::class,
     ],
 )
 class AccessCommand : Callable<Int> {
 
     override fun call(): Int {
         System.err.println("Usage: thoryn access <subcommand>")
-        System.err.println("Subcommands: grant | revoke | list | mine")
+        System.err.println("Subcommands: grant | revoke | list | mine | approve")
         return CommandSupport.EXIT_USAGE
     }
 
@@ -222,6 +225,51 @@ class AccessCommand : Callable<Int> {
                 CommandSupport.renderError(format, ex, requiredScope = SCOPE_READ)
             } catch (ex: Exception) {
                 CommandSupport.renderRequestFailure(ex, gateway)
+            }
+        }
+    }
+
+    /**
+     * SSO-3738 — `thoryn access approve <owner>/<repo>/<run_id> | <consent URL>`: Option 1 of a red provisioning check.
+     * Opens the run's by-run consent address — the same hub consent the check run's Option-2 link opens — in the browser,
+     * or prints it to open on any device. It grants nothing: a workspace admin approves on Thoryn's consent screen. The
+     * address and how its base is resolved: [AccessApprove].
+     */
+    @Command(
+        name = "approve",
+        description = [
+            "Open Thoryn's consent for the rights a red provisioning run asks for (the check run's Option 1).",
+            "Grants nothing itself: a workspace admin approves on Thoryn's consent screen.",
+        ],
+        mixinStandardHelpOptions = true,
+    )
+    class ApproveSubcommand : Callable<Int> {
+
+        @Parameters(
+            index = "0",
+            paramLabel = "<run>",
+            description = ["The run: <owner>/<repository>/<run_id> as the check run prints it, or the consent URL (https://…/github/consent/run/<owner>/<repository>/<run_id>)."],
+        )
+        lateinit var run: String
+
+        @Option(
+            names = ["--consent-url"],
+            paramLabel = "<base-url>",
+            description = ["The consent base URL (https://starters.<your Thoryn domain>). Default: the repository's .thoryn/workflow.yaml consentUrl, else derived from your signed-in platform."],
+        )
+        var consentUrl: String? = null
+
+        @Option(names = ["--no-browser"], description = ["Print the address instead of opening a browser (also: THORYN_NO_BROWSER=1)."])
+        var noBrowser: Boolean = false
+
+        override fun call(): Int = when (val r = AccessApprove.resolve(run, consentUrl)) {
+            is AccessApprove.Resolution.Refused -> {
+                System.err.println("Error: ${r.message}")
+                CommandSupport.EXIT_USAGE
+            }
+            is AccessApprove.Resolution.Ok -> {
+                AccessApprove.deliver(r.target, noBrowser)
+                CommandSupport.EXIT_OK
             }
         }
     }

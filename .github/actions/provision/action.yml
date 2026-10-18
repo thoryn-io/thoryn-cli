@@ -139,8 +139,9 @@ inputs:
   consent-url:
     description: >-
       SSO-3723 — base URL of the Thoryn GitHub App's browser consent (the CLI's THORYN_CONSENT_URL). A red sign-in or
-      plan then prints its fix in two options — the CLI commands and `<consent-url>/github/consent/run/<owner>/<repo>/<run_id>`
-      — and the fix request carries both (`options`). Empty ⇒ the commands alone. Configuration, never guessed.
+      plan then prints its fix in two options for the same hub consent — `thoryn access approve <owner>/<repo>/<run_id>`
+      (SSO-3738) and `<consent-url>/github/consent/run/<owner>/<repo>/<run_id>` — and the fix request carries both
+      (`options`). Empty ⇒ the raw commands alone, under a check-each-line warning. Configuration, never guessed.
     required: false
     default: ""
 
