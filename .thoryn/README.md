@@ -48,6 +48,9 @@ unchanged by them. Both are public clients, which cannot hold `allowTokenExchang
 identity's `manager` on the sandbox `cli-ci` is exactly the reach that may turn token exchange on there, while on the
 production plane it could not (that needs the workspace's `manager`, never granted to a repository identity — the plan
 row `token_exchange_not_grantable` carries a note, not a grant).
+`allowTokenIntrospection` and `accessTokenFormat` (SSO-3810 / SSO-3807) are declared by none of this repository's files
+either; both clients are public, which cannot hold `allowTokenIntrospection`
+(`token_introspection_requires_confidential_client`).
 
 ## The CLI's own login client lives here too (SSO-3104)
 

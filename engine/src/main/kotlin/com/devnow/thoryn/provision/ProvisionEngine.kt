@@ -894,7 +894,9 @@ class ProvisionEngine(
         if (r.kind != ProvisionFile.KIND_APPLICATION || gated.action == ChangeAction.ERROR || gated.readOnly) return gated
         val bound = gateBinding(r, gated, slug, reach)
         // SSO-3767 — nor turn token exchange ON without reach on its environment.
-        return if (bound.action == ChangeAction.ERROR) bound else gateTokenExchange(r, bound, file, envSlugs, slug, reach)
+        val exchange = if (bound.action == ChangeAction.ERROR) bound else gateTokenExchange(r, bound, file, envSlugs, slug, reach)
+        // SSO-3810 — nor token introspection: the same reach, for the same kind of reason.
+        return if (exchange.action == ChangeAction.ERROR) exchange else gateTokenIntrospection(r, exchange, file, envSlugs, slug, reach)
     }
 
     /**
@@ -907,19 +909,42 @@ class ProvisionEngine(
      * and the file says `true`): turning it off, omitting it, or re-declaring the stored value is never refused, and a create
      * already needs `manager` on the parent ([gateObject]).
      */
-    private fun gateTokenExchange(r: ProvisionResource, change: PlannedChange, file: ProvisionFile, envSlugs: Map<String, String>, slug: String?, reach: Reach): PlannedChange {
-        if (change.action != ChangeAction.UPDATE || ProvisionFile.SPEC_ALLOW_TOKEN_EXCHANGE !in change.diff) return change
-        if (!coerceBool(r.spec[ProvisionFile.SPEC_ALLOW_TOKEN_EXCHANGE])) return change
+    private fun gateTokenExchange(r: ProvisionResource, change: PlannedChange, file: ProvisionFile, envSlugs: Map<String, String>, slug: String?, reach: Reach): PlannedChange =
+        gateEnvironmentWideSetting(
+            r, change, file, envSlugs, slug, reach,
+            ProvisionFile.SPEC_ALLOW_TOKEN_EXCHANGE, ProvisionFile.ERR_TOKEN_EXCHANGE_NOT_GRANTABLE, TOKEN_EXCHANGE_WORKSPACE_NOTE,
+        )
+
+    /**
+     * SSO-3810 (oauthy SSO-3810) — turning `allowTokenIntrospection` ON for an EXISTING application needs `manager` on its
+     * environment, exactly like [gateTokenExchange]: an introspecting client reads the metadata of every token the
+     * environment issues (other applications' included), so an identity that manages one application may not grant it to
+     * itself. product-api answers `403 token_introspection_not_grantable`; the plan says so first. Turning it off, omitting
+     * it, or re-declaring the stored value is never refused.
+     */
+    private fun gateTokenIntrospection(r: ProvisionResource, change: PlannedChange, file: ProvisionFile, envSlugs: Map<String, String>, slug: String?, reach: Reach): PlannedChange =
+        gateEnvironmentWideSetting(
+            r, change, file, envSlugs, slug, reach,
+            ProvisionFile.SPEC_ALLOW_TOKEN_INTROSPECTION, ProvisionFile.ERR_TOKEN_INTROSPECTION_NOT_GRANTABLE, TOKEN_INTROSPECTION_WORKSPACE_NOTE,
+        )
+
+    /** The shared rule of [gateTokenExchange] / [gateTokenIntrospection]: a boolean [field] the update TURNS ON needs `manager` on the parent. */
+    private fun gateEnvironmentWideSetting(
+        r: ProvisionResource, change: PlannedChange, file: ProvisionFile, envSlugs: Map<String, String>, slug: String?, reach: Reach,
+        field: String, errorCode: String, workspaceNote: String,
+    ): PlannedChange {
+        if (change.action != ChangeAction.UPDATE || field !in change.diff) return change
+        if (!coerceBool(r.spec[field])) return change
         val parent = parentRef(r, file, envSlugs, slug, reach) ?: return change
         if (reach.managesParent(parent)) return change
         val appAccess = Access.entries.firstOrNull { it.label == change.access }
-        val why = "turning ${ProvisionFile.SPEC_ALLOW_TOKEN_EXCHANGE} on for ${r.key} requires `manager` on its environment $parent — the reach that may create an " +
-            "application there; managing the application alone is not enough (product-api answers `403 ${ProvisionFile.ERR_TOKEN_EXCHANGE_NOT_GRANTABLE}`)"
+        val why = "turning $field on for ${r.key} requires `manager` on its environment $parent — the reach that may create an " +
+            "application there; managing the application alone is not enough (product-api answers `403 $errorCode`)"
         return if (parent.startsWith("$OBJECT_TYPE_WORKSPACE:")) {
-            refuse(r, change, ProvisionFile.ERR_TOKEN_EXCHANGE_NOT_GRANTABLE, appAccess, "$why ($TOKEN_EXCHANGE_WORKSPACE_NOTE)", fixNote = TOKEN_EXCHANGE_WORKSPACE_NOTE)
+            refuse(r, change, errorCode, appAccess, "$why ($workspaceNote)", fixNote = workspaceNote)
         } else {
             val fix = FixRequest.manager(subject, parent, why)
-            refuse(r, change, ProvisionFile.ERR_TOKEN_EXCHANGE_NOT_GRANTABLE, appAccess, "$why (${FixRequest.hint(fix)})", fix = fix)
+            refuse(r, change, errorCode, appAccess, "$why (${FixRequest.hint(fix)})", fix = fix)
         }
     }
 
@@ -2648,6 +2673,22 @@ class ProvisionEngine(
                 }
                 "$why.\n$toFix"
             }
+            ProvisionFile.ERR_TOKEN_INTROSPECTION_NOT_GRANTABLE -> {
+                val parent = runCatching { planeParentRef(slug, Reach()) }.getOrElse { "$OBJECT_TYPE_WORKSPACE:${workspaceId ?: "(this workspace)"}" }
+                val why = "turning ${ProvisionFile.SPEC_ALLOW_TOKEN_INTROSPECTION} on requires `manager` on the application's environment $parent " +
+                    "(the reach that may create an application there); managing the application alone is not enough"
+                val toFix = if (parent.startsWith("$OBJECT_TYPE_WORKSPACE:")) {
+                    FixRequest.render(emptyList(), listOf("${r.kind} ${r.name}: $TOKEN_INTROSPECTION_WORKSPACE_NOTE"))
+                } else {
+                    FixRequest.render(listOf(FixRequest.manager(subject, parent, "${ProvisionFile.ERR_TOKEN_INTROSPECTION_NOT_GRANTABLE} — $why")))
+                }
+                "$why.\n$toFix"
+            }
+            ProvisionFile.ERR_TOKEN_INTROSPECTION_REQUIRES_CONFIDENTIAL_CLIENT ->
+                "${ProvisionFile.SPEC_ALLOW_TOKEN_INTROSPECTION}: true needs a client that authenticates (a secret, private_key_jwt or federated_assertion); " +
+                    "a public client cannot hold it, and a client that holds it cannot be made public — fix spec.clientType / spec.clientAuthenticationMethods, or drop the setting$detail"
+            ProvisionFile.ERR_INVALID_ACCESS_TOKEN_FORMAT ->
+                "spec.${ProvisionFile.SPEC_ACCESS_TOKEN_FORMAT} must be ${ProvisionFile.ACCESS_TOKEN_FORMATS.joinToString(" or ") { "'$it'" }}$detail"
             ProvisionFile.ERR_TOKEN_EXCHANGE_REQUIRES_CONFIDENTIAL_CLIENT ->
                 "${ProvisionFile.SPEC_ALLOW_TOKEN_EXCHANGE}: true needs a client that authenticates (a secret, private_key_jwt or federated_assertion); " +
                     "a public client cannot hold it, and a client that holds it cannot be made public — fix spec.clientType / spec.clientAuthenticationMethods, or drop the setting$detail"
@@ -2885,6 +2926,11 @@ class ProvisionEngine(
         const val TOKEN_EXCHANGE_WORKSPACE_NOTE = "not a grantable right: turning token exchange on for a production-plane application needs `manager` on the " +
             "workspace, which is never granted to a repository identity — a workspace admin applies this file from their own session " +
             "(or drop `allowTokenExchange: true` from the file)"
+
+        /** SSO-3810 — why a production-plane `token_introspection_not_grantable` has no item (as [TOKEN_EXCHANGE_WORKSPACE_NOTE]). */
+        const val TOKEN_INTROSPECTION_WORKSPACE_NOTE = "not a grantable right: turning token introspection on for a production-plane application needs `manager` " +
+            "on the workspace, which is never granted to a repository identity — a workspace admin applies this file from their own session " +
+            "(or drop `allowTokenIntrospection: true` from the file)"
 
         const val WORKSPACE_PARENT_NOTE = "not a grantable right: `manager` on the workspace is never granted to a repository identity — a workspace admin creates it, then grants this identity `owner` on it (or declare it `readOnly: true`)"
 
