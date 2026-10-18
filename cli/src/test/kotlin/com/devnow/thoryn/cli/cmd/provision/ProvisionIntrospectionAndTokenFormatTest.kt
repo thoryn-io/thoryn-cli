@@ -198,4 +198,25 @@ class ProvisionIntrospectionAndTokenFormatTest : CommandTestBase() {
             .hasMessageContaining("application/orders: ${ProvisionFile.ERR_TOKEN_INTROSPECTION_NOT_GRANTABLE}")
             .hasMessageContaining("thoryn access grant $subject manager environment:$envId")
     }
+
+    // ── SSO-3811 — the DPoP rungs ──
+
+    @Test
+    fun `SSO-3811 - dpopAllowed and dpopRequired are sent on create, converged on drift, and never gated`() {
+        val f = orders("dpopAllowed: true\ndpopRequired: true")
+        apply(f)
+        assertThat(api.writes.single { it.method == "POST" && it.path == "/api/v1/applications" }.body)
+            .containsEntry("dpopAllowed", true).containsEntry("dpopRequired", true)
+
+        live()["dpopRequired"] = false
+        api.reset()
+        val row = engine().plan(f, false).changes.single()
+        assertThat(row.action).isEqualTo(ChangeAction.UPDATE)
+        assertThat(row.diff.keys).containsExactly(ProvisionFile.SPEC_DPOP_REQUIRED)
+        apply(f)
+        assertThat(api.writes.single { it.method == "PATCH" }.body).isEqualTo(mapOf("dpopRequired" to true))
+
+        assertThatThrownBy { orders("dpopAllowed: \"yes\"") }.isInstanceOf(ProvisionException::class.java).hasMessageContaining("spec.dpopAllowed")
+    }
 }
+

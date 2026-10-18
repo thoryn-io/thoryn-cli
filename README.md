@@ -307,7 +307,8 @@ thoryn examples share    <name> [--output <file>]   # SSO-2876 — export the se
 # right) and the session lifetime `refreshTokenSlidingWindow` + `refreshTokenAbsoluteMaxTtlSeconds`. Converged on
 # update; an omitted setting keeps the live value. See "Application settings" below.
 # SSO-3810 / SSO-3807 (oauthy): also `allowTokenIntrospection` (RFC 7662; turning it ON needs `manager` on the
-# environment — else token_introspection_not_grantable) and `accessTokenFormat` (self-contained | reference).
+# environment — else token_introspection_not_grantable), `accessTokenFormat` (self-contained | reference) and the
+# DPoP rungs `dpopAllowed` / `dpopRequired` (SSO-3811).
 thoryn provision plan    [--file <path>] [--prune] [--fix-request <path>]  # read-only: what apply would create / remove (+ grant changes, pending publishes); exit 1 on an ownership error
                                              # SSO-3710 — --fix-request (env THORYN_FIX_REQUEST): a red plan also writes thoryn-provision-request.json — every missing RIGHT
                                              # (owner / manager / viewer) with the exact `thoryn access grant` command a workspace admin runs; a workflow uploads it
@@ -1488,6 +1489,8 @@ resources:
 | `refreshTokenSlidingWindow` | boolean, `false` | a value | — | — |
 | `allowTokenIntrospection` | boolean, `false` | a value | `token_introspection_requires_confidential_client` (`clientType: public` or method `none`) | `token_introspection_not_grantable` (403) — **predicted by the plan**, like `token_exchange_not_grantable` (same right, same production-plane note) |
 | `accessTokenFormat` | `self-contained` \| `reference`, `self-contained` | a value | `invalid_access_token_format` (any other value) | — |
+| `dpopAllowed` | boolean, `false` | a value | not a boolean | — |
+| `dpopRequired` | boolean, `false` | a value | not a boolean | — |
 | `refreshTokenAbsoluteMaxTtlSeconds` | integer seconds, 3600 – 7776000; live default 7776000 | a value | `token_ttl_out_of_range`; `session_lifetime_requires_sliding_window` (declared without `refreshTokenSlidingWindow: true` — the file states the session, it does not lean on the live window); `session_lifetime_below_refresh_ttl` (shorter than a declared `refreshTokenTtlSeconds`) | `session_lifetime_below_refresh_ttl` (shorter than the LIVE refresh TTL); `session_exceeds_tenant_policy` (longer than the environment authentication policy's `refreshClipSeconds` — the cap is named in the error) |
 
 **Who may turn token exchange on.** With the setting on, an application that holds a user's token can obtain
@@ -1518,6 +1521,11 @@ environment issues, so turning it **on** needs the same `manager` on the environ
 plan predicts `token_introspection_not_grantable` the same way. `accessTokenFormat: reference` makes the token
 endpoint issue the application opaque access tokens, which a resource server resolves through introspection;
 any manager of the application may set it. Thoryn's own management API accepts `self-contained` tokens only.
+
+**DPoP (SSO-3811).** `dpopAllowed: true` makes a DPoP proof the application presents bind its access token
+(`token_type: DPoP`); without it a proof is ignored and the application gets Bearer tokens. `dpopRequired: true`
+makes a proof mandatory — declare it only once every installation sends one. Neither is gated beyond managing the
+application: a sender constraint widens nothing.
 
 ```yaml
   - kind: application

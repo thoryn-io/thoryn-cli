@@ -281,12 +281,16 @@ class ProvisionFile private constructor(
         const val SPEC_ALLOW_TOKEN_INTROSPECTION = "allowTokenIntrospection"
         /** SSO-3807 — the access-token format the application receives: `self-contained` (a JWT, the default) or `reference` (opaque). */
         const val SPEC_ACCESS_TOKEN_FORMAT = "accessTokenFormat"
+        /** SSO-3811 — DPoP (RFC 9449) opt-in: a proof that arrives binds the access token (product-api `dpopAllowed`, default `false`). */
+        const val SPEC_DPOP_ALLOWED = "dpopAllowed"
+        /** SSO-3811 — every token request must carry a DPoP proof (product-api `dpopRequired`, default `false`). */
+        const val SPEC_DPOP_REQUIRED = "dpopRequired"
         /** product-api's `accessTokenFormat` values (the hub's `OAuth2TokenFormat` values, exact spelling). */
         val ACCESS_TOKEN_FORMATS: Set<String> = setOf("self-contained", "reference")
         /** The settings, in the order a plan lists them — each converged on UPDATE, an omitted one keeps the live value. */
         val APPLICATION_SETTING_FIELDS: List<String> = listOf(
             SPEC_ALLOW_TOKEN_EXCHANGE, SPEC_ALLOWED_AUTHORIZATION_DETAIL_TYPES, SPEC_REFRESH_TOKEN_SLIDING_WINDOW, SPEC_REFRESH_TOKEN_ABSOLUTE_MAX_TTL_SECONDS,
-            SPEC_ALLOW_TOKEN_INTROSPECTION, SPEC_ACCESS_TOKEN_FORMAT,
+            SPEC_ALLOW_TOKEN_INTROSPECTION, SPEC_ACCESS_TOKEN_FORMAT, SPEC_DPOP_ALLOWED, SPEC_DPOP_REQUIRED,
         )
         /** The RFC 8693 grant an application must register to hold [SPEC_ALLOW_TOKEN_EXCHANGE]. */
         const val GRANT_TOKEN_EXCHANGE = "urn:ietf:params:oauth:grant-type:token-exchange"
@@ -857,7 +861,7 @@ class ProvisionFile private constructor(
          */
         private fun validateApplicationSettings(spec: JsonNode, where: String, v: MutableList<String>) {
             fun present(field: String): JsonNode? = spec[field]?.takeIf { !it.isNull }
-            listOf(SPEC_ALLOW_TOKEN_EXCHANGE, SPEC_REFRESH_TOKEN_SLIDING_WINDOW, SPEC_ALLOW_TOKEN_INTROSPECTION).forEach { f ->
+            listOf(SPEC_ALLOW_TOKEN_EXCHANGE, SPEC_REFRESH_TOKEN_SLIDING_WINDOW, SPEC_ALLOW_TOKEN_INTROSPECTION, SPEC_DPOP_ALLOWED, SPEC_DPOP_REQUIRED).forEach { f ->
                 present(f)?.takeIf { !it.isBoolean() }?.let { v += "$where spec.$f must be true or false" }
             }
             present(SPEC_ACCESS_TOKEN_FORMAT)?.let { f ->

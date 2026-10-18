@@ -551,6 +551,7 @@ internal class FakeProductApi : Dispatcher() {
             "allowTokenExchange" to false, "allowedAuthorizationDetailTypes" to emptyList<String>(),
             "refreshTokenSlidingWindow" to false, "refreshTokenAbsoluteMaxTtlSeconds" to 7_776_000L,
             "allowTokenIntrospection" to false, "accessTokenFormat" to "self-contained",
+            "dpopAllowed" to false, "dpopRequired" to false,
         ) + withOwner(a, "application:${a["clientId"]}")
 
     /**
