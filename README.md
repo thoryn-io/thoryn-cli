@@ -306,6 +306,8 @@ thoryn examples share    <name> [--output <file>]   # SSO-2876 — export the se
 # turning it ON needs `manager` on the environment — else the red row token_exchange_not_grantable naming that
 # right) and the session lifetime `refreshTokenSlidingWindow` + `refreshTokenAbsoluteMaxTtlSeconds`. Converged on
 # update; an omitted setting keeps the live value. See "Application settings" below.
+# SSO-3810 / SSO-3807 (oauthy): also `allowTokenIntrospection` (RFC 7662; turning it ON needs `manager` on the
+# environment — else token_introspection_not_grantable) and `accessTokenFormat` (self-contained | reference).
 thoryn provision plan    [--file <path>] [--prune] [--fix-request <path>]  # read-only: what apply would create / remove (+ grant changes, pending publishes); exit 1 on an ownership error
                                              # SSO-3710 — --fix-request (env THORYN_FIX_REQUEST): a red plan also writes thoryn-provision-request.json — every missing RIGHT
                                              # (owner / manager / viewer) with the exact `thoryn access grant` command a workspace admin runs; a workflow uploads it
@@ -1453,7 +1455,8 @@ resources:
 
 ### Application settings — token exchange, authorization detail types, session lifetime (SSO-3766, SSO-3767, SSO-3770)
 
-Three settings of an application are on the product API (oauthy, 2026-10-17) and declarable on a
+These settings of an application are on the product API (oauthy, 2026-10-17; introspection and the token format
+2026-10-18) and declarable on a
 `kind: application`. Each is sent on create, read back from the live application and **converged on update**
 with exactly the fields that differ. **An omitted setting keeps whatever the platform holds** — the file only
 changes what it declares. `--prune` is unchanged: it removes resources, never a setting.
@@ -1483,6 +1486,8 @@ resources:
 | `allowTokenExchange` | boolean, `false` | a value | `token_exchange_requires_confidential_client` (`clientType: public` or method `none`), `token_exchange_grant_required` (the token-exchange grant is not in `grantTypes`) | `token_exchange_not_grantable` (403) — **predicted by the plan**, see below |
 | `allowedAuthorizationDetailTypes` | list of strings, `[]` | a **set**: order is not drift; the declared list replaces the live one; `[]` clears it | not a list, an entry with a space (one type per entry), a duplicate | `unsupported_authorization_details_type` (400 — not in the server's discovery `authorization_details_types_supported`, plus `thoryn_access_grant`); `authorization_details_type_not_permitted` (403 — `thoryn_access_grant` outside the `thoryn` home workspace; no grant changes this) |
 | `refreshTokenSlidingWindow` | boolean, `false` | a value | — | — |
+| `allowTokenIntrospection` | boolean, `false` | a value | `token_introspection_requires_confidential_client` (`clientType: public` or method `none`) | `token_introspection_not_grantable` (403) — **predicted by the plan**, like `token_exchange_not_grantable` (same right, same production-plane note) |
+| `accessTokenFormat` | `self-contained` \| `reference`, `self-contained` | a value | `invalid_access_token_format` (any other value) | — |
 | `refreshTokenAbsoluteMaxTtlSeconds` | integer seconds, 3600 – 7776000; live default 7776000 | a value | `token_ttl_out_of_range`; `session_lifetime_requires_sliding_window` (declared without `refreshTokenSlidingWindow: true` — the file states the session, it does not lean on the live window); `session_lifetime_below_refresh_ttl` (shorter than a declared `refreshTokenTtlSeconds`) | `session_lifetime_below_refresh_ttl` (shorter than the LIVE refresh TTL); `session_exceeds_tenant_policy` (longer than the environment authentication policy's `refreshClipSeconds` — the cap is named in the error) |
 
 **Who may turn token exchange on.** With the setting on, an application that holds a user's token can obtain
@@ -1505,6 +1510,34 @@ identity: the row carries a note instead — a workspace admin applies the file 
 file drops the setting. **Turning it off, omitting it, or re-declaring the value the application already holds
 is never refused.** A `federated_assertion` client may register the token-exchange grant too, only together
 with `allowTokenExchange: true` (`federated_assertion_grant_not_allowed` otherwise).
+
+**Introspection and reference tokens (SSO-3810 / SSO-3807).** `allowTokenIntrospection: true` lets an application
+(a resource server) call RFC 7662 introspection at its workspace; the endpoint answers `active` only for tokens of
+the same workspace and environment. An application that introspects reads the metadata of every token its
+environment issues, so turning it **on** needs the same `manager` on the environment as token exchange, and the
+plan predicts `token_introspection_not_grantable` the same way. `accessTokenFormat: reference` makes the token
+endpoint issue the application opaque access tokens, which a resource server resolves through introspection;
+any manager of the application may set it. Thoryn's own management API accepts `self-contained` tokens only.
+
+```yaml
+  - kind: application
+    name: orders-api
+    environment: staging
+    spec:
+      displayName: "Orders API"
+      clientType: confidential
+      grantTypes: [client_credentials]
+      scopes: [tenant:applications.read]
+      allowTokenIntrospection: true
+  - kind: application
+    name: orders-mobile
+    environment: staging
+    spec:
+      displayName: "Orders mobile"
+      redirectUris: ["https://orders.acme.example/cb"]
+      grantTypes: [authorization_code, refresh_token]
+      accessTokenFormat: reference
+```
 
 **A refusal at apply names the resource, the code and the change** (`Error: application/portal:
 session_exceeds_tenant_policy — … cap of 86400 seconds …`), never the "Required scope" hint a bare `403` would

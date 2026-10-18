@@ -532,6 +532,16 @@ internal class FakeProductApi : Dispatcher() {
                 return problem(403, "token_exchange_not_grantable")
             }
         }
+        // SSO-3807 / SSO-3810 — the access-token format values, and introspection only for an authenticating client; turning
+        // introspection ON on an existing application needs `manager` on its plane (`403`), like token exchange.
+        b["accessTokenFormat"]?.let { if (it !in setOf("self-contained", "reference")) return problem(400, "invalid_access_token_format") }
+        if (merged["allowTokenIntrospection"] == true) {
+            val methods = (merged["clientAuthenticationMethods"] as? List<*>)?.map { it.toString() }
+            if (merged["clientType"] == "public" || methods?.contains("none") == true) return problem(400, "token_introspection_requires_confidential_client")
+            if (previous != null && previous["allowTokenIntrospection"] != true && b["allowTokenIntrospection"] == true && !holds(planeRef(env), "manager")) {
+                return problem(403, "token_introspection_not_grantable")
+            }
+        }
         return null
     }
 
@@ -540,6 +550,7 @@ internal class FakeProductApi : Dispatcher() {
         mapOf<String, Any?>(
             "allowTokenExchange" to false, "allowedAuthorizationDetailTypes" to emptyList<String>(),
             "refreshTokenSlidingWindow" to false, "refreshTokenAbsoluteMaxTtlSeconds" to 7_776_000L,
+            "allowTokenIntrospection" to false, "accessTokenFormat" to "self-contained",
         ) + withOwner(a, "application:${a["clientId"]}")
 
     /**
