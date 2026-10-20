@@ -2239,7 +2239,10 @@ Commands that run on a session remembered from a retired issuer (a refresh, an A
 ```bash
 # Default scopes (SSO-3182): EXACTLY the `cli` login client's registered set — openid,
 # offline_access and the whole tenant-config surface (applications, clients, users,
-# federation, audit, environments, email, idp, access, domains, keys, workload-identity). A bare login therefore authorizes
+# federation, audit, environments, email, idp, access, domains, keys, workload-identity, github-connections).
+# SSO-3856 — `tenant:github-connections.read|write` has no `thoryn` command yet: it is requested so a workspace
+# admin HOLDS the family and can grant it onward (e.g. to a starter's client in a provisioning file; the hub grants
+# it to `cli` in V206, which must be deployed before a CLI release requesting it). A bare login therefore authorizes
 # `clients`, `federation`, `audit`, `env`, `workspace email-provider`, `branding`, `access`,
 # `domain` and `provision apply` (including a file's `grants:` block) with no --scope list.
 # `workspace` rides on SCOPE_openid (the hub /account surface). The hub mints only the

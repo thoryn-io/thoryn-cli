@@ -156,6 +156,12 @@ resources:
         # file once V192 is deployed.
         - tenant:workload-identity.read
         - tenant:workload-identity.write
+        # SSO-3856 — the workspace's GitHub connection (oathy SSO-3847). No `thoryn` command calls it yet: the login
+        # client carries the family so a workspace admin holds it and can grant it onward (oathy ADR
+        # 2026-10-19-operator-grants-platform-client-scopes, "The grant order"). Granted to this client by oathy hub
+        # V206 (SSO-3855) before any CLI release requests it, so converging this file finds it already present.
+        - tenant:github-connections.read
+        - tenant:github-connections.write
       requireAuthorizationConsent: false  # first-party: no consent screen for the platform's own CLI
 
   - kind: environment
