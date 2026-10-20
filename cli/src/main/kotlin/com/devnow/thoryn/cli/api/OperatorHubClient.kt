@@ -56,6 +56,38 @@ class OperatorHubClient(
     fun getCustomDomain(slug: String): JsonNode =
         send("GET", "/admin/tenants/${encode(slug)}/custom-domain", body = null)
 
+    /**
+     * SSO-3856 — `GET /admin/platform-clients/{clientId}/scopes`: a client of the platform HOME workspace's
+     * production plane and its `platform:` scopes (`{ clientId, workspace, environment, platformScopes, changed }`).
+     * The path has no workspace segment by design (oathy ADR `2026-10-19-operator-grants-platform-client-scopes.md`).
+     */
+    fun getPlatformScopes(clientId: String): JsonNode =
+        send("GET", platformScopesPath(clientId), body = null)
+
+    /** SSO-3856 — `PUT …/scopes/{scope}`: add one `platform:` scope (idempotent; `changed` says whether it was added). */
+    fun grantPlatformScope(clientId: String, scope: String, reason: String? = null, ticket: String? = null): JsonNode =
+        send("PUT", "${platformScopesPath(clientId)}/${encodeScope(scope)}", platformScopeChangeBody(reason, ticket))
+
+    /** SSO-3856 — `DELETE …/scopes/{scope}`: remove one `platform:` scope (idempotent). */
+    fun revokePlatformScope(clientId: String, scope: String, reason: String? = null, ticket: String? = null): JsonNode =
+        send("DELETE", "${platformScopesPath(clientId)}/${encodeScope(scope)}", platformScopeChangeBody(reason, ticket))
+
+    private fun platformScopesPath(clientId: String): String = "/admin/platform-clients/${encode(clientId)}/scopes"
+
+    /** The optional `{ reason, ticket }` body the hub writes onto the audit row; no body when neither is given. */
+    private fun platformScopeChangeBody(reason: String?, ticket: String?): Map<String, String>? =
+        buildMap {
+            reason?.takeIf { it.isNotBlank() }?.let { put("reason", it) }
+            ticket?.takeIf { it.isNotBlank() }?.let { put("ticket", it) }
+        }.takeIf { it.isNotEmpty() }
+
+    /**
+     * A scope as a path segment. `:` is a legal path character (RFC 3986 `pchar`), so it is sent as is —
+     * `/scopes/platform:trusted-issuers.read`, the form the hub's own tests and runbook use — while
+     * everything else is percent-encoded like any other segment.
+     */
+    private fun encodeScope(scope: String): String = encode(scope).replace("%3A", ":")
+
     private fun send(method: String, path: String, body: Any?): JsonNode {
         val uri = URI.create("${hubUrl.trimEnd('/')}$path")
         val scheme = DpopSession.schemeFor(tokens)

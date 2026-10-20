@@ -407,6 +407,13 @@ thoryn operator logout                                         # forget the oper
 thoryn operator custom-domain entitle <workspace> [--hub-url u] # PUT /admin/tenants/{slug}/custom-domain/entitlement {"entitled":true}
 thoryn operator custom-domain revoke  <workspace> [--hub-url u] # … {"entitled":false} (an existing domain stays)
 thoryn operator custom-domain status  <workspace> [--hub-url u] # GET /admin/tenants/{slug}/custom-domain
+# SSO-3856 — platform: scopes on machine clients of the platform home workspace (needs the operator scope
+# admin:clients.platform-scopes, requested only when used: thoryn operator login --scope "openid admin:clients.platform-scopes").
+thoryn operator platform-scopes get    <clientId>                       # GET    /admin/platform-clients/{clientId}/scopes
+thoryn operator platform-scopes grant  <clientId> <scope> [--reason r] [--ticket t]   # PUT    …/scopes/{scope} (idempotent)
+thoryn operator platform-scopes revoke <clientId> <scope> [--reason r] [--ticket t]   # DELETE …/scopes/{scope} (idempotent)
+thoryn operator platform-scopes plan   [-f .thoryn/platform-scopes.yaml]  # read each declared client, print the plan; writes nothing
+thoryn operator platform-scopes apply  [-f .thoryn/platform-scopes.yaml] [--dry-run]  # plan, then grant missing + revoke extra
 ```
 
 > The supply-chain / verifiable-credential command tree was **removed** when the
@@ -2937,6 +2944,86 @@ that participate, and `thoryn-operator` does not (not `dpop_required` / `dpop_al
 cutover list) — so its tokens are Bearer tokens today. Should the client ever be bound, the commands
 present the token under `DPoP` with a proof whose `htu` is the port-forward URL, which is what the hub
 (strict `htu`, reconstructed from the `Host` it receives) compares against.
+
+### Platform-client scopes (`thoryn operator platform-scopes`)
+
+A **platform client** is a workload the platform runs outside its own namespace (the provisioning service's
+machine client, for example). It reaches product-api's `/api/v1/platform` surface with a `platform:` scope, which no
+workspace admin, product service or provisioning file can grant. An operator does, with the hub capability
+`admin:clients.platform-scopes` (oathy ADR `2026-10-19-operator-grants-platform-client-scopes.md`, runbook
+`docs/content/operate/operator-plane/platform-client-scopes.mdx`). The hub enforces the rules; the CLI only calls it:
+
+* **The platform home's production plane only.** The endpoints take no workspace, so another workspace's client
+  cannot be named. A sandbox twin answers `404 client_not_found`.
+* **A closed set of scopes:** `platform:trusted-issuers.read`, `platform:audit-events.append`,
+  `platform:github-installations.sync`. Anything else is `400 unknown_platform_scope` / `not_a_platform_scope`.
+* **A machine client.** A grant needs the `client_credentials` grant type (`409 machine_client_required`).
+* **Idempotent and audited.** Each change writes `CLIENT_PLATFORM_SCOPE_GRANTED` / `…_REVOKED` on the home's
+  audit chain with your subject and the `reason` / `ticket` you pass; a call that changes nothing writes no row.
+* **Kept on ordinary updates.** A provisioning file or a console edit that replaces the client's scope list keeps
+  its `platform:` scopes — and `thoryn provision plan` never shows them as drift (it leaves `platform:` / `admin:`
+  scopes out of the comparison, and refuses a provisioning file that declares one: `reserved_scope`).
+
+The scope is not in the operator login's default request (an operator token carries no power the operator is not
+about to use, and an environment whose hub predates V207 would refuse it), so ask for it:
+
+```bash
+thoryn operator login --issuer https://auth.stg.thoryn.org --scope "openid admin:clients.platform-scopes"
+kubectl -n thoryn port-forward svc/thoryn-hub 18080:8080        # in another terminal
+
+thoryn operator platform-scopes get provisioning-m2m
+thoryn operator platform-scopes grant provisioning-m2m platform:trusted-issuers.read --ticket SSO-3857 \
+  --reason "the provisioning service reads the issuer registry"
+thoryn operator platform-scopes revoke provisioning-m2m platform:trusted-issuers.read --ticket SSO-3857
+```
+
+**Declare, review, apply.** The grants a workload needs are declared in git, in the repository that owns the
+workload (thoryn-provisioning's `.thoryn/platform-scopes.yaml`), and reviewed like any other change. `apply` reads
+every declared client first and prints the plan, then grants what is missing and revokes what is extra. Clients
+the file does not name are never touched; applying the same file again changes nothing, so a new environment
+converges by applying it once.
+
+```yaml
+# .thoryn/platform-scopes.yaml
+apiVersion: thoryn.io/platform-scopes/v1
+ticket: SSO-3857                       # optional; on every audit row (at most 64 characters)
+reason: "provisioning service grants"  # optional; on every audit row (at most 500 characters)
+clients:
+  - clientId: provisioning-m2m         # a client_credentials client of the home's production plane
+    scopes:                            # EXACTLY the platform: scopes it should hold; [] removes them all
+      - platform:trusted-issuers.read
+      - platform:audit-events.append
+      - platform:github-installations.sync
+    # ticket / reason may also be set per client; --ticket / --reason override both
+```
+
+```bash
+thoryn operator platform-scopes plan  -f .thoryn/platform-scopes.yaml      # = apply --dry-run; writes nothing
+thoryn operator platform-scopes apply -f .thoryn/platform-scopes.yaml
+# Platform-client scopes in the platform home workspace's production plane (1 client(s)):
+#   ~ provisioning-m2m
+#       + platform:trusted-issuers.read
+#       + platform:audit-events.append
+#       + platform:github-installations.sync
+#   granted platform:trusted-issuers.read to provisioning-m2m
+#   …
+# Applied: 3 granted, 0 revoked, 0 client(s) unchanged.
+```
+
+The file accepts only `platform:` scopes, no workspace and no environment, and refuses unknown fields; every
+problem is listed at once and nothing is sent. A refusal while reading the clients stops the run before any
+write; a refusal part-way through the writes keeps what was done, and re-running the file finishes the rest.
+`--output json|yaml` / `--json` print the plan (`grant`, `revoke`, `unchanged`, `applied`) as one document.
+
+| Symptom | Meaning | Fix |
+|---|---|---|
+| `403 insufficient_scope` | The operator token lacks `admin:clients.platform-scopes` | `thoryn operator login --scope "openid admin:clients.platform-scopes"` |
+| login fails with `invalid_scope` | No standing, not a passkey sign-in, or the hub predates V207 (`thoryn-operator` does not hold the scope yet) | Confirm standing and the hub version |
+| `404 not_found` | No operator standing here, or the hub predates V207 (the surface is not routed) | Confirm your subject is in `productApi.operatorPlatformSubjects`; check the hub version |
+| `404 client_not_found` | No such client in the home's **production** plane | Create it through the product first, in production |
+| `409 machine_client_required` | The client has no `client_credentials` grant | Give it that grant through the product, or use a machine client |
+| `400 unknown_platform_scope` | Not one of the three platform-client scopes | Check the spelling |
+| `503 audit_unavailable` | The audit row could not be written, so the hub undid the change | Retry |
 
 ## Build
 

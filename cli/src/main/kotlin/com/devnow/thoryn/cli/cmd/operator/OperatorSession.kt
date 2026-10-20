@@ -32,6 +32,15 @@ object OperatorSession {
     const val SCOPE_CUSTOM_DOMAINS_READ: String = "admin:custom-domains.read"
 
     /**
+     * `admin:clients.platform-scopes` — put a `platform:` scope on a machine client of the platform home workspace,
+     * and take it away (`thoryn operator platform-scopes …`, SSO-3856; granted to `thoryn-operator` by oathy hub V207,
+     * SSO-3854). Deliberately NOT in [DEFAULT_SCOPE]: it is requested only when it is about to be used
+     * (`thoryn operator login --scope "openid admin:clients.platform-scopes"`), and a default request for a scope the
+     * client does not yet hold on some environment would turn every operator sign-in there into `invalid_scope`.
+     */
+    const val SCOPE_CLIENTS_PLATFORM_SCOPES: String = "admin:clients.platform-scopes"
+
+    /**
      * What `thoryn operator login` requests by default: exactly the operator scopes the CLI has
      * commands for. The client also holds `admin:workspaces.transfer` / `.retire` and
      * `admin:devices.revoke`, but nothing in the CLI calls those surfaces yet, and an operator token
