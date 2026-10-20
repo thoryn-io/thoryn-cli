@@ -1455,7 +1455,11 @@ class ProvisionEngine(
             val (plane, n) = locate { it.getApplication(id) } ?: return@forEach skip("application:$id — listed as reachable but not readable in any environment")
             val spec = linkedMapOf<String, Any?>("clientId" to id, "displayName" to (n.str("displayName") ?: id))
             n.str("clientType")?.let { spec["clientType"] = it }
-            listOf("grantTypes", "redirectUris", "postLogoutRedirectUris", "scopes").forEach { f -> (plain(n[f] ?: return@forEach) as? List<*>)?.takeIf { it.isNotEmpty() }?.let { spec[f] = it } }
+            listOf("grantTypes", "redirectUris", "postLogoutRedirectUris", "scopes").forEach { f ->
+                // SSO-3856 — an imported file never declares an operator-plane scope: it could not be applied.
+                val value = plain(n[f] ?: return@forEach).let { if (f == "scopes") withoutOperatorPlaneScopes(it) else it }
+                (value as? List<*>)?.takeIf { it.isNotEmpty() }?.let { spec[f] = it }
+            }
             val confidential = !n.str("clientType").equals("public", ignoreCase = true)
             add(
                 ProvisionFile.KIND_APPLICATION, uniqueName(ProvisionFile.KIND_APPLICATION, n.str("displayName") ?: id), environmentField(plane), plane, id, access, spec,
@@ -1714,7 +1718,10 @@ class ProvisionEngine(
                 // `allowedAuthorizationDetailTypes: []` is declared, and clears).
                 val fields = listOf("displayName", "redirectUris", "postLogoutRedirectUris", "scopes", "grantTypes", ProvisionFile.SPEC_CLIENT_AUTHENTICATION_METHODS, ProvisionFile.SPEC_FEDERATED_TRUST) +
                     ProvisionFile.APPLICATION_SETTING_FIELDS
-                val live = n.toMap(fields)
+                // SSO-3856 — the live client's operator-plane scopes (`platform:` granted by an operator, `admin:`) are not
+                // this file's to converge: the hub keeps them across our update and refuses them on our create, so
+                // comparing them would plan a change on every run that applying can never make.
+                val live = n.toMap(fields).mapValues { (field, value) -> if (field == "scopes") withoutOperatorPlaneScopes(value) else value }
                 val want = desired.filterKeys { it in fields }
                 val id = n.str("clientId") ?: n.str("client_id") ?: ""
                 Live(id, diffOf(want, live), buildMap { (plain(n["redirectUris"] ?: return@buildMap) as? List<*>)?.firstOrNull()?.toString()?.let { put("redirectUri", it) } }, owner = ProvisionApi.ownerOf(n))
@@ -2802,6 +2809,10 @@ class ProvisionEngine(
     }
 
     /** Fields of [desired] whose normalised value differs from [live] (lists compare as sets; numbers/booleans as text). */
+    /** SSO-3856 — a live scope list without its operator-plane (`platform:` / `admin:`) members; anything else unchanged. */
+    private fun withoutOperatorPlaneScopes(value: Any?): Any? =
+        (value as? List<*>)?.filterNot { it != null && ProvisionFile.isReservedOperatorPlaneScope(it.toString()) } ?: value
+
     private fun diffOf(desired: Map<String, Any?>, live: Map<String, Any?>): Map<String, String> {
         val diff = LinkedHashMap<String, String>()
         desired.forEach { (field, want) ->

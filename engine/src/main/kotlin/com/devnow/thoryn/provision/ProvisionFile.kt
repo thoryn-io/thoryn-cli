@@ -376,6 +376,21 @@ class ProvisionFile private constructor(
         /** SSO-3702 — a read-only workspace scope (`tenant:<area>.read`), the only kind a plan profile may carry. */
         val READ_SCOPE_PATTERN = Regex("^tenant:[a-z-]+\\.read$")
 
+        /**
+         * SSO-3856 — the operator-plane scope namespaces. A `platform:` scope on a client is put there (and taken away)
+         * only by an operator (`thoryn operator platform-scopes`, oathy ADR `2026-10-19-operator-grants-platform-client-
+         * scopes.md`); an `admin:` scope only ever sits on the operator client. Neither can be granted from a provisioning
+         * file — the hub refuses both on every customer-plane path — and the hub KEEPS a client's `platform:` scopes when a
+         * provisioning update replaces its scope list. So the engine neither declares nor compares them: a declared one is
+         * refused here ([ERR_RESERVED_SCOPE]), and a live one is left out of the diff, or every plan of a client an
+         * operator has granted one to would show a change that applying can never make.
+         */
+        val RESERVED_OPERATOR_PLANE_SCOPE_PREFIXES: List<String> = listOf("platform:", "admin:")
+        const val ERR_RESERVED_SCOPE = "reserved_scope"
+
+        fun isReservedOperatorPlaneScope(scope: String): Boolean =
+            RESERVED_OPERATOR_PLANE_SCOPE_PREFIXES.any { scope.trim().startsWith(it) }
+
         /** The production plane: no `environment`, or the `production` slug (mirrors [ProvisionEngine.PRODUCTION_ENV_SLUG]). */
         fun isProductionPlane(environment: String?): Boolean = environment == null || environment == ProvisionEngine.PRODUCTION_ENV_SLUG
 
@@ -659,6 +674,11 @@ class ProvisionFile private constructor(
                 if (kind == KIND_APPLICATION) validateApplicationAuth(spec, r, where, v)
                 // SSO-3766 / SSO-3767 / SSO-3770 — token exchange, authorization detail types, session lifetime.
                 if (kind == KIND_APPLICATION) validateApplicationSettings(spec, where, v)
+                // SSO-3856 — an application cannot declare an operator-plane (`platform:` / `admin:`) scope.
+                if (kind == KIND_APPLICATION) spec["scopes"]?.takeIf { it.isArray() }?.toList()
+                    ?.mapNotNull { n -> n.takeIf { it.isTextual() }?.asString()?.trim() }
+                    ?.filter { isReservedOperatorPlaneScope(it) }?.distinct()
+                    ?.forEach { v += "$where spec.scopes: $ERR_RESERVED_SCOPE — '$it' is an operator-plane scope; a provisioning file cannot grant it (the hub refuses it). A platform: scope is declared in .thoryn/platform-scopes.yaml and applied by an operator with `thoryn operator platform-scopes apply`" }
                 // SSO-3689 — a workload-identity trust: the provider's pins, the scope grammar, the production rules.
                 if (kind == KIND_WORKLOAD_IDENTITY_TRUST) validateWorkloadIdentityTrust(spec, r, where, v)
             }
