@@ -83,7 +83,7 @@ class ProvisionGrantsTest : CommandTestBase() {
         assertThat(plan.changes.map { it.action }).allMatch { it == ChangeAction.CREATE }
         assertThat(plan.changes.map { it.grantAdds }).containsExactly(listOf("client:cli-ci manager"), listOf("member:alice viewer"), listOf("client:cli-ci manager"))
         assertThat(plan.grantChanges).isEqualTo(3)
-        assertThat(plan.toStructured()["summary"]).isEqualTo(mapOf("create" to 3, "update" to 0, "remove" to 0, "noop" to 0, "skip" to 0, "grants" to 3, "error" to 0, "publish" to 0, "deliver" to 0))
+        assertThat(plan.toStructured()["summary"]).isEqualTo(mapOf("create" to 3, "update" to 0, "remove" to 0, "noop" to 0, "skip" to 0, "grants" to 3, "error" to 0, "publish" to 0, "deliver" to 0, "pull" to 0))
 
         val receipt = apply(f)
         val envId = receipt.resources[0].id
