@@ -55,6 +55,17 @@ projected ServiceAccount token  ──►  init container 1: thoryn login --conn
      --object application:7f1c2d3e-4a5b-6c7d-8e9f-0a1b2c3d4e5f
    ```
 
+   With provisioning-as-code (SSO-3921), declare it on the application instead — `thoryn provision apply`
+   converges this grant, and a CI apply that creates the application discards the minted secret rather than
+   needing somewhere to deliver it (the pod's rotation replaces it):
+
+   ```yaml
+   - kind: application
+     name: forge-oauth2-proxy
+     spec: { displayName: "Forge oauth2-proxy", grantTypes: [authorization_code], redirectUris: ["https://forge.example/oauth2/callback"] }
+     secretSink: { kind: workloadPull, trust: forge-oauth2-proxy }   # the trust of step 1, by name
+   ```
+
 3. **Pin the image** — `ghcr.io/thoryn-io/thoryn-cli`, public, multi-arch, published by every `cli-v*`
    release. There is no `:latest`: use a released `<version>` and its **digest**, which exists only once
    that release has pushed it. Look it up, verify the signature, then pin `…:<version>@sha256:<digest>`:

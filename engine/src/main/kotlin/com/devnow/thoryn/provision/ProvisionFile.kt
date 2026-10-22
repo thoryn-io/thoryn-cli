@@ -53,7 +53,8 @@ data class ProvisionResource(
      * one-time `client_secret` a confidential `application` is minted with (see [SecretTarget]): the moment the
      * client is converged and recorded, into the place that consumes it — never a CI secret store, never the
      * console. `null` ⇒ the host's generic channel (the CLI's `--secret-file` / guarded TTY). Refused on a
-     * public client (nothing is minted), on any other kind, and together with [readOnly].
+     * public client (nothing is minted), on any other kind, and together with [readOnly]. SSO-3921 — or that NOTHING
+     * delivers it: `workloadPull` names the Kubernetes workload identity that mints its own at start ([SecretTarget]).
      */
     val secretSink: SecretTarget? = null,
 ) {
@@ -80,7 +81,7 @@ data class PublishTarget(val kind: String, val repository: String, val environme
 /**
  * SSO-3659 (ADR 2026-10-13 converge §5 "secrets are delivered where they are consumed, never into a CI secret
  * store"; production-clients ADR §3 tier 3) — the declared DELIVERY TARGET of a confidential application's
- * server-minted `client_secret`. Two kinds today:
+ * server-minted `client_secret`. Three kinds today:
  *
  *  - [ProvisionFile.SECRET_SINK_KIND_KUBERNETES_SECRET] — `data.<key>` of the Kubernetes Secret
  *    `<namespace>/<name>`, written by the host through the operator's own `kubectl` (`create secret generic …
@@ -88,6 +89,12 @@ data class PublishTarget(val kind: String, val repository: String, val environme
  *    the value rides on stdin, never on argv). The namespace must already exist — it is never created.
  *  - [ProvisionFile.SECRET_SINK_KIND_FILE] — an owner-only (`0600`) file at [path], never overwritten unless
  *    the host is told to.
+ *  - [ProvisionFile.SECRET_SINK_KIND_WORKLOAD_PULL] (SSO-3921; oauthy ADR 2026-10-14 credential ladder, rung 3 "runtime
+ *    pull") — delivered NOWHERE: `apply` discards the one-time value the create returns (never printed, never written,
+ *    never handed to a sink) and converges `manager` on the application for the `wi_` workload client of the
+ *    `kubernetes` workload-identity [trust] named here, so the workload's init container signs in with its projected
+ *    ServiceAccount token and mints its own (`thoryn clients rotate-secret`). Nothing is undelivered: no secret
+ *    channel is needed, which is what lets a CI apply with no cluster credential create the application.
  *
  * The engine hands the minted value to its [ProvisionEngine.DeclaredSecretSink] right after the client is
  * converged and recorded; the value itself never enters the file, the plan, the receipt, a log or argv. A
@@ -100,10 +107,16 @@ data class SecretTarget(
     val name: String? = null,
     val key: String? = null,
     val path: String? = null,
+    /** SSO-3921 — `workloadPull`: the NAME of the `workloadIdentityTrust` whose workload pulls the secret at runtime. */
+    val trust: String? = null,
 ) {
-    /** `kubernetesSecret <ns>/<name> key <key>` | `file <path>` — the display form in plans and messages. */
+    /** SSO-3921 — nothing is delivered: the named trust's workload mints its own secret when it starts. */
+    val runtimePull: Boolean get() = kind == ProvisionFile.SECRET_SINK_KIND_WORKLOAD_PULL
+
+    /** `kubernetesSecret <ns>/<name> key <key>` | `file <path>` | `workloadPull by trust <name>` — the display form in plans and messages. */
     val label: String get() = when (kind) {
         ProvisionFile.SECRET_SINK_KIND_KUBERNETES_SECRET -> "$kind $namespace/$name key $key"
+        ProvisionFile.SECRET_SINK_KIND_WORKLOAD_PULL -> "$kind by trust $trust"
         else -> "$kind $path"
     }
 
@@ -114,6 +127,7 @@ data class SecretTarget(
         name?.let { put("name", it) }
         key?.let { put("key", it) }
         path?.let { put("path", it) }
+        trust?.let { put("trust", it) }
     }
 }
 
@@ -443,14 +457,38 @@ class ProvisionFile private constructor(
         const val SECRET_SINK_KIND_KUBERNETES_SECRET = "kubernetesSecret"
         /** An owner-only (`0600`) file; never overwritten unless the host is told to. */
         const val SECRET_SINK_KIND_FILE = "file"
+        /**
+         * SSO-3921 (oauthy ADR 2026-10-14 credential ladder, rung 3) — delivered nowhere: the minted value is discarded and the
+         * named `kubernetes` trust's workload client is converged `manager` on the application, so the pod mints its own.
+         */
+        const val SECRET_SINK_KIND_WORKLOAD_PULL = "workloadPull"
         /** The CLOSED sink kind allowlist — must equal the schema's `secretSink.oneOf[*].kind` consts. */
-        val SECRET_SINK_KINDS: Set<String> = setOf(SECRET_SINK_KIND_KUBERNETES_SECRET, SECRET_SINK_KIND_FILE)
+        val SECRET_SINK_KINDS: Set<String> = setOf(SECRET_SINK_KIND_KUBERNETES_SECRET, SECRET_SINK_KIND_FILE, SECRET_SINK_KIND_WORKLOAD_PULL)
         /** The kinds a `secretSink:` may sit on: only a (confidential) application is minted a secret. */
         val SECRET_SINK_KINDS_ALLOWED_ON: Set<String> = setOf(KIND_APPLICATION)
         /** The members of a `kubernetesSecret` target — exactly these four (the schema's `additionalProperties: false`). */
         val SECRET_SINK_KUBERNETES_KEYS: Set<String> = setOf("kind", "namespace", "name", "key")
         /** The members of a `file` target — exactly these two. */
         val SECRET_SINK_FILE_KEYS: Set<String> = setOf("kind", "path")
+        /** SSO-3921 — the members of a `workloadPull` target — exactly these two. */
+        val SECRET_SINK_WORKLOAD_PULL_KEYS: Set<String> = setOf("kind", "trust")
+        /** SSO-3921 — the provider a runtime-pull trust must have: rung 3 is a POD minting its own secret at start. */
+        const val WORKLOAD_PULL_PROVIDER = PROVIDER_KUBERNETES
+        /**
+         * SSO-3921 — the scope the pod's `thoryn clients rotate-secret` needs (product-api's `POST /api/v1/applications/{id}/
+         * secret/rotate`; oauthy ADR 2026-10-14 rung 3: "a workload client holding `tenant:applications.write` on the
+         * application may call it"). The trust's scope ceiling must carry it, or the pod's rotation is a `403`.
+         */
+        const val ROTATE_SECRET_SCOPE = "tenant:applications.write"
+        // SSO-3921 — the file's (and the plan's) refusals of a `workloadPull` sink.
+        /** The named trust exists neither in the file nor live (in the application's plane). */
+        const val ERR_WORKLOAD_PULL_TRUST_NOT_FOUND = "workload_pull_trust_not_found"
+        /** The named trust lives on another plane than the application: its workload client could not rotate it. */
+        const val ERR_WORKLOAD_PULL_TRUST_OTHER_PLANE = "workload_pull_trust_other_plane"
+        /** The named trust is not a `kubernetes` trust: runtime pull is a pod's, never a CI job's (that would be the courier). */
+        const val ERR_WORKLOAD_PULL_TRUST_PROVIDER = "workload_pull_trust_not_kubernetes"
+        /** The named trust's scopes do not carry [ROTATE_SECRET_SCOPE]. */
+        const val ERR_WORKLOAD_PULL_SCOPE_MISSING = "workload_pull_scope_missing"
         /** A Kubernetes namespace: an RFC 1123 DNS label (lower-case alphanumerics and `-`, ≤ 63). */
         val K8S_NAMESPACE_PATTERN = Regex("^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$")
         /** A Kubernetes Secret name: an RFC 1123 DNS subdomain (lower-case labels joined by `.`, ≤ 253 in total). */
@@ -532,7 +570,7 @@ class ProvisionFile private constructor(
                     } ?: emptyList(),
                     secretSink = r[SECRET_SINK]?.takeIf { it.isObject() }?.let { t ->
                         fun text(field: String): String? = t[field]?.takeIf { it.isTextual() }?.asString()?.trim()?.takeIf { it.isNotEmpty() }
-                        SecretTarget(kind = text("kind") ?: "", namespace = text("namespace"), name = text("name"), key = text("key"), path = text("path"))
+                        SecretTarget(kind = text("kind") ?: "", namespace = text("namespace"), name = text("name"), key = text("key"), path = text("path"), trust = text("trust"))
                     },
                 )
             }
@@ -683,7 +721,46 @@ class ProvisionFile private constructor(
                 if (kind == KIND_WORKLOAD_IDENTITY_TRUST) validateWorkloadIdentityTrust(spec, r, where, v)
             }
             keys.groupBy { it }.filterValues { it.size > 1 }.keys.forEach { v += "duplicate resource '$it' — kind + name must be unique" }
+            validateWorkloadPullTrusts(resources.toList(), v)
             return v
+        }
+
+        /**
+         * SSO-3921 — the cross-resource rules of a `secretSink: { kind: workloadPull, trust }` whose trust is DECLARED in the
+         * same file (a trust that is only live is checked by the plan, against its live view): it lives on the application's
+         * plane ([ERR_WORKLOAD_PULL_TRUST_OTHER_PLANE] — the hub replaces an in-flight secret only for a workload client of the
+         * application's own environment, and product-api resolves the rotation in that plane), it is a `kubernetes` trust
+         * ([ERR_WORKLOAD_PULL_TRUST_PROVIDER] — rung 3 is a pod minting its own; a CI job pulling a secret is the courier
+         * again), and its scopes carry [ROTATE_SECRET_SCOPE] ([ERR_WORKLOAD_PULL_SCOPE_MISSING]).
+         */
+        private fun validateWorkloadPullTrusts(resources: List<JsonNode>, v: MutableList<String>) {
+            fun env(n: JsonNode): String? = n["environment"]?.takeIf { it.isTextual() }?.asString()?.trim()?.takeIf { it.isNotEmpty() }
+            fun plane(e: String?): String = e?.let { "environment '$it'" } ?: "the production plane"
+            resources.forEachIndexed { i, r ->
+                if (!r.isObject() || r["kind"]?.takeIf { it.isTextual() }?.asString() != KIND_APPLICATION) return@forEachIndexed
+                val sink = r[SECRET_SINK]?.takeIf { it.isObject() } ?: return@forEachIndexed
+                if (sink["kind"]?.takeIf { it.isTextual() }?.asString()?.trim() != SECRET_SINK_KIND_WORKLOAD_PULL) return@forEachIndexed
+                val name = sink["trust"]?.takeIf { it.isTextual() }?.asString()?.trim()?.takeIf { it.isNotEmpty() } ?: return@forEachIndexed
+                val trust = resources.firstOrNull { t ->
+                    t.isObject() && t["kind"]?.takeIf { it.isTextual() }?.asString() == KIND_WORKLOAD_IDENTITY_TRUST && t["name"]?.takeIf { it.isTextual() }?.asString() == name
+                } ?: return@forEachIndexed
+                val where = "resources[$i] $SECRET_SINK"
+                if (env(trust) != env(r)) {
+                    v += "$where: $ERR_WORKLOAD_PULL_TRUST_OTHER_PLANE — trust '$name' is declared for ${plane(env(trust))} while the application lives in ${plane(env(r))}; " +
+                        "the workload that pulls the secret must be a trust of the application's OWN environment"
+                }
+                val spec = trust["spec"]?.takeIf { it.isObject() } ?: return@forEachIndexed
+                val provider = spec["provider"]?.takeIf { it.isTextual() }?.asString()?.trim()
+                if (provider != null && provider != WORKLOAD_PULL_PROVIDER) {
+                    v += "$where: $ERR_WORKLOAD_PULL_TRUST_PROVIDER — trust '$name' is a '$provider' trust; a runtime pull is a POD minting its own secret at start " +
+                        "(provider: $WORKLOAD_PULL_PROVIDER). A CI job that fetches a secret to hand on is the courier the credential ladder rules out"
+                }
+                val scopes = spec[TRUST_SCOPES]?.takeIf { it.isArray() }?.toList()?.mapNotNull { s -> s.takeIf { it.isTextual() }?.asString()?.trim() }.orEmpty()
+                if (ROTATE_SECRET_SCOPE !in scopes) {
+                    v += "$where: $ERR_WORKLOAD_PULL_SCOPE_MISSING — trust '$name' must carry $ROTATE_SECRET_SCOPE in spec.$TRUST_SCOPES: " +
+                        "its pods mint the secret with `thoryn clients rotate-secret`, which product-api refuses without one"
+                }
+            }
         }
 
         /**
@@ -752,7 +829,7 @@ class ProvisionFile private constructor(
                 v += "$where a read-only reference cannot carry '$SECRET_SINK' — nothing is minted for it; the repository that owns the application delivers its secret"
             }
             if (!target.isObject()) {
-                v += "$where $SECRET_SINK must be an object { kind: $SECRET_SINK_KIND_KUBERNETES_SECRET, namespace, name, key } or { kind: $SECRET_SINK_KIND_FILE, path }"
+                v += "$where $SECRET_SINK must be an object { kind: $SECRET_SINK_KIND_KUBERNETES_SECRET, namespace, name, key }, { kind: $SECRET_SINK_KIND_FILE, path } or { kind: $SECRET_SINK_KIND_WORKLOAD_PULL, trust }"
                 return
             }
             fun text(field: String): String? = target[field]?.takeIf { it.isTextual() }?.asString()?.trim()?.takeIf { it.isNotEmpty() }
@@ -780,6 +857,14 @@ class ProvisionFile private constructor(
                 SECRET_SINK_KIND_FILE -> {
                     rejectUnknownKeys(target, SECRET_SINK_FILE_KEYS, tw, v)
                     if (text("path") == null) v += "$tw path is required (the owner-only file the secret is written to)"
+                }
+                SECRET_SINK_KIND_WORKLOAD_PULL -> {
+                    rejectUnknownKeys(target, SECRET_SINK_WORKLOAD_PULL_KEYS, tw, v)
+                    val trust = text("trust")
+                    when {
+                        trust == null -> v += "$tw trust is required (the NAME of the $PROVIDER_KUBERNETES $KIND_WORKLOAD_IDENTITY_TRUST whose pods mint the secret at start)"
+                        !NAME_PATTERN.matches(trust) -> v += "$tw trust '$trust' must be the NAME of a $KIND_WORKLOAD_IDENTITY_TRUST (${NAME_PATTERN.pattern})"
+                    }
                 }
                 else -> v += "$tw kind '$tKind' must be one of ${SECRET_SINK_KINDS.joinToString(", ")}"
             }

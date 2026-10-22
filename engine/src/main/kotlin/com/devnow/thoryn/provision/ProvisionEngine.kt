@@ -91,9 +91,16 @@ data class PlannedChange(
     /**
      * SSO-3659 (ADR 2026-10-13 §5) — where `apply` will DELIVER the client secret this CREATE mints, the moment the
      * client is converged. Shown as a line of the plan (a pull-request check shows where the secret will land);
-     * nothing is minted by `plan`. Only on a CREATE of a confidential application with a `secretSink:`.
+     * nothing is minted by `plan`. Only on a CREATE of a confidential application with a `secretSink:`. SSO-3921 — a
+     * `workloadPull` sink is shown on EVERY converging row of its application (nothing is delivered; the line says who
+     * pulls the secret at runtime), with the workload client in [pullClientId].
      */
     val secretSink: SecretTarget? = null,
+    /**
+     * SSO-3921 — on a `workloadPull` row: the `wi_` workload client of the named trust, which holds (or `apply` grants)
+     * `manager` on the application so its pod can mint the secret. Null while the trust is created by this apply.
+     */
+    val pullClientId: String? = null,
     /**
      * SSO-3689 — a `workloadIdentityTrust`'s live view when it exists (`id`, `clientId` — the `wi_…` workload client,
      * `audience`, `tokenEndpoint`, `provider`, `scopes`, the provider's pins): what a plan shows and what `apply`
@@ -138,7 +145,7 @@ data class PlannedChange(
         if (publishTo.isNotEmpty()) {
             put("publishTo", publishTo.map { mapOf("kind" to it.kind, "repository" to it.repository, "environment" to it.environment, "name" to it.name) })
         }
-        secretSink?.let { put("secretSink", it.toStructured()) }
+        secretSink?.let { put("secretSink", it.toStructured() + (pullClientId?.let { id -> mapOf("workloadClientId" to id) } ?: emptyMap())) }
         trust?.let { put("trust", it) }
         fix?.let { put("fix", it.toStructured()) }
     }
@@ -159,7 +166,9 @@ class ProvisionPlan(val changes: List<PlannedChange>) {
      */
     val publishes: Int get() = changes.sumOf { it.publishTo.size }
     /** SSO-3659 — client secrets `apply` will mint AND deliver to a declared `secretSink:` (a CREATE each; never by plan). */
-    val deliveries: Int get() = changes.count { it.secretSink != null }
+    val deliveries: Int get() = changes.count { it.secretSink != null && !it.secretSink.runtimePull }
+    /** SSO-3921 — applications whose secret a workload pulls at runtime (`secretSink: { kind: workloadPull }`): nothing is delivered. */
+    val runtimePulls: Int get() = changes.count { it.secretSink?.runtimePull == true }
     val hasChanges: Boolean get() = creates.isNotEmpty() || updates.isNotEmpty() || removes.isNotEmpty() || grantChanges > 0 || publishes > 0
     /** SSO-3659 — resources that failed the ownership gate; a plan with one is red and `apply` refuses it. */
     val errors: List<PlannedChange> get() = changes.filter { it.action == ChangeAction.ERROR }
@@ -187,6 +196,7 @@ class ProvisionPlan(val changes: List<PlannedChange>) {
             "error" to errors.size,
             "publish" to publishes,
             "deliver" to deliveries,
+            "pull" to runtimePulls,
         ),
     )
 }
@@ -538,11 +548,14 @@ class ProvisionEngine(
             val change = gate(r, probe(r, file, envSlugs), file, envSlugs, slug, reach)
                 // SSO-3774 — a trust's verdict is what an application naming it (planned after every trust) reads.
                 .also { c -> if (r.kind == ProvisionFile.KIND_WORKLOAD_IDENTITY_TRUST) trustVerdicts[r.name] = c }
-                .let { c -> if (c.action == ChangeAction.ERROR || c.readOnly) c else planGrants(r, c, slug, prune, file, envSlugs, reach) }
+                // SSO-3921 — a `workloadPull` sink: resolve the trust (same plane, kubernetes, tenant:applications.write) before the grants,
+                // whose diff then carries the workload client's `manager` on the application.
+                .let { c -> if (c.action == ChangeAction.ERROR || c.readOnly || r.secretSink?.runtimePull != true) c else planWorkloadPull(r, c, file, envSlugs, slug) }
+                .let { c -> if (c.action == ChangeAction.ERROR || c.readOnly) c else planGrants(r, c, slug, prune, file, envSlugs, reach, pullGrant(r, c)) }
                 // SSO-3668 — a resource that will be converged publishes its id afterwards (every apply); shown, never done, by plan.
                 .let { c -> if (c.action == ChangeAction.ERROR || c.readOnly || r.publishTo.isEmpty()) c else c.copy(publishTo = r.publishTo, reason = c.reason + "; publishes its id to ${r.publishTo.size} target(s)") }
                 // SSO-3659 — a CREATE of a confidential application mints a secret; where it will be delivered is shown, never done, by plan.
-                .let { c -> if (c.action == ChangeAction.CREATE && !c.readOnly && r.secretSink != null && mintsSecret(r.spec)) c.copy(secretSink = r.secretSink) else c }
+                .let { c -> if (c.action == ChangeAction.CREATE && !c.readOnly && r.secretSink != null && !r.secretSink.runtimePull && mintsSecret(r.spec)) c.copy(secretSink = r.secretSink) else c }
             changes += change
             if (r.kind == ProvisionFile.KIND_ENVIRONMENT && change.liveId != null) {
                 // The RESOLVED slug (a `{{env.NAME}}` placeholder names a per-run sandbox), never the raw spec.
@@ -717,6 +730,8 @@ class ProvisionEngine(
     /** SSO-3113 — the plan marker for a confidential application about to be created (its secret is shown once). */
     private fun mintNote(r: ProvisionResource): String = when {
         r.kind != ProvisionFile.KIND_APPLICATION || !mintsSecret(r.spec) -> ""
+        // SSO-3921 — a runtime pull: the one-time value is discarded; the trust's pod mints its own at start.
+        r.secretSink?.runtimePull == true -> " (a client secret will be minted and discarded — the pods of trust ${r.secretSink.trust} mint their own at start)"
         // SSO-3659 — with a declared sink the secret is delivered, not shown.
         r.secretSink != null -> " (a client secret will be minted and delivered to ${r.secretSink.label})"
         else -> " (a client secret will be minted and shown once)"
@@ -744,19 +759,100 @@ class ProvisionEngine(
      * §2) — an undeclared live grant is "present, not declared" unless [prune] is set AND the caller may
      * delete the object ([mayRemove]); the exclusions ([grantDiff]) hold either way.
      */
-    private fun planGrants(r: ProvisionResource, change: PlannedChange, slug: String?, prune: Boolean, file: ProvisionFile, envSlugs: Map<String, String>, reach: Reach): PlannedChange {
-        val declared = r.grants ?: return change
+    private fun planGrants(r: ProvisionResource, change: PlannedChange, slug: String?, prune: Boolean, file: ProvisionFile, envSlugs: Map<String, String>, reach: Reach, implicit: ProvisionGrant? = null): PlannedChange {
+        // SSO-3921 — [implicit] is the `workloadPull` workload client's `manager`: part of a declared block (so `--prune`
+        // never revokes it), or, without one, the ONE grant converged on the object — additive only, nothing else read as
+        // "undeclared" (a file without `grants:` does not manage the object's grants).
+        val manages = r.grants != null
+        val declared = (r.grants.orEmpty() + listOfNotNull(implicit)).distinctBy { it.label }.takeIf { manages || implicit != null } ?: return change
         if (change.action == ChangeAction.CREATE || change.liveId == null) {
             return change.copy(grantAdds = declared.map { it.label })
         }
-        val revoke = prune && mayRemove(r, change, slug, file, envSlugs, reach).allowed
-        val (adds, removes, undeclared) = grantDiff(declared, liveGrants(r, objectRef(r.kind, change.liveId, slug)), revoke)
+        val revoke = manages && prune && mayRemove(r, change, slug, file, envSlugs, reach).allowed
+        val (adds, removes, undeclaredAll) = grantDiff(declared, liveGrants(r, objectRef(r.kind, change.liveId, slug)), revoke)
+        val undeclared = if (manages) undeclaredAll else emptyList()
         if (adds.isEmpty() && removes.isEmpty() && undeclared.isEmpty()) return change
         val note = buildString {
             if (adds.isNotEmpty() || removes.isNotEmpty()) append("; grants: +${adds.size} −${removes.size}")
             if (undeclared.isNotEmpty()) append("; ${undeclared.size} grant(s) present, not declared" + if (prune && !revoke) " (kept: this identity may not delete the object)" else "")
         }
         return change.copy(reason = change.reason + note, grantAdds = adds, grantRemoves = removes, grantUndeclared = undeclared)
+    }
+
+    // ── runtime pull (SSO-3921; oauthy ADR 2026-10-14 credential ladder, rung 3) ─────────────────────────────
+
+    /**
+     * SSO-3921 — resolve a `secretSink: { kind: workloadPull, trust }` against the plane the application lives in: the trust
+     * is live there (its view gives the `wi_` client), or declared in this file and created by this apply (pending; the file
+     * loader already pinned its plane, provider and scopes). A live trust must be a `kubernetes` trust carrying
+     * [ProvisionFile.ROTATE_SECRET_SCOPE]; one this identity cannot see is `access_not_reachable` (`viewer` on it by name —
+     * the engine only needs to READ its workload client); anything else is [ProvisionFile.ERR_WORKLOAD_PULL_TRUST_NOT_FOUND].
+     * A resolved row carries the sink (the plan's line) and the workload client ([PlannedChange.pullClientId]).
+     */
+    private fun planWorkloadPull(r: ProvisionResource, change: PlannedChange, file: ProvisionFile, envSlugs: Map<String, String>, slug: String?): PlannedChange {
+        val sink = r.secretSink!!
+        val name = sink.trust ?: return change
+        val declared = file.resources.firstOrNull { it.kind == ProvisionFile.KIND_WORKLOAD_IDENTITY_TRUST && it.name == name }
+        // An environment this apply creates first holds no live trust yet: only one declared beside it can be named.
+        val planePending = r.environment != null && file.environmentResource(r.environment) != null && envSlugs[r.environment] == null
+        val live = if (planePending) null else try {
+            fetchOrNull { trustsOf(slug) }?.firstOrNull { it.str("name") == name }
+        } catch (ex: ProductApiException) {
+            throw ProvisionException("${r.key}: could not list the trusts of ${planeLabel(slug)} to resolve secretSink.trust '$name' (${ex.message})")
+        }
+        fun red(code: String, why: String, fix: FixRequest.MissingRight? = null): PlannedChange =
+            change.copy(action = ChangeAction.ERROR, reason = "$code — $why", error = code, fix = fix?.copy(reason = "$code — ${fix.reason}"), fixNote = if (fix == null) WORKLOAD_PULL_FILE_FIX_NOTE else null)
+        if (live != null) {
+            val view = trustView(live)
+            val provider = view["provider"]?.toString()
+            if (provider != ProvisionFile.WORKLOAD_PULL_PROVIDER) {
+                return red(ProvisionFile.ERR_WORKLOAD_PULL_TRUST_PROVIDER, "trust '$name' in ${planeLabel(slug)} is a '$provider' trust; a runtime pull is a POD minting its own secret at start (provider: ${ProvisionFile.WORKLOAD_PULL_PROVIDER})")
+            }
+            val scopes = (view["scopes"] as? List<*>).orEmpty().map { it.toString() }
+            if (ProvisionFile.ROTATE_SECRET_SCOPE !in scopes) {
+                return red(ProvisionFile.ERR_WORKLOAD_PULL_SCOPE_MISSING, "trust '$name' does not carry ${ProvisionFile.ROTATE_SECRET_SCOPE} (it has ${scopes.joinToString(" ").ifEmpty { "none" }}): its pods could not run `thoryn clients rotate-secret` — re-create the trust with it (a trust's scopes are immutable)")
+            }
+            val clientId = view["clientId"]?.toString() ?: return red(ProvisionFile.ERR_WORKLOAD_PULL_TRUST_NOT_FOUND, "trust '$name' in ${planeLabel(slug)} renders no workload client")
+            return change.copy(secretSink = sink, pullClientId = clientId)
+        }
+        val verdict = trustVerdicts[name]
+        return when {
+            declared != null && (verdict == null || verdict.action != ChangeAction.ERROR) -> change.copy(secretSink = sink, pullClientId = null)
+            declared != null && name in trustsHidden -> {
+                val why = "trust '$name' is declared in this file for ${planeLabel(slug)} but is not visible to this identity — it holds no relation on it, so ${r.key} cannot resolve secretSink.trust"
+                val fix = FixRequest.byName(FixRequest.Kind.VIEWER, subject, name, slug, why)
+                red(ERROR_NOT_REACHABLE, "$why (${FixRequest.hint(fix)})", fix)
+            }
+            declared != null -> red(ProvisionFile.ERR_WORKLOAD_PULL_TRUST_NOT_FOUND, "trust '$name' is declared in this file but its own row is red (${verdict?.error}) — it will not be created by this apply, so no workload can pull this secret")
+            else -> red(
+                ProvisionFile.ERR_WORKLOAD_PULL_TRUST_NOT_FOUND,
+                "no workloadIdentityTrust named '$name' in ${planeLabel(slug)} is visible to this identity — declare it in this file (same environment, provider kubernetes) " +
+                    "or create it first (`thoryn workload-identity trusts create --provider kubernetes`); a trust another identity owns is listed only to who holds a relation on it",
+            )
+        }
+    }
+
+    /**
+     * SSO-3921 — the grant a `workloadPull` row converges on its application: `manager` for the trust's workload client, the
+     * relation product-api's rotate-secret requires (`manageable(...)`, oauthy SSO-3111) and the one under which the hub lets
+     * that client REPLACE an in-flight secret (oauthy SSO-3696). While the trust is created by this apply its client id is
+     * not known yet: the plan shows a placeholder subject and `apply` resolves the real one ([workloadPullGrantAtApply]).
+     */
+    private fun pullGrant(r: ProvisionResource, change: PlannedChange): ProvisionGrant? {
+        val sink = change.secretSink?.takeIf { it.runtimePull && r.secretSink?.runtimePull == true } ?: return null
+        val subject = change.pullClientId?.let { "client:$it" } ?: "client:<wi_ client of trust ${sink.trust}, created by this apply>"
+        // The applying identity never grants itself (it already holds what it applies with).
+        if (subject == this.subject) return null
+        return ProvisionGrant(subject, RELATION_MANAGER)
+    }
+
+    /** SSO-3921 — the `workloadPull` grant with the trust's REAL workload client, read fresh (the trust may have been created by this apply). */
+    private fun workloadPullGrantAtApply(r: ProvisionResource, change: PlannedChange, plane: String?): ProvisionGrant? {
+        val name = r.secretSink?.takeIf { it.runtimePull }?.trust ?: return null
+        val clientId = change.pullClientId ?: fetchOrNull { trustsOf(plane, fresh = true) }?.firstOrNull { it.str("name") == name }?.str("clientId")
+            ?: throw ProvisionException("${r.key}: secretSink.trust '$name' is not visible in ${planeLabel(plane)} — the application exists, but no workload was granted to pull its secret; re-run once the trust exists")
+        if ("client:$clientId" == subject) return null
+        return ProvisionGrant("client:$clientId", RELATION_MANAGER)
     }
 
     // ── ownership gate (SSO-3659; ADR 2026-10-13 §1 — per object since SSO-3673) ────────────────
@@ -1621,7 +1717,7 @@ class ProvisionEngine(
         // unknown object, an unknown subject and insufficient reach), and it DEADLOCKS: a re-run reaches
         // the same grant before the same missing client. Deferring the whole block drops the ordering
         // dependency — a `grants:` block may name anything the file declares, in any order.
-        val pendingGrants = mutableListOf<Triple<ProvisionResource, String, PlannedChange>>()
+        val pendingGrants = mutableListOf<PendingGrants>()
         // SSO-3668 — outputs publish in their own pass too, once the resource is converged (the id is known), so an
         // unreachable target can never cost the id.
         val pendingPublishes = mutableListOf<Pair<ProvisionResource, String>>()
@@ -1631,13 +1727,18 @@ class ProvisionEngine(
             if (r.readOnly) return@forEach
             val resolved: AppliedResource? = when (change.action) {
                 // SSO-3659 — a minted client secret is delivered AFTER the client exists; an unreachable sink costs nothing.
-                ChangeAction.CREATE -> create(r, file, applied).let { c -> record(c.applied); c.mintedSecret?.let { deliverSecret(r, c.applied.id, it) }; c.applied }
+                // SSO-3921 — a `workloadPull` sink: the value is dropped here, unseen; the trust's pod mints its own at start.
+                ChangeAction.CREATE -> create(r, file, applied).let { c ->
+                    record(c.applied)
+                    c.mintedSecret?.let { if (r.secretSink?.runtimePull == true) discardSecret(r) else deliverSecret(r, c.applied.id, it) }
+                    c.applied
+                }
                 ChangeAction.UPDATE -> update(r, file, applied, change).also { record(it) }
                 ChangeAction.NOOP -> change.liveId?.let { AppliedResource(r.kind, r.name, it, change.environment, change.attributes, change.owner, ChangeAction.NOOP) }?.also { record(it) }
                 else -> null
             }
-            if (r.grants != null && resolved != null) {
-                pendingGrants += Triple(r, objectRef(r.kind, resolved.id, resolved.environment), change)
+            if ((r.grants != null || r.secretSink?.runtimePull == true) && resolved != null) {
+                pendingGrants += PendingGrants(r, objectRef(r.kind, resolved.id, resolved.environment), change, resolved.environment)
             }
             if (r.publishTo.isNotEmpty() && resolved != null) {
                 pendingPublishes += r to resolved.id
@@ -1661,7 +1762,7 @@ class ProvisionEngine(
                 }
             }
         }
-        pendingGrants.forEach { (r, ref, change) -> convergeGrants(r, ref, change.grantRemoves) }
+        pendingGrants.forEach { (r, ref, change, plane) -> convergeGrants(r, ref, change.grantRemoves, workloadPullGrantAtApply(r, change, plane)) }
         // SSO-3715 — `--prune`: the owned-and-undeclared removals the plan carries, child-first (each refusal was a skip row already).
         val pruned = destroy(ProvisionPlan(plan.removes), confirmSlug)
         if (pruned.failures.isNotEmpty()) {
@@ -1782,6 +1883,9 @@ class ProvisionEngine(
 
     // ── per-kind create / update ─────────────────────────────────────────────────────────────────
 
+    /** SSO-3119 — one object's grant block, converged after every resource exists; SSO-3921 — [plane] resolves a `workloadPull` trust. */
+    private data class PendingGrants(val resource: ProvisionResource, val ref: String, val change: PlannedChange, val plane: String?)
+
     /** A created resource and — for a confidential application — the one-time secret the create response carried. */
     private class Created(val applied: AppliedResource, val mintedSecret: String? = null)
 
@@ -1880,6 +1984,16 @@ class ProvisionEngine(
             "  ! application ${r.name}: $ERROR_UNDELIVERED_SECRETS — its client secret was minted but could NOT be delivered (clientId $clientId). " +
                 "The client exists; mint a new secret with `${recoverSecret(clientId)}`.",
         )
+    }
+
+    /**
+     * SSO-3921 (oauthy ADR 2026-10-14 credential ladder, rung 3) — a `workloadPull` sink: the one-time secret the create
+     * returned is DROPPED — never printed, written, logged or handed to any sink — and nothing is undelivered: the
+     * trust's pod mints its own at start (`thoryn clients rotate-secret`, which the `manager` grant this apply converges
+     * allows, and which may replace this unseen in-flight secret — oauthy SSO-3696).
+     */
+    private fun discardSecret(r: ProvisionResource) {
+        out.println("  > application ${r.name}: client secret discarded (never shown or stored) — pulled at runtime by the pods of trust ${r.secretSink?.trust}")
     }
 
     /** Converge an existing resource: send exactly the changed (non-secret) fields plus any write-only secret. */
@@ -2189,8 +2303,9 @@ class ProvisionEngine(
      * ([removes] — `--prune` on an object the caller may delete, after the exclusions). The live set is re-read here
      * so a grant someone added between plan and apply is never revoked on a stale diff.
      */
-    private fun convergeGrants(r: ProvisionResource, ref: String, removes: List<String>) {
-        val declared = r.grants ?: return
+    private fun convergeGrants(r: ProvisionResource, ref: String, removes: List<String>, implicit: ProvisionGrant? = null) {
+        // SSO-3921 — the `workloadPull` workload client's `manager` joins the declared block, or is the only grant converged.
+        val declared = (r.grants.orEmpty() + listOfNotNull(implicit)).distinctBy { it.label }.takeIf { r.grants != null || implicit != null } ?: return
         val live = liveGrants(r, ref)
         val adds = grantDiff(declared, live, revoke = false).adds
         val revoke = removes.filter { it in live }
@@ -2898,6 +3013,8 @@ class ProvisionEngine(
          */
         const val ERROR_CONVERGE_KEY_AMBIGUOUS = "converge_key_ambiguous"
         /** SSO-3715 — the fix request's note for a `converge_key_ambiguous` row: the FILE must say which one (`clientId`). */
+        /** SSO-3921 — the fix request's note for a refused `workloadPull` sink: the FILE (or the trust it names) must change. */
+        const val WORKLOAD_PULL_FILE_FIX_NOTE = "a change to the file, not a missing right: secretSink.trust must name a kubernetes workloadIdentityTrust of the application's own environment that carries tenant:applications.write"
         const val FILE_FIX_NOTE_AMBIGUOUS = "a change to the file, not a missing right: declare `clientId` so the converge key names exactly one live resource"
         /** SSO-3715 — the destroy / prune plan's reason for a `retain: true` resource. */
         const val RETAINED = "retained by the file (`retain: true`) — never removed by destroy / --prune"
