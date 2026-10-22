@@ -316,6 +316,8 @@ thoryn examples share    <name> [--output <file>]   # SSO-2876 — export the se
 thoryn provision plan    [--file <path>] [--prune] [--fix-request <path>]  # read-only: what apply would create / remove (+ grant changes, pending publishes); exit 1 on an ownership error
                                              # SSO-3710 — --fix-request (env THORYN_FIX_REQUEST): a red plan also writes thoryn-provision-request.json — every missing RIGHT
                                              # (owner / manager / viewer) with the exact `thoryn access grant` command a workspace admin runs; a workflow uploads it
+                                             # SSO-3792 — a declared PRODUCTION application (fixed clientId) this identity may not create is a `creator` item
+                                             # (`thoryn access reserve …`); with an unexpired slot it holds the row reads "will create (reserved …)" and passes
                                              # SSO-3738 — with web consent the log's Option 1 is `thoryn access approve <owner>/<repo>/<run_id>`, not the raw lines
 thoryn provision apply   [--file <path>] [--prune] [--confirm <ws>] [--yes] [--fix-request <path>] \
                          [--secret-file <path>] [--force-stdout] [--force] \
@@ -351,6 +353,13 @@ thoryn access mine   [--type <objectType>] [--relation <relation>]   # GET /api/
 # grants nothing itself; a workspace admin approves on the hub's consent screen (see "thoryn access approve" below).
 thoryn access approve <owner>/<repository>/<run_id> [--consent-url <base>] [--no-browser]
 thoryn access approve https://starters.<your Thoryn domain>/github/consent/run/<owner>/<repository>/<run_id>
+
+# Application creation slots (SSO-3792; oauthy ADR 2026-10-17, product-api SSO-3789) — a workspace admin approves that ONE
+# workload identity creates ONE named application on ONE plane, once, within 30 days. The repository's own apply then
+# creates it (POST /api/v1/applications with its clientId) and owns it. See "Creation slots" below.
+thoryn access reserve <client:wi_…> application:<clientId> [--environment <slug>]   # POST /api/v1/access/application-slots (admins; plane defaults to production)
+thoryn access reservations [--subject <client:wi_…>]   # GET /api/v1/access/application-slots — an admin sees all, anyone else its own
+thoryn access release application:<clientId>          # DELETE /api/v1/access/application-slots/{clientId} — the holder releases, an admin revokes
 
 # Custom domain (SSO-3303, epic SSO-3290) — serve the workspace's sign-in (and its token issuer) on a host
 # you own, e.g. auth.acme.com. One per workspace; workspace admins, and machine clients an admin granted
@@ -1203,6 +1212,14 @@ provisions. Two surfaces, one grammar:
 - **`thoryn access grant | revoke | list | mine`** — imperative, for a founder wiring things up
   or inspecting who can reach what. `list` needs `--object` and/or `--subject`; `mine` answers
   for the session's own subject (`{ "data": [ "environment:<id>", … ] }`).
+- **`thoryn access reserve | reservations | release`** (SSO-3792) — application **creation slots**, which are
+  not grants: a workspace admin approves that one workload identity creates one named application on one plane,
+  once, within 30 days (`reserve client:<wi_…> application:<clientId> [--environment <slug>]`, `production` by
+  default). The repository's own apply creates it and becomes its owner. `reservations` lists them (an admin sees
+  every slot, anyone else its own; `--subject` narrows); `release application:<clientId>` releases one (the
+  holder) or revokes it (an admin). Refusals: `409 application_exists` (grant `owner` instead),
+  `409 application_slot_held` (another identity holds it), `409 reserved_client_id`, and one opaque `404` for
+  "not an admin / not a trust's workload client / unknown environment". See "Creation slots" below.
 - **`grants:` on a resource in `provision.yaml`** — declarative, converged by `provision apply`
   like any other field. The **object is implicit** (it derives from the live id the resource
   resolves to — `environment:<id>`, `application:<clientId>`, `user:<id>`,
@@ -1841,8 +1858,9 @@ re-checks every write server-side, so the engine can never admit a write the pla
 ### A red check names its fix — `--fix-request` (SSO-3710, SSO-3722, SSO-3723; epic SSO-3304)
 
 A repository bound to Thoryn needs one-time rights before its App-dispatched plan can run: the **plan
-profile** on its trust (SSO-3700), the **`owner`** relation on a resource it declares (SSO-3697), or
-`manager` on the parent environment of something it creates. When one is missing the check run is red
+profile** on its trust (SSO-3700), the **`owner`** relation on a resource it declares (SSO-3697),
+`manager` on the parent environment of something it creates, or (SSO-3792) a **creation slot** for a
+production application it declares and that does not exist yet. When one is missing the check run is red
 in one of two places — at sign-in (`401 invalid_client`, the hub says nothing more) or at the engine's
 gate (`access_not_owned` / `access_read_only` / `access_owned_elsewhere`, and since SSO-3722
 `access_not_reachable`: the live read answered `404 unknown_environment` because the identity has **no reach
@@ -1855,7 +1873,7 @@ state" before the gate) — and the person reading it needs a path.
 To fix — Option 1, with the CLI (a workspace admin):
       thoryn access approve thoryn-io/thoryn-cicd/38751887466
   It opens the same approval as Option 2 — Thoryn's consent screen, which lists the rights below; nothing is granted until a workspace admin approves there. The command grants nothing itself.
-  - owner on application:forge-oauth2-proxy for client:wi_10a7…: access_not_reachable — the live read of … was answered HTTP 404 (unknown_environment): …
+  - creator on application:forge-forgejo-login in production for client:wi_10a7…: access_not_reachable — the live read of … was answered HTTP 404 (unknown_environment): …
 To fix — Option 2, in the browser: https://app.thoryn.io/github/consent/run/thoryn-io/thoryn-cicd/38751887466
 ```
 
@@ -1908,8 +1926,8 @@ right reads `thoryn access approve <owner>/<repository>/<run_id>` instead; file 
 | `invalid_scope` / `scope_outside_apply_profile`, other `invalid_scope` | `auth.scopes` (or `--scope`) must be a subset of the trust's (`trusts get <id>` lists them) |
 | token endpoint unreachable, unknown error | make the endpoint reachable from the runner / re-run, then the audit log |
 | `access_not_owned`, `access_read_only` (a resource to own) | `thoryn access grant client:<wi_> owner <object>` |
-| `access_not_owned` on a create | `thoryn access grant client:<wi_> manager environment:<id>`; a workspace parent is a note (never granted to a repository identity) |
-| `access_not_reachable` (404 on the live read) | `owner application:<clientId>` for a fixed `clientId`; `manager environment:<slug>` for a declared environment; a workspace note on the production plane without a fixed id |
+| `access_not_owned` on a create | `thoryn access grant client:<wi_> manager environment:<id>` on a sandbox; on the production plane (SSO-3792) an application with a fixed `clientId` is the **creator** item `thoryn access reserve client:<wi_> application:<clientId> --environment production`; any other workspace parent is a note (never granted to a repository identity) — an application without a fixed id says to declare `spec.clientId` |
+| `access_not_reachable` (404 on the live read) | SSO-3792: the **creator** item for a production application with a fixed `clientId` (never `owner` on something that may not exist — SSO-3787); `manager environment:<slug>` for a declared sandbox (with or without a fixed id); a workspace note on the production plane without a fixed id |
 | `access_not_reachable` (a declared trust the identity cannot see — SSO-3774) | `thoryn access grant client:<wi_> owner trust:<trust-id>` (item object `trust:<name>`; `viewer` for a `readOnly` reference); asked ONCE even when the trust's row and the application naming it both need it |
 | `workload_identity_trust_production_needs_person` | a note: a workspace admin applies the file as themselves, then `thoryn access grant client:<wi_> owner trust:<trust-id>` |
 | `access_owned_elsewhere` | no command runs for you: declare it `readOnly: true`, or an admin moves the ownership (the reason carries revoke-then-grant) |
@@ -1938,7 +1956,10 @@ exit codes are unchanged, and the request is never a credential — ids, names, 
   right: **`owner`** on an existing object this file is to own (`access_not_owned` on a live id, or
   `access_read_only` when the identity may only view it), **`manager`** on the parent `environment:<id>`
   of a refused create, **`viewer`** for a `readOnly: true` reference the identity cannot see; each with
-  `thoryn access grant client:<wi_…> <relation> <object>`, the subject being the session's own. An object
+  `thoryn access grant client:<wi_…> <relation> <object>`, the subject being the session's own. SSO-3792:
+  **`creator`** — a creation slot — for a production application the file declares with a fixed `clientId`
+  that the identity cannot see and may not create, with `thoryn access reserve client:<wi_…>
+  application:<clientId> --environment production` (the item's `environment` is the plane). An object
   **another repository owns** (`access_owned_elsewhere`) is an `owner` item with **no command** — a dispute
   an admin decides (the reason carries the Owner ADR's revoke-then-grant). Rows that are **file** fixes — a
   read-only reference that differs from what is live, a trust the file cannot declare, a scope the
@@ -1946,6 +1967,49 @@ exit codes are unchanged, and the request is never a credential — ids, names, 
   granted to a repository identity) — are listed under `notes`, so the request says so. The trust's name
   and id are resolved only when the session may list trusts (`tenant:workload-identity.read`); a plan-profile
   session names its `wi_` client only.
+
+#### Creation slots — a declared production application that does not exist yet (SSO-3792; absorbs SSO-3787)
+
+Creating a production-plane application needs `manager` on the **workspace**, which a repository identity is
+never granted (epic SSO-3108). Before SSO-3792 the plan of a file declaring a new production application asked
+for `owner` on it — a right on nothing: the admin approved it on the consent screen and product-api answered
+`not_found` (thoryn-cicd PR 34). A confined identity cannot tell **absent** from **invisible**, so the engine now
+asks for the one thing that is grantable — a **creation slot** (oauthy ADR
+`2026-10-17-consent-approved-application-creation-slots.md`):
+
+1. **Red.** The plan row (`access_not_reachable`, or `access_not_owned` when the plane is visible) carries the
+   `creator` item `thoryn access reserve client:<wi_…> application:<clientId> --environment production`. The
+   Thoryn GitHub App relays it onto the check run and lists it on the run's consent screen ("Let
+   *owner/repository* create the application *clientId* in *production*, and own it"); with a consent link the
+   log's Option 1 is `thoryn access approve <owner>/<repo>/<run_id>` (SSO-3738), which opens that same screen, and
+   without one it is the `reserve` command itself.
+2. **Approve.** A workspace admin runs the command, or approves it on the hub's consent screen. The slot binds the
+   **name**, the **plane** and the **holder** — not the spec; it lasts **30 days** and only the holder may use it.
+3. **Green.** The next plan reads the slots once (`GET /api/v1/access/application-slots`, `tenant:access.read`,
+   which the plan profile holds) and, for an unexpired slot this identity holds on that client id **and** plane,
+   plans the row as `create — will create (reserved by a workspace admin; expires <date>)`. A slot on another
+   plane, for another name, held by someone else, or expired leaves the row red with the same item (an expired
+   slot's reason says so). A platform without slots answers `404`, read as "no slots".
+4. **Apply.** The ordinary `POST /api/v1/applications` with the explicit `clientId`: product-api consumes the slot
+   and the repository becomes the application's `owner`. A refusal is spelled out: `404` — the slot no longer
+   admits the create (used, released, revoked, expired, or for another plane; re-plan, an admin reserves again);
+   `409 client_id_taken` — someone created the name meanwhile, the slot is used up and never adopts it (grant
+   `owner` instead).
+
+What a slot does **not** lift: turning `allowTokenExchange` or `allowTokenIntrospection` on at create still needs
+`manager` on the plane, so the plan refuses either under a slot (`token_exchange_not_grantable` /
+`token_introspection_not_grantable`, a note) before any write; a `federatedTrust`
+binding still needs `manager` on the trust; the new client's scopes are still capped at the identity's own.
+Sandboxes keep `manager` on their environment (decision D3), an application without a fixed `clientId` keeps
+the workspace note (now: "declare `spec.clientId` to make its creation approvable"), and production **trusts**
+stay a person's act (`workload_identity_trust_production_needs_person`). If the name turns out to exist when the
+admin approves, the App's callback answers `application_exists` and offers a follow-up consent for `owner` on
+it (decision D1). An admin lists and revokes slots with `thoryn access reservations` / `thoryn access release
+application:<clientId>`.
+
+A `creator` item is a kind a consumer must know: the Thoryn GitHub App accepts it since oauthy SSO-3791, and
+since then an unknown kind drops that ONE item rather than the whole request. The document's `version` stays
+`1` — the change is additive (a new enum value) and no consumer dispatches on the version.
 
 **One rendering.** The `cli` string of every item is the same text the CLI prints on stderr when there is no web
 consent (the row reasons quote it; the `To fix — Option 1, with the CLI (a workspace admin):` block lists it with the

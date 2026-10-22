@@ -116,6 +116,12 @@ data class PlannedChange(
     val fix: FixRequest.MissingRight? = null,
     /** SSO-3710 — on an `ERROR` row with no [fix]: why no right would fix it (a file fix), for the request's `notes`. */
     val fixNote: String? = null,
+    /**
+     * SSO-3792 (oauthy ADR 2026-10-17 §6) — on a [ChangeAction.CREATE] of an application this identity may not create on
+     * its own reach: the unexpired CREATION SLOT a workspace admin reserved for exactly this client id on exactly this
+     * plane, which product-api consumes at apply. Null on every other row.
+     */
+    val reservation: CreationSlot? = null,
 ) {
     val hasGrantChanges: Boolean get() = grantAdds.isNotEmpty() || grantRemoves.isNotEmpty()
 
@@ -148,7 +154,22 @@ data class PlannedChange(
         secretSink?.let { put("secretSink", it.toStructured() + (pullClientId?.let { id -> mapOf("workloadClientId" to id) } ?: emptyMap())) }
         trust?.let { put("trust", it) }
         fix?.let { put("fix", it.toStructured()) }
+        reservation?.let { put("reservation", it.toStructured()) }
     }
+}
+
+/**
+ * SSO-3792 (oauthy ADR 2026-10-17 §2 / §6) — one application creation slot as the plan uses it: the application
+ * ([clientId], raw), the plane ([environment], `production` for the production plane), and when it stops admitting the
+ * create ([expiresAt], ISO-8601 as product-api renders it). Only an UNEXPIRED slot held by the planning identity is ever
+ * attached to a row.
+ */
+data class CreationSlot(val clientId: String, val environment: String, val expiresAt: String?) {
+    fun toStructured(): Map<String, Any?> = linkedMapOf(
+        "object" to FixRequest.applicationRef(clientId),
+        "environment" to environment,
+        "expiresAt" to expiresAt,
+    )
 }
 
 class ProvisionPlan(val changes: List<PlannedChange>) {
@@ -368,6 +389,16 @@ data class RemovalOutcome(val removed: List<AppliedResource>, val failures: List
  * tuple store, not the platform resource graph — `/api/v1/access/check` and `/mine` are that graph's
  * check and list-objects.
  *
+ * **Creation slots (SSO-3792; oauthy ADR 2026-10-17 consent-approved-application-creation-slots §6).** A production-plane
+ * application create needs `manager` on the workspace, which a repository identity is never granted. When the file
+ * declares it with a fixed `clientId` and this identity may not create it — or cannot even see the plane — the row asks
+ * for a CREATION SLOT ([FixRequest.Kind.CREATOR], `thoryn access reserve`): a workspace admin approves that this identity
+ * creates that one name on that plane, once, within 30 days. `plan` reads the slots once
+ * (`GET /api/v1/access/application-slots`, `tenant:access.read`; a platform without them answers 404 ⇒ none); a create
+ * matching an unexpired slot of this identity on client id AND plane plans as "will create (reserved …)" and passes, and
+ * `apply` is the ordinary create — product-api consumes the slot and the identity becomes the owner. Sandboxes keep
+ * `manager` on their environment (decision D3); a slot never lifts the token-exchange rule.
+ *
  * **Outputs (SSO-3668; ADR 2026-10-13 production-clients-declared-in-the-config-project §2).** An
  * `application`'s `publishTo:` targets receive its clientId through [outputSink] — the sibling of
  * [secretSink] for a value that is PUBLIC by construction — AFTER the resource is converged (the id is
@@ -545,7 +576,7 @@ class ProvisionEngine(
             val slug = planSlug(r, file, envSlugs)
             // SSO-3659 — the ownership gate sits between the live lookup and everything that would write:
             // a resource that fails it plans no grants (its object may not even be visible to this identity).
-            val change = gate(r, probe(r, file, envSlugs), file, envSlugs, slug, reach)
+            val change = gate(r, probe(r, file, envSlugs, reach), file, envSlugs, slug, reach)
                 // SSO-3774 — a trust's verdict is what an application naming it (planned after every trust) reads.
                 .also { c -> if (r.kind == ProvisionFile.KIND_WORKLOAD_IDENTITY_TRUST) trustVerdicts[r.name] = c }
                 // SSO-3921 — a `workloadPull` sink: resolve the trust (same plane, kubernetes, tenant:applications.write) before the grants,
@@ -640,8 +671,12 @@ class ProvisionEngine(
         else -> envSlugs[r.environment]
     }
 
-    /** Live lookup by converge key → create / update / noop for one declared resource. */
-    private fun probe(r: ProvisionResource, file: ProvisionFile, envSlugs: Map<String, String>): PlannedChange {
+    /**
+     * Live lookup by converge key → create / update / noop for one declared resource. [reach] is the PLAN's (null from
+     * [planDestroy]): with it, a 404 on the live read may plan a reserved create or ask for a creation slot (SSO-3792);
+     * without it — a destroy, which never creates — the read keeps asking for `owner` on a fixed id.
+     */
+    private fun probe(r: ProvisionResource, file: ProvisionFile, envSlugs: Map<String, String>, reach: Reach? = null): PlannedChange {
         if (r.kind == ProvisionFile.KIND_CUSTOM_DOMAIN) return probeCustomDomain(r)
         val slug: String? = when {
             r.kind == ProvisionFile.KIND_ENVIRONMENT -> null
@@ -675,7 +710,7 @@ class ProvisionEngine(
             // SSO-3722 — product-api answers 404 `unknown_environment` not only for a plane that does not exist but for
             // one this identity has NO reach into (SSO-3118, the 404-not-403 rule): a brand-new repository identity gets it
             // on its very first read. That is the missing-rights shape, not a broken read — a red row with its fix.
-            if (ex.httpStatus == 404) return unreachable(r, slug, desired, ex)
+            if (ex.httpStatus == 404) return unreachable(r, slug, desired, ex, reach)
             throw ProvisionException("${r.key}: could not read live state (${ex.message})")
         }
         return when {
@@ -692,31 +727,92 @@ class ProvisionEngine(
      * SSO-3722 (the thoryn-cicd run 38751887466 shape) — the live read of a declared resource answered 404: the plane it
      * lives in is not reachable by this identity (product-api's `EnvironmentClaimFilter` answers `unknown_environment`
      * both for a missing environment and for one the caller holds no relation into — a new repository identity with no
-     * relation on anything). The row is red with the code [ERROR_NOT_REACHABLE] and the RIGHT that opens the plane:
-     * `owner` on the application the file declares by a fixed `clientId` (the file is to OWN it); `manager` on the
-     * declared environment when the file would create something there; a note when the parent is the WORKSPACE (the
-     * production plane without a fixed id — `manager` on the workspace is never granted to a repository identity).
+     * relation on anything). The row is red with the code [ERROR_NOT_REACHABLE] and the RIGHT that opens the plane.
+     *
+     * SSO-3792 (oauthy ADR 2026-10-17 §6; absorbs SSO-3787) — a confined identity cannot tell ABSENT from INVISIBLE, so an
+     * application the file declares by a fixed `clientId` never asks for `owner` (a right on a thing that may not exist —
+     * the consent offered it, product-api answered `not_found`, PR 34). Instead:
+     *  - on the PRODUCTION plane: a creation slot ([FixRequest.Kind.CREATOR], `thoryn access reserve`) — or, when this
+     *    identity already holds an unexpired slot for that id on that plane, a reserved CREATE ([reservedCreate]): a slot
+     *    is only ever reserved for a name that did not exist, and any creation of the name sweeps it;
+     *  - on a sandbox (decision D3): `manager` on the declared environment, as for every other sandbox resource;
+     *  - an application without a fixed id on the production plane: the workspace note, plus "declare `spec.clientId`".
+     * A [planDestroy] probe ([reach] null) never creates, so there a fixed id keeps asking for `owner` — what may remove it.
      */
-    private fun unreachable(r: ProvisionResource, slug: String?, desired: Map<String, Any?>, ex: ProductApiException): PlannedChange {
+    private fun unreachable(r: ProvisionResource, slug: String?, desired: Map<String, Any?>, ex: ProductApiException, reach: Reach?): PlannedChange {
         val plane = planeLabel(slug)
         val code = ex.errorCode ?: "not_found"
         val why = "the live read of ${r.key} in $plane was answered HTTP 404 ($code): this identity has no relation that reaches $plane, " +
             "so nothing there is visible to it (a new repository identity holds no relation until a workspace admin grants one)"
         val change = PlannedChange(r.kind, r.name, ChangeAction.ERROR, why, resource = r, environment = slug)
         val fixedId = desired["clientId"]?.toString()?.trim()?.takeIf { r.kind == ProvisionFile.KIND_APPLICATION && it.isNotEmpty() }
+        val production = slug == null || slug == PRODUCTION_ENV_SLUG
         return when {
-            fixedId != null -> {
+            fixedId != null && reach == null -> {
                 val ref = objectRef(r.kind, fixedId, slug)
                 val fix = FixRequest.owner(subject, ref, "$why; the file declares `clientId: $fixedId`, so this identity is to OWN it")
                 refuse(r, change, ERROR_NOT_REACHABLE, Access.NONE, "$why (${FixRequest.hint(fix)})", fix = fix)
+            }
+            fixedId != null && production -> {
+                val pending = PlannedChange(r.kind, r.name, ChangeAction.CREATE, "", resource = r, environment = slug, retain = r.retain)
+                reach!!.slot(fixedId, slug)?.let { return reservedCreate(r, pending, slug, it) }
+                creatorRefusal(r, change, ERROR_NOT_REACHABLE, Access.NONE, why, fixedId, reach)
             }
             slug != null && slug != PRODUCTION_ENV_SLUG -> {
                 val ref = "$OBJECT_TYPE_ENVIRONMENT:$slug"
                 val fix = FixRequest.manager(subject, ref, "$why; the file declares `environment: $slug`, which this identity cannot see")
                 refuse(r, change, ERROR_NOT_REACHABLE, Access.NONE, "$why (${FixRequest.hint(fix)}; `$ref` is the environment as `thoryn env list` names it)", fix = fix)
             }
-            else -> refuse(r, change, ERROR_NOT_REACHABLE, Access.NONE, "$why ($WORKSPACE_PARENT_NOTE)", fixNote = WORKSPACE_PARENT_NOTE)
+            else -> workspaceParentRefusal(r, change, ERROR_NOT_REACHABLE, Access.NONE, why)
         }
+    }
+
+    /**
+     * SSO-3792 — the production-plane refusal of an application with a fixed [clientId] this identity may not create: a
+     * creation slot ([FixRequest.creator]). When the identity holds a slot for the id on this plane that has EXPIRED, the
+     * reason says so (an expired slot reads as no slot: the admin reserves it again).
+     */
+    private fun creatorRefusal(r: ProvisionResource, change: PlannedChange, code: String, access: Access?, why: String, clientId: String, reach: Reach): PlannedChange {
+        val expired = reach.expiredSlot(clientId, PRODUCTION_ENV_SLUG)
+        val reason = "$why; the file declares `clientId: $clientId` on the production plane, where only a workspace admin may approve its creation" +
+            (expired?.let { " (this identity's creation slot for it expired${it.expiresAt?.let { at -> " at $at" } ?: ""}: a slot admits the create for 30 days)" } ?: "")
+        val fix = FixRequest.creator(subject, clientId, PRODUCTION_ENV_SLUG, reason)
+        return refuse(r, change, code, access, "$reason (${FixRequest.hint(fix)})", fix = fix)
+    }
+
+    /**
+     * SSO-3710 / SSO-3792 — a refusal whose parent is the WORKSPACE: a note, never a right. An application additionally
+     * learns how to make its creation approvable: declare a fixed `spec.clientId` (a creation slot names one id).
+     */
+    private fun workspaceParentRefusal(r: ProvisionResource, change: PlannedChange, code: String, access: Access?, why: String): PlannedChange {
+        val note = if (r.kind == ProvisionFile.KIND_APPLICATION) "$WORKSPACE_PARENT_NOTE; $DECLARE_CLIENT_ID_NOTE" else WORKSPACE_PARENT_NOTE
+        return refuse(r, change, code, access, "$why ($note)", fixNote = note)
+    }
+
+    /**
+     * SSO-3792 (oauthy ADR 2026-10-17 §3 / §6) — a CREATE this identity may make only because a workspace admin reserved
+     * a creation slot for exactly this client id on exactly this plane: green, with the reservation on the row. Apply is
+     * the ordinary create — product-api's gate consumes the slot and the identity becomes the owner. The slot lifts
+     * nothing else (ADR §3, "What the slot does not lift"): turning token exchange or token introspection on at create
+     * still needs `manager` on the plane (product-api answers `403 token_exchange_not_grantable` /
+     * `403 token_introspection_not_grantable` before it claims the slot), so the plan says so first, as
+     * [gateTokenExchange] / [gateTokenIntrospection] do for an update.
+     */
+    private fun reservedCreate(r: ProvisionResource, change: PlannedChange, slug: String?, slot: CreationSlot): PlannedChange {
+        val pending = change.copy(action = ChangeAction.CREATE, access = null, reservation = slot, retain = r.retain, error = null, fix = null, fixNote = null)
+        SLOT_EXCLUDED_SETTINGS.firstOrNull { (field, _, _) -> coerceBool(r.spec[field]) }?.let { (field, errorCode, workspaceNote) ->
+            val why = "${r.key} is to be created under a creation slot, and a slot does not include turning $field on — " +
+                "that needs `manager` on its environment (product-api answers `403 $errorCode`)"
+            return if (slug == null || slug == PRODUCTION_ENV_SLUG) {
+                refuse(r, pending, errorCode, null, "$why ($workspaceNote)", fixNote = workspaceNote).copy(reservation = null)
+            } else {
+                val parent = "$OBJECT_TYPE_ENVIRONMENT:$slug"
+                val fix = FixRequest.manager(subject, parent, why)
+                refuse(r, pending, errorCode, null, "$why (${FixRequest.hint(fix)})", fix = fix).copy(reservation = null)
+            }
+        }
+        val expires = slot.expiresAt?.let { "; expires $it" } ?: ""
+        return pending.copy(reason = "will create (reserved by a workspace admin$expires)${mintNote(r)}")
     }
 
     /**
@@ -972,6 +1068,42 @@ class ProvisionEngine(
         }
 
         fun environmentId(slug: String): String? = environments().firstOrNull { it.str("slug") == slug }?.str("id")
+
+        /**
+         * SSO-3792 — the creation slots this identity may see (`GET /api/v1/access/application-slots`), read ONCE per plan and
+         * only when a create would otherwise be refused. A product-api from before SSO-3789 answers `404` (no such route):
+         * no slots. Any other failure fails closed, like every access read.
+         */
+        private var slotList: List<JsonNode>? = null
+
+        private fun slots(): List<JsonNode> = slotList ?: try {
+            listItems(clients(null).listApplicationSlots(), "data").also { slotList = it }
+        } catch (ex: ProductApiException) {
+            if (ex.httpStatus == 404 || ex.httpStatus == 405) emptyList<JsonNode>().also { slotList = it } else throw accessFailure(ex)
+        }
+
+        /** The slots for [clientId] on [plane] HELD BY THIS IDENTITY (an admin's listing carries every holder's). */
+        private fun slotsFor(clientId: String, plane: String): List<JsonNode> {
+            val me = subject ?: return emptyList()
+            return slots().filter { n ->
+                n.str("subject") == me && (n.str("environment") ?: "") == plane &&
+                    n.str("object")?.takeIf { it.startsWith("$OBJECT_TYPE_APPLICATION:") }?.substringAfter(':')?.let { decodePlatformId(it) } == clientId
+            }
+        }
+
+        private fun JsonNode.expiredSlot(): Boolean =
+            this["expired"]?.takeIf { it.isBoolean }?.asBoolean() == true ||
+                str("expiresAt")?.let { runCatching { java.time.Instant.parse(it) }.getOrNull() }?.isBefore(java.time.Instant.now()) == true
+
+        /** SSO-3792 — this identity's UNEXPIRED creation slot for [clientId] on the plane [slug] (null ⇒ production), or null. */
+        fun slot(clientId: String, slug: String?): CreationSlot? {
+            val plane = slug ?: PRODUCTION_ENV_SLUG
+            return slotsFor(clientId, plane).firstOrNull { !it.expiredSlot() }?.let { CreationSlot(clientId, plane, it.str("expiresAt")) }
+        }
+
+        /** SSO-3792 — this identity's EXPIRED slot for [clientId] on [plane], to say why the plan is red again; null otherwise. */
+        fun expiredSlot(clientId: String, plane: String): CreationSlot? =
+            slotsFor(clientId, plane).firstOrNull { it.expiredSlot() }?.let { CreationSlot(clientId, plane, it.str("expiresAt")) }
     }
 
     /**
@@ -1110,21 +1242,31 @@ class ProvisionEngine(
         }
         val parent = parentRef(r, file, envSlugs, slug, reach)
             ?: return change.copy(access = Access.MANAGER.label) // the parent environment is created by this very apply: creator-becomes-manager covers both
-        return if (reach.managesParent(parent)) {
-            change.copy(access = Access.MANAGER.label)
-        } else {
-            refuseCreate(r, change, parent, "creating a ${r.kind} here requires `manager` on its parent $parent, which this identity does not hold")
-        }
+        if (reach.managesParent(parent)) return change.copy(access = Access.MANAGER.label)
+        // SSO-3792 — a workspace admin may have reserved a creation slot for exactly this client id on exactly this plane.
+        val fixedId = fixedClientId(r)
+        fixedId?.let { id -> reach.slot(id, slug)?.let { return reservedCreate(r, change, slug, it) } }
+        return refuseCreate(r, change, parent, slug, fixedId, reach, "creating a ${r.kind} here requires `manager` on its parent $parent, which this identity does not hold")
     }
+
+    /** SSO-3792 — the fixed `spec.clientId` of an application (the converge key and the slot's name), or null. */
+    private fun fixedClientId(r: ProvisionResource): String? =
+        if (r.kind != ProvisionFile.KIND_APPLICATION) null else resolveSpec(r, strict = false)["clientId"]?.toString()?.trim()?.takeIf { it.isNotEmpty() }
 
     /**
      * SSO-3710 — a create refused on its parent: `manager` on a parent ENVIRONMENT is a grantable right (an item with
      * its command); `manager` on the WORKSPACE is not — a production-plane create needs a workspace manager, which a
      * confined repository identity must never be — so that row is a note, not a right (ADR §3 grantable set).
+     *
+     * SSO-3792 (oauthy ADR 2026-10-17 §6, decision D3) — except an APPLICATION on the PRODUCTION plane with a fixed
+     * `clientId`: its creation is approvable, one name at a time, as a creation slot ([creatorRefusal]). Without a fixed id
+     * the note says to declare one. Sandboxes keep `manager` on their environment.
      */
-    private fun refuseCreate(r: ProvisionResource, change: PlannedChange, parent: String, why: String): PlannedChange =
+    private fun refuseCreate(r: ProvisionResource, change: PlannedChange, parent: String, slug: String?, fixedId: String?, reach: Reach, why: String): PlannedChange =
         if (parent.startsWith("$OBJECT_TYPE_WORKSPACE:")) {
-            refuse(r, change, ERROR_NOT_OWNED, null, "$why ($WORKSPACE_PARENT_NOTE)", fixNote = WORKSPACE_PARENT_NOTE)
+            val production = slug == null || slug == PRODUCTION_ENV_SLUG
+            if (fixedId != null && production) creatorRefusal(r, change, ERROR_NOT_OWNED, null, why, fixedId, reach)
+            else workspaceParentRefusal(r, change, ERROR_NOT_OWNED, null, why)
         } else {
             val fix = FixRequest.manager(subject, parent, why)
             refuse(r, change, ERROR_NOT_OWNED, null, "$why (${FixRequest.hint(fix)})", fix = fix)
@@ -1728,7 +1870,7 @@ class ProvisionEngine(
             val resolved: AppliedResource? = when (change.action) {
                 // SSO-3659 — a minted client secret is delivered AFTER the client exists; an unreachable sink costs nothing.
                 // SSO-3921 — a `workloadPull` sink: the value is dropped here, unseen; the trust's pod mints its own at start.
-                ChangeAction.CREATE -> create(r, file, applied).let { c ->
+                ChangeAction.CREATE -> create(r, file, applied, change.reservation).let { c ->
                     record(c.applied)
                     c.mintedSecret?.let { if (r.secretSink?.runtimePull == true) discardSecret(r) else deliverSecret(r, c.applied.id, it) }
                     c.applied
@@ -1889,9 +2031,9 @@ class ProvisionEngine(
     /** A created resource and — for a confidential application — the one-time secret the create response carried. */
     private class Created(val applied: AppliedResource, val mintedSecret: String? = null)
 
-    private fun create(r: ProvisionResource, file: ProvisionFile, applied: List<AppliedResource>): Created {
+    private fun create(r: ProvisionResource, file: ProvisionFile, applied: List<AppliedResource>, reservation: CreationSlot? = null): Created {
         val spec = resolveSpec(r, strict = true)
-        if (r.kind == ProvisionFile.KIND_APPLICATION) return createApplication(r, file, applied, spec)
+        if (r.kind == ProvisionFile.KIND_APPLICATION) return createApplication(r, file, applied, spec, reservation)
         return Created(when (r.kind) {
             ProvisionFile.KIND_ENVIRONMENT -> {
                 val slug = spec["slug"].toString()
@@ -1927,11 +2069,17 @@ class ProvisionEngine(
         })
     }
 
-    private fun createApplication(r: ProvisionResource, file: ProvisionFile, applied: List<AppliedResource>, spec: Map<String, Any?>): Created {
+    /**
+     * The application create. SSO-3792 — under a creation slot ([reservation], from the plan) the call is the same
+     * `POST /api/v1/applications` with the explicit `clientId`; product-api's gate consumes the slot. Its refusals are
+     * then mapped to what they mean for a reserved create ([reservedCreateFailure]).
+     */
+    private fun createApplication(r: ProvisionResource, file: ProvisionFile, applied: List<AppliedResource>, spec: Map<String, Any?>, reservation: CreationSlot? = null): Created {
         val slug = targetSlug(r, file, applied)
         val resp = try {
             clients(slug).createApplication(applicationBody(r, spec, slug))
         } catch (ex: ProductApiException) {
+            reservation?.let { slot -> reservedCreateFailure(r, ex, slot)?.let { throw it } }
             throw applicationSettingFailure(r, ex, slug) ?: ex
         }
         val id = resp.str("clientId") ?: resp.str("client_id") ?: throw ProvisionException("${r.key}: the application create returned no clientId")
@@ -2842,6 +2990,38 @@ class ProvisionEngine(
         return ProvisionException(head + message)
     }
 
+    /**
+     * SSO-3792 (oauthy ADR 2026-10-17 §3) — what product-api's refusal of a create under a creation slot means, or null to
+     * fall through to the ordinary mapping:
+     *  - `404`: the slot no longer admits this create — consumed by an earlier apply, released or revoked by an admin,
+     *    expired since the plan, or reserved for another plane; nothing was created. Re-plan; an admin reserves again.
+     *  - `409 client_id_taken`: the name exists (someone created it since the reservation); the slot is used up and a slot
+     *    never adopts a live application — the right that fits now is `owner` on it.
+     *  - `403 token_exchange_not_grantable` / `403 token_introspection_not_grantable`: a slot never includes turning token
+     *    exchange or token introspection on (the plan refuses both first).
+     */
+    private fun reservedCreateFailure(r: ProvisionResource, ex: ProductApiException, slot: CreationSlot): ProvisionException? {
+        val ref = FixRequest.applicationRef(slot.clientId)
+        val reserve = FixRequest.reserveCommand(subject, slot.clientId, slot.environment)
+        val message = when {
+            ex.httpStatus == 404 ->
+                "${r.key}: the creation slot for $ref in ${slot.environment} no longer admits this create (HTTP 404) — it was used by an earlier apply, " +
+                    "released or revoked by a workspace admin, expired since the plan, or reserved for another plane; nothing was created. Re-run the plan: " +
+                    "it shows what is live now. A workspace admin approves the creation again with `$reserve`."
+            ex.httpStatus == 409 && ex.errorCode == "client_id_taken" ->
+                "${r.key}: ${slot.clientId} already exists (HTTP 409 client_id_taken) — it was created after the reservation, so the creation slot is used up and " +
+                    "was not applied to it (a creation approval never adopts a live application). If this repository is to own it, a workspace admin grants it: " +
+                    "`${FixRequest.grantCommand(subject, RELATION_OWNER, ref)}`; otherwise declare it `readOnly: true` or pick another clientId."
+            else -> {
+                val (field, code, _) = SLOT_EXCLUDED_SETTINGS.firstOrNull { it.second == ex.errorCode } ?: return null
+                "${r.key}: $code — a creation slot does not include turning $field on " +
+                    "(that needs `manager` on the plane); nothing was created and the slot is kept. Drop `$field: true` from the file, " +
+                    "or have a workspace admin apply it from their own session."
+            }
+        }
+        return ProvisionException(message)
+    }
+
     /** A member of an RFC 9457 problem body (`field`, `min`, `max`, …), as text; null when absent or unparseable. */
     private fun problemExtension(ex: ProductApiException, name: String): String? = runCatching {
         json.readTree(ex.rawBody)[name]?.takeIf { it.isNumber || it.isTextual }?.asString()?.takeIf { it.isNotBlank() }
@@ -3055,10 +3235,26 @@ class ProvisionEngine(
             "workspace, which is never granted to a repository identity — a workspace admin applies this file from their own session " +
             "(or drop `allowTokenExchange: true` from the file)"
 
+        /**
+         * SSO-3792 (oauthy ADR 2026-10-17 §6) — appended to [WORKSPACE_PARENT_NOTE] for a production-plane APPLICATION
+         * without a fixed id: a creation slot names exactly one client id, so an auto-generated one can never be approved.
+         */
+        const val DECLARE_CLIENT_ID_NOTE = "declare `spec.clientId` to make its creation approvable (a workspace admin then reserves that one name for this identity)"
+
         /** SSO-3810 — why a production-plane `token_introspection_not_grantable` has no item (as [TOKEN_EXCHANGE_WORKSPACE_NOTE]). */
         const val TOKEN_INTROSPECTION_WORKSPACE_NOTE = "not a grantable right: turning token introspection on for a production-plane application needs `manager` " +
             "on the workspace, which is never granted to a repository identity — a workspace admin applies this file from their own session " +
             "(or drop `allowTokenIntrospection: true` from the file)"
+
+        /**
+         * SSO-3792 (oauthy ADR 2026-10-17 §3) — the parent-manager-gated settings a creation slot does NOT lift, each with
+         * product-api's refusal code and the production-plane note: `allowTokenExchange` (SSO-3758) and
+         * `allowTokenIntrospection` (SSO-3810, gated at a slot create by product-api's `introspectionGate`).
+         */
+        private val SLOT_EXCLUDED_SETTINGS: List<Triple<String, String, String>> = listOf(
+            Triple(ProvisionFile.SPEC_ALLOW_TOKEN_EXCHANGE, ProvisionFile.ERR_TOKEN_EXCHANGE_NOT_GRANTABLE, TOKEN_EXCHANGE_WORKSPACE_NOTE),
+            Triple(ProvisionFile.SPEC_ALLOW_TOKEN_INTROSPECTION, ProvisionFile.ERR_TOKEN_INTROSPECTION_NOT_GRANTABLE, TOKEN_INTROSPECTION_WORKSPACE_NOTE),
+        )
 
         const val WORKSPACE_PARENT_NOTE = "not a grantable right: `manager` on the workspace is never granted to a repository identity — a workspace admin creates it, then grants this identity `owner` on it (or declare it `readOnly: true`)"
 

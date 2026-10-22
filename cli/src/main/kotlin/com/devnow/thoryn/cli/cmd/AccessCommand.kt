@@ -39,6 +39,8 @@ import java.util.concurrent.Callable
  *  - `mine [--type …] [--relation …]`       — GET    /api/v1/access/mine?type=…&relation=… (`{ data: [ "<type>:<id>" ] }`)
  *  - `approve <owner>/<repo>/<run_id> | <consent URL>` — SSO-3738: opens the hub consent for a red provisioning run's
  *    missing rights in the browser (or prints its address); no API call, grants nothing itself ([AccessApprove])
+ *  - `reserve | reservations | release`      — SSO-3792: application CREATION SLOTS (`/api/v1/access/application-slots`),
+ *    a workspace admin's approval that a workload identity creates one named application — see [AccessReservations]
  *
  * The same grammar backs the `grants:` block of a provisioning file (`thoryn provision apply`
  * converges grants per resource — see `ProvisionFile`).
@@ -53,13 +55,17 @@ import java.util.concurrent.Callable
         AccessCommand.ListSubcommand::class,
         AccessCommand.MineSubcommand::class,
         AccessCommand.ApproveSubcommand::class,
+        // SSO-3792 — application creation slots (oauthy ADR 2026-10-17).
+        AccessReservations.ReserveSubcommand::class,
+        AccessReservations.ReservationsSubcommand::class,
+        AccessReservations.ReleaseSubcommand::class,
     ],
 )
 class AccessCommand : Callable<Int> {
 
     override fun call(): Int {
         System.err.println("Usage: thoryn access <subcommand>")
-        System.err.println("Subcommands: grant | revoke | list | mine | approve")
+        System.err.println("Subcommands: grant | revoke | list | mine | approve | reserve | reservations | release")
         return CommandSupport.EXIT_USAGE
     }
 

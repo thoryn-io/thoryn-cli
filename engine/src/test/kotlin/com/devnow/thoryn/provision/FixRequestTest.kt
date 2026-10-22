@@ -66,6 +66,21 @@ class FixRequestTest {
     }
 
     @Test
+    fun `a creator item names the application as the access API spells it, its plane, and the reserve command — one spelling`() {
+        // SSO-3792 (oauthy ADR 2026-10-17 §6) — a creation slot: the plane is spelled out, production included.
+        val item = FixRequest.creator(subject, "forge-forgejo-login", "production", "access_not_reachable — …")
+        val doc = json.readTree(request(listOf(item)).toJson())["missing"][0]
+
+        assertThat(doc["kind"].asString()).isEqualTo("creator")
+        assertThat(doc["object"].asString()).isEqualTo("application:forge-forgejo-login")
+        assertThat(doc["environment"].asString()).isEqualTo("production")
+        assertThat(doc["cli"].asString()).isEqualTo("thoryn access reserve $subject application:forge-forgejo-login --environment production")
+        assertThat(FixRequest.hint(item)).contains(doc["cli"].asString())
+        // An id outside the plain grammar is percent-encoded exactly as product-api's PlatformRefs.encodeId does.
+        assertThat(FixRequest.applicationRef("a@b#c d%e")).isEqualTo("application:a%40b%23c%20d%25e")
+    }
+
+    @Test
     fun `an unknown subject renders as a placeholder, never as an empty token`() {
         assertThat(FixRequest.grantCommand(null, "manager", "environment:env-1")).isEqualTo("thoryn access grant <subject> manager environment:env-1")
         assertThat(FixRequest.manager(null, "environment:env-1", "…").cli).contains("<subject>")

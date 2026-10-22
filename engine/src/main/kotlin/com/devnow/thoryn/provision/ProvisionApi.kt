@@ -112,6 +112,18 @@ interface ProvisionApi {
      */
     fun checkAccess(objectRef: String, relation: String): AccessCheck
 
+    /**
+     * SSO-3792 (oauthy ADR 2026-10-17 §2, product-api SSO-3789) — `GET /api/v1/access/application-slots` (scope
+     * `tenant:access.read`, which a plan profile holds): the application CREATION SLOTS the caller may see — a workspace
+     * admin every slot, anyone else the slots it holds — as the ListEnvelope `{ data: [ {object, subject, environment,
+     * createdAt, expiresAt, expired} ] }`. The engine reads it once per plan, only for a create it would otherwise refuse.
+     *
+     * Defaulted (unlike every other method) so a host that predates slots keeps compiling: the default answers what a
+     * product-api from before SSO-3789 answers — `404` — which the engine reads as "no slots".
+     */
+    fun listApplicationSlots(): JsonNode =
+        throw ProductApiException(404, "not_found", "this host does not read application creation slots", "")
+
     companion object {
         /**
          * SSO-3667 / SSO-3673 — the platform `owner` of a resource as its response renders it
