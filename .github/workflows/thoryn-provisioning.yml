@@ -38,7 +38,7 @@ permissions: {}
 jobs:
   # thoryn-provisioning: apply-job
   provisioning:
-    uses: thoryn-io/thoryn-cli/.github/workflows/provisioning.yml@cli-v0.42.0
+    uses: thoryn-io/thoryn-cli/.github/workflows/provisioning.yml@cli-v0.43.0
     permissions:
       id-token: write
       checks: write
