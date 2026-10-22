@@ -374,7 +374,11 @@ object ThorynConfig {
      * (`keys.retire` for `thoryn keys retire`; granted by oathy hub V189, which must be deployed before a
      * release carrying this default — same rule), SSO-3308 (`workload-identity.*` for `thoryn workload-identity
      * trusts …`; granted to `cli` / `thoryn-cli` by oathy hub V192 (oathy #3787), which must be deployed before
-     * a release carrying this default — same rule).
+     * a release carrying this default — same rule), SSO-3856 (`github-connections.*`: no CLI command uses them yet —
+     * they are requested so a workspace admin who signs in with the CLI HOLDS the family and can grant it onward, e.g.
+     * to `thoryn-starters` through provisioning-as-code; oathy ADR 2026-10-19-operator-grants-platform-client-scopes,
+     * "The grant order" step 2. Granted to `cli` / `thoryn-cli` by oathy hub V206 (SSO-3855), which must be deployed
+     * before a release carrying this default — same rule).
      */
     const val DEFAULT_SCOPE =
         "openid offline_access " +
@@ -389,7 +393,8 @@ object ThorynConfig {
             "tenant:access.read tenant:access.write " +
             "tenant:domains.read tenant:domains.write " +
             "tenant:keys.read tenant:keys.rotate tenant:keys.retire " +
-            "tenant:workload-identity.read tenant:workload-identity.write"
+            "tenant:workload-identity.read tenant:workload-identity.write " +
+            "tenant:github-connections.read tenant:github-connections.write"
 
     /**
      * The `--hub` / `--gateway` "not given" sentinel of the post-login commands (SSO-2827): they use the

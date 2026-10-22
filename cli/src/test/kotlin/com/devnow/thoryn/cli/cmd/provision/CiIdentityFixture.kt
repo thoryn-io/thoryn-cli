@@ -92,7 +92,7 @@ internal object CiIdentityFixture {
      * cli-v0.35.0's fix request (SSO-3710) and cli-v0.34.0's plan-profile sign-in (SSO-3702). The tag is cut FROM the merge
      * that lands the reusable workflow, so the first App dispatch after that merge needs the tag to exist.
      */
-    const val CLI_RELEASE = "cli-v0.39.0"
+    const val CLI_RELEASE = "cli-v0.42.0"
 
     /** The platform base issuer the workflow provisions against (the connection derives the workspace issuer from it). */
     const val PLATFORM_ISSUER = "https://auth.stg.thoryn.org"

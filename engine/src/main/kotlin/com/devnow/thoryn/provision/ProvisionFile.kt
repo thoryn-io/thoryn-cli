@@ -277,9 +277,20 @@ class ProvisionFile private constructor(
         const val SPEC_REFRESH_TOKEN_ABSOLUTE_MAX_TTL_SECONDS = "refreshTokenAbsoluteMaxTtlSeconds"
         /** The sliding refresh-token TTL the absolute lifetime must not undercut (sent on create; not converged today). */
         const val SPEC_REFRESH_TOKEN_TTL_SECONDS = "refreshTokenTtlSeconds"
-        /** The four settings, in the order a plan lists them — each converged on UPDATE, an omitted one keeps the live value. */
+        /** SSO-3810 — the application may call RFC 7662 introspection at its workspace (product-api `allowTokenIntrospection`, default `false`). */
+        const val SPEC_ALLOW_TOKEN_INTROSPECTION = "allowTokenIntrospection"
+        /** SSO-3807 — the access-token format the application receives: `self-contained` (a JWT, the default) or `reference` (opaque). */
+        const val SPEC_ACCESS_TOKEN_FORMAT = "accessTokenFormat"
+        /** SSO-3811 — DPoP (RFC 9449) opt-in: a proof that arrives binds the access token (product-api `dpopAllowed`, default `false`). */
+        const val SPEC_DPOP_ALLOWED = "dpopAllowed"
+        /** SSO-3811 — every token request must carry a DPoP proof (product-api `dpopRequired`, default `false`). */
+        const val SPEC_DPOP_REQUIRED = "dpopRequired"
+        /** product-api's `accessTokenFormat` values (the hub's `OAuth2TokenFormat` values, exact spelling). */
+        val ACCESS_TOKEN_FORMATS: Set<String> = setOf("self-contained", "reference")
+        /** The settings, in the order a plan lists them — each converged on UPDATE, an omitted one keeps the live value. */
         val APPLICATION_SETTING_FIELDS: List<String> = listOf(
             SPEC_ALLOW_TOKEN_EXCHANGE, SPEC_ALLOWED_AUTHORIZATION_DETAIL_TYPES, SPEC_REFRESH_TOKEN_SLIDING_WINDOW, SPEC_REFRESH_TOKEN_ABSOLUTE_MAX_TTL_SECONDS,
+            SPEC_ALLOW_TOKEN_INTROSPECTION, SPEC_ACCESS_TOKEN_FORMAT, SPEC_DPOP_ALLOWED, SPEC_DPOP_REQUIRED,
         )
         /** The RFC 8693 grant an application must register to hold [SPEC_ALLOW_TOKEN_EXCHANGE]. */
         const val GRANT_TOKEN_EXCHANGE = "urn:ietf:params:oauth:grant-type:token-exchange"
@@ -295,6 +306,12 @@ class ProvisionFile private constructor(
         const val ERR_TOKEN_EXCHANGE_GRANT_REQUIRED = "token_exchange_grant_required"
         /** API-only (403): turning the setting ON needs `manager` on the application's environment — the plan gate predicts it. */
         const val ERR_TOKEN_EXCHANGE_NOT_GRANTABLE = "token_exchange_not_grantable"
+        /** SSO-3810 — `allowTokenIntrospection: true` on a public client (product-api / hub `400`). */
+        const val ERR_TOKEN_INTROSPECTION_REQUIRES_CONFIDENTIAL_CLIENT = "token_introspection_requires_confidential_client"
+        /** SSO-3810 — API-only (403): turning introspection ON needs `manager` on the application's environment — the plan gate predicts it. */
+        const val ERR_TOKEN_INTROSPECTION_NOT_GRANTABLE = "token_introspection_not_grantable"
+        /** SSO-3807 — `accessTokenFormat` is not exactly `self-contained` or `reference`. */
+        const val ERR_INVALID_ACCESS_TOKEN_FORMAT = "invalid_access_token_format"
         /** API-only (400): a type the authorization server does not support (its discovery list, plus [AUTHORIZATION_DETAILS_TYPE_ACCESS_GRANT]). */
         const val ERR_UNSUPPORTED_AUTHORIZATION_DETAILS_TYPE = "unsupported_authorization_details_type"
         /** API-only (403): [AUTHORIZATION_DETAILS_TYPE_ACCESS_GRANT] outside the platform home workspace. */
@@ -358,6 +375,21 @@ class ProvisionFile private constructor(
 
         /** SSO-3702 — a read-only workspace scope (`tenant:<area>.read`), the only kind a plan profile may carry. */
         val READ_SCOPE_PATTERN = Regex("^tenant:[a-z-]+\\.read$")
+
+        /**
+         * SSO-3856 — the operator-plane scope namespaces. A `platform:` scope on a client is put there (and taken away)
+         * only by an operator (`thoryn operator platform-scopes`, oathy ADR `2026-10-19-operator-grants-platform-client-
+         * scopes.md`); an `admin:` scope only ever sits on the operator client. Neither can be granted from a provisioning
+         * file — the hub refuses both on every customer-plane path — and the hub KEEPS a client's `platform:` scopes when a
+         * provisioning update replaces its scope list. So the engine neither declares nor compares them: a declared one is
+         * refused here ([ERR_RESERVED_SCOPE]), and a live one is left out of the diff, or every plan of a client an
+         * operator has granted one to would show a change that applying can never make.
+         */
+        val RESERVED_OPERATOR_PLANE_SCOPE_PREFIXES: List<String> = listOf("platform:", "admin:")
+        const val ERR_RESERVED_SCOPE = "reserved_scope"
+
+        fun isReservedOperatorPlaneScope(scope: String): Boolean =
+            RESERVED_OPERATOR_PLANE_SCOPE_PREFIXES.any { scope.trim().startsWith(it) }
 
         /** The production plane: no `environment`, or the `production` slug (mirrors [ProvisionEngine.PRODUCTION_ENV_SLUG]). */
         fun isProductionPlane(environment: String?): Boolean = environment == null || environment == ProvisionEngine.PRODUCTION_ENV_SLUG
@@ -642,6 +674,11 @@ class ProvisionFile private constructor(
                 if (kind == KIND_APPLICATION) validateApplicationAuth(spec, r, where, v)
                 // SSO-3766 / SSO-3767 / SSO-3770 — token exchange, authorization detail types, session lifetime.
                 if (kind == KIND_APPLICATION) validateApplicationSettings(spec, where, v)
+                // SSO-3856 — an application cannot declare an operator-plane (`platform:` / `admin:`) scope.
+                if (kind == KIND_APPLICATION) spec["scopes"]?.takeIf { it.isArray() }?.toList()
+                    ?.mapNotNull { n -> n.takeIf { it.isTextual() }?.asString()?.trim() }
+                    ?.filter { isReservedOperatorPlaneScope(it) }?.distinct()
+                    ?.forEach { v += "$where spec.scopes: $ERR_RESERVED_SCOPE — '$it' is an operator-plane scope; a provisioning file cannot grant it (the hub refuses it). A platform: scope is declared in .thoryn/platform-scopes.yaml and applied by an operator with `thoryn operator platform-scopes apply`" }
                 // SSO-3689 — a workload-identity trust: the provider's pins, the scope grammar, the production rules.
                 if (kind == KIND_WORKLOAD_IDENTITY_TRUST) validateWorkloadIdentityTrust(spec, r, where, v)
             }
@@ -837,11 +874,25 @@ class ProvisionFile private constructor(
          *    [ERR_TOKEN_TTL_OUT_OF_RANGE]): the absolute lifetime is declared WITH `refreshTokenSlidingWindow: true`
          *    ([ERR_SESSION_LIFETIME_REQUIRES_SLIDING_WINDOW] — a file says what the session is, it does not lean on the live
          *    window) and is at least a declared `refreshTokenTtlSeconds` ([ERR_SESSION_LIFETIME_BELOW_REFRESH_TTL]).
+         *  - SSO-3810 `allowTokenIntrospection` (boolean): when `true`, the client authenticates
+         *    ([ERR_TOKEN_INTROSPECTION_REQUIRES_CONFIDENTIAL_CLIENT]). WHO may turn it on (`manager` on the environment) is
+         *    the plan gate's.
+         *  - SSO-3807 `accessTokenFormat`: exactly `self-contained` or `reference` ([ERR_INVALID_ACCESS_TOKEN_FORMAT]).
          */
         private fun validateApplicationSettings(spec: JsonNode, where: String, v: MutableList<String>) {
             fun present(field: String): JsonNode? = spec[field]?.takeIf { !it.isNull }
-            listOf(SPEC_ALLOW_TOKEN_EXCHANGE, SPEC_REFRESH_TOKEN_SLIDING_WINDOW).forEach { f ->
+            listOf(SPEC_ALLOW_TOKEN_EXCHANGE, SPEC_REFRESH_TOKEN_SLIDING_WINDOW, SPEC_ALLOW_TOKEN_INTROSPECTION, SPEC_DPOP_ALLOWED, SPEC_DPOP_REQUIRED).forEach { f ->
                 present(f)?.takeIf { !it.isBoolean() }?.let { v += "$where spec.$f must be true or false" }
+            }
+            present(SPEC_ACCESS_TOKEN_FORMAT)?.let { f ->
+                if (!f.isTextual() || f.asString() !in ACCESS_TOKEN_FORMATS) {
+                    v += "$where spec.$SPEC_ACCESS_TOKEN_FORMAT: $ERR_INVALID_ACCESS_TOKEN_FORMAT — must be ${ACCESS_TOKEN_FORMATS.joinToString(" or ") { "'$it'" }}"
+                }
+            }
+            val publicClient = spec[SPEC_CLIENT_TYPE]?.takeIf { it.isTextual() }?.asString()?.trim().equals(CLIENT_TYPE_PUBLIC, ignoreCase = true) ||
+                present(SPEC_CLIENT_AUTHENTICATION_METHODS)?.takeIf { it.isArray() }?.toList()?.any { it.asString().trim() == METHOD_NONE } == true
+            if (present(SPEC_ALLOW_TOKEN_INTROSPECTION)?.takeIf { it.isBoolean() }?.asBoolean() == true && publicClient) {
+                v += "$where $ERR_TOKEN_INTROSPECTION_REQUIRES_CONFIDENTIAL_CLIENT — $SPEC_ALLOW_TOKEN_INTROSPECTION: true needs a client that authenticates ($METHOD_CLIENT_SECRET_BASIC, $METHOD_PRIVATE_KEY_JWT or $METHOD_FEDERATED_ASSERTION); a public client ('$METHOD_NONE') cannot hold it"
             }
             present(SPEC_ALLOWED_AUTHORIZATION_DETAIL_TYPES)?.let { types ->
                 if (!types.isArray()) {

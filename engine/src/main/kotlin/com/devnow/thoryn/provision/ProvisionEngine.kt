@@ -780,21 +780,22 @@ class ProvisionEngine(
      * SSO-3792 (oauthy ADR 2026-10-17 §3 / §6) — a CREATE this identity may make only because a workspace admin reserved
      * a creation slot for exactly this client id on exactly this plane: green, with the reservation on the row. Apply is
      * the ordinary create — product-api's gate consumes the slot and the identity becomes the owner. The slot lifts
-     * nothing else: turning token exchange on at create still needs `manager` on the plane (product-api answers
-     * `403 token_exchange_not_grantable`), so the plan says so first, as [gateTokenExchange] does for an update.
+     * nothing else (ADR §3, "What the slot does not lift"): turning token exchange or token introspection on at create
+     * still needs `manager` on the plane (product-api answers `403 token_exchange_not_grantable` /
+     * `403 token_introspection_not_grantable` before it claims the slot), so the plan says so first, as
+     * [gateTokenExchange] / [gateTokenIntrospection] do for an update.
      */
     private fun reservedCreate(r: ProvisionResource, change: PlannedChange, slug: String?, slot: CreationSlot): PlannedChange {
         val pending = change.copy(action = ChangeAction.CREATE, access = null, reservation = slot, retain = r.retain, error = null, fix = null, fixNote = null)
-        if (coerceBool(r.spec[ProvisionFile.SPEC_ALLOW_TOKEN_EXCHANGE])) {
-            val why = "${r.key} is to be created under a creation slot, and a slot does not include turning ${ProvisionFile.SPEC_ALLOW_TOKEN_EXCHANGE} on — " +
-                "that needs `manager` on its environment (product-api answers `403 ${ProvisionFile.ERR_TOKEN_EXCHANGE_NOT_GRANTABLE}`)"
+        SLOT_EXCLUDED_SETTINGS.firstOrNull { (field, _, _) -> coerceBool(r.spec[field]) }?.let { (field, errorCode, workspaceNote) ->
+            val why = "${r.key} is to be created under a creation slot, and a slot does not include turning $field on — " +
+                "that needs `manager` on its environment (product-api answers `403 $errorCode`)"
             return if (slug == null || slug == PRODUCTION_ENV_SLUG) {
-                refuse(r, pending, ProvisionFile.ERR_TOKEN_EXCHANGE_NOT_GRANTABLE, null, "$why ($TOKEN_EXCHANGE_WORKSPACE_NOTE)", fixNote = TOKEN_EXCHANGE_WORKSPACE_NOTE)
-                    .copy(reservation = null)
+                refuse(r, pending, errorCode, null, "$why ($workspaceNote)", fixNote = workspaceNote).copy(reservation = null)
             } else {
                 val parent = "$OBJECT_TYPE_ENVIRONMENT:$slug"
                 val fix = FixRequest.manager(subject, parent, why)
-                refuse(r, pending, ProvisionFile.ERR_TOKEN_EXCHANGE_NOT_GRANTABLE, null, "$why (${FixRequest.hint(fix)})", fix = fix).copy(reservation = null)
+                refuse(r, pending, errorCode, null, "$why (${FixRequest.hint(fix)})", fix = fix).copy(reservation = null)
             }
         }
         val expires = slot.expiresAt?.let { "; expires $it" } ?: ""
@@ -1025,7 +1026,9 @@ class ProvisionEngine(
         if (r.kind != ProvisionFile.KIND_APPLICATION || gated.action == ChangeAction.ERROR || gated.readOnly) return gated
         val bound = gateBinding(r, gated, slug, reach)
         // SSO-3767 — nor turn token exchange ON without reach on its environment.
-        return if (bound.action == ChangeAction.ERROR) bound else gateTokenExchange(r, bound, file, envSlugs, slug, reach)
+        val exchange = if (bound.action == ChangeAction.ERROR) bound else gateTokenExchange(r, bound, file, envSlugs, slug, reach)
+        // SSO-3810 — nor token introspection: the same reach, for the same kind of reason.
+        return if (exchange.action == ChangeAction.ERROR) exchange else gateTokenIntrospection(r, exchange, file, envSlugs, slug, reach)
     }
 
     /**
@@ -1038,19 +1041,42 @@ class ProvisionEngine(
      * and the file says `true`): turning it off, omitting it, or re-declaring the stored value is never refused, and a create
      * already needs `manager` on the parent ([gateObject]).
      */
-    private fun gateTokenExchange(r: ProvisionResource, change: PlannedChange, file: ProvisionFile, envSlugs: Map<String, String>, slug: String?, reach: Reach): PlannedChange {
-        if (change.action != ChangeAction.UPDATE || ProvisionFile.SPEC_ALLOW_TOKEN_EXCHANGE !in change.diff) return change
-        if (!coerceBool(r.spec[ProvisionFile.SPEC_ALLOW_TOKEN_EXCHANGE])) return change
+    private fun gateTokenExchange(r: ProvisionResource, change: PlannedChange, file: ProvisionFile, envSlugs: Map<String, String>, slug: String?, reach: Reach): PlannedChange =
+        gateEnvironmentWideSetting(
+            r, change, file, envSlugs, slug, reach,
+            ProvisionFile.SPEC_ALLOW_TOKEN_EXCHANGE, ProvisionFile.ERR_TOKEN_EXCHANGE_NOT_GRANTABLE, TOKEN_EXCHANGE_WORKSPACE_NOTE,
+        )
+
+    /**
+     * SSO-3810 (oauthy SSO-3810) — turning `allowTokenIntrospection` ON for an EXISTING application needs `manager` on its
+     * environment, exactly like [gateTokenExchange]: an introspecting client reads the metadata of every token the
+     * environment issues (other applications' included), so an identity that manages one application may not grant it to
+     * itself. product-api answers `403 token_introspection_not_grantable`; the plan says so first. Turning it off, omitting
+     * it, or re-declaring the stored value is never refused.
+     */
+    private fun gateTokenIntrospection(r: ProvisionResource, change: PlannedChange, file: ProvisionFile, envSlugs: Map<String, String>, slug: String?, reach: Reach): PlannedChange =
+        gateEnvironmentWideSetting(
+            r, change, file, envSlugs, slug, reach,
+            ProvisionFile.SPEC_ALLOW_TOKEN_INTROSPECTION, ProvisionFile.ERR_TOKEN_INTROSPECTION_NOT_GRANTABLE, TOKEN_INTROSPECTION_WORKSPACE_NOTE,
+        )
+
+    /** The shared rule of [gateTokenExchange] / [gateTokenIntrospection]: a boolean [field] the update TURNS ON needs `manager` on the parent. */
+    private fun gateEnvironmentWideSetting(
+        r: ProvisionResource, change: PlannedChange, file: ProvisionFile, envSlugs: Map<String, String>, slug: String?, reach: Reach,
+        field: String, errorCode: String, workspaceNote: String,
+    ): PlannedChange {
+        if (change.action != ChangeAction.UPDATE || field !in change.diff) return change
+        if (!coerceBool(r.spec[field])) return change
         val parent = parentRef(r, file, envSlugs, slug, reach) ?: return change
         if (reach.managesParent(parent)) return change
         val appAccess = Access.entries.firstOrNull { it.label == change.access }
-        val why = "turning ${ProvisionFile.SPEC_ALLOW_TOKEN_EXCHANGE} on for ${r.key} requires `manager` on its environment $parent — the reach that may create an " +
-            "application there; managing the application alone is not enough (product-api answers `403 ${ProvisionFile.ERR_TOKEN_EXCHANGE_NOT_GRANTABLE}`)"
+        val why = "turning $field on for ${r.key} requires `manager` on its environment $parent — the reach that may create an " +
+            "application there; managing the application alone is not enough (product-api answers `403 $errorCode`)"
         return if (parent.startsWith("$OBJECT_TYPE_WORKSPACE:")) {
-            refuse(r, change, ProvisionFile.ERR_TOKEN_EXCHANGE_NOT_GRANTABLE, appAccess, "$why ($TOKEN_EXCHANGE_WORKSPACE_NOTE)", fixNote = TOKEN_EXCHANGE_WORKSPACE_NOTE)
+            refuse(r, change, errorCode, appAccess, "$why ($workspaceNote)", fixNote = workspaceNote)
         } else {
             val fix = FixRequest.manager(subject, parent, why)
-            refuse(r, change, ProvisionFile.ERR_TOKEN_EXCHANGE_NOT_GRANTABLE, appAccess, "$why (${FixRequest.hint(fix)})", fix = fix)
+            refuse(r, change, errorCode, appAccess, "$why (${FixRequest.hint(fix)})", fix = fix)
         }
     }
 
@@ -1571,7 +1597,11 @@ class ProvisionEngine(
             val (plane, n) = locate { it.getApplication(id) } ?: return@forEach skip("application:$id — listed as reachable but not readable in any environment")
             val spec = linkedMapOf<String, Any?>("clientId" to id, "displayName" to (n.str("displayName") ?: id))
             n.str("clientType")?.let { spec["clientType"] = it }
-            listOf("grantTypes", "redirectUris", "postLogoutRedirectUris", "scopes").forEach { f -> (plain(n[f] ?: return@forEach) as? List<*>)?.takeIf { it.isNotEmpty() }?.let { spec[f] = it } }
+            listOf("grantTypes", "redirectUris", "postLogoutRedirectUris", "scopes").forEach { f ->
+                // SSO-3856 — an imported file never declares an operator-plane scope: it could not be applied.
+                val value = plain(n[f] ?: return@forEach).let { if (f == "scopes") withoutOperatorPlaneScopes(it) else it }
+                (value as? List<*>)?.takeIf { it.isNotEmpty() }?.let { spec[f] = it }
+            }
             val confidential = !n.str("clientType").equals("public", ignoreCase = true)
             add(
                 ProvisionFile.KIND_APPLICATION, uniqueName(ProvisionFile.KIND_APPLICATION, n.str("displayName") ?: id), environmentField(plane), plane, id, access, spec,
@@ -1830,7 +1860,10 @@ class ProvisionEngine(
                 // `allowedAuthorizationDetailTypes: []` is declared, and clears).
                 val fields = listOf("displayName", "redirectUris", "postLogoutRedirectUris", "scopes", "grantTypes", ProvisionFile.SPEC_CLIENT_AUTHENTICATION_METHODS, ProvisionFile.SPEC_FEDERATED_TRUST) +
                     ProvisionFile.APPLICATION_SETTING_FIELDS
-                val live = n.toMap(fields)
+                // SSO-3856 — the live client's operator-plane scopes (`platform:` granted by an operator, `admin:`) are not
+                // this file's to converge: the hub keeps them across our update and refuses them on our create, so
+                // comparing them would plan a change on every run that applying can never make.
+                val live = n.toMap(fields).mapValues { (field, value) -> if (field == "scopes") withoutOperatorPlaneScopes(value) else value }
                 val want = desired.filterKeys { it in fields }
                 val id = n.str("clientId") ?: n.str("client_id") ?: ""
                 Live(id, diffOf(want, live), buildMap { (plain(n["redirectUris"] ?: return@buildMap) as? List<*>)?.firstOrNull()?.toString()?.let { put("redirectUri", it) } }, owner = ProvisionApi.ownerOf(n))
@@ -2795,6 +2828,22 @@ class ProvisionEngine(
                 }
                 "$why.\n$toFix"
             }
+            ProvisionFile.ERR_TOKEN_INTROSPECTION_NOT_GRANTABLE -> {
+                val parent = runCatching { planeParentRef(slug, Reach()) }.getOrElse { "$OBJECT_TYPE_WORKSPACE:${workspaceId ?: "(this workspace)"}" }
+                val why = "turning ${ProvisionFile.SPEC_ALLOW_TOKEN_INTROSPECTION} on requires `manager` on the application's environment $parent " +
+                    "(the reach that may create an application there); managing the application alone is not enough"
+                val toFix = if (parent.startsWith("$OBJECT_TYPE_WORKSPACE:")) {
+                    FixRequest.render(emptyList(), listOf("${r.kind} ${r.name}: $TOKEN_INTROSPECTION_WORKSPACE_NOTE"))
+                } else {
+                    FixRequest.render(listOf(FixRequest.manager(subject, parent, "${ProvisionFile.ERR_TOKEN_INTROSPECTION_NOT_GRANTABLE} — $why")))
+                }
+                "$why.\n$toFix"
+            }
+            ProvisionFile.ERR_TOKEN_INTROSPECTION_REQUIRES_CONFIDENTIAL_CLIENT ->
+                "${ProvisionFile.SPEC_ALLOW_TOKEN_INTROSPECTION}: true needs a client that authenticates (a secret, private_key_jwt or federated_assertion); " +
+                    "a public client cannot hold it, and a client that holds it cannot be made public — fix spec.clientType / spec.clientAuthenticationMethods, or drop the setting$detail"
+            ProvisionFile.ERR_INVALID_ACCESS_TOKEN_FORMAT ->
+                "spec.${ProvisionFile.SPEC_ACCESS_TOKEN_FORMAT} must be ${ProvisionFile.ACCESS_TOKEN_FORMATS.joinToString(" or ") { "'$it'" }}$detail"
             ProvisionFile.ERR_TOKEN_EXCHANGE_REQUIRES_CONFIDENTIAL_CLIENT ->
                 "${ProvisionFile.SPEC_ALLOW_TOKEN_EXCHANGE}: true needs a client that authenticates (a secret, private_key_jwt or federated_assertion); " +
                     "a public client cannot hold it, and a client that holds it cannot be made public — fix spec.clientType / spec.clientAuthenticationMethods, or drop the setting$detail"
@@ -2833,7 +2882,8 @@ class ProvisionEngine(
      *    expired since the plan, or reserved for another plane; nothing was created. Re-plan; an admin reserves again.
      *  - `409 client_id_taken`: the name exists (someone created it since the reservation); the slot is used up and a slot
      *    never adopts a live application — the right that fits now is `owner` on it.
-     *  - `403 token_exchange_not_grantable`: a slot never includes turning token exchange on (the plan refuses it first).
+     *  - `403 token_exchange_not_grantable` / `403 token_introspection_not_grantable`: a slot never includes turning token
+     *    exchange or token introspection on (the plan refuses both first).
      */
     private fun reservedCreateFailure(r: ProvisionResource, ex: ProductApiException, slot: CreationSlot): ProvisionException? {
         val ref = FixRequest.applicationRef(slot.clientId)
@@ -2847,11 +2897,12 @@ class ProvisionEngine(
                 "${r.key}: ${slot.clientId} already exists (HTTP 409 client_id_taken) — it was created after the reservation, so the creation slot is used up and " +
                     "was not applied to it (a creation approval never adopts a live application). If this repository is to own it, a workspace admin grants it: " +
                     "`${FixRequest.grantCommand(subject, RELATION_OWNER, ref)}`; otherwise declare it `readOnly: true` or pick another clientId."
-            ex.errorCode == ProvisionFile.ERR_TOKEN_EXCHANGE_NOT_GRANTABLE ->
-                "${r.key}: ${ProvisionFile.ERR_TOKEN_EXCHANGE_NOT_GRANTABLE} — a creation slot does not include turning ${ProvisionFile.SPEC_ALLOW_TOKEN_EXCHANGE} on " +
-                    "(that needs `manager` on the plane); nothing was created and the slot is kept. Drop `${ProvisionFile.SPEC_ALLOW_TOKEN_EXCHANGE}: true` from the file, " +
+            else -> {
+                val (field, code, _) = SLOT_EXCLUDED_SETTINGS.firstOrNull { it.second == ex.errorCode } ?: return null
+                "${r.key}: $code — a creation slot does not include turning $field on " +
+                    "(that needs `manager` on the plane); nothing was created and the slot is kept. Drop `$field: true` from the file, " +
                     "or have a workspace admin apply it from their own session."
-            else -> return null
+            }
         }
         return ProvisionException(message)
     }
@@ -2938,6 +2989,10 @@ class ProvisionEngine(
     }
 
     /** Fields of [desired] whose normalised value differs from [live] (lists compare as sets; numbers/booleans as text). */
+    /** SSO-3856 — a live scope list without its operator-plane (`platform:` / `admin:`) members; anything else unchanged. */
+    private fun withoutOperatorPlaneScopes(value: Any?): Any? =
+        (value as? List<*>)?.filterNot { it != null && ProvisionFile.isReservedOperatorPlaneScope(it.toString()) } ?: value
+
     private fun diffOf(desired: Map<String, Any?>, live: Map<String, Any?>): Map<String, String> {
         val diff = LinkedHashMap<String, String>()
         desired.forEach { (field, want) ->
@@ -3068,6 +3123,21 @@ class ProvisionEngine(
          * without a fixed id: a creation slot names exactly one client id, so an auto-generated one can never be approved.
          */
         const val DECLARE_CLIENT_ID_NOTE = "declare `spec.clientId` to make its creation approvable (a workspace admin then reserves that one name for this identity)"
+
+        /** SSO-3810 — why a production-plane `token_introspection_not_grantable` has no item (as [TOKEN_EXCHANGE_WORKSPACE_NOTE]). */
+        const val TOKEN_INTROSPECTION_WORKSPACE_NOTE = "not a grantable right: turning token introspection on for a production-plane application needs `manager` " +
+            "on the workspace, which is never granted to a repository identity — a workspace admin applies this file from their own session " +
+            "(or drop `allowTokenIntrospection: true` from the file)"
+
+        /**
+         * SSO-3792 (oauthy ADR 2026-10-17 §3) — the parent-manager-gated settings a creation slot does NOT lift, each with
+         * product-api's refusal code and the production-plane note: `allowTokenExchange` (SSO-3758) and
+         * `allowTokenIntrospection` (SSO-3810, gated at a slot create by product-api's `introspectionGate`).
+         */
+        private val SLOT_EXCLUDED_SETTINGS: List<Triple<String, String, String>> = listOf(
+            Triple(ProvisionFile.SPEC_ALLOW_TOKEN_EXCHANGE, ProvisionFile.ERR_TOKEN_EXCHANGE_NOT_GRANTABLE, TOKEN_EXCHANGE_WORKSPACE_NOTE),
+            Triple(ProvisionFile.SPEC_ALLOW_TOKEN_INTROSPECTION, ProvisionFile.ERR_TOKEN_INTROSPECTION_NOT_GRANTABLE, TOKEN_INTROSPECTION_WORKSPACE_NOTE),
+        )
 
         const val WORKSPACE_PARENT_NOTE = "not a grantable right: `manager` on the workspace is never granted to a repository identity — a workspace admin creates it, then grants this identity `owner` on it (or declare it `readOnly: true`)"
 

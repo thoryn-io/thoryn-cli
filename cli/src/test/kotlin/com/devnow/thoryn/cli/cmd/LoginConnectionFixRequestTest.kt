@@ -242,6 +242,24 @@ class LoginConnectionFixRequestTest : CommandTestBase() {
         assertThat(err).contains("${FixRequest.OPTION_BROWSER_HEADING} $link").doesNotContain(FixRequest.NO_CONSENT_LINK_LINE)
         val doc = request(out)
         assertThat(doc["options"]["consentUrl"].asString()).isEqualTo(link)
+        // SSO-3738 — with web consent, Option 1 is the approve command for this run (log and request alike); the raw
+        // set-plan-profile line is not relayed, though the item still carries it as data.
+        val approve = "thoryn access approve thoryn-io/thoryn-cli/38547022158"
+        assertThat(doc["options"]["cli"].asString()).isEqualTo(approve)
+        assertThat(err).contains("${FixRequest.OPTION_CLI_HEADING}\n      $approve\n").doesNotContain(doc["missing"][0]["cli"].asString())
+        assertThat(doc["missing"][0]["cli"].asString()).startsWith("thoryn workload-identity trusts set-plan-profile")
+    }
+
+    @Test
+    fun `without THORYN_CONSENT_URL the raw command is printed under the check-each-line warning and options carry that body`() {
+        jobIn(planEnvironment)
+        val out = tempHome.resolve("thoryn-provision-request.json")
+
+        val (_, _, err) = runCli("login", "--connection", writeConnection().toString(), "--fix-request", out.toString())
+
+        val doc = request(out)
+        assertThat(err).contains("${FixRequest.OPTION_CLI_HEADING}\n  ${FixRequest.CHECK_EACH_LINE_WARNING}").contains(doc["missing"][0]["cli"].asString())
+            .doesNotContain("thoryn access approve")
         assertThat(doc["options"]["cli"].asString()).isEqualTo(expectedCommandBody(doc))
     }
 

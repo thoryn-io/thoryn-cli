@@ -89,7 +89,7 @@ on:
         type: string
         default: ".thoryn/workflow.yaml"
       consent-url:
-        description: "SSO-3723 — base URL of the Thoryn GitHub App's browser consent (THORYN_CONSENT_URL): a red job prints its fix as the CLI commands AND a link for this run. Empty: .thoryn/workflow.yaml consentUrl, else the commands alone"
+        description: "SSO-3723 — base URL of the Thoryn GitHub App's browser consent (THORYN_CONSENT_URL): a red job prints its fix as `thoryn access approve <owner>/<repo>/<run_id>` (SSO-3738) AND a link for this run, both the same hub consent. Empty: .thoryn/workflow.yaml consentUrl, else the raw commands alone under a check-each-line warning"
         required: false
         type: string
         default: ""

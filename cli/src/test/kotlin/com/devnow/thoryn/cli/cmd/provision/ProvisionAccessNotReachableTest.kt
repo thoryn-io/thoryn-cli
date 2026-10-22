@@ -163,6 +163,11 @@ class ProvisionAccessNotReachableTest : CommandTestBase() {
         val link = "https://app.thoryn.io/github/consent/run/thoryn-io/thoryn-cicd/38751887466"
         assertThat(err).contains("${FixRequest.OPTION_BROWSER_HEADING} $link").contains("Nothing was changed.")
         assertThat(request(out)["options"]["consentUrl"].asString()).isEqualTo(link)
+        // SSO-3738 — Option 1 is the approve command for this run; the raw line (SSO-3792: the reserve command) is not printed.
+        assertThat(err).contains("thoryn access approve thoryn-io/thoryn-cicd/38751887466")
+            .doesNotContain("thoryn access grant").doesNotContain("thoryn access reserve")
+            .contains("  - creator on application:forge-oauth2-proxy in production for $subject: ")
+        assertThat(request(out)["options"]["cli"].asString()).isEqualTo("thoryn access approve thoryn-io/thoryn-cicd/38751887466")
         assertThat(request(out)["missing"].single()["kind"].asString()).isEqualTo("creator")
         assertThat(api.writes).isEmpty()
     }

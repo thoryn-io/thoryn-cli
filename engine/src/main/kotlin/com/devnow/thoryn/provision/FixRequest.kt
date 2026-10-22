@@ -37,6 +37,12 @@ import java.nio.file.Path
  * [NO_CONSENT_LINK_LINE]). The request carries the same two as [Options] (`options.cli`, `options.consentUrl`). A
  * refusal whose fix is a FILE edit (a connection.json without its apply environment, a scope outside the trust's)
  * has no item: it is a note, and the request is still written so the App can show it.
+ *
+ * **SSO-3738 — one consent flow, two entry points** (product owner 2026-10-16). When the run has a consent link,
+ * Option 1 is `thoryn access approve <owner>/<repository>/<run_id>` ([approveCommand]), which opens the SAME hub consent
+ * the Option-2 link opens; the raw grant lines are printed only when there is no web consent, under
+ * [CHECK_EACH_LINE_WARNING]. Every item still carries its own `cli` command — the data, and what a deployment without
+ * web consent relays. The document's shape is unchanged (still [VERSION] 1): only what `options.cli` holds moved.
  */
 data class FixRequest(
     /** The schema version of this document ([VERSION]). */
@@ -65,15 +71,21 @@ data class FixRequest(
     val consentUrl: String? = null,
 ) {
     /**
-     * SSO-3723 — the two options a reader has, as DATA: [Options.cli] is the Option-1 body exactly as the log prints it
-     * (the commands and the file edits, one rendering), [Options.consentUrl] the Option-2 link or null.
+     * SSO-3723 — the two options a reader has, as DATA: [Options.cli] is Option 1, [Options.consentUrl] the Option-2 link
+     * or null. SSO-3738: with a consent link and something to approve, [Options.cli] is exactly the approve command
+     * (`thoryn access approve <owner>/<repository>/<run_id>`, [approveCommand]) — the CLI entry point to the same consent
+     * the link opens; otherwise it is the Option-1 body as the log prints it ([renderOption1Body]: the raw commands under
+     * [CHECK_EACH_LINE_WARNING], and the file edits).
      */
     data class Options(val cli: String?, val consentUrl: String?) {
         fun toStructured(): Map<String, Any?> = linkedMapOf("cli" to cli, "consentUrl" to consentUrl)
     }
 
     /** The two options of this request — what the check-run summary shows and what the log printed. */
-    val options: Options get() = Options(renderOption1Body(missing, notes).ifEmpty { null }, consentUrl)
+    val options: Options get() = Options(
+        approveRun(missing, consentUrl)?.let { approveCommand(it) } ?: renderOption1Body(missing, notes).ifEmpty { null },
+        consentUrl,
+    )
 
     /** GitHub's names and immutable ids of the repository (`GITHUB_REPOSITORY*` / the OIDC `repository*` claims). */
     data class Repository(val owner: String?, val ownerId: Long?, val repository: String?, val repositoryId: Long?)
@@ -208,6 +220,37 @@ data class FixRequest(
         const val NO_CONSENT_LINK_LINE: String = "Run through the Thoryn GitHub App to get a browser link."
 
         /**
+         * SSO-3738 — the line above the raw commands when there is NO web consent (no consent link): they are text the
+         * repository's own job wrote, and nothing has checked them against the repository's trust or its `.thoryn/` file.
+         * The same words the check run uses (oauthy `ProvisionFixPath.renderOptions`, SSO-3737).
+         */
+        const val CHECK_EACH_LINE_WARNING: String =
+            "Check each line before running it: these commands were written by the run that failed, and without web consent " +
+                "nothing has verified them against the repository's trust or its .thoryn/ file."
+
+        /** SSO-3738 — what the approve command does, printed under it: it grants nothing, it opens the consent. */
+        const val APPROVE_EXPLANATION: String =
+            "It opens the same approval as Option 2 — Thoryn's consent screen, which lists the rights below; nothing is " +
+                "granted until a workspace admin approves there. The command grants nothing itself."
+
+        /** SSO-3738 — the heading of the file edits when Option 1 is the approve command: approving does not make them. */
+        const val FILE_EDITS_HEADING: String = "The file must change too (neither option does this):"
+
+        /** SSO-3738 — `thoryn access approve <owner>/<repository>/<run_id>`: the CLI entry point to the run's consent. */
+        fun approveCommand(run: ConsentRun): String = "thoryn access approve ${run.ref}"
+
+        /**
+         * SSO-3738 — the run Option 1 approves, or null when Option 1 is NOT the approve command: there is no consent link
+         * (no web consent configured, or not a GitHub Actions run), the link does not name a run, or nothing in [items] is
+         * a right the consent can grant (only file edits, or only a dispute an admin decides — the orchestrator never asks
+         * for those, so the consent would have nothing to show).
+         */
+        fun approveRun(items: List<MissingRight>, consentUrl: String?): ConsentRun? {
+            if (items.none { it.cli != null }) return null
+            return ConsentRun.ofConsentLink(consentUrl)
+        }
+
+        /**
          * SSO-3723 — the consent link for ONE run: `<base>/github/consent/run/<owner>/<repository>/<runId>`, built from the
          * job's own GitHub context; null unless the base URL, both repository names and the run id are all known. The
          * opaque consent id the App mints after the run completes is unknowable here, so the link is resolvable BY RUN
@@ -216,7 +259,9 @@ data class FixRequest(
         fun consentUrl(baseUrl: String?, owner: String?, repository: String?, runId: Long?): String? {
             val base = baseUrl?.trim()?.trimEnd('/')?.takeIf { it.startsWith("https://") || it.startsWith("http://") } ?: return null
             if (owner.isNullOrBlank() || repository.isNullOrBlank() || runId == null) return null
-            return "$base/github/consent/run/${owner.trim()}/${repository.trim()}/$runId"
+            // SSO-3738 — the names go into a link a person opens: GitHub's grammar, strictly, or no link at all.
+            val run = ConsentRun.of(owner.trim(), repository.trim(), runId.toString()) ?: return null
+            return run.urlUnder(base)
         }
 
         /** `thoryn access grant <subject> <relation> <object>` — THE spelling of a grant, for the prose and the JSON alike. */
@@ -332,15 +377,23 @@ data class FixRequest(
 
         /**
          * THE rendering of what is missing — the "To fix" block the CLI prints on stderr after every refusal and what a
-         * reader copies. SSO-3723: two options in one fixed shape. Option 1 ([OPTION_CLI_HEADING]) lists each missing
-         * right — its kind and object, the reason, the command (indented, one line) and, for a placeholder trust id, the
-         * command that resolves it — then every [notes] entry as a FILE edit. Option 2 ([OPTION_BROWSER_HEADING]) is the
-         * run's consent link, or [NO_CONSENT_LINK_LINE] when none can be built. The same text is the request's
-         * [Options]. Nothing to fix (no item, no note) ⇒ empty string.
+         * reader copies. SSO-3723: two options in one fixed shape, Option 2 ([OPTION_BROWSER_HEADING]) always the last
+         * line — the run's consent link, or [NO_CONSENT_LINK_LINE] when none can be built.
+         *
+         * SSO-3738 (product owner 2026-10-16: one consent flow, two entry points) — Option 1 ([OPTION_CLI_HEADING]) is:
+         *  - **with a consent link and something to approve** ([approveRun]): `thoryn access approve <owner>/<repo>/<run_id>`
+         *    and [APPROVE_EXPLANATION], then each missing right WITHOUT its command (what the consent screen will show),
+         *    then the file edits under [FILE_EDITS_HEADING]. The raw grant lines are not printed: the consent re-checks
+         *    them; a pasted line would not.
+         *  - **otherwise**: [CHECK_EACH_LINE_WARNING] (when there is any command at all), each right with its command and,
+         *    for a placeholder trust id, the command that resolves it, then every note as a file edit.
+         *
+         * The same Option 1 is the request's [Options.cli]. Nothing to fix (no item, no note) ⇒ empty string.
          */
         fun render(items: List<MissingRight>, notes: List<String> = emptyList(), consentUrl: String? = null, writtenTo: Path? = null): String {
-            val body = renderOption1Body(items, notes)
-            if (body.isEmpty()) return ""
+            if (items.isEmpty() && notes.isEmpty()) return ""
+            val approve = approveRun(items, consentUrl)
+            val body = if (approve != null) renderApproveBody(approve, items, notes) else renderOption1Body(items, notes)
             return buildString {
                 appendLine(OPTION_CLI_HEADING)
                 appendLine(body)
@@ -349,29 +402,73 @@ data class FixRequest(
             }
         }
 
-        /** The body of Option 1 — the items then the notes, without the heading (the request's `options.cli`). */
-        fun renderOption1Body(items: List<MissingRight>, notes: List<String> = emptyList()): String = buildString {
+        /**
+         * SSO-3738 — Option 1 when the run has a consent: the approve command, what it does, the rights the consent will
+         * list (no command lines), and the file edits approving does not make.
+         */
+        fun renderApproveBody(run: ConsentRun, items: List<MissingRight>, notes: List<String> = emptyList()): String = buildString {
+            appendLine("      ${approveCommand(run)}")
+            appendLine("  $APPROVE_EXPLANATION")
             items.forEach { item ->
-                val target = when {
-                    // SSO-3792 — a creation slot names its plane: the admin approves the name AND where it is created.
-                    item.kind == Kind.CREATOR -> "${item.objectRef ?: "(unknown object)"} in ${item.environment ?: "production"}"
-                    else -> item.objectRef ?: item.environment?.let { "GitHub environment '$it'" } ?: "(unknown object)"
-                }
-                appendLine("  - ${item.kind.wire} on $target" + (item.subject?.let { " for $it" } ?: "") + ": ${item.reason}")
+                appendLine(itemLine(item.copy(reason = reasonForDisplay(item.reason, item, approving = true))))
+                // A dispute is shown, never asked for: the consent will not list it (the orchestrator never pushes one).
+                if (item.cli == null) appendLine(DISPUTE_LINE)
+            }
+            if (notes.isNotEmpty()) {
+                appendLine("  $FILE_EDITS_HEADING")
+                notes.forEach { appendLine("  - $it") }
+            }
+        }.trimEnd()
+
+        /**
+         * The body of Option 1 WITHOUT web consent — the items with their commands then the notes, without the heading
+         * (the request's `options.cli` in that case). SSO-3738: the commands are preceded by [CHECK_EACH_LINE_WARNING].
+         */
+        fun renderOption1Body(items: List<MissingRight>, notes: List<String> = emptyList()): String = buildString {
+            if (items.any { it.cli != null }) appendLine("  $CHECK_EACH_LINE_WARNING")
+            items.forEach { item ->
+                appendLine(itemLine(item))
                 when {
                     item.cli != null -> {
                         appendLine("      ${item.cli}")
                         if (item.cli.contains(TRUST_ID_PLACEHOLDER)) appendLine("      ($TRUST_ID_PLACEHOLDER: `$LIST_TRUSTS_COMMAND` shows each trust with its id and pins — the one named above, or the one pinned to this repository)")
                     }
-                    else -> appendLine("      (no command runs for you: an admin decides — declare it `readOnly: true`, or move the ownership as the reason says)")
+                    else -> appendLine(DISPUTE_LINE)
                 }
             }
             notes.forEach { appendLine("  - $it") }
         }.trimEnd()
 
+        private const val DISPUTE_LINE: String =
+            "      (no command runs for you: an admin decides — declare it `readOnly: true`, or move the ownership as the reason says)"
+
+        /** One missing right as a line: its kind, object, subject and reason. */
+        private fun itemLine(item: MissingRight): String {
+            val target = when (item.kind) {
+                // SSO-3792 — a creation slot names its plane: the admin approves the name AND where it is created.
+                Kind.CREATOR -> "${item.objectRef ?: "(unknown object)"} in ${item.environment ?: "production"}"
+                else -> item.objectRef ?: item.environment?.let { "GitHub environment '$it'" } ?: "(unknown object)"
+            }
+            return "  - ${item.kind.wire} on $target" + (item.subject?.let { " for $it" } ?: "") + ": ${item.reason}"
+        }
+
         /** The prose hint the engine appends to a row's reason for a right it can name — the same [MissingRight.cli]. */
         fun hint(item: MissingRight): String = item.cli?.let {
             if (item.kind == Kind.CREATOR) "a workspace admin approves its creation with `$it` (or on the consent screen)" else "a workspace admin grants it with `$it`"
         } ?: ""
+
+        /** SSO-3738 — what replaces [hint] in a printed reason when the run has a consent: approve, don't paste. */
+        const val APPROVE_HINT: String = "a workspace admin approves it on Thoryn's consent screen — `thoryn access approve`, To fix below"
+
+        /**
+         * SSO-3738 — [reason] as PRINTED: when [approving] (the run has a consent, [approveRun]) the engine's inline grant
+         * command ([hint] of [fix]) is replaced by [APPROVE_HINT], so the log carries no raw grant line to paste; otherwise
+         * the reason unchanged. The request's data (`missing[].reason`, `missing[].cli`) is never rewritten.
+         */
+        fun reasonForDisplay(reason: String, fix: MissingRight?, approving: Boolean): String {
+            if (!approving || fix == null) return reason
+            val h = hint(fix)
+            return if (h.isEmpty()) reason else reason.replace(h, APPROVE_HINT)
+        }
     }
 }

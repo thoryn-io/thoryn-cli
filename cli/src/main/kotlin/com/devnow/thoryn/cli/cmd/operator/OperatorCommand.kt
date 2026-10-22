@@ -25,12 +25,13 @@ import java.util.concurrent.Callable
         OperatorLoginCommand::class,
         OperatorLogoutCommand::class,
         OperatorCustomDomainCommand::class,
+        OperatorPlatformScopesCommand::class,
     ],
 )
 class OperatorCommand : Callable<Int> {
     override fun call(): Int {
         System.err.println("Usage: thoryn operator <subcommand>")
-        System.err.println("Subcommands: login | logout | custom-domain")
+        System.err.println("Subcommands: login | logout | custom-domain | platform-scopes")
         System.err.println()
         System.err.println("  1. thoryn operator login --issuer <platform issuer>      # passkey sign-in on 'thoryn'")
         System.err.println("  2. ${OperatorSession.PORT_FORWARD_COMMAND}   # in another terminal")

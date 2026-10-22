@@ -99,7 +99,7 @@ release tag it pins to have been cut.
 | `runs-on` | no | `ubuntu-latest` | a label, or a JSON array of labels | self-hosted pools; the runner needs bash, gh, jq, curl (Java is set up) |
 | `timeout-minutes` | no | `30` | positive integer | each job |
 | `config` | no | `.thoryn/workflow.yaml` | relative path | the run-time configuration (§5) |
-| `consent-url` | no | `""` | `https://` base URL, no query/fragment | SSO-3723 — `THORYN_CONSENT_URL` for the CLI: a red job's `To fix — Option 2, in the browser:` link, `<url>/github/consent/run/<owner>/<repo>/<run_id>`; empty ⇒ §5 `consentUrl`, else the CLI commands alone |
+| `consent-url` | no | `""` | `https://` base URL, no query/fragment | SSO-3723 — `THORYN_CONSENT_URL` for the CLI: a red job's `To fix — Option 2, in the browser:` link, `<url>/github/consent/run/<owner>/<repo>/<run_id>`, and (SSO-3738) Option 1 `thoryn access approve <owner>/<repo>/<run_id>` for the same consent; empty ⇒ §5 `consentUrl`, else the raw CLI commands alone, under a check-each-line warning |
 
 Jobs **`plan`** and **`apply`**, each: `if: inputs.mode == '<mode>'`; `runs-on` from `inputs.runs-on`
 (`startsWith(…, '[') && fromJSON(…) || …`); `timeout-minutes` from the input; **`environment: ${{ inputs.<mode>-environment }}`
@@ -140,7 +140,7 @@ level; each value's grammar checked). Absent ⇒ the built-in defaults. Keys: `a
 connection defaults to the `connection.json` beside its file), `env` (`THORYN_*` names only, not workflow-owned, never
 credential-shaped; exported, never evaluated), `fixRequest` (default true), `consentUrl` (SSO-3723 — the browser
 consent base URL, `https://` without query or fragment; `THORYN_CONSENT_URL` for the CLI when the `consent-url` input is
-empty; default empty ⇒ the CLI commands alone), `apply.prune` / `apply.destroy` (default false) / `apply.confirm`
+empty; default empty ⇒ the raw CLI commands alone, under a check-each-line warning; set ⇒ Option 1 is `thoryn access approve`, SSO-3738), `apply.prune` / `apply.destroy` (default false) / `apply.confirm`
 (workspace slug). The check also confirms every configured file is committed.
 
 ## 6. A hand-written workflow (`custom.*`) — unsupported
@@ -155,3 +155,8 @@ contract can hold them. When configuration is not enough, file a product gap.
 
 `contractVersion: 1`. The rule ids above (`dispatch.*`, `stub.*`, `reusable.*`, `config.*`, `custom.*`, `common.*`) are
 the stable names the check prints and `--output json` carries.
+
+SSO-3738 did **not** bump it: what a valid stub or reusable workflow looks like is unchanged (same inputs, same
+`consentUrl` key) — only the text a red job prints moved (Option 1 is `thoryn access approve <owner>/<repo>/<run_id>`
+when a consent link exists). Nor did it bump the fix request's own `version` (still `1`): its shape is unchanged; only
+what `options.cli` holds moved, and the App renders its own options from the run rather than reading that field.

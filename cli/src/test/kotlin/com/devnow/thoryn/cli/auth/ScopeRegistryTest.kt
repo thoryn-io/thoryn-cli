@@ -64,6 +64,15 @@ class ScopeRegistryTest {
     }
 
     @Test
+    fun `the default login scope requests the github-connections family so an admin can grant it onward`() {
+        // SSO-3856 — no command calls the GitHub-connection API yet; the family is requested so a workspace admin
+        // holds it and can delegate it (oathy ADR 2026-10-19-operator-grants-platform-client-scopes, "The grant
+        // order" step 2). Hub V206 grants it to `cli`; it must be deployed before a release carrying this default.
+        val default = com.devnow.thoryn.cli.config.ThorynConfig.DEFAULT_SCOPE.split(' ')
+        assertThat(default).contains("tenant:github-connections.read", "tenant:github-connections.write")
+    }
+
+    @Test
     fun `non-wildcard scope passes through unchanged`() {
         assertThat(ScopeRegistry.expand("openid offline_access"))
             .isEqualTo("openid offline_access")

@@ -340,6 +340,34 @@ class ProvisionCreationSlotTest : CommandTestBase() {
     }
 
     @Test
+    fun `a slot never includes token introspection — the plan refuses allowTokenIntrospection under a slot before any write`() {
+        api.seedSlot("forge-forgejo-login", subject)
+
+        val (exit, _, err) = plan(
+            """
+            apiVersion: thoryn.io/provision/v1
+            resources:
+              - kind: application
+                name: forge-forgejo-login
+                spec:
+                  clientId: forge-forgejo-login
+                  displayName: "Forgejo login"
+                  redirectUris: ["https://forge.example.com/cb"]
+                  allowTokenIntrospection: true
+            """,
+        )
+
+        assertThat(exit).isEqualTo(CommandSupport.EXIT_HTTP_ERROR)
+        assertThat(err).contains("token_introspection_not_grantable — application/forge-forgejo-login is to be created under a creation slot")
+            .doesNotContain("will create (reserved")
+        val doc = request(out)
+        assertThat(doc["missing"].isEmpty).isTrue()
+        assertThat(doc["notes"].single().asString()).contains(ProvisionEngine.TOKEN_INTROSPECTION_WORKSPACE_NOTE)
+        assertThat(api.slots).hasSize(1)
+        assertThat(api.writes).isEmpty()
+    }
+
+    @Test
     fun `a platform from before creation slots answers 404 for the listing — read as no slots, and the plan still asks for one`() {
         api.slotsSupported = false
 
@@ -379,6 +407,25 @@ class ProvisionCreationSlotTest : CommandTestBase() {
 
         assertThat(item.cli).isEqualTo(reserve)
         assertThat(FixRequest.hint(item)).contains("`$reserve`")
-        assertThat(FixRequest.renderOption1Body(listOf(item))).startsWith("  - creator on application:forge-forgejo-login in production for $subject: ")
+        // Without web consent: under the SSO-3738 check-each-line warning, the item with its plane, then the command.
+        assertThat(FixRequest.renderOption1Body(listOf(item)))
+            .startsWith("  ${FixRequest.CHECK_EACH_LINE_WARNING}\n")
+            .contains("\n  - creator on application:forge-forgejo-login in production for $subject: ")
+            .endsWith("\n      $reserve")
+    }
+
+    @Test
+    fun `with a consent link a creator item is listed with its plane under thoryn access approve — and no reserve line is printed`() {
+        val hinted = "access_not_owned — creating it needs a creation slot (${FixRequest.hint(FixRequest.creator(subject, "forge-forgejo-login", "production", "x"))})"
+        val item = FixRequest.creator(subject, "forge-forgejo-login", "production", hinted)
+        val link = "https://app.thoryn.io/github/consent/run/thoryn-io/thoryn-cicd/38751887466"
+
+        val rendered = FixRequest.render(listOf(item), consentUrl = link)
+
+        assertThat(rendered).contains("      thoryn access approve thoryn-io/thoryn-cicd/38751887466")
+            .contains("  - creator on application:forge-forgejo-login in production for $subject: ")
+            .contains(FixRequest.APPROVE_HINT)
+            .doesNotContain("thoryn access reserve")
+            .endsWith("${FixRequest.OPTION_BROWSER_HEADING} $link")
     }
 }

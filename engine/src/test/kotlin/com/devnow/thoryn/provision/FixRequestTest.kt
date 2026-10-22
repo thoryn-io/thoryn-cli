@@ -141,32 +141,74 @@ class FixRequestTest {
     private val link = "https://app.thoryn.io/github/consent/run/thoryn-io/thoryn-cli/38547022158"
 
     @Test
-    fun `render prints the two options in the fixed shape — the CLI block with items and notes, then the browser link`() {
+    fun `without web consent Option 1 is the raw commands under the check-each-line warning, then the notes — Option 2 says how to get a link`() {
         val item = FixRequest.owner(subject, "application:cli", "access_not_owned — …")
-        val rendered = FixRequest.render(listOf(item), listOf("application shared: a change to the file"), link)
-        assertThat(rendered.lines().first()).isEqualTo("To fix — Option 1, with the CLI (a workspace admin):")
+        val rendered = FixRequest.render(listOf(item), listOf("application shared: a change to the file"), null)
+        val lines = rendered.lines()
+        assertThat(lines[0]).isEqualTo("To fix — Option 1, with the CLI (a workspace admin):")
+        assertThat(lines[1]).isEqualTo("  ${FixRequest.CHECK_EACH_LINE_WARNING}")
         assertThat(rendered)
             .contains("\n  - owner on application:cli for $subject: access_not_owned — …\n      ${item.cli}\n")
             .contains("\n  - application shared: a change to the file\n")
-        assertThat(rendered.lines().last()).isEqualTo("To fix — Option 2, in the browser: $link")
-        // A note alone is still a fix (a file edit): the block is printed for it.
+            .doesNotContain("thoryn access approve")
+        assertThat(lines.last()).isEqualTo("To fix — Option 2, in the browser: ${FixRequest.NO_CONSENT_LINK_LINE}")
+        // A note alone is still a fix (a file edit): the block is printed for it — with no command, no warning.
         assertThat(FixRequest.render(emptyList(), listOf("connection.json: add auth.github.environment"), null))
             .startsWith(FixRequest.OPTION_CLI_HEADING).contains("  - connection.json: add auth.github.environment")
+            .doesNotContain(FixRequest.CHECK_EACH_LINE_WARNING)
     }
 
     @Test
-    fun `without a consent link Option 2 says how to get one — and the request's options carry exactly what was printed`() {
+    fun `with web consent Option 1 is thoryn access approve for the run — the rights listed without their raw commands, the notes apart, the link last`() {
+        val item = FixRequest.owner(subject, "application:cli", "access_not_owned — …")
+        val plan = FixRequest.planProfile(null, null, "thoryn-provision-e2e-plan", "thoryn-provision-e2e")
+        val rendered = FixRequest.render(listOf(item, plan), listOf("application shared: a change to the file"), link)
+        val lines = rendered.lines()
+        assertThat(lines[0]).isEqualTo(FixRequest.OPTION_CLI_HEADING)
+        assertThat(lines[1]).isEqualTo("      thoryn access approve thoryn-io/thoryn-cli/38547022158")
+        assertThat(lines[2]).isEqualTo("  ${FixRequest.APPROVE_EXPLANATION}")
+        assertThat(rendered)
+            .contains("\n  - owner on application:cli for $subject: access_not_owned — …\n")
+            .contains("\n  - plan_profile on GitHub environment 'thoryn-provision-e2e-plan': ")
+            .contains("\n  ${FixRequest.FILE_EDITS_HEADING}\n  - application shared: a change to the file\n")
+            // The raw grant lines are NOT relayed when a consent exists: the consent re-checks them, a pasted line would not.
+            .doesNotContain(item.cli!!)
+            .doesNotContain(plan.cli!!)
+            .doesNotContain("trusts list")
+            .doesNotContain(FixRequest.CHECK_EACH_LINE_WARNING)
+        assertThat(lines.last()).isEqualTo("To fix — Option 2, in the browser: $link")
+    }
+
+    @Test
+    fun `a consent link with nothing the consent could grant keeps Option 1 as the file edits or the dispute — no approve command`() {
+        val notesOnly = FixRequest.render(emptyList(), listOf("connection.json: add auth.github.environment"), link)
+        assertThat(notesOnly).doesNotContain("thoryn access approve").contains("  - connection.json: add auth.github.environment")
+        assertThat(notesOnly.lines().last()).isEqualTo("To fix — Option 2, in the browser: $link")
+        val dispute = FixRequest.ownedElsewhere(subject, "application:rp", "access_owned_elsewhere — …")
+        val disputeOnly = FixRequest.render(listOf(dispute), emptyList(), link)
+        assertThat(disputeOnly).doesNotContain("thoryn access approve").contains("(no command runs for you: an admin decides")
+        assertThat(FixRequest.approveRun(listOf(dispute), link)).isNull()
+        assertThat(FixRequest.approveRun(listOf(FixRequest.owner(subject, "application:cli", "…")), "https://app.thoryn.io/not-a-run-link")).isNull()
+    }
+
+    @Test
+    fun `the request's options carry Option 1 as data — the approve command with web consent, the warned body without`() {
         val item = FixRequest.manager(subject, "environment:env-1", "access_not_owned — …")
-        val rendered = FixRequest.render(listOf(item), emptyList(), null)
-        assertThat(rendered.lines().last()).isEqualTo("To fix — Option 2, in the browser: ${FixRequest.NO_CONSENT_LINK_LINE}")
-        val doc = json.readTree(request(listOf(item), notes = listOf("user x: a note")).copy(consentUrl = link).toJson())
-        assertThat(doc["options"]["cli"].asString()).isEqualTo(FixRequest.renderOption1Body(listOf(item), listOf("user x: a note")))
-        assertThat(doc["options"]["cli"].asString()).contains(item.cli!!).contains("user x: a note")
-        assertThat(doc["options"]["consentUrl"].asString()).isEqualTo(link)
+        val withConsent = json.readTree(request(listOf(item), notes = listOf("user x: a note")).copy(consentUrl = link).toJson())
+        assertThat(withConsent["options"]["cli"].asString()).isEqualTo("thoryn access approve thoryn-io/thoryn-cli/38547022158")
+        assertThat(withConsent["options"]["consentUrl"].asString()).isEqualTo(link)
+        // Every item still carries its own command — the data a deployment without web consent relays.
+        assertThat(withConsent["missing"][0]["cli"].asString()).isEqualTo(item.cli)
+        val without = json.readTree(request(listOf(item), notes = listOf("user x: a note")).toJson())
+        assertThat(without["options"]["cli"].asString()).isEqualTo(FixRequest.renderOption1Body(listOf(item), listOf("user x: a note")))
+        assertThat(without["options"]["cli"].asString()).startsWith("  ${FixRequest.CHECK_EACH_LINE_WARNING}").contains(item.cli!!).contains("user x: a note")
+        assertThat(without["options"]["consentUrl"].isNull).isTrue()
         val none = json.readTree(request(emptyList()).toJson())
         assertThat(none["options"]["cli"].isNull).isTrue()
         assertThat(none["options"]["consentUrl"].isNull).isTrue()
         assertThat(schema["properties"]["options"]["required"].toList().map { it.asString() }).containsExactlyInAnyOrder("cli", "consentUrl")
+        // The document's shape did not change: still version 1.
+        assertThat(withConsent["version"].asInt()).isEqualTo(1)
     }
 
     @Test

@@ -194,7 +194,8 @@ internal class FakeProductApi : Dispatcher() {
     /**
      * SSO-3792 — `ApplicationsService.create`'s gate (`whenCreatorOrSlot`): `manager` on the plane, OR an unexpired slot the
      * caller holds for exactly this client id on exactly this plane — claimed (removed) before the create. Answers the
-     * refusing response, or null to proceed. A slot never includes turning token exchange on (`403`, slot kept).
+     * refusing response, or null to proceed. A slot never includes turning token exchange or token introspection on
+     * (`403`, slot kept).
      */
     private fun applicationCreateGate(id: String, explicit: Boolean, env: String?, b: Map<String, Any?>): MockResponse? {
         if (releaseSlotsBeforeCreate) slots.clear()
@@ -202,6 +203,8 @@ internal class FakeProductApi : Dispatcher() {
         val slot = slots.firstOrNull { explicit && it["clientId"] == id && it["subject"] == caller && it["_env"] == env && it["expired"] != true }
             ?: return problem(404, "not_found")
         if (b["allowTokenExchange"] == true) return problem(403, "token_exchange_not_grantable")
+        // SSO-3810 — nor turning token introspection on (product-api's `introspectionGate` at a slot create, ADR §3).
+        if (b["allowTokenIntrospection"] == true) return problem(403, "token_introspection_not_grantable")
         slots.remove(slot)
         return null
     }
@@ -620,6 +623,16 @@ internal class FakeProductApi : Dispatcher() {
                 return problem(403, "token_exchange_not_grantable")
             }
         }
+        // SSO-3807 / SSO-3810 — the access-token format values, and introspection only for an authenticating client; turning
+        // introspection ON on an existing application needs `manager` on its plane (`403`), like token exchange.
+        b["accessTokenFormat"]?.let { if (it !in setOf("self-contained", "reference")) return problem(400, "invalid_access_token_format") }
+        if (merged["allowTokenIntrospection"] == true) {
+            val methods = (merged["clientAuthenticationMethods"] as? List<*>)?.map { it.toString() }
+            if (merged["clientType"] == "public" || methods?.contains("none") == true) return problem(400, "token_introspection_requires_confidential_client")
+            if (previous != null && previous["allowTokenIntrospection"] != true && b["allowTokenIntrospection"] == true && !holds(planeRef(env), "manager")) {
+                return problem(403, "token_introspection_not_grantable")
+            }
+        }
         return null
     }
 
@@ -628,6 +641,8 @@ internal class FakeProductApi : Dispatcher() {
         mapOf<String, Any?>(
             "allowTokenExchange" to false, "allowedAuthorizationDetailTypes" to emptyList<String>(),
             "refreshTokenSlidingWindow" to false, "refreshTokenAbsoluteMaxTtlSeconds" to 7_776_000L,
+            "allowTokenIntrospection" to false, "accessTokenFormat" to "self-contained",
+            "dpopAllowed" to false, "dpopRequired" to false,
         ) + withOwner(a, "application:${a["clientId"]}")
 
     /**

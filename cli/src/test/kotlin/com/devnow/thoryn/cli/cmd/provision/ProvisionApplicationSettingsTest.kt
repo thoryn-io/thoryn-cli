@@ -100,7 +100,10 @@ class ProvisionApplicationSettingsTest : CommandTestBase() {
 
         val change = engine().plan(f, false).changes.single()
         assertThat(change.action).isEqualTo(ChangeAction.UPDATE)
-        assertThat(change.diff.keys).containsExactlyElementsOf(ProvisionFile.APPLICATION_SETTING_FIELDS)
+        // The four this file declares (SSO-3810 / SSO-3807 added two more settings it does not declare, so they are not diffed).
+        assertThat(change.diff.keys).containsExactly(
+            "allowTokenExchange", "allowedAuthorizationDetailTypes", "refreshTokenSlidingWindow", "refreshTokenAbsoluteMaxTtlSeconds",
+        )
         assertThat(change.diff["allowTokenExchange"]).isEqualTo("false → true")
         assertThat(change.diff["refreshTokenAbsoluteMaxTtlSeconds"]).isEqualTo("7776000 → 28800")
         apply(f)

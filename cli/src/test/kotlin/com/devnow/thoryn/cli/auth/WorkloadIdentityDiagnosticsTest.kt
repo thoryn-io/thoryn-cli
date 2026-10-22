@@ -206,15 +206,25 @@ class WorkloadIdentityDiagnosticsTest {
         val lines = withLink.lines()
         assertThat(lines).withFailMessage("[%s]\n%s", name, withLink).anyMatch { it == FixRequest.OPTION_CLI_HEADING }
         assertThat(lines.last()).withFailMessage("[%s]\n%s", name, withLink).isEqualTo("${FixRequest.OPTION_BROWSER_HEADING} $link")
-        assertThat(withLink.substringAfter(FixRequest.OPTION_CLI_HEADING)).withFailMessage("[%s]\n%s", name, withLink).contains(option1Text)
         // The fix the request would carry is the same text (one rendering).
         val fix = WorkloadIdentityDiagnostics.fixFor(e, b)
         assertThat(fix.isEmpty).isFalse()
-        assertThat(withLink).contains(FixRequest.renderOption1Body(fix.items, fix.notes))
-        // No link known: Option 2 says how to get one, and nothing else changes.
+        val approve = FixRequest.approveRun(fix.items, link)
+        if (approve != null) {
+            // SSO-3738 — a right the consent can grant: with a link, Option 1 is `thoryn access approve`, never the raw command.
+            assertThat(withLink.substringAfter(FixRequest.OPTION_CLI_HEADING)).withFailMessage("[%s]\n%s", name, withLink)
+                .contains("thoryn access approve thoryn-io/thoryn-cli/38547022158").doesNotContain(option1Text)
+            assertThat(withLink).contains(FixRequest.renderApproveBody(approve, fix.items, fix.notes))
+        } else {
+            assertThat(withLink.substringAfter(FixRequest.OPTION_CLI_HEADING)).withFailMessage("[%s]\n%s", name, withLink).contains(option1Text)
+            assertThat(withLink).contains(FixRequest.renderOption1Body(fix.items, fix.notes))
+        }
+        // No link known: Option 2 says how to get one, and Option 1 is the exact edit or command (warned when a command).
         val without = WorkloadIdentityDiagnostics.render(e, b)
         assertThat(without.lines().last()).isEqualTo("${FixRequest.OPTION_BROWSER_HEADING} ${FixRequest.NO_CONSENT_LINK_LINE}")
-        assertThat(without).doesNotContain(link)
+        assertThat(without).doesNotContain(link).doesNotContain("thoryn access approve")
+        assertThat(without.substringAfter(FixRequest.OPTION_CLI_HEADING)).withFailMessage("[%s]\n%s", name, without).contains(option1Text)
+        assertThat(without).contains(FixRequest.renderOption1Body(fix.items, fix.notes))
     }
 
     @Test

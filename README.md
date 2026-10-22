@@ -306,11 +306,15 @@ thoryn examples share    <name> [--output <file>]   # SSO-2876 — export the se
 # turning it ON needs `manager` on the environment — else the red row token_exchange_not_grantable naming that
 # right) and the session lifetime `refreshTokenSlidingWindow` + `refreshTokenAbsoluteMaxTtlSeconds`. Converged on
 # update; an omitted setting keeps the live value. See "Application settings" below.
+# SSO-3810 / SSO-3807 (oauthy): also `allowTokenIntrospection` (RFC 7662; turning it ON needs `manager` on the
+# environment — else token_introspection_not_grantable), `accessTokenFormat` (self-contained | reference) and the
+# DPoP rungs `dpopAllowed` / `dpopRequired` (SSO-3811).
 thoryn provision plan    [--file <path>] [--prune] [--fix-request <path>]  # read-only: what apply would create / remove (+ grant changes, pending publishes); exit 1 on an ownership error
                                              # SSO-3710 — --fix-request (env THORYN_FIX_REQUEST): a red plan also writes thoryn-provision-request.json — every missing RIGHT
                                              # (owner / manager / viewer) with the exact `thoryn access grant` command a workspace admin runs; a workflow uploads it
                                              # SSO-3792 — a declared PRODUCTION application (fixed clientId) this identity may not create is a `creator` item
                                              # (`thoryn access reserve …`); with an unexpired slot it holds the row reads "will create (reserved …)" and passes
+                                             # SSO-3738 — with web consent the log's Option 1 is `thoryn access approve <owner>/<repo>/<run_id>`, not the raw lines
 thoryn provision apply   [--file <path>] [--prune] [--confirm <ws>] [--yes] [--fix-request <path>] \
                          [--secret-file <path>] [--force-stdout] [--force] \
                          [--wait [--wait-until ACTIVE|VERIFIED] [--wait-timeout 15m] [--wait-interval 20s]]
@@ -341,6 +345,10 @@ thoryn access grant  <subject> <relation> <object>   # POST   /api/v1/access/gra
 thoryn access revoke <subject> <relation> <object>   # DELETE /api/v1/access/grants  (grant identified in the JSON body; 204)
 thoryn access list   [--object <ref>] [--subject <ref>]   # GET /api/v1/access/grants?object=…|subject=…
 thoryn access mine   [--type <objectType>] [--relation <relation>]   # GET /api/v1/access/mine — the objects YOU hold a relation on
+# SSO-3738 — Option 1 of a red provisioning check: open Thoryn's consent for the rights that run asks for. No API call,
+# grants nothing itself; a workspace admin approves on the hub's consent screen (see "thoryn access approve" below).
+thoryn access approve <owner>/<repository>/<run_id> [--consent-url <base>] [--no-browser]
+thoryn access approve https://starters.<your Thoryn domain>/github/consent/run/<owner>/<repository>/<run_id>
 
 # Application creation slots (SSO-3792; oauthy ADR 2026-10-17, product-api SSO-3789) — a workspace admin approves that ONE
 # workload identity creates ONE named application on ONE plane, once, within 30 days. The repository's own apply then
@@ -408,6 +416,13 @@ thoryn operator logout                                         # forget the oper
 thoryn operator custom-domain entitle <workspace> [--hub-url u] # PUT /admin/tenants/{slug}/custom-domain/entitlement {"entitled":true}
 thoryn operator custom-domain revoke  <workspace> [--hub-url u] # … {"entitled":false} (an existing domain stays)
 thoryn operator custom-domain status  <workspace> [--hub-url u] # GET /admin/tenants/{slug}/custom-domain
+# SSO-3856 — platform: scopes on machine clients of the platform home workspace (needs the operator scope
+# admin:clients.platform-scopes, requested only when used: thoryn operator login --scope "openid admin:clients.platform-scopes").
+thoryn operator platform-scopes get    <clientId>                       # GET    /admin/platform-clients/{clientId}/scopes
+thoryn operator platform-scopes grant  <clientId> <scope> [--reason r] [--ticket t]   # PUT    …/scopes/{scope} (idempotent)
+thoryn operator platform-scopes revoke <clientId> <scope> [--reason r] [--ticket t]   # DELETE …/scopes/{scope} (idempotent)
+thoryn operator platform-scopes plan   [-f .thoryn/platform-scopes.yaml]  # read each declared client, print the plan; writes nothing
+thoryn operator platform-scopes apply  [-f .thoryn/platform-scopes.yaml] [--dry-run]  # plan, then grant missing + revoke extra
 ```
 
 > The supply-chain / verifiable-credential command tree was **removed** when the
@@ -1465,7 +1480,8 @@ resources:
 
 ### Application settings — token exchange, authorization detail types, session lifetime (SSO-3766, SSO-3767, SSO-3770)
 
-Three settings of an application are on the product API (oauthy, 2026-10-17) and declarable on a
+These settings of an application are on the product API (oauthy, 2026-10-17; introspection and the token format
+2026-10-18) and declarable on a
 `kind: application`. Each is sent on create, read back from the live application and **converged on update**
 with exactly the fields that differ. **An omitted setting keeps whatever the platform holds** — the file only
 changes what it declares. `--prune` is unchanged: it removes resources, never a setting.
@@ -1495,6 +1511,10 @@ resources:
 | `allowTokenExchange` | boolean, `false` | a value | `token_exchange_requires_confidential_client` (`clientType: public` or method `none`), `token_exchange_grant_required` (the token-exchange grant is not in `grantTypes`) | `token_exchange_not_grantable` (403) — **predicted by the plan**, see below |
 | `allowedAuthorizationDetailTypes` | list of strings, `[]` | a **set**: order is not drift; the declared list replaces the live one; `[]` clears it | not a list, an entry with a space (one type per entry), a duplicate | `unsupported_authorization_details_type` (400 — not in the server's discovery `authorization_details_types_supported`, plus `thoryn_access_grant`); `authorization_details_type_not_permitted` (403 — `thoryn_access_grant` outside the `thoryn` home workspace; no grant changes this) |
 | `refreshTokenSlidingWindow` | boolean, `false` | a value | — | — |
+| `allowTokenIntrospection` | boolean, `false` | a value | `token_introspection_requires_confidential_client` (`clientType: public` or method `none`) | `token_introspection_not_grantable` (403) — **predicted by the plan**, like `token_exchange_not_grantable` (same right, same production-plane note) |
+| `accessTokenFormat` | `self-contained` \| `reference`, `self-contained` | a value | `invalid_access_token_format` (any other value) | — |
+| `dpopAllowed` | boolean, `false` | a value | not a boolean | — |
+| `dpopRequired` | boolean, `false` | a value | not a boolean | — |
 | `refreshTokenAbsoluteMaxTtlSeconds` | integer seconds, 3600 – 7776000; live default 7776000 | a value | `token_ttl_out_of_range`; `session_lifetime_requires_sliding_window` (declared without `refreshTokenSlidingWindow: true` — the file states the session, it does not lean on the live window); `session_lifetime_below_refresh_ttl` (shorter than a declared `refreshTokenTtlSeconds`) | `session_lifetime_below_refresh_ttl` (shorter than the LIVE refresh TTL); `session_exceeds_tenant_policy` (longer than the environment authentication policy's `refreshClipSeconds` — the cap is named in the error) |
 
 **Who may turn token exchange on.** With the setting on, an application that holds a user's token can obtain
@@ -1517,6 +1537,39 @@ identity: the row carries a note instead — a workspace admin applies the file 
 file drops the setting. **Turning it off, omitting it, or re-declaring the value the application already holds
 is never refused.** A `federated_assertion` client may register the token-exchange grant too, only together
 with `allowTokenExchange: true` (`federated_assertion_grant_not_allowed` otherwise).
+
+**Introspection and reference tokens (SSO-3810 / SSO-3807).** `allowTokenIntrospection: true` lets an application
+(a resource server) call RFC 7662 introspection at its workspace; the endpoint answers `active` only for tokens of
+the same workspace and environment. An application that introspects reads the metadata of every token its
+environment issues, so turning it **on** needs the same `manager` on the environment as token exchange, and the
+plan predicts `token_introspection_not_grantable` the same way. `accessTokenFormat: reference` makes the token
+endpoint issue the application opaque access tokens, which a resource server resolves through introspection;
+any manager of the application may set it. Thoryn's own management API accepts `self-contained` tokens only.
+
+**DPoP (SSO-3811).** `dpopAllowed: true` makes a DPoP proof the application presents bind its access token
+(`token_type: DPoP`); without it a proof is ignored and the application gets Bearer tokens. `dpopRequired: true`
+makes a proof mandatory — declare it only once every installation sends one. Neither is gated beyond managing the
+application: a sender constraint widens nothing.
+
+```yaml
+  - kind: application
+    name: orders-api
+    environment: staging
+    spec:
+      displayName: "Orders API"
+      clientType: confidential
+      grantTypes: [client_credentials]
+      scopes: [tenant:applications.read]
+      allowTokenIntrospection: true
+  - kind: application
+    name: orders-mobile
+    environment: staging
+    spec:
+      displayName: "Orders mobile"
+      redirectUris: ["https://orders.acme.example/cb"]
+      grantTypes: [authorization_code, refresh_token]
+      accessTokenFormat: reference
+```
 
 **A refusal at apply names the resource, the code and the change** (`Error: application/portal:
 session_exceeds_tenant_policy — … cap of 86400 seconds …`), never the "Required scope" hint a bare `403` would
@@ -1767,22 +1820,48 @@ state" before the gate) — and the person reading it needs a path.
 
 ```text
 To fix — Option 1, with the CLI (a workspace admin):
+      thoryn access approve thoryn-io/thoryn-cicd/38751887466
+  It opens the same approval as Option 2 — Thoryn's consent screen, which lists the rights below; nothing is granted until a workspace admin approves there. The command grants nothing itself.
   - creator on application:forge-forgejo-login in production for client:wi_10a7…: access_not_reachable — the live read of … was answered HTTP 404 (unknown_environment): …
-      thoryn access reserve client:wi_10a7b379c79f7d1353f5798d application:forge-forgejo-login --environment production
 To fix — Option 2, in the browser: https://app.thoryn.io/github/consent/run/thoryn-io/thoryn-cicd/38751887466
 ```
 
-Option 1 lists every missing **right** with its exact command and every **file / job edit** as a line (a
-`connection.json` that names no apply environment, a job without `environment:`, a trust to re-create with the
-job's own pins, a read-only reference that differs). Option 2 is the Thoryn GitHub App's web consent for **this
+**One consent flow, two entry points (SSO-3738).** When the run has a consent link, Option 1 is
+`thoryn access approve <owner>/<repository>/<run_id>` — the CLI entry point to the **same** hub consent the
+Option-2 link opens ([`thoryn access approve`](#thoryn-access-approve--the-cli-entry-point-to-the-consent)). The
+rights are listed so the reader knows what the consent screen will show, but their raw grant commands are **not**
+printed: the consent re-checks each one (the pin-matched trust, the objects declared at the head commit, no owner
+on an owned object, no manager on the workspace) and yields a token that can write only what was approved; a line
+pasted from a CI log into an admin shell would get none of that. File and job edits follow under *The file must
+change too*, because neither option makes them. A dispute (an object another repository owns) is shown and never
+asked for.
+
+**Without web consent** (no consent link — no `consentUrl` configured, or outside a GitHub Actions run) Option 1 is
+the raw commands, under the warning *Check each line before running it: these commands were written by the run that
+failed, and without web consent nothing has verified them against the repository's trust or its .thoryn/ file.*:
+
+```text
+To fix — Option 1, with the CLI (a workspace admin):
+  Check each line before running it: these commands were written by the run that failed, and without web consent nothing has verified them against the repository's trust or its .thoryn/ file.
+  - owner on application:forge-oauth2-proxy for client:wi_10a7…: access_not_reachable — …
+      thoryn access grant client:wi_10a7b379c79f7d1353f5798d owner application:forge-oauth2-proxy
+To fix — Option 2, in the browser: Run through the Thoryn GitHub App to get a browser link.
+```
+
+Every **file / job edit** is a line either way (a `connection.json` that names no apply environment, a job without
+`environment:`, a trust to re-create with the job's own pins, a read-only reference that differs). With a consent,
+the refused plan rows say *a workspace admin approves it on Thoryn's consent screen* where they otherwise quote the
+grant command. Option 2 is the Thoryn GitHub App's web consent for **this
 run**, resolvable by run — `<consentUrl>/github/consent/run/<owner>/<repository>/<run_id>` from the job's own
 `GITHUB_REPOSITORY` / `GITHUB_RUN_ID` (the opaque consent id the App mints after the run is unknowable to the
 job). The base URL is **configuration** (`.thoryn/workflow.yaml` `consentUrl`, or the reusable workflow's
 `consent-url` input, reaching the CLI as `THORYN_CONSENT_URL`), never guessed from the issuer; unset, or outside
 a GitHub Actions run, the line reads `Run through the Thoryn GitHub App to get a browser link.` The fix request
-carries the same two as `options.cli` / `options.consentUrl`, so the check-run summary and the log never disagree.
+carries the same two as `options.cli` / `options.consentUrl`: with a consent, `options.cli` is exactly
+`thoryn access approve <owner>/<repository>/<run_id>`; without one, it is the warned Option-1 body.
 
-The audited refusals and what their Option 1 says:
+The audited refusals and what their Option 1 says **without web consent** (with a consent, every row whose fix is a
+right reads `thoryn access approve <owner>/<repository>/<run_id>` instead; file edits are unchanged):
 
 | Refusal | Option 1 |
 |---|---|
@@ -1806,8 +1885,9 @@ The audited refusals and what their Option 1 says:
 writes **one file**, `thoryn-provision-request.json` (schema
 `engine/src/main/resources/provision/fix-request.schema.json`), and the workflow uploads it as the run
 artifact **`thoryn-provision-request`**. The Thoryn GitHub App reads that artifact and puts two options on
-the failed check run: the CLI commands, verbatim, or a web consent a workspace admin approves (oauthy
-SSO-3711 / SSO-3712).
+the failed check run, both leading to the hub's own consent screen (oauthy SSO-3737 / SSO-3755): `thoryn access
+approve <owner>/<repository>/<run_id>` and the by-run consent link. Only where web consent is disabled does it relay
+the request's raw commands, under *Check each line before running it*.
 
 Both producers take the same opt-in `--fix-request <path>` (or the env var `THORYN_FIX_REQUEST` — the
 spelling a workflow uses, because a release that predates the flag ignores a variable and refuses a flag);
@@ -1847,9 +1927,11 @@ asks for the one thing that is grantable — a **creation slot** (oauthy ADR
 `2026-10-17-consent-approved-application-creation-slots.md`):
 
 1. **Red.** The plan row (`access_not_reachable`, or `access_not_owned` when the plane is visible) carries the
-   `creator` item `thoryn access reserve client:<wi_…> application:<clientId> --environment production`, and the
-   check run offers it as Option 1 and on the consent screen ("Let *owner/repository* create the application
-   *clientId* in *production*, and own it").
+   `creator` item `thoryn access reserve client:<wi_…> application:<clientId> --environment production`. The
+   Thoryn GitHub App relays it onto the check run and lists it on the run's consent screen ("Let
+   *owner/repository* create the application *clientId* in *production*, and own it"); with a consent link the
+   log's Option 1 is `thoryn access approve <owner>/<repo>/<run_id>` (SSO-3738), which opens that same screen, and
+   without one it is the `reserve` command itself.
 2. **Approve.** A workspace admin runs the command, or approves it on the hub's consent screen. The slot binds the
    **name**, the **plane** and the **holder** — not the spec; it lasts **30 days** and only the holder may use it.
 3. **Green.** The next plan reads the slots once (`GET /api/v1/access/application-slots`, `tenant:access.read`,
@@ -1863,8 +1945,9 @@ asks for the one thing that is grantable — a **creation slot** (oauthy ADR
    `409 client_id_taken` — someone created the name meanwhile, the slot is used up and never adopts it (grant
    `owner` instead).
 
-What a slot does **not** lift: turning `allowTokenExchange` on at create still needs `manager` on the plane, so
-the plan refuses it under a slot (`token_exchange_not_grantable`, a note) before any write; a `federatedTrust`
+What a slot does **not** lift: turning `allowTokenExchange` or `allowTokenIntrospection` on at create still needs
+`manager` on the plane, so the plan refuses either under a slot (`token_exchange_not_grantable` /
+`token_introspection_not_grantable`, a note) before any write; a `federatedTrust`
 binding still needs `manager` on the trust; the new client's scopes are still capped at the identity's own.
 Sandboxes keep `manager` on their environment (decision D3), an application without a fixed `clientId` keeps
 the workspace note (now: "declare `spec.clientId` to make its creation approvable"), and production **trusts**
@@ -1877,10 +1960,12 @@ A `creator` item is a kind a consumer must know: the Thoryn GitHub App accepts i
 since then an unknown kind drops that ONE item rather than the whole request. The document's `version` stays
 `1` — the change is additive (a new enum value) and no consumer dispatches on the version.
 
-**One rendering.** The `cli` string of every item is the same text the CLI prints on stderr (the row
-reasons quote it; the `To fix — Option 1, with the CLI (a workspace admin):` block lists it with the notes),
-`options.cli` is that block's body and `options.consentUrl` the Option 2 link — so the check run and the
-terminal never disagree. The binding fields the file carries — `repository`, `run` — are hints: a consumer
+**One rendering.** The `cli` string of every item is the same text the CLI prints on stderr when there is no web
+consent (the row reasons quote it; the `To fix — Option 1, with the CLI (a workspace admin):` block lists it with the
+notes, under the check-each-line warning), and `options.cli` is that block's body. With a consent link (SSO-3738)
+`options.cli` is exactly `thoryn access approve <owner>/<repository>/<run_id>` and `options.consentUrl` the Option 2
+link; each item keeps its own `cli` as data. The document's shape is unchanged — `version` stays `1`: only what
+`options.cli` holds moved, and the App does not read it (it renders its own two options from the run). The binding fields the file carries — `repository`, `run` — are hints: a consumer
 takes them from GitHub's own record of the run and discards the body's copy.
 
 ```json
@@ -1893,7 +1978,7 @@ takes them from GitHub's own record of the run and discards the body's copy.
                  "reason": "access_not_owned — this identity holds no relation on application:cli — …",
                  "cli": "thoryn access grant client:wi_10a7b379c79f7d1353f5798d owner application:cli" } ],
   "notes": [],
-  "options": { "cli": "  - owner on application:cli for client:wi_10a7…: access_not_owned — …\n      thoryn access grant client:wi_10a7b379c79f7d1353f5798d owner application:cli",
+  "options": { "cli": "thoryn access approve thoryn-io/thoryn-cli/38547022158",
                "consentUrl": "https://app.thoryn.io/github/consent/run/thoryn-io/thoryn-cli/38547022158" } }
 ```
 
@@ -1917,6 +2002,57 @@ reusable `provisioning.yml` (SSO-3719) and the composite Action's `fix-request` 
           if-no-files-found: ignore
           retention-days: 7
 ```
+
+### `thoryn access approve` — the CLI entry point to the consent
+
+SSO-3738 (oauthy ADR `2026-10-15-missing-rights-fix-path-cli-and-web-consent.md`, amendment and As built SSO-3737 /
+SSO-3755). A red provisioning check names its fix in two options that lead to **one** approval — the hub's own
+consent screen. Option 1 is this command; Option 2 is the link. A workspace admin runs:
+
+```bash
+thoryn access approve thoryn-io/thoryn-cicd/38751887466
+# or, the link from the check run or the job log:
+thoryn access approve https://starters.stg.thoryn.org/github/consent/run/thoryn-io/thoryn-cicd/38751887466
+```
+
+**It grants nothing.** It builds the run's by-run consent address,
+`<base>/github/consent/run/<owner>/<repository>/<run_id>`, and opens it in your browser; with no browser
+(`--no-browser`, `THORYN_NO_BROWSER=1`, an SSH session) it prints the address to open on any device — the same
+pattern as `thoryn login`. It makes no API call and follows no redirect itself: the browser goes to the Thoryn
+GitHub App's starters service, which rebuilds the request from GitHub's own record of the run and redirects to the
+hub, which signs you in and shows each right. Nothing is written until you approve there, and then only with a token
+that carries exactly the approved items. Which workspace, which rights and whether you may grant them are decided
+there, not by the CLI.
+
+**How the consent base URL is resolved**, first match wins:
+
+1. a **consent URL** passed as the argument — it names its own base;
+2. **`--consent-url <base>`** (`https://starters.<your Thoryn domain>`);
+3. the **`consentUrl` of `.thoryn/workflow.yaml`** — the nearest one from the working directory up to the
+   repository root, so running it inside the repository uses the address the job's own log printed;
+4. **derived from your signed-in platform**: `https://starters.<platform domain>`, where the platform domain is the
+   session's base issuer without its host label (`https://auth.stg.thoryn.org` ⇒ `https://starters.stg.thoryn.org`).
+   A local hub, an IP address or a custom domain names no platform domain, so nothing is derived.
+
+With none of them the command stops and names the two ways to pass the address. The line `(consent address from …)`
+under the address says which source was used.
+
+**Strict input.** `<owner>/<repository>/<run_id>` follows GitHub's grammar: an account name of letters, digits and
+`-` (not starting with `-`), a repository name of letters, digits, `.`, `_` and `-` (never `.` or `..`), and a
+positive run id. A consent URL must be `https://`, a DNS host, an optional port, an optional plain path prefix, and
+end in exactly `/github/consent/run/<owner>/<repository>/<run_id>` — no user-info, query, fragment, percent-encoding,
+backslash, whitespace or dot segment. The address handed to the browser is rebuilt from the validated parts, never
+the string as typed. Anything else exits `64` and opens nothing.
+
+| Error | Cause | Fix |
+|---|---|---|
+| `… is not <owner>/<repository>/<run_id>` / `… is not a GitHub Actions run id` | The argument is not the run reference the check run prints. | Copy it from the check run, or pass the consent link. |
+| `… is not an https:// consent URL` / `… is not a consent URL` | An `http://` link, or one with a query, fragment, user-info or extra path. | Pass the link exactly as the check run shows it. |
+| `--consent-url … is a full consent link` | The whole link was passed as the base. | Pass it as the argument instead. |
+| `no consent address for …` | No argument URL, no flag, no `consentUrl` in the repository, and the session names no platform domain (or you are not signed in). | Pass the link, or `--consent-url https://starters.<your Thoryn domain>`, or `thoryn login`. |
+
+`thoryn access grant` stays as the expert command, unchanged; the raw grant lines it would take are printed in a job
+log only when the deployment has no web consent, under *Check each line before running it*.
 
 ### Configure the provisioning workflow — the stub, its inputs, `.thoryn/workflow.yaml` (SSO-3719, epic SSO-3304)
 
@@ -1998,7 +2134,7 @@ the same pin selects the CLI the jobs run (`job.workflow_ref`), so there is no s
 | `runs-on` | `ubuntu-latest` | a runner label, or a JSON array of labels for a **self-hosted** pool: `'["self-hosted", "linux", "x64"]'` (the runner needs bash, gh, jq, curl; Java is set up). A trust pinned "GitHub-hosted runners only" refuses a self-hosted job's token — that pin is yours to change on the trust |
 | `timeout-minutes` | `30` | each job's timeout |
 | `config` | `.thoryn/workflow.yaml` | where the run-time configuration lives |
-| `consent-url` | `""` | SSO-3723 — base URL of the Thoryn GitHub App's browser consent (`THORYN_CONSENT_URL`): a red job's `To fix — Option 2, in the browser:` becomes `<url>/github/consent/run/<owner>/<repo>/<run_id>`. Empty ⇒ `.thoryn/workflow.yaml` `consentUrl`, else the commands alone |
+| `consent-url` | `""` | SSO-3723 — base URL of the Thoryn GitHub App's browser consent (`THORYN_CONSENT_URL`): a red job's `To fix — Option 2, in the browser:` becomes `<url>/github/consent/run/<owner>/<repo>/<run_id>` and Option 1 `thoryn access approve <owner>/<repo>/<run_id>` (SSO-3738). Empty ⇒ `.thoryn/workflow.yaml` `consentUrl`, else the raw commands alone, under *Check each line before running it* |
 
 #### Run-time configuration — `.thoryn/workflow.yaml`
 
@@ -2011,7 +2147,7 @@ Committed beside your provisioning files; absent ⇒ the defaults below; schema
 | `files[]` | `[{file: .thoryn/provision.yaml, connection: .thoryn/connection.json}]` | **one or many** provisioning files, planned and applied in order, each signed in with its own connection (`connection` defaults to the `connection.json` beside the file — the layout `thoryn project init` and the App seed) |
 | `env` | `{}` | extra environment variables for the CLI: **`THORYN_*` names only** (the CLI's own variables, and the `{{env.NAME}}` placeholders a provisioning file reads — SSO-3430), never one the workflow sets itself (`THORYN_ISSUER`, `THORYN_HUB`, `THORYN_FIX_REQUEST`, `THORYN_CONSENT_URL`, `THORYN_CI_PLAINTEXT_TOKENS`), never credential-shaped (`*_SECRET`, `*_PASSWORD`, `*_TOKEN`, `*_KEY` — this file is committed plaintext). Values are exported, never evaluated |
 | `fixRequest` | `true` | upload the SSO-3710 fix request (`thoryn-provision-request`) when a job is red on a missing right, so the App names the fix on the check run |
-| `consentUrl` | `""` | SSO-3723 — the base URL of the App's browser consent, exported to the CLI as `THORYN_CONSENT_URL` when the `consent-url` input is empty; every `To fix` block then carries `Option 2, in the browser: <consentUrl>/github/consent/run/<owner>/<repository>/<run_id>` and the fix request `options.consentUrl`. `https://`, no query or fragment. Configuration — never guessed from the issuer |
+| `consentUrl` | `""` | SSO-3723 — the base URL of the App's browser consent, exported to the CLI as `THORYN_CONSENT_URL` when the `consent-url` input is empty; every `To fix` block then carries `Option 2, in the browser: <consentUrl>/github/consent/run/<owner>/<repository>/<run_id>` and the fix request `options.consentUrl`, and Option 1 becomes `thoryn access approve <owner>/<repository>/<run_id>` (SSO-3738; the raw grant lines are printed only without it). `https://`, no query or fragment. Configuration — never guessed from the issuer |
 | `apply.prune` | `false` | pass `--prune`: remove owned resources the file no longer declares |
 | `apply.destroy` | `false` | run `thoryn provision destroy` after a successful apply — an ephemeral fixture (an e2e sandbox) |
 | `apply.confirm` | `""` | the workspace slug confirming production-plane removals (the SSO-2413 gate) |
@@ -2167,7 +2303,10 @@ Commands that run on a session remembered from a retired issuer (a refresh, an A
 ```bash
 # Default scopes (SSO-3182): EXACTLY the `cli` login client's registered set — openid,
 # offline_access and the whole tenant-config surface (applications, clients, users,
-# federation, audit, environments, email, idp, access, domains, keys, workload-identity). A bare login therefore authorizes
+# federation, audit, environments, email, idp, access, domains, keys, workload-identity, github-connections).
+# SSO-3856 — `tenant:github-connections.read|write` has no `thoryn` command yet: it is requested so a workspace
+# admin HOLDS the family and can grant it onward (e.g. to a starter's client in a provisioning file; the hub grants
+# it to `cli` in V206, which must be deployed before a CLI release requesting it). A bare login therefore authorizes
 # `clients`, `federation`, `audit`, `env`, `workspace email-provider`, `branding`, `access`,
 # `domain` and `provision apply` (including a file's `grants:` block) with no --scope list.
 # `workspace` rides on SCOPE_openid (the hub /account surface). The hub mints only the
@@ -2872,6 +3011,86 @@ that participate, and `thoryn-operator` does not (not `dpop_required` / `dpop_al
 cutover list) — so its tokens are Bearer tokens today. Should the client ever be bound, the commands
 present the token under `DPoP` with a proof whose `htu` is the port-forward URL, which is what the hub
 (strict `htu`, reconstructed from the `Host` it receives) compares against.
+
+### Platform-client scopes (`thoryn operator platform-scopes`)
+
+A **platform client** is a workload the platform runs outside its own namespace (the provisioning service's
+machine client, for example). It reaches product-api's `/api/v1/platform` surface with a `platform:` scope, which no
+workspace admin, product service or provisioning file can grant. An operator does, with the hub capability
+`admin:clients.platform-scopes` (oathy ADR `2026-10-19-operator-grants-platform-client-scopes.md`, runbook
+`docs/content/operate/operator-plane/platform-client-scopes.mdx`). The hub enforces the rules; the CLI only calls it:
+
+* **The platform home's production plane only.** The endpoints take no workspace, so another workspace's client
+  cannot be named. A sandbox twin answers `404 client_not_found`.
+* **A closed set of scopes:** `platform:trusted-issuers.read`, `platform:audit-events.append`,
+  `platform:github-installations.sync`. Anything else is `400 unknown_platform_scope` / `not_a_platform_scope`.
+* **A machine client.** A grant needs the `client_credentials` grant type (`409 machine_client_required`).
+* **Idempotent and audited.** Each change writes `CLIENT_PLATFORM_SCOPE_GRANTED` / `…_REVOKED` on the home's
+  audit chain with your subject and the `reason` / `ticket` you pass; a call that changes nothing writes no row.
+* **Kept on ordinary updates.** A provisioning file or a console edit that replaces the client's scope list keeps
+  its `platform:` scopes — and `thoryn provision plan` never shows them as drift (it leaves `platform:` / `admin:`
+  scopes out of the comparison, and refuses a provisioning file that declares one: `reserved_scope`).
+
+The scope is not in the operator login's default request (an operator token carries no power the operator is not
+about to use, and an environment whose hub predates V207 would refuse it), so ask for it:
+
+```bash
+thoryn operator login --issuer https://auth.stg.thoryn.org --scope "openid admin:clients.platform-scopes"
+kubectl -n thoryn port-forward svc/thoryn-hub 18080:8080        # in another terminal
+
+thoryn operator platform-scopes get provisioning-m2m
+thoryn operator platform-scopes grant provisioning-m2m platform:trusted-issuers.read --ticket SSO-3857 \
+  --reason "the provisioning service reads the issuer registry"
+thoryn operator platform-scopes revoke provisioning-m2m platform:trusted-issuers.read --ticket SSO-3857
+```
+
+**Declare, review, apply.** The grants a workload needs are declared in git, in the repository that owns the
+workload (thoryn-provisioning's `.thoryn/platform-scopes.yaml`), and reviewed like any other change. `apply` reads
+every declared client first and prints the plan, then grants what is missing and revokes what is extra. Clients
+the file does not name are never touched; applying the same file again changes nothing, so a new environment
+converges by applying it once.
+
+```yaml
+# .thoryn/platform-scopes.yaml
+apiVersion: thoryn.io/platform-scopes/v1
+ticket: SSO-3857                       # optional; on every audit row (at most 64 characters)
+reason: "provisioning service grants"  # optional; on every audit row (at most 500 characters)
+clients:
+  - clientId: provisioning-m2m         # a client_credentials client of the home's production plane
+    scopes:                            # EXACTLY the platform: scopes it should hold; [] removes them all
+      - platform:trusted-issuers.read
+      - platform:audit-events.append
+      - platform:github-installations.sync
+    # ticket / reason may also be set per client; --ticket / --reason override both
+```
+
+```bash
+thoryn operator platform-scopes plan  -f .thoryn/platform-scopes.yaml      # = apply --dry-run; writes nothing
+thoryn operator platform-scopes apply -f .thoryn/platform-scopes.yaml
+# Platform-client scopes in the platform home workspace's production plane (1 client(s)):
+#   ~ provisioning-m2m
+#       + platform:trusted-issuers.read
+#       + platform:audit-events.append
+#       + platform:github-installations.sync
+#   granted platform:trusted-issuers.read to provisioning-m2m
+#   …
+# Applied: 3 granted, 0 revoked, 0 client(s) unchanged.
+```
+
+The file accepts only `platform:` scopes, no workspace and no environment, and refuses unknown fields; every
+problem is listed at once and nothing is sent. A refusal while reading the clients stops the run before any
+write; a refusal part-way through the writes keeps what was done, and re-running the file finishes the rest.
+`--output json|yaml` / `--json` print the plan (`grant`, `revoke`, `unchanged`, `applied`) as one document.
+
+| Symptom | Meaning | Fix |
+|---|---|---|
+| `403 insufficient_scope` | The operator token lacks `admin:clients.platform-scopes` | `thoryn operator login --scope "openid admin:clients.platform-scopes"` |
+| login fails with `invalid_scope` | No standing, not a passkey sign-in, or the hub predates V207 (`thoryn-operator` does not hold the scope yet) | Confirm standing and the hub version |
+| `404 not_found` | No operator standing here, or the hub predates V207 (the surface is not routed) | Confirm your subject is in `productApi.operatorPlatformSubjects`; check the hub version |
+| `404 client_not_found` | No such client in the home's **production** plane | Create it through the product first, in production |
+| `409 machine_client_required` | The client has no `client_credentials` grant | Give it that grant through the product, or use a machine client |
+| `400 unknown_platform_scope` | Not one of the three platform-client scopes | Check the spelling |
+| `503 audit_unavailable` | The audit row could not be written, so the hub undid the change | Retry |
 
 ## Build
 

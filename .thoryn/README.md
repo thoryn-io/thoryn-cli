@@ -9,7 +9,7 @@ the same two files and the same commands.
 | `connection.json` | **who I am** — the `thoryn` workspace and the **workload identity trust** CI signs in under: the trust's `wi_…` client id, its audience, its GitHub pins and the exact scope set. No secret, no env var naming one (SSO-3690) | `cli/src/main/resources/examples/connection.schema.json` (SSO-2948) | `thoryn login --connection .thoryn/connection.json` |
 | `provision.yaml` | **what I own** — the desired state: the CLI's own login client `cli` in the `thoryn` workspace (SSO-3104; this repository's CI identity is its platform `owner`, SSO-3697; `retain: true`, SSO-3717 — never removed by `destroy` / `--prune`), plus the long-lived sandbox environment `cli-ci` (`retain: true`) — whose one grant makes the CI identity its `manager` — with a public loopback OAuth client inside it: the one resource a `destroy` removes | `engine/src/main/resources/provision/provision.schema.json` (SSO-3088) | `thoryn provision plan / apply / destroy --file .thoryn/provision.yaml` |
 | `trusts.provision.yaml` | **the one trust, declared** (SSO-3689 `kind: workloadIdentityTrust`; SSO-3697 / SSO-3705 / SSO-3704) — `thoryn-cli-ci`, adopted, production plane, with its two profiles: the reviewed apply environment and the **plan profile** `spec.plan` keyed on `thoryn-provision-e2e-plan` (read-only by construction). Applied by a **founder**, never by CI: a production-plane trust is reached through the workspace, and a file cannot declare its own bootstrap trust | the provision schema | `thoryn provision plan / apply --file .thoryn/trusts.provision.yaml` (founder session) |
-| _(run artifact, never committed)_ `thoryn-provision-request` | the **fix request** (SSO-3710): when a job is red on a missing RIGHT — the trust's plan profile, `owner` on a declared resource, `manager` on a parent environment, a creation slot (`creator`, SSO-3792) for a declared production application that does not exist yet — the CLI writes `thoryn-provision-request.json` naming each right and the exact command a workspace admin runs (SSO-3722: on EVERY refusal — a file / job edit is a `notes` line; SSO-3723: `options.cli` + `options.consentUrl`, the two options the log printed as `To fix — Option 1, with the CLI` / `Option 2, in the browser`); the workflows upload it `if: failure()` and the Thoryn GitHub App relays it onto the check run (two options: the commands, or a web consent — oauthy SSO-3711/3712) | `engine/src/main/resources/provision/fix-request.schema.json` | `thoryn login --connection --fix-request <path>` · `thoryn provision plan\|apply --fix-request <path>` (env `THORYN_FIX_REQUEST`) |
+| _(run artifact, never committed)_ `thoryn-provision-request` | the **fix request** (SSO-3710): when a job is red on a missing RIGHT — the trust's plan profile, `owner` on a declared resource, `manager` on a parent environment, a creation slot (`creator`, SSO-3792) for a declared production application that does not exist yet — the CLI writes `thoryn-provision-request.json` naming each right and the exact command a workspace admin runs (SSO-3722: on EVERY refusal — a file / job edit is a `notes` line; SSO-3723: `options.cli` + `options.consentUrl`, the two options the log printed as `To fix — Option 1, with the CLI` / `Option 2, in the browser`; SSO-3738: with a consent link `options.cli` is `thoryn access approve <owner>/<repo>/<run_id>`); the workflows upload it `if: failure()` and the Thoryn GitHub App relays it onto the check run (two options: the commands, or a web consent — oauthy SSO-3711/3712) | `engine/src/main/resources/provision/fix-request.schema.json` | `thoryn login --connection --fix-request <path>` · `thoryn provision plan\|apply --fix-request <path>` (env `THORYN_FIX_REQUEST`) |
 | `workflow.yaml` | **how the App-dispatched workflow runs** (SSO-3719): the run-time configuration the reusable workflow `thoryn-io/thoryn-cli/.github/workflows/provisioning.yml` reads — which provisioning files with which connections (one or many), `THORYN_*` env vars for the CLI, whether to upload the fix request, the apply toggles (`prune` / `destroy`, never on by default). This repository's copy states the defaults. Unknown keys are refused: a knob that is not there is a product gap, not a script | `cli/src/main/resources/examples/workflow.schema.json` | `thoryn provision workflow check` |
 
 The provisioning Action (`.github/actions/provision`) runs, in order:
@@ -48,6 +48,9 @@ unchanged by them. Both are public clients, which cannot hold `allowTokenExchang
 identity's `manager` on the sandbox `cli-ci` is exactly the reach that may turn token exchange on there, while on the
 production plane it could not (that needs the workspace's `manager`, never granted to a repository identity — the plan
 row `token_exchange_not_grantable` carries a note, not a grant).
+`allowTokenIntrospection` and `accessTokenFormat` (SSO-3810 / SSO-3807) are declared by none of this repository's files
+either; both clients are public, which cannot hold `allowTokenIntrospection`
+(`token_introspection_requires_confidential_client`).
 
 ## The CLI's own login client lives here too (SSO-3104)
 
@@ -251,11 +254,18 @@ through `THORYN_FIX_REQUEST` on the plan step and on the Action's sign-in / appl
 the run artifact `thoryn-provision-request`. Steps (a) and (b) below ARE its contents for this repository: a
 `plan_profile` item with the `set-plan-profile` command when the plan job's exchange is refused for its environment,
 an `owner` item with the `thoryn access grant … owner application:cli` command when the file declares a resource the
-identity does not own. The App (SSO-3711) puts them on the check run as **Option 1 — CLI** (the commands, verbatim)
-next to **Option 2 — Web consent** (SSO-3712: a workspace admin signs in and approves exactly what the repository
-asks for; the App re-dispatches the plan on the same check run). Until the workflow pin moves to a release that
-carries `--fix-request`, the variable is ignored and the upload step finds no file — the steps below are then the
-founder's path, as before.
+identity does not own. The App puts two options on the check run, and both open **the same approval on the hub's
+own consent screen** (oauthy SSO-3737 / SSO-3755): **Option 1** is `thoryn access approve <owner>/<repo>/<run_id>`
+(thoryn-cli SSO-3738 — it opens that consent in the browser, or prints its address to open on any device, and grants
+nothing itself), **Option 2** the run's consent link. A workspace admin approves exactly what the repository asks for,
+and the App re-dispatches the plan on the same check run. The job's own log prints the same two options when the
+workflow configures `consentUrl` (`.thoryn/workflow.yaml`, below); without it the log prints the raw commands of (a)
+and (b) under *Check each line before running it* — they were written by the run that failed and nothing has
+verified them. How `thoryn access approve` finds the consent address: the link itself, `--consent-url`, this
+repository's `.thoryn/workflow.yaml` `consentUrl` when run inside it, else `https://starters.<platform domain>` from
+the signed-in session (README, *`thoryn access approve`*). Until the workflow pin moves to a release that carries
+`--fix-request`, the variable is ignored and the upload step finds no file — the steps below are then the founder's
+path, as before.
 
 **A new production application (SSO-3792; oauthy ADR 2026-10-17-consent-approved-application-creation-slots).** A
 production application this file declares with a fixed `clientId` and that does not exist yet is never asked for as
