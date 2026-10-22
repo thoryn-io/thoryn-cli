@@ -76,6 +76,10 @@ import java.util.concurrent.Callable
  *    the TTY; when nothing reaches, the client stays and `apply` exits [SecretIo.EXIT_NO_SECRET] with
  *    `undelivered_secrets`, naming the resource and `thoryn clients rotate-secret <clientId> --secret-file <path>`.
  *    `plan` prints the intended delivery as a line and mints nothing.
+ *  - **SSO-3921 (oauthy ADR 2026-10-14 credential ladder, rung 3)** — `secretSink: { kind: workloadPull, trust }`:
+ *    nothing is delivered. `apply` discards the minted value and converges `manager` on the application for the named
+ *    `kubernetes` trust's workload client; the pod's init container mints its own secret at start. No channel is
+ *    needed, so a CI apply with no kubeconfig creates the application and exits 0. `plan` prints who pulls it.
  */
 @Command(
     name = "provision",
@@ -257,7 +261,16 @@ class ProvisionCommand : Callable<Int> {
                 c.publishTo.forEach { t -> println("      ${c.kind} ${c.name}: publish clientId → ${t.label}") }
             }
             // SSO-3659 — where apply will deliver the minted client secret (a line; no secret exists at plan time).
-            plan.changes.forEach { c -> c.secretSink?.let { t -> println("      ${c.kind} ${c.name}: deliver client secret → ${t.label}") } }
+            plan.changes.forEach { c ->
+                c.secretSink?.let { t ->
+                    // SSO-3921 — a runtime pull delivers nothing: the line says WHO mints the secret, and with which workload client.
+                    if (t.runtimePull) {
+                        println("      ${c.kind} ${c.name}: secret: pulled at runtime by trust ${t.trust} (workload client ${c.pullClientId ?: "created by this apply"}; apply discards the minted value)")
+                    } else {
+                        println("      ${c.kind} ${c.name}: deliver client secret → ${t.label}")
+                    }
+                }
+            }
             // SSO-3689 — a live trust's workload client and audience (what its consumer's connection.json names; apply prints that document).
             plan.changes.forEach { c ->
                 c.trust?.let { t ->
@@ -283,6 +296,7 @@ class ProvisionCommand : Callable<Int> {
                     (if (plan.grantChanges > 0) ", ${plan.grantChanges} grant change(s)" else "") +
                     (if (plan.publishes > 0) ", ${plan.publishes} output(s) to publish" else "") +
                     (if (plan.deliveries > 0) ", ${plan.deliveries} client secret(s) to deliver" else "") +
+                    (if (plan.runtimePulls > 0) ", ${plan.runtimePulls} client secret(s) pulled at runtime" else "") +
                     (if (plan.hasErrors) ", ${plan.errors.size} ownership error(s)." else "."),
             )
         }

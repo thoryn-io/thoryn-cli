@@ -45,6 +45,8 @@ internal class CliDeclaredSecretSink(
     override fun deliver(target: SecretTarget, clientId: String, secret: String): String? = when (target.kind) {
         ProvisionFile.SECRET_SINK_KIND_KUBERNETES_SECRET -> kubernetesSecret(target, secret)
         ProvisionFile.SECRET_SINK_KIND_FILE -> file(target, secret)
+        // SSO-3921 — the engine discards a runtime-pull secret and never hands it here; refuse rather than place it anywhere.
+        ProvisionFile.SECRET_SINK_KIND_WORKLOAD_PULL -> "a workloadPull secret is never delivered — the pods of trust ${target.trust} mint their own"
         else -> "unsupported secretSink kind '${target.kind}'"
     }
 

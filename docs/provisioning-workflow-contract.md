@@ -143,6 +143,14 @@ consent base URL, `https://` without query or fragment; `THORYN_CONSENT_URL` for
 empty; default empty ⇒ the raw CLI commands alone, under a check-each-line warning; set ⇒ Option 1 is `thoryn access approve`, SSO-3738), `apply.prune` / `apply.destroy` (default false) / `apply.confirm`
 (workspace slug). The check also confirms every configured file is committed.
 
+`config.secret-delivery` (SSO-3921) reads every configured provisioning file that is committed: the apply job runs on a
+hosted runner with no kubeconfig, no `--secret-file` and no TTY, so an application that MINTS a client secret on create
+(confidential, `client_secret_basic` or no declared method; not `readOnly`) fails the rule unless it declares
+`secretSink: { kind: workloadPull, trust: <kubernetes trust> }` — its pod mints its own secret at start (oauthy ADR
+2026-10-14 credential ladder, rung 3). Without a sink the create ends in `undelivered_secrets` (exit 65); a
+`kubernetesSecret` sink has no cluster to reach; a `file` sink writes onto a runner that is gone when the job ends
+(green, the secret lost). A public or secret-less (`private_key_jwt`, `federated_assertion`) client passes.
+
 ## 6. A hand-written workflow (`custom.*`) — unsupported
 
 `thoryn provision workflow check` evaluates §1's rules plus one (`custom.jobs`: a job gated on each mode, in two different
@@ -160,3 +168,8 @@ SSO-3738 did **not** bump it: what a valid stub or reusable workflow looks like 
 `consentUrl` key) — only the text a red job prints moved (Option 1 is `thoryn access approve <owner>/<repo>/<run_id>`
 when a consent link exists). Nor did it bump the fix request's own `version` (still `1`): its shape is unchanged; only
 what `options.cli` holds moved, and the App renders its own options from the run rather than reading that field.
+
+SSO-3921 did **not** bump it either: the stub and the reusable workflow are unchanged. It adds `config.secret-delivery`,
+which reads the provisioning FILES the configuration names — a repository whose file declares a secret-minting
+application without `secretSink: { kind: workloadPull }` now fails the check, which is what its first CI apply would
+have done (`undelivered_secrets`) or, with a `file` sink, silently lost.

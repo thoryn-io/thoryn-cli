@@ -293,6 +293,10 @@ thoryn examples share    <name> [--output <file>]   # SSO-2876 — export the se
 # `kind: file` (owner-only, no overwrite without --force) — right after apply recorded the client. Nothing reaches
 # ⇒ exit 65 `undelivered_secrets` naming `thoryn clients rotate-secret <id> --secret-file <path>`. See "Where a
 # minted secret goes" below.
+# SSO-3921 (oauthy ADR 2026-10-14 credential ladder, rung 3): `secretSink: { kind: workloadPull, trust: <name> }` delivers
+# NOTHING — apply discards the minted value and converges `manager` on the application for the named kubernetes trust's
+# wi_ client, whose pod mints its own secret at start. The way a CI apply (no kubeconfig, no TTY) creates a confidential
+# application and stays green. plan prints `secret: pulled at runtime by trust <name>`.
 # SSO-3689 (ADR 2026-10-14 credential ladder; ADR 2026-10-14 federated client authentication): an application declares HOW it
 # authenticates — `clientAuthenticationMethods: [private_key_jwt]` with `jwksUri` or an inline public `jwks` (rung 1), or
 # `[federated_assertion]` with `federatedTrust: <trust name>` (rung 2: the pod's / job's platform token IS the client
@@ -870,7 +874,10 @@ The connection contract gains a **token source**: the identity token is read fro
   this pod runs in 'staging'`). The hub's own reasons (`namespace_mismatch`, `service_account_mismatch`,
   `claim_missing` for a legacy non-projected token, `unknown_signing_key` after a key rotation) are in the
   workspace audit log.
-- The trust's client needs `manager` on the application whose secret it rotates (`thoryn access grant`).
+- The trust's client needs `manager` on the application whose secret it rotates (`thoryn access grant`) — or,
+  with provisioning-as-code, declare `secretSink: { kind: workloadPull, trust: <trust name> }` on the
+  application and `apply` converges that grant (and creates the application from CI without delivering its
+  secret anywhere; SSO-3921, "Where a minted secret goes" below).
   Rotation is a pod restart: the previous secret stays valid for 24 hours.
 
 The complete, applyable manifest — ServiceAccount, the connection ConfigMap, the projected token volume
@@ -1268,8 +1275,12 @@ converged. The `--secret-file` / TTY channel above stays the default when no sin
 fallback when the declared one cannot be reached. The value never enters the file, the plan, a log, or a
 `kubectl` argument.
 
-The forge's own login client (`thoryn-cicd/.thoryn/provision.yaml`, the ADR's first consumer), delivered
-into the cluster the job already has a kubeconfig for:
+**From CI, nothing delivers: the pod pulls (SSO-3921).** oauthy ADR
+`2026-10-14-kubernetes-workload-identity-and-runtime-credential-pull` rules out a CI job pushing a client secret
+into a cluster (rung 4, "courier: never"): the application's own pod mints its secret at start, signed in with
+its projected ServiceAccount token under a `kubernetes` workload-identity trust (see "Kubernetes — a pod pulls its
+own client secret" above). The forge's Forgejo login client (`thoryn-cicd/.thoryn/provision.yaml`, the ADR's
+first consumer), created by the repository's CI apply on a runner with no kubeconfig:
 
 ```yaml
 apiVersion: thoryn.io/provision/v1
@@ -1280,6 +1291,44 @@ resources:
       displayName: "Forgejo login"
       grantTypes: ["authorization_code"]           # no clientType ⇒ confidential ⇒ a secret is minted on create
       redirectUris: ["https://forge.thoryn.org/user/oauth2/thoryn/callback"]
+    secretSink:
+      kind: workloadPull
+      trust: forge-forgejo                         # a kubernetes trust on the same plane, pinning the Forgejo pod's
+                                                   # namespace + service account, carrying tenant:applications.write
+```
+
+The trust is either declared in the same file (same `environment`; a sandbox trust is created by this apply) or
+already live — a **production** trust is created once by a person (`thoryn workload-identity trusts create
+--provider kubernetes …`) and only looked up here by name.
+
+- **`plan`** prints `application forge-forgejo-login: secret: pulled at runtime by trust forge-forgejo
+  (workload client wi_…; apply discards the minted value)` on every plan of the application, and the grant
+  it converges: `grant + client:wi_… manager` (the relation `thoryn clients rotate-secret` needs on the
+  application, and the one under which the hub lets that workload client replace an in-flight secret —
+  oauthy SSO-3696). In `--output json`: `changes[].secretSink` = `{ kind: workloadPull, trust,
+  workloadClientId }` and `summary.pull`. A create is marked `(a client secret will be minted and discarded —
+  the pods of trust forge-forgejo mint their own at start)`.
+- **`apply`** creates the client and **drops** the one-time value — never printed, written, logged or handed to
+  a sink — so nothing is undelivered: no `--secret-file`, TTY or `kubectl` is needed and the apply exits 0. It
+  then converges `client:<wi_…> manager` on the application (with a declared `grants:` block it is part of the
+  block, so `--prune` never revokes it; without one it is the only grant touched). A re-apply mints nothing and,
+  with the grant in place, writes nothing.
+- **The pod** signs in and runs `thoryn clients rotate-secret <clientId> --secret-file /shared/client-secret`
+  (the init containers of [`examples/kubernetes/`](examples/kubernetes/README.md)); its rotation replaces the
+  unseen secret the create minted.
+- **Refused** at plan time, before any write: a trust that is neither declared nor visible in the application's
+  plane (`workload_pull_trust_not_found`; a declared one this identity cannot see is `access_not_reachable`,
+  `viewer` on it by name); a trust declared for ANOTHER plane (`workload_pull_trust_other_plane`); a trust that
+  is not `provider: kubernetes` (`workload_pull_trust_not_kubernetes` — a CI job that fetches a secret to hand
+  on is the courier again); a trust without `tenant:applications.write` (`workload_pull_scope_missing` — its
+  pod's rotation would be a `403`). A `workloadPull` sink on a public or secret-less client is refused like any
+  `secretSink:`. `thoryn provision workflow check` fails (`config.secret-delivery`) a CI-applied file whose
+  secret-minting application declares no sink, a `kubernetesSecret` sink or a `file` sink.
+
+**From your own workstation, a sink can deliver.** A `kubernetesSecret` sink is for an apply an OPERATOR runs
+with a `kubectl` context for the cluster (the reusable provisioning workflow has none):
+
+```yaml
     secretSink:
       kind: kubernetesSecret
       namespace: forge                             # must already exist — thoryn never creates a namespace
@@ -1328,7 +1377,9 @@ Rules the schema and the loader both enforce: `secretSink` sits on `kind: applic
 confidential one (`clientType: public` is minted nothing and is refused); it is refused on a `readOnly: true`
 reference (nothing is minted for a dependency — the owning repository delivers); a `kubernetesSecret` is
 exactly `{ kind, namespace, name, key }` with Kubernetes grammars (namespace: RFC 1123 label; name: RFC 1123
-subdomain; key: `[-._a-zA-Z0-9]+`); a `file` is exactly `{ kind, path }`.
+subdomain; key: `[-._a-zA-Z0-9]+`); a `file` is exactly `{ kind, path }`; a `workloadPull` is exactly
+`{ kind, trust }` with `trust` a resource name, and a trust declared in the same file must sit on the
+application's plane, be `provider: kubernetes` and carry `tenant:applications.write`.
 
 ### Publishing an application's client id to the repository that deploys it (SSO-3668)
 
