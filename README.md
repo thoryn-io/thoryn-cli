@@ -2811,10 +2811,11 @@ A `thoryn login` session is the hub's `cli` client session. The hub sets its lim
 | Limit | Value | In practice |
 |---|---|---|
 | Access token | 15 min | Renewed automatically; you never see it. |
-| Idle window | 8 h | A session not used for 8 hours ends. Leave it overnight and the next morning's first command asks you to sign in again. Any command renews it. |
+| Idle window | 72 h | A session not used for 72 hours ends. A night or a weekend away does not end it; any command renews it. |
 | Maximum lifetime | 7 days from sign-in | However often you use it, sign in again once a week. |
 
-A workspace's authentication policy can only shorten these. The refresh token rotates on every renewal
+(Set by the product owner on 2026-10-23, SSO-3930; until then the idle window was 8 h, so a session
+left overnight ended — SSO-3928.) A workspace's authentication policy can only shorten these. The refresh token rotates on every renewal
 and, where the machine holds a DPoP key, is bound to it, so a copied token is useless elsewhere. Two commands that renew
 at the same moment are fine: the hub accepts the just-rotated token for 30 seconds and returns the same
 successor.
@@ -2823,7 +2824,7 @@ When the hub ends the session, the CLI says why and when, from the hub's reason 
 tokens:
 
 ```
-Your sign-in session has ended: it was not used within the hub's idle window (last renewed 2026-10-22 18:31 UTC, 12 h 48 min ago). Run `thoryn login --workspace thoryn` to sign in again.
+Your sign-in session has ended: it was not used within the hub's idle window (last renewed 2026-10-20 18:31 UTC, 3 d 0 h ago). Run `thoryn login --workspace thoryn` to sign in again.
 Your sign-in session has ended: it reached its maximum lifetime (signed in 2026-10-15 18:00 UTC, 7 d 0 h ago). Run `thoryn login --workspace thoryn` to sign in again.
 ```
 
