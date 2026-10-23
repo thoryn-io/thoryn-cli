@@ -97,6 +97,12 @@ internal class FakeProductApi : Dispatcher() {
      * (`400 invalid_type` on `/access/check` and `/access/mine`) and a trust is reached through its plane only.
      */
     var trustObjects = true
+    /**
+     * SSO-3925 — how product-api answers a WIDENING `PUT …/trusts/{id}/scopes` (a scope added to either set): null ⇒ made
+     * (a person with a fresh passkey sign-in), `"step_up"` ⇒ the RFC 9470 `403` + `WWW-Authenticate`, `"machine"` ⇒
+     * `403 elevated_action_requires_person`. A narrowing is always made.
+     */
+    var trustWidening: String? = null
     // ── SSO-3766 / SSO-3767 / SSO-3770 — the application settings product-api validates (oauthy SSO-3758 / 3759 / 3762) ──
     /** The workspace is the platform HOME (`thoryn`): only then may an application list `thoryn_access_grant`. */
     var homeWorkspace = false
@@ -387,6 +393,8 @@ internal class FakeProductApi : Dispatcher() {
                 t["subjectPatterns"] = listOfNotNull((t["subjectPatterns"] as? List<*>)?.firstOrNull()?.toString(), "^repo:\\Q${github?.get("owner")}/${github?.get("repository")}\\E:environment:\\Q${plan["environment"]}\\E$")
                 json(200, trustView(t))
             }
+            // SSO-3925 (oauthy product-api) — the in-place scope change: `PUT …/{id}/scopes` `{ scopes?, planScopes? }`.
+            seg.endsWith("/scopes") && method == "PUT" -> changeTrustScopes(visible.firstOrNull { it["id"] == seg.removeSuffix("/scopes") && may(it, "manager") }, b)
             method == "GET" -> visible.firstOrNull { it["id"] == seg }?.let { json(200, trustView(it)) } ?: problem(404, "workload_identity_trust_not_found")
             method == "DELETE" -> {
                 val t = visible.firstOrNull { it["id"] == seg && may(it, "manager") } ?: return problem(404, "workload_identity_trust_not_found")
@@ -398,6 +406,37 @@ internal class FakeProductApi : Dispatcher() {
             }
             else -> problem(405, "method")
         }
+    }
+
+    /** SSO-3925 — product-api's `WorkloadIdentityTrustService.updateScopes` (+ the hub's rules) in miniature. */
+    private fun changeTrustScopes(t: MutableMap<String, Any?>?, b: Map<String, Any?>): MockResponse {
+        if (t == null) return problem(404, "workload_identity_trust_not_found")
+        val liveScopes = (t["scopes"] as List<*>).map { it.toString() }
+        @Suppress("UNCHECKED_CAST")
+        val plan = (t["plan"] as? Map<String, Any?>)?.toMutableMap()
+        val livePlan = (plan?.get("scopes") as? List<*>)?.map { it.toString() }.orEmpty()
+        val scopes = (b["scopes"] as? List<*>)?.map { it.toString() }
+        val planScopes = (b["planScopes"] as? List<*>)?.map { it.toString() }
+        if (scopes == null && planScopes == null) return problem(400, "invalid_request")
+        if (scopes != null && (scopes.isEmpty() || scopes.any { !it.startsWith("tenant:") })) return problem(400, "invalid_scope")
+        if (planScopes != null && plan == null) return problem(400, "plan_profile_not_set")
+        callerScopes?.let { held -> if ((scopes.orEmpty() + planScopes.orEmpty()).any { it !in held }) return problem(403, "scope_not_grantable") }
+        val apply = scopes ?: liveScopes
+        val planAfter = planScopes ?: livePlan
+        if (planAfter.any { it !in apply }) return problem(400, "plan_scope_not_subset")
+        val widened = apply.any { it !in liveScopes } || planAfter.any { it !in livePlan }
+        if (widened) {
+            when (trustWidening) {
+                "step_up" -> return problem(403, "insufficient_user_authentication").setHeader(
+                    "WWW-Authenticate",
+                    "Bearer error=\"insufficient_user_authentication\", acr_values=\"urn:thoryn:acr:phishing_resistant\", max_age=\"300\"",
+                )
+                "machine" -> return problem(403, "elevated_action_requires_person")
+            }
+        }
+        t["scopes"] = apply
+        if (plan != null) t["plan"] = plan.also { it["scopes"] = planAfter }
+        return json(200, trustView(t))
     }
 
     /** product-api's `WorkloadIdentityTrustService.create` in miniature: name, scope ceiling, production rules, the provider's pin block. */

@@ -1,0 +1,1 @@
+{"type":"about:blank","title":"Forbidden","status":403,"detail":"Adding scopes to a workload identity trust is a person's act: sign in as a workspace member with a passkey. A workload identity may narrow a trust's scopes, never widen them.","instance":"/api/v1/workload-identity/trusts/7c2d9e4f-1a3b-4c5d-8e6f-9a0b1c2d3e4f/scopes","errorCode":"elevated_action_requires_person"}

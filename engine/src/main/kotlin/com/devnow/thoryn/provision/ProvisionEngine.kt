@@ -909,7 +909,7 @@ class ProvisionEngine(
             }
             val scopes = (view["scopes"] as? List<*>).orEmpty().map { it.toString() }
             if (ProvisionFile.ROTATE_SECRET_SCOPE !in scopes) {
-                return red(ProvisionFile.ERR_WORKLOAD_PULL_SCOPE_MISSING, "trust '$name' does not carry ${ProvisionFile.ROTATE_SECRET_SCOPE} (it has ${scopes.joinToString(" ").ifEmpty { "none" }}): its pods could not run `thoryn clients rotate-secret` — re-create the trust with it (a trust's scopes are immutable)")
+                return red(ProvisionFile.ERR_WORKLOAD_PULL_SCOPE_MISSING, "trust '$name' does not carry ${ProvisionFile.ROTATE_SECRET_SCOPE} (it has ${scopes.joinToString(" ").ifEmpty { "none" }}): its pods could not run `thoryn clients rotate-secret` — add it to the trust in place (declare it in the trust's spec.scopes, or `thoryn workload-identity trusts set-scopes $name --scope …`; adding a scope is a person's act with a passkey sign-in), then re-run")
             }
             val clientId = view["clientId"]?.toString() ?: return red(ProvisionFile.ERR_WORKLOAD_PULL_TRUST_NOT_FOUND, "trust '$name' in ${planeLabel(slug)} renders no workload client")
             return change.copy(secretSink = sink, pullClientId = clientId)
@@ -2180,13 +2180,13 @@ class ProvisionEngine(
                 out.println("  ~ application ${r.name}: updated ${change.diff.keys}${if (keyLocation.isNotEmpty()) " + key location" else ""} (clientId $id)")
                 base.copy(attributes = applicationAttributes(spec))
             }
-            // SSO-3689 — a differing pin or scope set is never planned (`workload_identity_trust_immutable`); SSO-3702 — the ONE
-            // update a plan can carry is the additive plan profile on a trust that has none.
-            ProvisionFile.KIND_WORKLOAD_IDENTITY_TRUST -> {
-                if (change.diff.keys.any { !it.startsWith(PLAN_FIELD_PREFIX) }) {
-                    throw ProvisionException("${r.key}: $ERROR_TRUST_IMMUTABLE — a trust's pins and scopes cannot be changed in place; delete it and re-apply, or declare what is live")
-                }
-                setTrustPlanProfile(r, change, slug, spec)
+            // SSO-3689 — a differing pin is never planned (`workload_identity_trust_immutable`). The updates a plan can carry:
+            // SSO-3925 — the trust's scopes (and its live plan profile's) changed in place; SSO-3702 — the additive plan
+            // profile on a trust that has none.
+            ProvisionFile.KIND_WORKLOAD_IDENTITY_TRUST -> when {
+                isTrustScopeChange(change.diff.keys, livePlanScopes(change.trust) != null) -> setTrustScopes(r, change, slug, spec)
+                change.diff.keys.all { it.startsWith(PLAN_FIELD_PREFIX) } -> setTrustPlanProfile(r, change, slug, spec)
+                else -> throw ProvisionException("${r.key}: $ERROR_TRUST_IMMUTABLE — a trust's pins cannot be changed in place; delete it and re-apply, or declare what is live")
             }
             ProvisionFile.KIND_USER -> {
                 clients(slug).updateUser(id, changed)
@@ -2584,8 +2584,8 @@ class ProvisionEngine(
     /**
      * Live lookup of a trust by its NAME in its plane (or by the owned id): absent ⇒ create (refused up front with the
      * hub's `scope_not_grantable` when the host knows the caller's scopes and a declared one is not among them);
-     * present and every DECLARED field equal ⇒ adopt / no-op; present and different ⇒ `workload_identity_trust_immutable`
-     * (the hub has no update; the pins are immutable by design). A trust whose workload client IS the applying identity is
+     * present and every DECLARED field equal ⇒ adopt / no-op; present with only its scopes different ⇒ an in-place scope
+     * change (SSO-3925); present with a pin different ⇒ `workload_identity_trust_immutable` (the pins are immutable by design). A trust whose workload client IS the applying identity is
      * refused: a file cannot declare the bootstrap trust it signs in with.
      */
     private fun probeTrust(r: ProvisionResource, slug: String?, desired: Map<String, Any?>): PlannedChange {
@@ -2625,12 +2625,13 @@ class ProvisionEngine(
             )
         }
         val diff = diffOf(trustDesired(desired), trustLive(node))
-        // SSO-3702 — the ONE additive exception to immutability: a declared plan profile on a live trust that has none is
-        // converged by `set plan profile` (the wi_ client stays). Anything else that differs — a pin, the scopes, a live
-        // profile that is not the declared one — is still the immutable error.
+        // SSO-3702 — the additive exception to immutability: a declared plan profile on a live trust that has none is
+        // converged by `set plan profile` (the wi_ client stays). SSO-3925 — the trust's scopes, and its live plan profile's,
+        // change in place. Anything else that differs — a pin, a live profile's environment — is still the immutable error.
         val planOnly = diff.isNotEmpty() && diff.keys.all { it.startsWith(PLAN_FIELD_PREFIX) }
         val liveHasPlan = node[ProvisionFile.TRUST_PLAN]?.takeIf { it.isObject && it.str("environment") != null } != null
         return when {
+            isTrustScopeChange(diff.keys, liveHasPlan) -> planTrustScopeChange(r, slug, desired, view, id, attributes, diff, clientId, owner)
             planOnly && !liveHasPlan -> PlannedChange(
                 r.kind, r.name, ChangeAction.UPDATE,
                 "exists — adds the plan profile (GitHub environment '${(desired[ProvisionFile.TRUST_PLAN] as? Map<*, *>)?.get("environment")}', read-only scopes) " +
@@ -2639,7 +2640,7 @@ class ProvisionEngine(
             )
             planOnly -> PlannedChange(
                 r.kind, r.name, ChangeAction.ERROR,
-                "$ERROR_TRUST_IMMUTABLE — the live trust already carries a plan profile that differs from the declared one (${diff.keys.joinToString(", ")}); a plan profile is set once: " +
+                "$ERROR_TRUST_IMMUTABLE — the live trust already carries a plan profile that differs from the declared one (${diff.keys.joinToString(", ")}); a plan profile's environment is set once: " +
                     "declare what is live, or re-create the trust (`thoryn workload-identity trusts delete $id${slug?.let { " --environment $it" } ?: ""}`, then re-apply — a new wi_ client, re-paste it)",
                 resource = r, liveId = id, environment = slug, attributes = attributes, diff = diff, error = ERROR_TRUST_IMMUTABLE, trust = view,
             )
@@ -2647,7 +2648,7 @@ class ProvisionEngine(
             // a new pin set is a NEW trust, and creating that is a person's act (a human approves every production pin set).
             diff.isNotEmpty() -> PlannedChange(
                 r.kind, r.name, ChangeAction.ERROR,
-                "$ERROR_TRUST_IMMUTABLE — ${diff.size} declared field(s) differ from the live trust (${diff.keys.joinToString(", ")}); a trust's pins and scopes are immutable on the hub: " +
+                "$ERROR_TRUST_IMMUTABLE — ${diff.size} declared field(s) differ from the live trust (${diff.keys.joinToString(", ")}); a trust's pins are immutable on the hub (its scopes change in place, but not together with a pin): " +
                     if (slug == null || slug == PRODUCTION_ENV_SLUG) {
                         "declare what is live. On the PRODUCTION plane a changed pin set is a NEW trust, and a new production trust is created by a PERSON, never by this file " +
                             "from CI: a workspace admin reviews the new pins, creates the trust (declare it under a new name and apply the file signed in as themselves), " +
@@ -2660,6 +2661,161 @@ class ProvisionEngine(
             )
             else -> PlannedChange(r.kind, r.name, ChangeAction.NOOP, "exists and matches", resource = r, liveId = id, environment = slug, attributes = attributes, trust = view, retain = r.retain, owner = owner)
         }
+    }
+
+    /** SSO-3925 — is a trust's [diff] a pure scope change the hub makes in place? The plan's scopes only when the live trust has a plan profile. */
+    private fun isTrustScopeChange(diff: Set<String>, liveHasPlan: Boolean): Boolean =
+        diff.isNotEmpty() && diff.all { it in TRUST_SCOPE_FIELDS } && (TRUST_PLAN_SCOPES_FIELD !in diff || liveHasPlan)
+
+    /** SSO-3925 — the live plan profile's scopes from a trust view, or null when the trust has no plan profile. */
+    private fun livePlanScopes(view: Map<String, Any?>?): List<String>? =
+        (view?.get(ProvisionFile.TRUST_PLAN) as? Map<*, *>)?.takeIf { it["environment"] != null }
+            ?.let { plan -> (plan[ProvisionFile.TRUST_SCOPES] as? List<*>).orEmpty().map { it.toString() } }
+
+    /**
+     * SSO-3925 — the in-place scope change a declared trust needs against its live view: the `PUT …/{id}/scopes` body (only
+     * the sets that differ), whether it WIDENS either set, and what it adds / removes — or, in [problem], why it cannot be
+     * planned. A plan profile whose scopes the file leaves to the hub (`plan:` without `scopes`) is never widened here; when
+     * the new apply scopes drop some of its live scopes, the profile keeps the rest (`planScopes` = live ∩ new), and with
+     * none left the file must name `spec.plan.scopes`.
+     */
+    private class TrustScopeChange(
+        val body: Map<String, Any?>,
+        val widened: Boolean,
+        val added: List<String>,
+        val removed: List<String>,
+        val problem: String? = null,
+    )
+
+    private fun trustScopeChange(spec: Map<String, Any?>, view: Map<String, Any?>?): TrustScopeChange {
+        val liveApply = (view?.get("scopes") as? List<*>).orEmpty().map { it.toString() }
+        val livePlan = livePlanScopes(view)
+        val desiredApply = (spec[ProvisionFile.TRUST_SCOPES] as? List<*>)?.map { it.toString().trim() }?.distinct() ?: liveApply
+        val declaredPlan = ((spec[ProvisionFile.TRUST_PLAN] as? Map<*, *>)?.get(ProvisionFile.TRUST_SCOPES) as? List<*>)?.map { it.toString().trim() }?.distinct()
+        val body = linkedMapOf<String, Any?>()
+        if (desiredApply.toSet() != liveApply.toSet()) body[ProvisionFile.TRUST_SCOPES] = desiredApply
+        var planAfter = livePlan.orEmpty()
+        if (livePlan != null) {
+            if (declaredPlan != null && declaredPlan.toSet() != livePlan.toSet()) {
+                planAfter = declaredPlan
+                body[API_PLAN_SCOPES] = declaredPlan
+            } else if (declaredPlan == null && livePlan.any { it !in desiredApply }) {
+                planAfter = livePlan.filter { it in desiredApply }
+                if (planAfter.isEmpty()) {
+                    return TrustScopeChange(
+                        body, false, emptyList(), emptyList(),
+                        problem = "the new spec.scopes keep none of the plan profile's live scopes (${livePlan.joinToString(" ")}): name spec.plan.scopes — read-only scopes from spec.scopes",
+                    )
+                }
+                body[API_PLAN_SCOPES] = planAfter
+            }
+        }
+        val added = desiredApply.filterNot { it in liveApply } + planAfter.filterNot { it in livePlan.orEmpty() }.map { "plan:$it" }
+        val removed = liveApply.filterNot { it in desiredApply } + livePlan.orEmpty().filterNot { it in planAfter }.map { "plan:$it" }
+        return TrustScopeChange(body, added.isNotEmpty(), added, removed)
+    }
+
+    /**
+     * SSO-3925 — plan a declared trust whose only difference from the live one is its scopes: an in-place `set scopes`
+     * (the id, the `wi_` client, its owner and every consumer's `connection.json` stay). Refused in the plan, with the
+     * API's own codes, when the applying identity does not hold a declared scope (`scope_not_grantable`) or when a CI
+     * identity would WIDEN the trust (`elevated_action_requires_person`: adding a scope is a person's act with a fresh
+     * passkey sign-in, ADR 2026-10-21 §4b); a narrowing converges from CI.
+     */
+    private fun planTrustScopeChange(
+        r: ProvisionResource,
+        slug: String?,
+        desired: Map<String, Any?>,
+        view: Map<String, Any?>,
+        id: String,
+        attributes: Map<String, String>,
+        diff: Map<String, String>,
+        clientId: String?,
+        owner: String?,
+    ): PlannedChange {
+        val change = trustScopeChange(desired, view)
+        fun red(code: String, why: String, fixNote: String? = null) = PlannedChange(
+            r.kind, r.name, ChangeAction.ERROR, "$code — $why",
+            resource = r, liveId = id, environment = slug, attributes = attributes, diff = diff, error = code, trust = view, fixNote = fixNote,
+        )
+        change.problem?.let { return red(ProvisionFile.ERR_PLAN_SCOPE_NOT_SUBSET, it) }
+        val requested = ((change.body[ProvisionFile.TRUST_SCOPES] as? List<*>).orEmpty() + (change.body[API_PLAN_SCOPES] as? List<*>).orEmpty())
+            .map { it.toString() }.distinct()
+        val notHeld = callerScopes?.let { held -> requested.filter { it !in held } }.orEmpty()
+        if (notHeld.isNotEmpty()) {
+            return red(
+                ERROR_SCOPE_NOT_GRANTABLE,
+                "a trust can carry only tenant: scopes the applying identity itself holds, and this one does not hold ${notHeld.joinToString(", ")}: " +
+                    "drop the scope from spec.scopes, or sign in with it first",
+            )
+        }
+        val setScopes = "thoryn workload-identity trusts set-scopes $id${slug?.let { " --environment $it" } ?: ""}"
+        if (change.widened && subject?.startsWith("client:") == true) {
+            return red(
+                ERROR_ELEVATED_ACTION_REQUIRES_PERSON,
+                "this file adds ${change.added.joinToString(" ")} to trust '${r.name}', and adding a scope to a trust is a PERSON's act with a fresh passkey sign-in — " +
+                    "never a workload identity's: a workspace member runs `$setScopes ${scopeFlags(change)}` (or applies this file signed in as themselves), " +
+                    "then this file converges as a no-op. Removing scopes converges from CI.",
+                fixNote = "a person's act, not a missing right: a workload identity may narrow a trust's scopes, never widen them",
+            )
+        }
+        val what = buildList {
+            if (change.added.isNotEmpty()) add("adds ${change.added.joinToString(" ")}")
+            if (change.removed.isNotEmpty()) add("removes ${change.removed.joinToString(" ")}")
+        }.joinToString("; ")
+        val elevation = if (change.widened) {
+            " — adding a scope needs a passkey sign-in from the last 5 minutes (`thoryn login --acr-values $PASSKEY_ACR --max-age $ELEVATED_MAX_AGE_SECONDS`)"
+        } else {
+            ""
+        }
+        return PlannedChange(
+            r.kind, r.name, ChangeAction.UPDATE,
+            "exists — changes its scopes in place ($what); the wi_ workload client ${clientId ?: ""} stays$elevation".replace("  ", " "),
+            resource = r, liveId = id, environment = slug, attributes = attributes, diff = diff, trust = view, retain = r.retain, owner = owner,
+        )
+    }
+
+    /** SSO-3925 — the `set-scopes` flags that make the live trust what the file declares (for the fix line). */
+    private fun scopeFlags(change: TrustScopeChange): String = buildList {
+        (change.body[ProvisionFile.TRUST_SCOPES] as? List<*>)?.let { add("--scope \"${it.joinToString(" ")}\"") }
+        (change.body[API_PLAN_SCOPES] as? List<*>)?.let { add("--plan-scope \"${it.joinToString(" ")}\"") }
+    }.joinToString(" ")
+
+    /**
+     * SSO-3925 — apply an in-place scope change ([planTrustScopeChange]): `PUT …/{id}/scopes` with only the sets that differ.
+     * A step-up refusal (the applying person's sign-in is not a fresh passkey one) and a platform that predates the route each
+     * name what to do; nothing else of the trust changes.
+     */
+    private fun setTrustScopes(r: ProvisionResource, change: PlannedChange, slug: String?, spec: Map<String, Any?>): AppliedResource {
+        val id = change.liveId ?: throw ProvisionException("${r.key}: scope update planned without a live id")
+        val scopeChange = trustScopeChange(spec, change.trust)
+        scopeChange.problem?.let { throw ProvisionException("${r.key}: ${ProvisionFile.ERR_PLAN_SCOPE_NOT_SUBSET} — $it") }
+        val resp = try {
+            clients(slug).setWorkloadIdentityTrustScopes(id, scopeChange.body)
+        } catch (ex: ProductApiException) {
+            throw when {
+                ex.isStepUpRequired -> ProvisionException(
+                    "${r.key}: adding ${scopeChange.added.joinToString(" ")} to trust '${r.name}' needs a passkey sign-in from the last " +
+                        "${(ex.stepUpMaxAge ?: ELEVATED_MAX_AGE_SECONDS) / 60} minutes: sign in again with " +
+                        "`thoryn login --acr-values ${ex.stepUpAcrValues ?: PASSKEY_ACR} --max-age ${ex.stepUpMaxAge ?: ELEVATED_MAX_AGE_SECONDS}` and re-run (nothing was changed)",
+                )
+                ex.errorCode == ERROR_ELEVATED_ACTION_REQUIRES_PERSON -> ProvisionException(
+                    "${r.key}: $ERROR_ELEVATED_ACTION_REQUIRES_PERSON — adding a scope to trust '${r.name}' is a person's act with a fresh passkey sign-in; " +
+                        "a workload identity may only narrow it (nothing was changed)",
+                )
+                ex.httpStatus in setOf(404, 405) && ex.errorCode != "workload_identity_trust_not_found" -> ProvisionException(
+                    "${r.key}: this platform does not change a trust's scopes in place yet — declare what is live (nothing was changed)",
+                )
+                else -> trustFailure(r, ex)
+            }
+        }
+        trustLists.remove(slug)
+        val view = trustView(resp)
+        out.println(
+            "  ~ workloadIdentityTrust ${r.name}: scopes changed in place (${(scopeChange.added.map { "+$it" } + scopeChange.removed.map { "-$it" }).joinToString(" ")}); " +
+                "wi_ client ${view["clientId"] ?: change.trust?.get("clientId") ?: ""} unchanged (id $id)",
+        )
+        return AppliedResource(r.kind, r.name, id, slug, trustAttributes(view.ifEmpty { change.trust.orEmpty() }), owner = change.owner, action = ChangeAction.UPDATE)
     }
 
     /** The declared scopes the caller's token does not carry (empty when the host did not say what it carries). */
@@ -2839,7 +2995,7 @@ class ProvisionEngine(
                     printTrustConnection(view)
                     return result
                 }
-                throw ProvisionException("${r.key}: $ERROR_TRUST_IMMUTABLE — a trust named '${r.name}' already exists in ${planeLabel(slug)} with other pins or scopes; declare what is live, or delete it and re-apply")
+                throw ProvisionException("${r.key}: $ERROR_TRUST_IMMUTABLE — a trust named '${r.name}' already exists in ${planeLabel(slug)} with other pins or scopes; declare what is live and re-apply (a scope change is then planned in place), or delete it and re-apply")
             }
             throw trustFailure(r, ex)
         }
@@ -3296,6 +3452,20 @@ class ProvisionEngine(
         const val ERROR_TRUST_IMMUTABLE = "workload_identity_trust_immutable"
         /** SSO-3702 — the flat-diff key prefix of a trust's plan profile (`plan.environment`, `plan.scopes`): the one additive exception to immutability. */
         const val PLAN_FIELD_PREFIX = "plan."
+
+        /** SSO-3925 — the trust fields that change in place (`PUT …/{id}/scopes`): the apply scopes and the plan profile's. */
+        private val TRUST_PLAN_SCOPES_FIELD = PLAN_FIELD_PREFIX + ProvisionFile.TRUST_SCOPES
+        private val TRUST_SCOPE_FIELDS = setOf(ProvisionFile.TRUST_SCOPES, TRUST_PLAN_SCOPES_FIELD)
+
+        /** SSO-3925 — the scope-change body's plan member (`UpdateWorkloadIdentityTrustScopesRequest.planScopes`). */
+        private const val API_PLAN_SCOPES = "planScopes"
+
+        /** SSO-3925 — product-api's refusal of a widening by a workload identity: adding a trust scope is a person's act. */
+        const val ERROR_ELEVATED_ACTION_REQUIRES_PERSON = "elevated_action_requires_person"
+
+        /** SSO-3925 — what the step-up of a widening asks for (oauthy ADR 2026-10-21 §4b: passkey + 300 s). */
+        const val PASSKEY_ACR = "urn:thoryn:acr:phishing_resistant"
+        const val ELEVATED_MAX_AGE_SECONDS = 300L
         /** The hub's scope ceiling: a trust may carry only tenant: scopes the applying identity itself holds. */
         const val ERROR_SCOPE_NOT_GRANTABLE = "scope_not_grantable"
         /** `spec.federatedTrust` names no trust of the application's environment (missing, or declared for another one). */

@@ -450,6 +450,10 @@ class ProductApiClient(
     override fun setWorkloadIdentityTrustPlanProfile(id: String, body: Map<String, Any?>): JsonNode =
         post("/api/v1/workload-identity/trusts/${encode(id)}/plan-profile", mapper.valueToTree<JsonNode>(body.withoutNulls()))
 
+    // SSO-3925 (oauthy product-api) — change a trust's scopes / plan scopes IN PLACE, keep its id and wi_ client.
+    override fun setWorkloadIdentityTrustScopes(id: String, body: Map<String, Any?>): JsonNode =
+        put("/api/v1/workload-identity/trusts/${encode(id)}/scopes", mapper.valueToTree<JsonNode>(body.withoutNulls()))
+
     /** Drop null members (recursively through nested maps) so an omitted option is absent, not `null`. */
     private fun Map<String, Any?>.withoutNulls(): Map<String, Any?> =
         filterValues { it != null }.mapValues { (_, v) ->

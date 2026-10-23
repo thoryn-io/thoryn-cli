@@ -57,9 +57,15 @@ import java.util.concurrent.Callable
  *  - `create --provider kubernetes --name <n> --issuer <https url> [--namespace <ns> --service-account <sa>]
  *     [--jwks-file <path>] --scope <s>… [--confirm-production]`                               — POST
  *  - `set-plan-profile <id> --plan-environment <gh-env> [--plan-scope <s>…]`                 — POST …/{id}/plan-profile
+ *  - `set-scopes <id|name> [--scope <s>…] [--plan-scope <s>…]`                                — PUT …/{id}/scopes
  *  - `list [--limit n] [--cursor c]`                                                         — GET
  *  - `get <id>`                                                                              — GET …/{id}
  *  - `delete <id> [--yes] [--confirm <workspace-slug>]`                                      — DELETE …/{id}
+ *
+ * SSO-3925 — `set-scopes` changes a trust's scopes (and its plan profile's) IN PLACE: same id, same `wi_` client, so no
+ * `connection.json` and no owner grant moves. Removing scopes needs nothing more; ADDING one is a person's act — product-api
+ * answers a workload identity `403 elevated_action_requires_person` and a person without a passkey sign-in from the last five
+ * minutes the RFC 9470 step-up (`thoryn login --acr-values urn:thoryn:acr:phishing_resistant --max-age 300`, then retry).
  *
  * The environment is the one `--environment <slug>` names, else the one `env use` selected (production
  * otherwise). Scopes: create/set-plan-profile/delete → `tenant:workload-identity.write`, list/get →
@@ -80,7 +86,7 @@ class WorkloadIdentityCommand : Callable<Int> {
 
     override fun call(): Int {
         System.err.println("Usage: thoryn workload-identity trusts <subcommand>")
-        System.err.println("Subcommands: trusts create | set-plan-profile <id> | list | get <id> | delete <id>")
+        System.err.println("Subcommands: trusts create | set-plan-profile <id> | set-scopes <id|name> | list | get <id> | delete <id>")
         return CommandSupport.EXIT_USAGE
     }
 
@@ -89,12 +95,12 @@ class WorkloadIdentityCommand : Callable<Int> {
         name = "trusts",
         description = ["Manage the environment's workload identity trusts (one GitHub repository, or one Kubernetes service account, each)."],
         mixinStandardHelpOptions = true,
-        subcommands = [CreateSubcommand::class, SetPlanProfileSubcommand::class, ListSubcommand::class, GetSubcommand::class, DeleteSubcommand::class],
+        subcommands = [CreateSubcommand::class, SetPlanProfileSubcommand::class, SetScopesSubcommand::class, ListSubcommand::class, GetSubcommand::class, DeleteSubcommand::class],
     )
     class TrustsCommand : Callable<Int> {
         override fun call(): Int {
             System.err.println("Usage: thoryn workload-identity trusts <subcommand>")
-            System.err.println("Subcommands: create | set-plan-profile <id> | list | get <id> | delete <id>")
+            System.err.println("Subcommands: create | set-plan-profile <id> | set-scopes <id|name> | list | get <id> | delete <id>")
             return CommandSupport.EXIT_USAGE
         }
     }
@@ -455,14 +461,15 @@ class WorkloadIdentityCommand : Callable<Int> {
      * SSO-3702 — `thoryn workload-identity trusts set-plan-profile <id> --plan-environment <gh-env> [--plan-scope …]`:
      * the ONE additive mutation of a trust (SSO-3699 option B, decision (b)) — give an existing `github_actions`
      * trust its plan profile and keep its `wi_` client, so nothing is re-created, re-pasted or re-owned. A profile
-     * is set once: to change it, re-create the trust (`409 plan_profile_already_set`).
+     * is set once (`409 plan_profile_already_set`); its scopes change later with `set-scopes --plan-scope` (SSO-3925), its
+     * environment only by re-creating the trust.
      */
     @Command(
         name = "set-plan-profile",
         description = [
             "Give an existing GitHub Actions trust its PLAN profile: a second GitHub environment whose jobs are minted read-only",
             "scopes only (the .read members of the trust's scopes, or --plan-scope). Additive — the wi_ client, its owner relation",
-            "and the committed connection.json stay. Set once; to change it, re-create the trust.",
+            "and the committed connection.json stay. Set once: change its scopes with set-scopes --plan-scope; its environment by re-creating the trust.",
         ],
         mixinStandardHelpOptions = true,
     )
@@ -516,6 +523,84 @@ class WorkloadIdentityCommand : Callable<Int> {
                     Printers.record(trustFields(body), out)
                     out.println()
                     printPlanUsage(body, out)
+                }
+                else -> CommandSupport.emitRecord(format, body, ::trustFields)
+            }
+            return CommandSupport.EXIT_OK
+        }
+    }
+
+    /**
+     * SSO-3925 — `thoryn workload-identity trusts set-scopes <id|name> [--scope …] [--plan-scope …]`: change a trust's scopes
+     * and/or its plan profile's IN PLACE (product-api `PUT …/{id}/scopes`). The trust keeps its id, its `wi_` client and every
+     * pin, so the committed `connection.json` and every owner grant stay. Each option replaces its set; an omitted one is kept.
+     * Removing scopes needs `manager` on the trust and nothing more; adding one is a person's act with a passkey sign-in from
+     * the last five minutes (the API answers the RFC 9470 step-up otherwise, and a workload identity
+     * `403 elevated_action_requires_person`).
+     */
+    @Command(
+        name = "set-scopes",
+        description = [
+            "Change a trust's scopes (--scope) and/or its plan profile's (--plan-scope) IN PLACE: the trust keeps its id and its wi_",
+            "client, so connection.json and every owner grant stay. Each option REPLACES its set; leave one out to keep it.",
+            "Removing scopes needs nothing more; ADDING one needs a passkey sign-in from the last 5 minutes",
+            "(thoryn login --acr-values urn:thoryn:acr:phishing_resistant --max-age 300) and is never allowed to a workload identity.",
+        ],
+        mixinStandardHelpOptions = true,
+    )
+    class SetScopesSubcommand : Base() {
+        @Parameters(index = "0", paramLabel = "<id|name>", description = ["The trust id, or its name in this environment (`trusts list`)."])
+        lateinit var trust: String
+
+        @Option(
+            names = ["--scope"],
+            paramLabel = "<scope>",
+            description = ["The trust's new scopes (repeatable, or space/comma-separated): tenant: scopes your session holds. Omitted: kept."],
+        )
+        var scopeArgs: List<String> = emptyList()
+
+        @Option(
+            names = ["--plan-scope"],
+            paramLabel = "<scope>",
+            description = [
+                "The plan profile's new scopes (repeatable, or space/comma-separated): tenant:<area>.read scopes among the trust's scopes.",
+                "Omitted: kept — they must then still be among the trust's (new) scopes.",
+            ],
+        )
+        var planScopeArgs: List<String> = emptyList()
+
+        override val requiredScope: String = SCOPE_WRITE
+
+        internal val scopes: List<String> get() = splitScopes(scopeArgs)
+        internal val planScopes: List<String> get() = splitScopes(planScopeArgs)
+
+        override fun precheck(): Int? {
+            setScopesProblem(scopes, planScopes)?.let {
+                System.err.println("Error: $it")
+                return CommandSupport.EXIT_USAGE
+            }
+            return null
+        }
+
+        override fun run(client: ProductApiClient, format: OutputFormat): Int {
+            val id = resolveTrustId(client, trust.trim()) ?: run {
+                System.err.println("Error: workload_identity_trust_not_found — no trust named '${trust.trim()}' in this environment that you can see. List them with `thoryn workload-identity trusts list`.")
+                return CommandSupport.EXIT_HTTP_ERROR
+            }
+            val before = client.getWorkloadIdentityTrust(id)
+            val body = client.setWorkloadIdentityTrustScopes(id, setScopesBody(scopes, planScopes))
+            when (format) {
+                OutputFormat.TABLE -> {
+                    val out = System.out
+                    out.println("Workload identity trust '${text(body, "name")}' (id ${text(body, "id")}): scopes changed in place.")
+                    out.println("  scopes: ${scopesOf(before).joinToString(" ").ifEmpty { "(none)" }} → ${scopesOf(body).joinToString(" ").ifEmpty { "(none)" }}")
+                    if (planOf(body) != null) {
+                        out.println("  plan scopes: ${planScopesOf(before).joinToString(" ").ifEmpty { "(none)" }} → ${planScopesOf(body).joinToString(" ").ifEmpty { "(none)" }}")
+                    }
+                    out.println("The wi_ client ${text(body, "clientId") ?: ""} is unchanged: nothing to re-paste, no owner or grant moves. Its next token carries the new scopes;".replace("  ", " "))
+                    out.println("tokens already issued keep theirs until they expire (at most 15 minutes). Keep connection.json auth.scopes in step.")
+                    out.println()
+                    Printers.record(trustFields(body), out)
                 }
                 else -> CommandSupport.emitRecord(format, body, ::trustFields)
             }
@@ -631,6 +716,9 @@ class WorkloadIdentityCommand : Callable<Int> {
         const val SCOPE_WRITE: String = "tenant:workload-identity.write"
         const val PROVIDER_GITHUB_ACTIONS: String = "github_actions"
 
+        /** SSO-3925 — the `acr_values` a trust-scope widening's step-up asks for (a passkey satisfies it). */
+        const val PASSKEY_ACR: String = "urn:thoryn:acr:phishing_resistant"
+
         /** SSO-3684 — the trust API's `provider` for a pod's projected ServiceAccount token (oathy SSO-3678). */
         const val PROVIDER_KUBERNETES: String = "kubernetes"
 
@@ -709,6 +797,49 @@ class WorkloadIdentityCommand : Callable<Int> {
         internal fun subjectPatternsOf(body: JsonNode): List<String> =
             body["subjectPatterns"]?.takeIf { it.isArray }?.toList()?.mapNotNull { it.asString() }?.takeIf { it.isNotEmpty() }
                 ?: listOfNotNull(text(body, "subjectPattern"))
+
+        /** SSO-3925 — the `PUT …/{id}/scopes` body: only the sets the caller named (an omitted one is kept by the API). */
+        internal fun setScopesBody(scopes: List<String>, planScopes: List<String>): Map<String, Any?> =
+            mapOf("scopes" to scopes.takeIf { it.isNotEmpty() }, "planScopes" to planScopes.takeIf { it.isNotEmpty() })
+
+        /**
+         * SSO-3925 — what the API would refuse about a `set-scopes`, refused first with its codes: nothing named
+         * (`invalid_request`), a scope that is not a workspace scope (`invalid_scope`), a plan scope that is not a `.read`
+         * scope (`plan_scope_not_read_only`) or — when `--scope` is given too — not among the new scopes (`plan_scope_not_subset`).
+         */
+        internal fun setScopesProblem(scopes: List<String>, planScopes: List<String>): String? {
+            if (scopes.isEmpty() && planScopes.isEmpty()) {
+                return "invalid_request — name the trust's new scopes (--scope) and/or its plan profile's (--plan-scope)."
+            }
+            val notWorkspace = (scopes + planScopes).filterNot { it.startsWith("tenant:") }
+            if (notWorkspace.isNotEmpty()) return "invalid_scope — a trust can carry only workspace (tenant:) scopes, not ${notWorkspace.joinToString()}."
+            val notReadOnly = planScopes.filterNot { it.endsWith(".read") }
+            if (notReadOnly.isNotEmpty()) {
+                return "plan_scope_not_read_only — a plan profile is read-only by construction: every --plan-scope must be a tenant:<area>.read scope, not ${notReadOnly.joinToString()}."
+            }
+            if (scopes.isNotEmpty()) {
+                val notSubset = planScopes.filterNot { it in scopes }
+                if (notSubset.isNotEmpty()) return "plan_scope_not_subset — every --plan-scope must be among the --scope list; not ${notSubset.joinToString()}."
+            }
+            return null
+        }
+
+        private val UUID_SHAPE = Regex("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+        /** SSO-3925 — a trust id as given, or the id of the trust with that NAME in the environment (paging the list); null when none. */
+        internal fun resolveTrustId(client: ProductApiClient, idOrName: String): String? {
+            if (UUID_SHAPE.matches(idOrName)) return idOrName
+            var cursor: String? = null
+            repeat(MAX_LIST_PAGES) {
+                val page = client.listWorkloadIdentityTrusts(null, cursor)
+                val items = page["data"]?.takeIf { it.isArray }?.toList().orEmpty()
+                items.firstOrNull { text(it, "name") == idOrName }?.let { return text(it, "id") }
+                cursor = page["pagination"]?.get("cursor")?.takeUnless { it.isNull }?.asString()?.takeIf { it.isNotBlank() } ?: return null
+            }
+            return null
+        }
+
+        private const val MAX_LIST_PAGES = 20
 
         /** SSO-3702 — the `plan` request member: the environment, plus the explicit scopes only when given (derived otherwise). */
         internal fun planProfileBody(environment: String, scopes: List<String>): Map<String, Any?> =
@@ -1017,6 +1148,17 @@ class WorkloadIdentityCommand : Callable<Int> {
          * `--confirm <slug>` header guard of destructive actions.
          */
         fun renderTrustError(format: OutputFormat, ex: ProductApiException, requiredScope: String): Int {
+            // SSO-3925 — RFC 9470: adding a scope to a trust needs a fresh passkey sign-in (`set-scopes`).
+            if (ex.isStepUpRequired) {
+                val exit = CommandSupport.renderError(format, ex, requiredScope = null)
+                if (format == OutputFormat.TABLE) {
+                    val acr = ex.stepUpAcrValues ?: PASSKEY_ACR
+                    val maxAge = ex.stepUpMaxAge ?: 300
+                    System.err.println("Adding a scope to a trust needs a passkey sign-in from the last ${maxAge / 60} minutes. Sign in again, then retry:")
+                    System.err.println("  thoryn login --acr-values $acr --max-age $maxAge")
+                }
+                return exit
+            }
             val hint = when (ex.errorCode) {
                 "scope_not_grantable" ->
                     "A trust can carry only tenant: scopes your own session holds. Drop the scope, or sign in with it first."
@@ -1044,8 +1186,18 @@ class WorkloadIdentityCommand : Callable<Int> {
                 "workload_identity_trust_name_taken" -> "Choose another --name, or delete the existing trust first."
                 // SSO-3702 — the plan profile's refusals (product-api SSO-3701 / hub SSO-3700).
                 "plan_profile_already_set" ->
-                    "This trust already has a plan profile; a profile is set once. To change it, re-create the trust " +
+                    "This trust already has a plan profile; a profile is set once. Change its scopes in place with " +
+                        "`thoryn workload-identity trusts set-scopes <id> --plan-scope …`; to change its environment, re-create the trust " +
                         "(delete it and `trusts create … --plan-environment <gh-env>`), then re-paste its new wi_ client id."
+                // SSO-3925 — the in-place scope change's refusals.
+                "elevated_action_requires_person" ->
+                    "Adding a scope to a trust is a person's act: a workspace member runs `thoryn workload-identity trusts set-scopes` " +
+                        "signed in with a passkey. A workload identity may only remove scopes."
+                "plan_profile_not_set" ->
+                    "This trust has no plan profile, so --plan-scope has nothing to change: add one first with `thoryn workload-identity trusts set-plan-profile <id> --plan-environment <gh-env>`."
+                "elevation_evidence_required" ->
+                    "The platform could not confirm a fresh passkey sign-in for adding a scope. Sign in again with " +
+                        "`thoryn login --acr-values $PASSKEY_ACR --max-age 300` and retry."
                 "plan_environment_equals_apply" ->
                     "The plan environment must differ from the trust's apply environment (--github-environment): the GitHub environment is " +
                         "what separates \"may read\" from \"may write\". Use an unprotected one, e.g. <apply>-plan."

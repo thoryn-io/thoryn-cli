@@ -18,8 +18,8 @@ import java.io.PrintStream
 /**
  * SSO-3702 (SSO-3699 option B) — `kind: workloadIdentityTrust` with a `plan:` block. Sent on create; compared as an
  * immutable pin EXCEPT for the one additive case — a declared profile on a live trust WITHOUT one converges through
- * `POST …/{id}/plan-profile` (the `wi_` client stays) — while a live profile that differs is the red plan
- * `workload_identity_trust_immutable` ("re-create the trust"). The file refuses what product-api refuses, with its
+ * `POST …/{id}/plan-profile` (the `wi_` client stays) — while a live profile whose ENVIRONMENT differs is the red plan
+ * `workload_identity_trust_immutable` ("re-create the trust"); differing plan scopes change in place (SSO-3925). The file refuses what product-api refuses, with its
  * codes; `import` renders a live profile. And the regression the story names: the OWNER identity, signed in with a
  * read-only (plan-profile) token, plans an owned resource GREEN, while a foreign `manager` still gets
  * `owned_elsewhere` in plan and apply.
@@ -153,12 +153,14 @@ class ProvisionWorkloadIdentityPlanProfileTest : CommandTestBase() {
         assertThatThrownBy { engine().apply(file(withDerivedPlan), plan, "acme", "acme") }.isInstanceOf(ProvisionException::class.java).hasMessageContaining("nothing was written")
         assertThat(api.writes.filter { it.method != "GET" }).isEmpty()
 
-        // Explicit plan scopes that differ from the live profile's are a difference too.
+        // Explicit plan scopes that differ from the live profile's are a difference too — SSO-3925: one changed IN PLACE
+        // (the profile's environment stays; ProvisionTrustScopesInPlaceTest covers the change itself).
         api.trusts.clear()
         api.seedTrust(null, "thoryn-cli-ci", pins = pins, scopes = sixScopes, plan = mapOf("environment" to "thoryn-provision-e2e-plan", "scopes" to readScopes))
         val scopesDiffer = engine().plan(file(withExplicitPlan), false).changes.single()
-        assertThat(scopesDiffer.action).isEqualTo(ChangeAction.ERROR)
+        assertThat(scopesDiffer.action).isEqualTo(ChangeAction.UPDATE)
         assertThat(scopesDiffer.diff).containsOnlyKeys("plan.scopes")
+        assertThat(scopesDiffer.reason).contains("changes its scopes in place")
         // …while a derived declaration (no scopes listed) matches whatever the hub derived.
         assertThat(engine().plan(file(withDerivedPlan), false).changes.single().action).isEqualTo(ChangeAction.NOOP)
         // And a file that declares no plan block does not compare the live one at all.
