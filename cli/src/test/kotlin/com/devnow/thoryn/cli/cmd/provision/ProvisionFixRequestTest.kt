@@ -118,7 +118,8 @@ class ProvisionFixRequestTest : CommandTestBase() {
     }
 
     /** A plan-profile workload-identity session: a JWT without `sub` (Spring AS names the principal after the client), read scopes only. */
-    private fun session(scope: String = "tenant:environments.read tenant:applications.read tenant:access.read", issuer: String = "https://thoryn.auth.stg.thoryn.org") {
+    // SSO-3926 — the plan profile carries tenant:users.read: [redFile] declares a user, and a plan reads it (users.read).
+    private fun session(scope: String = "tenant:environments.read tenant:applications.read tenant:users.read tenant:access.read", issuer: String = "https://thoryn.auth.stg.thoryn.org") {
         val enc = Base64.getUrlEncoder().withoutPadding()
         val header = enc.encodeToString("""{"alg":"none"}""".toByteArray())
         val payload = enc.encodeToString("""{"client_id":"$clientId","scope":"$scope","tnt":"${api.tenantId}"}""".toByteArray())
@@ -258,7 +259,7 @@ class ProvisionFixRequestTest : CommandTestBase() {
 
     @Test
     fun `a session that may list trusts resolves the trust's name, id and apply environment into the request`() {
-        session(scope = "tenant:environments.read tenant:applications.read tenant:access.read tenant:workload-identity.read")
+        session(scope = "tenant:environments.read tenant:applications.read tenant:users.read tenant:access.read tenant:workload-identity.read")
         api.seedGrant(subject, "viewer", "workspace:${api.tenantId}")
         api.seedTrust(null, "decoy", clientId = "wi_000000000000000000000001")
         val trustId = api.seedTrust(

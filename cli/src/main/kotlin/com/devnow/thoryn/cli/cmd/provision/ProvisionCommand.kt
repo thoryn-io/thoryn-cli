@@ -3,12 +3,14 @@ package com.devnow.thoryn.cli.cmd.provision
 import com.devnow.thoryn.provision.ChangeAction
 import com.devnow.thoryn.provision.FixRequest
 import com.devnow.thoryn.provision.ImportedResource
+import com.devnow.thoryn.provision.MissingScopeException
 import com.devnow.thoryn.provision.ProvisionEngine
 import com.devnow.thoryn.provision.ProvisionException
 import com.devnow.thoryn.provision.ProvisionFile
 import com.devnow.thoryn.provision.ProvisionPlan
 import com.devnow.thoryn.cli.api.ProductApiException
 import com.devnow.thoryn.cli.auth.JwtClaims
+import com.devnow.thoryn.cli.auth.TokenStoreFactory
 import com.devnow.thoryn.cli.auth.Tokens
 import com.devnow.thoryn.cli.cmd.CommandSupport
 import com.devnow.thoryn.cli.cmd.CustomDomainView
@@ -176,6 +178,20 @@ class ProvisionCommand : Callable<Int> {
             return (claim ?: tokens.scope)?.split(' ')?.map { it.trim() }?.filter { it.isNotEmpty() }?.toSet()?.takeIf { it.isNotEmpty() }
         }
 
+        /** SSO-3926 — the stored session, as far as naming a profile goes (an unreadable store names none). */
+        private fun storedSession(): TrustScopes.Session =
+            runCatching { TokenStoreFactory.default().read() }.getOrNull()?.let { TrustScopes.Session.of(it) } ?: TrustScopes.Session(null, null, null, null)
+
+        /**
+         * SSO-3926 — `config.trust-scopes` before the work: the scopes [file] needs to plan (or, with [plan], the writes that
+         * plan makes) against the session's token. Prints the message and answers true when one is missing.
+         */
+        fun scopesMissing(file: ProvisionFile, prune: Boolean, tokens: Tokens, plan: ProvisionPlan? = null): Boolean {
+            val message = TrustScopes.preflight(file, prune, callerScopesOf(tokens), TrustScopes.Session.of(tokens), plan) ?: return false
+            System.err.println(message)
+            return true
+        }
+
         /** SSO-3668 — test seam: how `gh` is run for `publishTo:`. Production spawns the customer's real `gh`. */
         @Volatile
         internal var ghRunner: () -> GhRunner = { ProcessGhRunner() }
@@ -333,6 +349,8 @@ class ProvisionCommand : Callable<Int> {
         fun fail(ex: Exception, gateway: String, format: OutputFormat): Int {
             CommandSupport.unrenewableSessionGuidance()?.let { return CommandSupport.renderUnrenewableSession(format, it) }
             return when (ex) {
+                // SSO-3926 — a scope 403 names the scope AND the profile to add it to (config.trust-scopes), for this session.
+                is MissingScopeException -> { System.err.println(TrustScopes.render(ex, storedSession())); CommandSupport.EXIT_HTTP_ERROR }
                 is ProvisionException -> { System.err.println("Error: ${ex.message}"); CommandSupport.EXIT_HTTP_ERROR }
                 is ProductApiException -> CommandSupport.renderError(format, ex, requiredScope = "tenant:applications.write")
                 else -> CommandSupport.renderRequestFailure(ex, gateway)
@@ -358,6 +376,7 @@ class ProvisionCommand : Callable<Int> {
             }
             val tokens = CommandSupport.readTokens() ?: return CommandSupport.EXIT_NOT_SIGNED_IN
             gateway = CommandSupport.resolveGateway(gateway, tokens)
+            if (scopesMissing(file, prune, tokens)) return CommandSupport.EXIT_HTTP_ERROR
             return try {
                 val plan = engine(gateway, tokens, format = format).plan(file, prune)
                 renderPlan(plan, file, format, fixRequestTarget(), tokens, gateway)
@@ -429,6 +448,7 @@ class ProvisionCommand : Callable<Int> {
             } catch (ex: ProvisionException) {
                 System.err.println("Error: ${ex.message}"); return CommandSupport.EXIT_USAGE
             }
+            if (scopesMissing(file, prune, tokens)) return CommandSupport.EXIT_HTTP_ERROR
             val plan = try {
                 engine.plan(file, prune)
             } catch (ex: Exception) {
@@ -453,6 +473,8 @@ class ProvisionCommand : Callable<Int> {
                 System.err.println("--prune would remove resources on the PRODUCTION plane; re-run with --confirm <workspace-slug>.")
                 return CommandSupport.EXIT_HTTP_ERROR
             }
+            // SSO-3926 — the writes this plan makes, against the token: a missing write scope is named before the first write.
+            if (scopesMissing(file, prune, tokens, plan)) return CommandSupport.EXIT_HTTP_ERROR
             if (!yes && !Prompt.confirm("Apply these changes now?")) {
                 println("Aborted — nothing was changed.")
                 return CommandSupport.EXIT_OK

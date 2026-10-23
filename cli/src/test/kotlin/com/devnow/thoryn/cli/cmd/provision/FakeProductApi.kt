@@ -74,6 +74,16 @@ internal class FakeProductApi : Dispatcher() {
      * (`403 scope_not_grantable` otherwise). Null ⇒ the caller holds everything (a founder's session).
      */
     var callerScopes: Set<String>? = null
+
+    /**
+     * SSO-3926 — model product-api's `@PreAuthorize` scope gates: with this on (and [callerScopes] set), a call whose
+     * endpoint is gated on a scope the caller does not hold is answered `403 access_denied` "The token does not grant the
+     * scope required for this operation" — the exact refusal thoryn-cicd run 39917407017 met. [requests] records every call
+     * the fake answered, so a test can assert that a refused-up-front plan sent none. Off by default.
+     */
+    var enforceScopeGates = false
+    /** SSO-3926 — every `METHOD /route` the fake was asked, in order (reads included; [writes] keeps the non-GETs). */
+    val requests = mutableListOf<String>()
     /** Race fixture: the first trust POST finds its name taken meanwhile — the fake seeds the trust from the body and answers 409. */
     var trustNameTakenOnce = false
     /** The page size the trusts list uses (cursor = the offset), so a test can exercise the engine's paging. */
@@ -658,6 +668,33 @@ internal class FakeProductApi : Dispatcher() {
     }
 
     /** The first path segment of every route product-api's EnvironmentClaimFilter guards (the plane-scoped surface). */
+    /**
+     * SSO-3926 — the scope product-api's controller gates [seg] on, written out from the oauthy controllers (not derived
+     * from the engine's own table, so a drift between the two shows up as a failing test): `EnvironmentController`,
+     * `ApplicationsController`, `UsersController`, `FederationMembersController`, `EmailProviderController`,
+     * `LoginExperienceController`, `LoginFlowController`, `LoginMethodPolicyController`, `CustomDomainController`,
+     * `WorkloadIdentityTrustController`, `AccessController`, `ApplicationSlotController`.
+     */
+    private fun scopeGate(method: String, seg: List<String>): String? {
+        val verb = if (method == "GET" || (seg[0] == "access" && seg.getOrNull(1) == "check")) "read" else "write"
+        val area = when (seg[0]) {
+            "environments" -> "environments"
+            "applications" -> "applications"
+            "users" -> "users"
+            "federation-members" -> "federation"
+            "email-provider" -> "email"
+            "login-experience", "login-flows", "login-methods" -> "idp"
+            "custom-domain" -> "domains"
+            "workload-identity" -> "workload-identity"
+            "access" -> "access"
+            else -> return null
+        }
+        return "tenant:$area.$verb"
+    }
+
+    /** SSO-3926 — product-api's `hasAnyAuthority` aliases: the deprecated `tenant:clients.*` still opens `/applications`. */
+    private val SCOPE_ALIASES = mapOf("tenant:applications.read" to "tenant:clients.read", "tenant:applications.write" to "tenant:clients.write")
+
     private val PLANE_SCOPED_ROUTES = setOf("applications", "users", "federation-members", "email-provider", "login-experience", "login-methods", "login-flows")
 
     private fun mintsSecret(b: Map<String, Any?>): Boolean {
@@ -677,6 +714,14 @@ internal class FakeProductApi : Dispatcher() {
         if (method != "GET" && route != "/api/v1/access/check") writes += Write(method, route, env, confirm, b)
         if (method == "DELETE" && failingDeletes.any { route.startsWith(it) }) return problem(503, "unavailable")
         val seg = route.removePrefix("/api/v1/").split('/')
+        requests += "$method $route"
+        if (enforceScopeGates) scopeGate(method, seg)?.let { required ->
+            val held = callerScopes.orEmpty()
+            val alias = SCOPE_ALIASES[required]
+            if (required !in held && (alias == null || alias !in held)) {
+                return json(403, mapOf("type" to "https://thoryn.io/problems/access_denied", "status" to 403, "title" to "Forbidden", "errorCode" to "access_denied", "detail" to "The token does not grant the scope required for this operation."))
+            }
+        }
         if (environmentClaimFilter && seg[0] in PLANE_SCOPED_ROUTES && !reaches(env)) return problem(404, "unknown_environment")
         return when {
             // ── environments ──

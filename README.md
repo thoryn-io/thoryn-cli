@@ -2234,6 +2234,55 @@ A self-hosted pool with a longer timeout — in the stub's `with:`:
 reported as **not the supported shape**: the check still says what the App would need from it (`custom.jobs`), but
 Thoryn does not promote or support it; a `uses:` of any other reusable workflow cannot be verified at all.
 
+#### The scopes a provisioning file needs — `config.trust-scopes` (SSO-3926)
+
+A repository identity signs in with **two profiles of one trust**: the **plan profile** (the read-only scopes a job in
+`plan-environment` is minted) and the trust's **scopes** (its apply profile, which `connection.json` `auth.scopes` lists
+and the CLI requests exactly in `apply-environment`). What a file needs from each follows from what it declares, so the
+CLI derives it — every scope is the gate product-api puts on the endpoint the engine calls:
+
+| The file declares | to **plan** (plan profile) | to **apply** (the trust's scopes) |
+|---|---|---|
+| any resource | its kind's `.read` scope, and `tenant:access.read` (the ownership check) | its kind's `.write` scope (not for a `readOnly: true` reference) |
+| `environment` / `application` / `user` / `federationMember` | `tenant:environments.read` / `tenant:applications.read` / `tenant:users.read` / `tenant:federation.read` | the matching `.write` |
+| `emailProvider` / `loginTheme`, `loginFlow`, `loginMethods` / `customDomain` | `tenant:email.read` / `tenant:idp.read` / `tenant:domains.read` | the matching `.write` |
+| `workloadIdentityTrust` | `tenant:workload-identity.read` | `tenant:workload-identity.write`, and every scope the trust carries (`spec.scopes` — the hub's ceiling, `scope_not_grantable`) |
+| a `grants:` block | `tenant:access.read` | `tenant:access.write` |
+| `secretSink: { kind: workloadPull }` | `tenant:workload-identity.read` (the trust, by name) | `tenant:access.write` (the workload client's `manager` grant) |
+| `spec.federatedTrust` | `tenant:workload-identity.read` (the trust, by name) | — |
+| a resource in a sandbox | `tenant:environments.read` (to resolve the sandbox, for a create) | — |
+
+`tenant:clients.read` / `.write` still satisfy `tenant:applications.*` (product-api's deprecated alias). Because `apply`
+plans first, the trust's scopes must hold **both** columns; a plan profile can only hold scopes the trust holds.
+
+**Three places say it, in one wording:**
+
+- **`thoryn provision workflow check`** — rule `config.trust-scopes` holds every configured file against its
+  `connection.json`: an APPLY scope missing from `auth.scopes` names the trust's scopes; a PLAN scope missing names the
+  **plan profile** (a profile set without explicit `--plan-scope` is every `.read` scope of the trust, and an explicit one
+  must be among them, so a read scope the connection does not list cannot be in the profile). The repository identity
+  cannot read its own trust's profile — that takes `tenant:workload-identity.read`, the scope this rule is most often
+  about — so the check derives it from the connection, and `provision plan` re-checks the token it is actually minted.
+- **`thoryn provision plan` / `apply`** — before the first call, the scopes the file needs to plan are held against the
+  session's token (a plan job's token IS its plan profile); `apply` then holds the writes its plan actually makes (a
+  converged resource writes nothing, so needs no write scope). A scope only some plans need (resolving a sandbox for a
+  create) never blocks up front.
+- **A `403` that happens anyway** (a token whose scopes the CLI cannot read) is rendered the same way, never as the
+  generic `could not read live state (HTTP 403: access_denied …)`.
+
+```text
+$ thoryn provision plan                      # in the plan job, a trust whose plan profile lacks it
+Error: config.trust-scopes — this session's token does not carry 1 scope(s) .thoryn/provision.yaml needs to plan:
+  - tenant:workload-identity.read — application/forge-oauth2-proxy (resolve secretSink.trust 'forge-oauth2-proxy-pod' by name); workloadIdentityTrust/forge-oauth2-proxy-pod (read its live state)
+To fix: add tenant:workload-identity.read to the plan profile of trust wi_… — the read-only scopes a job in GitHub environment 'forge-plan' is minted. …
+Nothing was read or written.
+```
+
+Exit `2`, like the `403` it replaces. A trust's scopes are fixed when it is created, and its plan profile once set
+(`trusts set-plan-profile` works once): today, adding a scope means a trust that carries it (`thoryn workload-identity
+trusts create … --scope <scope> --plan-environment <gh-env>`), `connection.json` pointing at its `wi_` client, and its
+ownership moved to it.
+
 **Recorded gaps (not knobs, by design — tell us if you need them):**
 
 - **Forgejo.** `provider: forgejo` is refused: a Forgejo workload identity trust exists on the hub (oauthy ADR 2026-10-13

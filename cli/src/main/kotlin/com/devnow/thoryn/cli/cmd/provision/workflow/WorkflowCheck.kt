@@ -11,6 +11,9 @@ import com.devnow.thoryn.cli.cmd.provision.workflow.ProvisioningWorkflowContract
 import com.devnow.thoryn.cli.cmd.provision.workflow.ProvisioningWorkflowContract.RUN_NAME_MARKER
 import com.devnow.thoryn.cli.cmd.provision.workflow.ProvisioningWorkflowContract.STUB_REQUIRED_INPUTS
 import com.devnow.thoryn.cli.cmd.provision.workflow.ProvisioningWorkflowContract.forwarded
+import com.devnow.thoryn.cli.cmd.connection.Connection
+import com.devnow.thoryn.cli.cmd.connection.ConnectionException
+import com.devnow.thoryn.cli.cmd.provision.TrustScopes
 import com.devnow.thoryn.provision.FixRequest
 import com.devnow.thoryn.provision.ProvisionException
 import com.devnow.thoryn.provision.ProvisionFile
@@ -130,6 +133,7 @@ object WorkflowCheck {
                     RuleResult("config.valid", "the run-time configuration is valid", Status.FAIL, "configured file(s) not found in the repository: ${missing.joinToString(", ")}", "commit them, or point `files[].file` / `files[].connection` in ${config.source ?: WorkflowConfig.DEFAULT_PATH} at the committed paths")
                 }
                 if (root != null) secretDeliveryRule(config, root)?.let { rules += it }
+                if (root != null) trustScopesRule(config, root)?.let { rules += it }
             } catch (ex: WorkflowConfigException) {
                 configError = ex.message
                 rules += RuleResult("config.valid", "the run-time configuration is valid", Status.FAIL, ex.message ?: "invalid", "fix $configDisplay — schema: examples/workflow.schema.json (unknown keys are refused: a knob that is not there is a product gap to report)")
@@ -182,6 +186,49 @@ object WorkflowCheck {
                 "declare `secretSink: { kind: ${ProvisionFile.SECRET_SINK_KIND_WORKLOAD_PULL}, trust: <a kubernetes workloadIdentityTrust> }` so the pod mints its own secret at start " +
                     "(oauthy ADR 2026-10-14 credential ladder, rung 3), or authenticate without a minted secret (clientAuthenticationMethods: [private_key_jwt] / [federated_assertion])",
             )
+        }
+    }
+
+    /**
+     * SSO-3926 — `config.trust-scopes`: every configured provisioning file against the connection it is planned and applied
+     * with. The scopes a file needs are derived from what it declares ([com.devnow.thoryn.provision.ScopeRequirements] — each
+     * kind's read and write scope as product-api gates them, `tenant:access.*` for the ownership check, `grants:` blocks and a
+     * `workloadPull` sink's grant, `tenant:workload-identity.read` for a trust a binding or sink names, a declared trust's
+     * scope ceiling) and held against `auth.scopes`, and — the plan scopes — against the trust's plan profile as the
+     * connection implies it ([TrustScopes.evaluate]). A missing one fails here, naming the scope and the profile, instead
+     * of as a `403 access_denied` in the middle of the plan job (thoryn-cicd run 39917407017). A file or connection that does
+     * not load is not judged (`thoryn provision plan` / `thoryn login --connection` name those); null when nothing could be read.
+     */
+    private fun trustScopesRule(config: WorkflowConfig, root: File): RuleResult? {
+        val title = "the identity carries every scope the provisioning files need"
+        val problems = mutableListOf<String>()
+        val satisfied = mutableListOf<String>()
+        val unreadable = mutableListOf<String>()
+        config.files.forEach { entry ->
+            val f = File(root, entry.file).takeIf { it.isFile } ?: return@forEach
+            val c = File(root, entry.connection).takeIf { it.isFile } ?: return@forEach
+            val file = try {
+                ProvisionFile.parse(f.readBytes(), entry.file, yaml = !f.name.endsWith(".json", ignoreCase = true))
+            } catch (ex: ProvisionException) {
+                unreadable += entry.file
+                return@forEach
+            }
+            val connection = try {
+                Connection.load(c)
+            } catch (ex: ConnectionException) {
+                unreadable += entry.connection
+                return@forEach
+            }
+            val verdict = TrustScopes.evaluate(file, entry.file, connection, entry.connection, config.prune)
+            problems += verdict.problems
+            if (verdict.problems.isEmpty()) satisfied += verdict.satisfied
+        }
+        if (problems.isEmpty() && satisfied.isEmpty()) return null
+        val skipped = unreadable.takeIf { it.isNotEmpty() }?.let { " (not checked — does not load, see `thoryn provision plan` / `thoryn login --connection`: ${it.joinToString(", ")})" } ?: ""
+        return if (problems.isEmpty()) {
+            RuleResult(TrustScopes.RULE_ID, title, Status.PASS, satisfied.joinToString("; ") + skipped)
+        } else {
+            RuleResult(TrustScopes.RULE_ID, title, Status.FAIL, problems.joinToString("; ") + skipped, TrustScopes.FIX)
         }
     }
 

@@ -711,6 +711,8 @@ class ProvisionEngine(
             // one this identity has NO reach into (SSO-3118, the 404-not-403 rule): a brand-new repository identity gets it
             // on its very first read. That is the missing-rights shape, not a broken read — a red row with its fix.
             if (ex.httpStatus == 404) return unreachable(r, slug, desired, ex, reach)
+            // SSO-3926 — a 403 here is the token's SCOPE, not a right: name the scope (the host names the profile).
+            MissingScopeException.of(ex, ScopeRequirements.readScope(r.kind), ScopeRequirements.Phase.PLAN, r.key, "read live state")?.let { throw it }
             throw ProvisionException("${r.key}: could not read live state (${ex.message})")
         }
         return when {
@@ -894,6 +896,7 @@ class ProvisionEngine(
         val live = if (planePending) null else try {
             fetchOrNull { trustsOf(slug) }?.firstOrNull { it.str("name") == name }
         } catch (ex: ProductApiException) {
+            MissingScopeException.of(ex, ScopeRequirements.SCOPE_WORKLOAD_IDENTITY_READ, ScopeRequirements.Phase.PLAN, r.key, "list the trusts of ${planeLabel(slug)} to resolve secretSink.trust '$name'")?.let { throw it }
             throw ProvisionException("${r.key}: could not list the trusts of ${planeLabel(slug)} to resolve secretSink.trust '$name' (${ex.message})")
         }
         fun red(code: String, why: String, fix: FixRequest.MissingRight? = null): PlannedChange =
@@ -1616,14 +1619,12 @@ class ProvisionEngine(
     }
 
     /** Fail closed: an access read (`/access/check`, `/access/mine`) names the scope it needs; every other failure keeps its cause. */
-    private fun accessFailure(ex: ProductApiException): ProvisionException = when {
-        ex.isInsufficientScope -> ProvisionException(
-            "could not check this identity's access (${ex.message}) — ownership is decided by the relation it holds on each resource " +
-                "(`POST /api/v1/access/check`), which needs the '${AccessRefs.SCOPE_READ}' scope. Sign in with `thoryn login --scope ${AccessRefs.SCOPE_READ}` " +
-                "(or grant the CI identity that scope) and re-run.",
-        )
-        else -> ProvisionException("could not check this identity's access (${ex.message}); nothing was planned or written")
-    }
+    private fun accessFailure(ex: ProductApiException): ProvisionException =
+        // SSO-3926 — the scope, as a [MissingScopeException] the host renders with the profile to add it to.
+        MissingScopeException.of(
+            ex, AccessRefs.SCOPE_READ, ScopeRequirements.Phase.PLAN, null,
+            "check this identity's access — ownership is decided by the relation it holds on each resource (`POST /api/v1/access/check`)",
+        ) ?: ProvisionException("could not check this identity's access (${ex.message}); nothing was planned or written")
 
     // ── import (SSO-3659; ADR 2026-10-13 §2) ─────────────────────────────────────────────────────
 
@@ -1870,12 +1871,12 @@ class ProvisionEngine(
             val resolved: AppliedResource? = when (change.action) {
                 // SSO-3659 — a minted client secret is delivered AFTER the client exists; an unreachable sink costs nothing.
                 // SSO-3921 — a `workloadPull` sink: the value is dropped here, unseen; the trust's pod mints its own at start.
-                ChangeAction.CREATE -> create(r, file, applied, change.reservation).let { c ->
+                ChangeAction.CREATE -> writing(r, "create it") { create(r, file, applied, change.reservation) }.let { c ->
                     record(c.applied)
                     c.mintedSecret?.let { if (r.secretSink?.runtimePull == true) discardSecret(r) else deliverSecret(r, c.applied.id, it) }
                     c.applied
                 }
-                ChangeAction.UPDATE -> update(r, file, applied, change).also { record(it) }
+                ChangeAction.UPDATE -> writing(r, "update it") { update(r, file, applied, change) }.also { record(it) }
                 ChangeAction.NOOP -> change.liveId?.let { AppliedResource(r.kind, r.name, it, change.environment, change.attributes, change.owner, ChangeAction.NOOP) }?.also { record(it) }
                 else -> null
             }
@@ -1914,6 +1915,17 @@ class ProvisionEngine(
         // SSO-3668 — raised LAST: everything above is live, so the fallback is one command per target with the id from [result].
         if (publishFailures.isNotEmpty()) throw PublishTargetUnreachableException(publishFailures, result)
         return result
+    }
+
+    /**
+     * SSO-3926 — a write refused by product-api's scope gate (`403 access_denied` / `insufficient_scope`) names the kind's
+     * write scope ([MissingScopeException], phase apply) instead of surfacing as a bare HTTP error the host would render
+     * with a guessed scope. Every other failure passes through unchanged.
+     */
+    private fun <T> writing(r: ProvisionResource, operation: String, call: () -> T): T = try {
+        call()
+    } catch (ex: ProductApiException) {
+        throw MissingScopeException.of(ex, ScopeRequirements.writeScope(r.kind), ScopeRequirements.Phase.APPLY, r.key, operation) ?: ex
     }
 
     // ── live lookup per kind (SSO-3089) ──────────────────────────────────────────────────────────
@@ -2292,6 +2304,7 @@ class ProvisionEngine(
             clients(null).getCustomDomain()
         } catch (ex: ProductApiException) {
             if (ex.httpStatus == 404) throw ProvisionException("${r.key}: ${CustomDomainMessages.NO_ACCESS}")
+            MissingScopeException.of(ex, ScopeRequirements.readScope(r.kind), ScopeRequirements.Phase.PLAN, r.key, "read live state")?.let { throw it }
             throw ProvisionException("${r.key}: could not read live state (${ex.message})")
         }
         val view = CustomDomainView.of(body)
@@ -2477,14 +2490,16 @@ class ProvisionEngine(
 
     /** Fail closed: a 403 `insufficient_scope` on the access API names the missing scope and the login line. */
     private fun grantFailure(r: ProvisionResource, ex: ProductApiException, scope: String, what: String): ProvisionException =
-        if (ex.isInsufficientScope) {
-            ProvisionException(
-                "${r.key}: could not $what — this session lacks the '$scope' scope (${ex.message}). " +
-                    "Grants are NOT converged; sign in with `thoryn login --scope $scope` (or grant the CI client that scope) and re-run.",
-            )
-        } else {
-            ProvisionException("${r.key}: could not $what (${ex.message})")
-        }
+        // SSO-3926 — reading grants is part of a plan (tenant:access.read); writing them only of an apply (tenant:access.write).
+        MissingScopeException.of(ex, scope, if (scope == AccessRefs.SCOPE_WRITE) ScopeRequirements.Phase.APPLY else ScopeRequirements.Phase.PLAN, r.key, "$what (grants are NOT converged)")
+            ?: if (ex.isInsufficientScope) {
+                ProvisionException(
+                    "${r.key}: could not $what — this session lacks the '$scope' scope (${ex.message}). " +
+                        "Grants are NOT converged; sign in with `thoryn login --scope $scope` (or grant the CI client that scope) and re-run.",
+                )
+            } else {
+                ProvisionException("${r.key}: could not $what (${ex.message})")
+            }
 
     // ── per-kind remove ──────────────────────────────────────────────────────────────────────────
 
@@ -2577,6 +2592,7 @@ class ProvisionEngine(
         val node = try {
             fetchOrNull { trustsOf(slug) }?.firstOrNull { it.str("name") == r.name }
         } catch (ex: ProductApiException) {
+            MissingScopeException.of(ex, ScopeRequirements.readScope(r.kind), ScopeRequirements.Phase.PLAN, r.key, "read live state")?.let { throw it }
             throw ProvisionException("${r.key}: could not read live state (${ex.message})")
         }
         if (node == null) {
@@ -2903,6 +2919,7 @@ class ProvisionEngine(
         val live = try {
             fetchOrNull { trustsOf(slug, fresh = atApply) }?.firstOrNull { it.str("name") == name }
         } catch (ex: ProductApiException) {
+            MissingScopeException.of(ex, ScopeRequirements.SCOPE_WORKLOAD_IDENTITY_READ, ScopeRequirements.Phase.PLAN, r.key, "list the trusts of ${planeLabel(slug)} to resolve spec.federatedTrust '$name'")?.let { throw it }
             throw ProvisionException("${r.key}: could not list the trusts of ${planeLabel(slug)} to resolve spec.federatedTrust '$name' (${ex.message})")
         }
         val verdict = trustVerdicts[name]
