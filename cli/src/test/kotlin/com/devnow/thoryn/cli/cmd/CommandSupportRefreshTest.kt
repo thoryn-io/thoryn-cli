@@ -91,7 +91,8 @@ class CommandSupportRefreshTest : CommandTestBase() {
         CommandSupport.gatewayClient(baseUrl(), base, selected, PrintStream(out))
 
         val printed = out.toString()
-        assertThat(printed).contains("Could not renew your sign-in session").contains("invalid_grant")
+        // SSO-3928 — an invalid_grant renewal says the session ENDED (and, with no hub reason, that it was refused).
+        assertThat(printed).contains("Your sign-in session has ended").contains("invalid_grant")
         assertThat(printed).contains("thoryn login --workspace thoryn")
         assertThat(printed).contains("Could not enter workspace 'examples'")
     }
@@ -126,6 +127,7 @@ class CommandSupportRefreshTest : CommandTestBase() {
         assertThat(printed)
             .describedAs("and the generic expiry line must NOT be what they read")
             .doesNotContain("Could not renew your sign-in session")
+            .doesNotContain("Your sign-in session has ended")
     }
 
     @Test
