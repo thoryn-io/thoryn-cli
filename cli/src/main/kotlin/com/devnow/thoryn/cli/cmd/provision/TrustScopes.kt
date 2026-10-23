@@ -37,11 +37,11 @@ internal object TrustScopes {
         }
     }
 
-    /** A trust's scopes and plan profile are set when it is created (`set-plan-profile` works once) — what adding one means today. */
+    /** SSO-3925 — a trust's scopes change in place (`trusts set-scopes`): same trust, same wi_ client, no ownership moves. */
     const val TRUST_FIXED_NOTE: String =
-        "A trust's scopes are fixed when it is created and its plan profile once set (`thoryn workload-identity trusts set-plan-profile` " +
-            "works once): today that means a trust that carries them (`thoryn workload-identity trusts create … --scope <scope> " +
-            "--plan-environment <gh-env>`), with connection.json pointing at its wi_ client and its ownership moved to it."
+        "Add it in place with `thoryn workload-identity trusts set-scopes <trust> --scope <scope> --plan-scope <scope>`: the trust " +
+            "keeps its id and wi_ client, so connection.json and ownership stay as they are. Narrowing works from CI; widening " +
+            "is a person's act with a recent passkey sign-in (`thoryn login --acr-values urn:thoryn:acr:phishing_resistant --max-age 300`)."
 
     /**
      * Where [scopes], needed in [phase], are added for [session] — one sentence a person can act on. [connection] is the

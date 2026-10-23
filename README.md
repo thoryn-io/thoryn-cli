@@ -2294,10 +2294,9 @@ To fix: add tenant:workload-identity.read to the plan profile of trust wi_… �
 Nothing was read or written.
 ```
 
-Exit `2`, like the `403` it replaces. A trust's scopes are fixed when it is created, and its plan profile once set
-(`trusts set-plan-profile` works once): today, adding a scope means a trust that carries it (`thoryn workload-identity
-trusts create … --scope <scope> --plan-environment <gh-env>`), `connection.json` pointing at its `wi_` client, and its
-ownership moved to it.
+Exit `2`, like the `403` it replaces. Add the scope in place with `thoryn workload-identity trusts set-scopes <trust>
+--scope <scope> --plan-scope <scope>` (SSO-3925): the trust keeps its id and `wi_` client, so `connection.json` and
+ownership stay as they are. Narrowing works from CI; widening is a person's act with a recent passkey sign-in.
 
 **Recorded gaps (not knobs, by design — tell us if you need them):**
 
