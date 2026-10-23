@@ -22,10 +22,10 @@
 #   thoryn provision apply --file .thoryn/trusts.provision.yaml --yes
 #
 # Nothing is written beside this file (SSO-3715: the engine writes no receipt — the plan of a live, matching trust is a
-# `noop` row, and the platform is the ledger). A trust's pins and scopes are IMMUTABLE on the hub: a declared field that differs from the live trust is
+# `noop` row, and the platform is the ledger). A trust's pins are IMMUTABLE on the hub: a declared pin that differs from the live trust is
 # the plan error `workload_identity_trust_immutable` — align the file, or delete and re-apply to re-create (which
 # mints a NEW wi_ client: re-paste it into connection.json and provision.yaml). The ONE additive exception is the
-# plan profile below. The App-dispatched workflow never reads this file; it plans and applies `.thoryn/provision.yaml`
+# plan profile below; its SCOPES change in place (SSO-3925 — removing from CI, adding a person's passkey act). The App-dispatched workflow never reads this file; it plans and applies `.thoryn/provision.yaml`
 # only. `destroy` of this file would delete the trust and stop CI signing in at once — a founder's deliberate act,
 # never automation's.
 #
@@ -44,8 +44,8 @@
 # `plan:` here on a live trust that has none is the one field the engine converges ADDITIVELY (SSO-3702): a founder's
 # `thoryn provision apply --file .thoryn/trusts.provision.yaml` issues the single `POST …/trusts/{id}/plan-profile`
 # — the wi_ client, its `owner` relation on `application:cli`, its `manager` grant on the sandbox and the committed
-# `connection.json` all stay; nothing is re-created or re-pasted. Once set, a profile is immutable like every other
-# pin: a live profile that differs from the declared one is `workload_identity_trust_immutable` (re-create the trust).
+# `connection.json` all stay; nothing is re-created or re-pasted. Once set, a profile's environment is immutable like every
+# other pin (a live one that differs is `workload_identity_trust_immutable` — re-create the trust); its scopes change in place.
 apiVersion: thoryn.io/provision/v1
 resources:
   # SSO-3690 — the CI identity: created once by the founder on 2026-10-14 (clientId wi_10a7b379c79f7d1353f5798d),

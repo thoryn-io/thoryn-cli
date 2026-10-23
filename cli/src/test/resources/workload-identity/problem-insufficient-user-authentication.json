@@ -1,0 +1,1 @@
+{"type":"about:blank","title":"Forbidden","status":403,"detail":"Adding scopes to a workload identity trust needs a passkey sign-in from the last 5 minutes. Sign in again and retry.","instance":"/api/v1/workload-identity/trusts/7c2d9e4f-1a3b-4c5d-8e6f-9a0b1c2d3e4f/scopes","errorCode":"insufficient_user_authentication"}

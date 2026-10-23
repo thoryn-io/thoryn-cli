@@ -302,7 +302,8 @@ thoryn examples share    <name> [--output <file>]   # SSO-2876 — export the se
 # `[federated_assertion]` with `federatedTrust: <trust name>` (rung 2: the pod's / job's platform token IS the client
 # credential; nothing is minted) — converged on update too; `client_secret_post` is not declarable. New kind
 # `workloadIdentityTrust` (provider github_actions | forgejo | kubernetes + that provider's pins, scopes, confirmProduction):
-# converged by name (also on the API's 409), never updated in place (workload_identity_trust_immutable), removed only
+# converged by name (also on the API's 409), its pins never updated in place (workload_identity_trust_immutable) — its
+# SCOPES are (SSO-3925: narrowing from CI, widening a person's passkey act) — removed only
 # with its sandbox; the plan shows the wi_ client + audience; apply PRINTS the consumer's connection.json, never
 # writes it. See "Secretless clients" and "Declaring a workload-identity trust" below.
 # SSO-3766 / SSO-3767 / SSO-3770 (oauthy SSO-3759 / SSO-3758 / SSO-3762): an application also declares
@@ -400,6 +401,11 @@ thoryn workload-identity trusts create --provider kubernetes --name <n> --issuer
     [--namespace <ns> [--service-account <sa>]] [--jwks-file <cluster-jwks.json>] [--confirm-production]   # production: both pins
 thoryn workload-identity trusts set-plan-profile <id> --plan-environment <gh-env> [--plan-scope <tenant:…read>…]   # POST …/{id}/plan-profile
                                                                    # the ONE additive mutation: adds the plan profile, keeps the wi_ client (409 once set)
+thoryn workload-identity trusts set-scopes <id|name> [--scope <tenant:…>…] [--plan-scope <tenant:…read>…]   # PUT …/{id}/scopes (SSO-3925)
+                                                                   # scopes changed IN PLACE: same id, same wi_ client, no connection.json or owner moves.
+                                                                   # Removing: needs nothing more. ADDING: a person with a passkey sign-in from the last
+                                                                   # 5 min (403 step-up → `thoryn login --acr-values urn:thoryn:acr:phishing_resistant
+                                                                   # --max-age 300`); a workload identity never (elevated_action_requires_person)
 thoryn workload-identity trusts list [--limit n] [--cursor c]         # GET    /api/v1/workload-identity/trusts
 thoryn workload-identity trusts get <id> [--connection]               # GET    /api/v1/workload-identity/trusts/{id} (+ the sign-in line); --connection: ONLY the
                                                                       # complete connection.json (SSO-3722 — provider + the whole github/kubernetes block), to paste
@@ -1675,10 +1681,19 @@ What `thoryn provision` does with it:
   match: `provider`, `scopes` as a set, the pins; a field the file leaves out is not compared); absent, it
   is **created** (`POST /api/v1/workload-identity/trusts`, with the file's `repository: owner/name` as the
   API's `owner` + `repository`); a `409 workload_identity_trust_name_taken` between the lookup and the
-  create converges onto the matching trust, as `project init` does. **There is no update:** a trust's pins and
-  scopes are immutable on the hub, so a declared field that differs from the live trust is the plan error
+  create converges onto the matching trust, as `project init` does. **A trust's pins never change:** a
+  declared pin that differs from the live trust is the plan error
   **`workload_identity_trust_immutable`**, naming the fix — declare what is live, or
-  `thoryn workload-identity trusts delete <id>` and re-apply to re-create it. **On the production plane a
+  `thoryn workload-identity trusts delete <id>` and re-apply to re-create it. **Its scopes change in place
+  (SSO-3925):** when only `scopes` (and/or a live profile's `plan.scopes`) differ, the plan is an `update`
+  that calls `PUT …/{id}/scopes` (`~ workloadIdentityTrust …: scopes changed in place`) — the id, the `wi_`
+  client, its `owner` and every `connection.json` stay. A **narrowing** converges from CI. A **widening** is a
+  person's act: from a `client:` identity the plan is red **`elevated_action_requires_person`** naming the
+  `thoryn workload-identity trusts set-scopes <id> --scope …` line a workspace member runs (signed in with a
+  passkey); for a person it is planned with the passkey note, and a sign-in that is not a fresh passkey one is
+  refused at apply with the `thoryn login --acr-values … --max-age …` line. A derived plan profile (no
+  `plan.scopes` declared) keeps the live scopes still inside the new `scopes`; with none left, name
+  `plan.scopes`. A scope change together with a pin change is still `workload_identity_trust_immutable`. **On the production plane a
   changed pin set is a NEW trust, which a person creates** (SSO-3774; below): the engine never mutates a pin,
   and the plan says so. **Removal (SSO-3774):** the `client:` identity that **owns** a trust (`trust:<id>`)
   removes it with `destroy`, and `--prune` removes the owned trusts the file no longer declares — on the
@@ -1690,8 +1705,9 @@ What `thoryn provision` does with it:
   like a pin (`plan.environment`; `plan.scopes` only when the file lists them — a derived declaration
   matches whatever the hub derived), with one exception: a **declared profile on a live trust that has
   none** is a plain `update` that calls the additive `POST …/{id}/plan-profile` (`~ workloadIdentityTrust
-  …: plan profile added`) — the `wi_` client, its `owner` relation and the consumer's `connection.json` stay. A live profile that **differs** from the declared one is the red plan
-  `workload_identity_trust_immutable` ("re-create the trust"). The file refuses what the API refuses, with
+  …: plan profile added`) — the `wi_` client, its `owner` relation and the consumer's `connection.json` stay. A live profile whose
+  **environment** differs from the declared one is the red plan `workload_identity_trust_immutable` ("re-create the trust");
+  differing `plan.scopes` change in place (above). The file refuses what the API refuses, with
   its codes: `plan_profile_unsupported` (not `github_actions`), `plan_profile_requires_environment`,
   `plan_environment_equals_apply`, `plan_scope_not_read_only`, `plan_scope_not_subset`, `plan_scopes_empty`.
   The printed `connection.json` is unchanged — one file serves both profiles (the hub decides by the job's

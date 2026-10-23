@@ -78,9 +78,10 @@ interface ProvisionApi {
 
     // ── Workload identity trusts (`/api/v1/workload-identity/trusts`, environment-scoped; SSO-3689) ──
     // Scopes `tenant:workload-identity.read` (list / get) and `tenant:workload-identity.write` (create / delete /
-    // set plan profile); environment managers write, viewers read, anyone else is answered 404. There is NO
-    // general update: the pins are immutable on the hub, so the engine never asks for one — the ONE additive
-    // mutation is [setWorkloadIdentityTrustPlanProfile] (SSO-3702 / SSO-3701; SSO-3699 option B). [createWorkloadIdentityTrust]
+    // set plan profile / set scopes); environment managers write, viewers read, anyone else is answered 404. There is NO
+    // general update: the pins are immutable on the hub, so the engine never asks for one — the mutations are the additive
+    // [setWorkloadIdentityTrustPlanProfile] (SSO-3702 / SSO-3701; SSO-3699 option B) and the in-place scope change
+    // [setWorkloadIdentityTrustScopes] (SSO-3925). [createWorkloadIdentityTrust]
     // answers 201 with the trust's `clientId` (`wi_…`), `audience` and `tokenEndpoint`; a name already in use is `409
     // workload_identity_trust_name_taken`; a scope the caller does not hold is `403 scope_not_grantable`.
     fun listWorkloadIdentityTrusts(limit: Int? = null, cursor: String? = null): JsonNode
@@ -98,6 +99,22 @@ interface ProvisionApi {
      * `invalid_plan_environment`; `403 scope_not_grantable` for a plan scope the caller does not hold.
      */
     fun setWorkloadIdentityTrustPlanProfile(id: String, body: Map<String, Any?>): JsonNode
+
+    /**
+     * SSO-3925 (oauthy product-api) — `PUT /api/v1/workload-identity/trusts/{id}/scopes` `{ scopes?, planScopes? }`:
+     * change a trust's apply scopes and/or its plan profile's scopes IN PLACE — the trust keeps its id, its `wi_`
+     * client and every pin (no `connection.json` or owner moves). An omitted member keeps its set. Answers 200 with the
+     * trust. NARROWING needs only `tenant:workload-identity.write` and `manager`; WIDENING (either set gains a scope) is
+     * a person's elevated act: a machine identity is `403 elevated_action_requires_person`, a person without a passkey
+     * sign-in from the last five minutes the RFC 9470 step-up `403` (`WWW-Authenticate` … `insufficient_user_authentication`).
+     * `403 scope_not_grantable` for a scope the caller does not hold; `400 plan_profile_not_set`, `plan_scope_not_subset`,
+     * `plan_scope_not_read_only`, `plan_scopes_empty`, `invalid_scope`.
+     *
+     * Defaulted so a host that predates in-place scope changes keeps compiling: the default answers what a product-api
+     * from before SSO-3925 answers for the route — `404` with no trust error code.
+     */
+    fun setWorkloadIdentityTrustScopes(id: String, body: Map<String, Any?>): JsonNode =
+        throw ProductApiException(404, "not_found", "this host does not change a trust's scopes in place", "")
 
     // ── Access grants, reach and the forward check (`/api/v1/access/grants`, `/mine`, `/check`; SSO-3112 / SSO-3659 / SSO-3673; workspace-level) ──
     fun listGrants(objectRef: String? = null, subjectRef: String? = null): JsonNode
