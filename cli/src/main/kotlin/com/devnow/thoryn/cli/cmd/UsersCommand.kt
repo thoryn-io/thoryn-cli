@@ -168,9 +168,10 @@ class UsersCommand : Callable<Int> {
 
         /**
          * Build the client for the target environment. An explicit `--environment` rides
-         * `X-Thoryn-Environment` directly (the client-credentials/CI path, SSO-3068 — a CI session
-         * clears the SelectedWorkspaceStore, so `env use` can't select one); otherwise the environment
-         * comes from `env use` via [CommandSupport.gatewayClient].
+         * `X-Thoryn-Environment` directly (the client-credentials/CI path, SSO-3068 — one flag per
+         * command, no `env use` state to carry between CI steps; SSO-3927: a CI login that names a
+         * workspace does select it, so `env use` also works there); otherwise the environment comes
+         * from `env use` via [CommandSupport.gatewayClient].
          */
         internal fun clientFor(gateway: String, tokens: com.devnow.thoryn.cli.auth.Tokens, environment: String?): ProductApiClient =
             if (!environment.isNullOrBlank()) {

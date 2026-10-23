@@ -11,6 +11,7 @@ import com.devnow.thoryn.cli.auth.DpopCapability
 import com.devnow.thoryn.cli.auth.HttpSender
 import com.devnow.thoryn.cli.auth.IssuerUrlValidationException
 import com.devnow.thoryn.cli.auth.IssuerUrlValidator
+import com.devnow.thoryn.cli.auth.JwtClaims
 import com.devnow.thoryn.cli.auth.LoopbackRedirectServer
 import com.devnow.thoryn.cli.auth.LoopbackTimeoutException
 import com.devnow.thoryn.cli.auth.ParCapability
@@ -333,6 +334,52 @@ class LoginCommand : Callable<Int> {
     }
 
     /**
+     * SSO-3927 — after a successful sign-in, select the workspace the session was signed in ON, so
+     * `thoryn login --workspace acme && thoryn env use production` works with no `workspace switch`
+     * in between.
+     *
+     * Every login path used to CLEAR the selection here (SSO-2863: "a fresh login resets the base
+     * tenant; drop any stale selection"). That was right while a login landed on the shared default
+     * tenant. Since SSO-3104 an interactive login lands on the workspace itself, so clearing threw
+     * away exactly the workspace `--workspace` had just named, and `env use` refused with "no
+     * workspace selected". Since SSO-3692 a selection whose issuer IS the session's issuer is served
+     * with the base token (no exchange), so recording it costs nothing and changes no request.
+     *
+     * The SSO-2863 invariant still holds: a login never leaves a STALE selection behind. The record
+     * is REPLACED (the previous workspace's environment does not carry over, since environments
+     * belong to one workspace). A session that names no workspace clears it, for example an API key
+     * signed in at the platform base issuer.
+     *
+     * The workspace is the one the session recorded (`--workspace` / the announced default, a
+     * connection's `workspace.slug`, a workload identity trust's audience), else the one its issuer
+     * spells. The selection issuer is the session's issuer verbatim, which may be a workspace's
+     * followed custom domain or a sandbox audience, so `gatewayClient` recognises it as home.
+     *
+     * Best-effort, like the clear it replaces. The sign-in has already succeeded, so a write that
+     * fails prints the one command that does the same thing and leaves the exit code alone.
+     */
+    private fun selectSignedInWorkspace(session: Tokens) {
+        val store = SelectedWorkspaceStore()
+        val slug = session.workspace?.takeIf { it.isNotBlank() } ?: ThorynConfig.workspaceOfIssuer(session.issuer)
+        val issuerOfSession = session.issuer?.trim()?.takeIf { it.isNotEmpty() }
+        if (slug == null || issuerOfSession == null) {
+            store.clear()
+            return
+        }
+        val tenantId = runCatching { JwtClaims.of(session.accessToken)["tnt"]?.takeUnless { it.isNull }?.asString() }
+            .getOrNull().orEmpty()
+        runCatching { store.write(SelectedWorkspace(tenantId = tenantId, slug = slug, tenantHubIssuer = issuerOfSession)) }
+            .onSuccess { println("Workspace '$slug' is selected; `thoryn env use <environment>` picks an environment in it.") }
+            .onFailure {
+                store.clear()
+                System.err.println(
+                    "Warning: could not record workspace '$slug' as selected (${it.message}). " +
+                        "Run `thoryn workspace switch $slug` before `thoryn env use`.",
+                )
+            }
+    }
+
+    /**
      * SSO-2827 — stamp the hub issuer + gateway this login used onto the token
      * before persisting, so later commands default to them. The gateway is the
      * explicit `--gateway` when given, otherwise derived from `--issuer`.
@@ -600,16 +647,14 @@ class LoginCommand : Callable<Int> {
             // client id (NOT the secret) so `CommandSupport.forceRefresh` can re-mint a fresh token
             // on expiry from the env-supplied secret, rather than a refresh_token redemption (a
             // client_credentials grant returns no refresh token — RFC 6749 §4.4.3).
-            persistSession(
+            val session = persistSession(
                 withSession(tokens).copy(
                     authMode = Tokens.AUTH_MODE_CLIENT_CREDENTIALS,
                     clientId = creds.clientId,
                 ),
             )
-            // SSO-2863 — a fresh login resets the base tenant; drop any stale `workspace switch`
-            // selection so later commands don't silently re-exchange into an old workspace.
-            SelectedWorkspaceStore().clear()
             println("Signed in (client-credentials / service account '${creds.clientId}').")
+            selectSignedInWorkspace(session)
             tokens.scope?.let { println("Scopes: $it") }
             EXIT_OK
         } catch (e: ClientCredentialsException) {
@@ -764,7 +809,7 @@ class LoginCommand : Callable<Int> {
 
         return try {
             val tokens = flow.run(requestedScope)
-            persistSession(
+            val session = persistSession(
                 tokens.copy(
                     issuer = workspaceIssuer,
                     gateway = derivedGateway,
@@ -775,9 +820,8 @@ class LoginCommand : Callable<Int> {
                     workspace = connection.slug,
                 ),
             )
-            // SSO-2863 — a fresh login resets the base tenant; drop any stale workspace selection.
-            SelectedWorkspaceStore().clear()
             println("Signed in (connection '${connection.slug}' / service account '${connection.clientId}').")
+            selectSignedInWorkspace(session)
             tokens.scope?.let { println("Scopes: $it") }
             EXIT_OK
         } catch (e: ClientCredentialsException) {
@@ -1045,7 +1089,7 @@ class LoginCommand : Callable<Int> {
                 hubDecided = hubDecidesWhenApplyEnvironmentUnknown && WorkloadProfile.hubDecides(identity, applyEnvironment)
                 scopeSent()
             }
-            persistSession(
+            val session = persistSession(
                 tokens.copy(
                     issuer = audience,
                     gateway = sessionGateway,
@@ -1060,10 +1104,9 @@ class LoginCommand : Callable<Int> {
                     jobEnvironment = jobEnvironment,
                 ),
             )
-            // SSO-2863 — a fresh login resets the base tenant; drop any stale workspace selection.
-            SelectedWorkspaceStore().clear()
             val who = com.devnow.thoryn.cli.auth.JwtClaims.of(tokens.accessToken)["sub"]?.asString() ?: clientIdValue
             println("Signed in (workload identity / client '$clientIdValue' at $audience, as $who).")
+            selectSignedInWorkspace(session)
             when (selected) {
                 WorkloadProfile.PLAN -> println(
                     "Profile: plan (read-only) — this job runs in GitHub environment '${jobEnvironment ?: "(none)"}', not the trust's apply " +
@@ -1144,12 +1187,10 @@ class LoginCommand : Callable<Int> {
                 println()
                 println("Waiting for sign-in (expires in ${authorization.expiresIn / 60} minutes)…")
             }
-            persistSession(withSession(tokens))
-            // SSO-2863 — a fresh login resets the base tenant; drop any stale `workspace switch`
-            // selection so later commands don't silently re-exchange into an old workspace.
-            SelectedWorkspaceStore().clear()
+            val session = persistSession(withSession(tokens))
             println()
             println("Signed in.")
+            selectSignedInWorkspace(session)
             noRefreshTokenNotice(tokens, expandedScope(), deviceCode = true)?.let { System.err.println(it) }
             0
         } catch (e: DeviceCodeException) {
@@ -1284,12 +1325,10 @@ class LoginCommand : Callable<Int> {
                 devMode = devMode,
             )
             val tokens = flow.exchange(code)
-            persistSession(withSession(tokens))
-            // SSO-2863 — a fresh login resets the base tenant; drop any stale `workspace switch`
-            // selection so later commands don't silently re-exchange into an old workspace.
-            SelectedWorkspaceStore().clear()
+            val session = persistSession(withSession(tokens))
             println()
             println("Signed in.")
+            selectSignedInWorkspace(session)
             tokens.scope?.let { println("Scopes: $it") }
             noRefreshTokenNotice(tokens, expandedScope(), deviceCode = false)?.let { System.err.println(it) }
             EXIT_OK
