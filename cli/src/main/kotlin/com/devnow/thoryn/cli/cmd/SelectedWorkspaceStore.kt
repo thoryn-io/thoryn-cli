@@ -57,8 +57,9 @@ internal class SelectedWorkspaceStore(
     }
 
     /**
-     * SSO-2863 — drop any active workspace selection. Called on `thoryn login` (a fresh login resets
-     * the base tenant, so a stale selection must not silently re-exchange into an old workspace).
+     * SSO-2863 — drop any active workspace selection, so a stale selection never silently
+     * re-exchanges into an old workspace. SSO-3927 — `thoryn login` now REPLACES the selection with
+     * the workspace it signed in on, and calls this only when the new session names no workspace.
      * Best-effort: a missing file or unreadable path is a no-op.
      */
     fun clear() {

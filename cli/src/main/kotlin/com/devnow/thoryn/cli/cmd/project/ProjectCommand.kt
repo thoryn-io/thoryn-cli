@@ -135,7 +135,8 @@ class ProjectCommand : Callable<Int> {
             val selected = runCatching { SelectedWorkspaceStore().read() }.getOrNull()
             val session = ProjectInit.Session(
                 workspaceSlug = selected?.slug ?: tokens.workspace?.takeIf { it.isNotBlank() } ?: ThorynConfig.workspaceOfIssuer(tokens.issuer),
-                tenantId = selected?.tenantId ?: JwtClaims.of(tokens.accessToken)["tnt"]?.takeUnless { it.isNull }?.asString(),
+                // SSO-3927 — a selection can carry a blank tenantId (an opaque token had no `tnt` to record).
+                tenantId = selected?.tenantId?.takeIf { it.isNotBlank() } ?: JwtClaims.of(tokens.accessToken)["tnt"]?.takeUnless { it.isNull }?.asString(),
                 issuer = CommandSupport.resolvePlatformIssuer(ThorynConfig.DEFAULT_HUB, tokens),
                 authMode = tokens.authMode,
             )

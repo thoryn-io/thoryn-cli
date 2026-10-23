@@ -149,7 +149,7 @@ store…` line per step; that is the explicit opt-in above being announced, not 
 ## Command tree
 
 ```
-thoryn login --workspace <slug> [--issuer https://auth.<env>]  # Auth code + PKCE (loopback) or --device-code — ON your workspace (SSO-3104)
+thoryn login --workspace <slug> [--issuer https://auth.<env>]  # Auth code + PKCE (loopback) or --device-code — ON your workspace (SSO-3104), and selects it (SSO-3927)
 thoryn login --client-credentials [--client-id <id>] # SSO-1553/2941 — non-interactive API key (CI); THORYN_API_KEY=<id>:<secret>, auto re-mints on expiry
 thoryn login --workload-identity --client-id <wi_…> --audience <aud> [--scope s]  # SSO-3308 — GitHub Actions job, NO secret (id-token: write); renews with a fresh job token
 thoryn login --connection <file> [--fix-request <path>]  # SSO-2948 — sign in from a connection contract; SSO-3702/3722 — the profile is decided from the job's
@@ -181,7 +181,7 @@ thoryn federation delete <memberId> [--confirm <workspace-slug>]
 
 thoryn workspace list                        # Workspaces (hub /account/workspaces)
 thoryn workspace create --slug <slug> --display-name <name>
-thoryn workspace switch <slug>               # select a workspace you belong to; later commands exchange into it per call (your sign-in workspace: base token, no exchange — SSO-3692)
+thoryn workspace switch <slug>               # select ANOTHER workspace you belong to; later commands exchange into it per call (login --workspace already selects its own: base token, no exchange — SSO-3692/3927)
 thoryn workspace archive <slug> --confirm <slug>   # SSO-2831 — archive (reversible); name-confirmed
 thoryn workspace reactivate <slug>           # SSO-2831 — clear the archive flag
 
@@ -902,8 +902,8 @@ What each connection gets comes from the template's `.thoryn/template.json`
 grant, and the GitHub Actions variables to set. This is the same contract the console's GitHub App
 flow uses, so both set up a repository the same way.
 
-**Before you start.** Sign in (`thoryn login`, and `thoryn workspace switch <slug>` when you have more
-than one workspace). Install `gh` and run `gh auth login` as a GitHub user who can create repositories
+**Before you start.** Sign in (`thoryn login --workspace <slug>`, which also selects that workspace; run
+`thoryn workspace switch <slug>` only to act in another workspace you belong to). Install `gh` and run `gh auth login` as a GitHub user who can create repositories
 for the owner, and who is an admin of an existing repository. Thoryn never sees your GitHub token: it
 runs `gh` and `gh` authenticates on its own.
 
@@ -2766,6 +2766,22 @@ thoryn clients list                                                # uses the se
 
 The session also remembers the WORKSPACE it signed in on, so when it can no longer be renewed the CLI
 prints the exact line to fix it (`Run \`thoryn login --workspace acme\``) instead of a bare `HTTP 401`.
+
+A sign-in also SELECTS that workspace (SSO-3927), so environment commands work straight away, with no
+`thoryn workspace switch` in between:
+
+```bash
+thoryn login --workspace acme --issuer https://auth.stg.thoryn.org
+# Signed in.
+# Workspace 'acme' is selected; `thoryn env use <environment>` picks an environment in it.
+thoryn env use production
+```
+
+Each sign-in replaces the previous selection, and an environment chosen with `env use` in another
+workspace does not carry over. A login without `--workspace` selects the default workspace it
+announces (`thoryn`). `login --connection` selects the contract's `workspace.slug`, and
+`--workload-identity` selects `--workspace`, else the workspace its audience names. An API-key login at the
+platform base issuer names no workspace, so it clears the selection.
 
 The gateway is derived from the base issuer host (`<label>.<env>` → `api.<env>`, so both
 `hub.stg.thoryn.org` and `auth.stg.thoryn.org` yield `api.stg.thoryn.org`); for a non-standard

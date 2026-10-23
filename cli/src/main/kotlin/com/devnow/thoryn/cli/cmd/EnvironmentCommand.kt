@@ -154,8 +154,10 @@ class EnvironmentCommand : Callable<Int> {
             val tokens = CommandSupport.readTokens() ?: return CommandSupport.EXIT_NOT_SIGNED_IN
             val selected = runCatching { store.read() }.getOrNull()
             if (selected == null) {
-                System.err.println("Error: no workspace selected. Run `thoryn workspace switch <slug>` first —")
-                System.err.println("environments live inside a workspace.")
+                // SSO-3927 — `thoryn login --workspace <slug>` selects it; a session that names no workspace (an
+                // API key at the platform base issuer) or one signed in by a CLI before SSO-3927 needs the switch.
+                System.err.println("Error: no workspace selected. Run `thoryn workspace switch <slug>` (or sign in with")
+                System.err.println("`thoryn login --workspace <slug>`) first — environments live inside a workspace.")
                 return CommandSupport.EXIT_USAGE
             }
             gateway = CommandSupport.resolveGateway(gateway, tokens)
