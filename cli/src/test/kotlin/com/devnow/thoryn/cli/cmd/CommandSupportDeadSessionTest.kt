@@ -80,7 +80,7 @@ class CommandSupportDeadSessionTest : CommandTestBase() {
         assertThat(server.takeRequest().path).isEqualTo("/oauth2/token")
 
         assertThat(finalMessage(err))
-            .contains("Could not renew your sign-in session")
+            .contains("Your sign-in session has ended") // SSO-3928 wording
             .contains("thoryn login --workspace thoryn")
         // The whole point: no second, more-memorable, wronger story after it.
         assertThat(err).doesNotContain("Error:").doesNotContain("Request failed")
@@ -112,7 +112,7 @@ class CommandSupportDeadSessionTest : CommandTestBase() {
         assertThat(exit).isNotZero()
         assertThat(server.requestCount).isEqualTo(1)
         assertThat(server.takeRequest().path).isEqualTo("/oauth2/token")
-        assertThat(err).contains("Could not renew your sign-in session").contains("thoryn login --workspace thoryn")
+        assertThat(err).contains("Your sign-in session has ended").contains("thoryn login --workspace thoryn")
         // The regression itself: the wrapper that made a dead session look like a DPoP protocol fault.
         assertThat(err)
             .doesNotContain("could not read live state")

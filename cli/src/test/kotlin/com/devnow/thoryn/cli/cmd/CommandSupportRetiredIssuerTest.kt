@@ -73,6 +73,7 @@ class CommandSupportRetiredIssuerTest : CommandTestBase() {
             .contains("Your sign-in session belongs to ${baseUrl()}, which has been retired (HTTP 410 issuer_retired)")
             .contains("thoryn login --issuer https://auth.stg.thoryn.org --workspace thoryn")
             .doesNotContain("Could not renew your sign-in session")
+            .doesNotContain("Your sign-in session has ended")
         assertThat(server.takeRequest().path).isEqualTo("/oauth2/token")
         // The remembered session is not rewritten.
         assertThat(FileTokenStore().read()).isEqualTo(session)

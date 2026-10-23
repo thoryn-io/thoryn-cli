@@ -2798,12 +2798,39 @@ On `--output json|yaml` the same guidance arrives as `hint`, beside the stable
 `errorCode: session_cannot_be_renewed`, so a script can branch on "go and sign
 in" instead of on a `401`. The exit code is unchanged.
 
-**Caveat (hub-side).** The authorization server issues **no refresh token to a public client on the
-authorization-code grant** (Spring Authorization Server's `OAuth2RefreshTokenGenerator`), and the CLI's
-`cli` login client is a public RFC 8252 native client. A loopback `thoryn login` session therefore ends
-at the access-token expiry today; `thoryn login --device-code` sessions do receive a refresh token and
-renew. The CLI prints a note right after a sign-in that received none. Making public-client
-authorization-code logins refreshable (rotation + replay detection, OAuth 2.1 §4.3.1) is a hub change.
+**Public-client refresh tokens (hub, SSO-3185).** Spring Authorization Server withholds a refresh token
+from a public client on the authorization-code grant; the hub issues one to the `cli` client anyway,
+because it rotates and is replay-protected (RFC 9700 §2.2.2), so a loopback `thoryn login` renews like a
+`--device-code` one. The CLI still prints a note right after a sign-in that received none (an older hub,
+or a client without the opt-in).
+
+### How long a sign-in lasts (SSO-3928)
+
+A `thoryn login` session is the hub's `cli` client session. The hub sets its limits, not the CLI:
+
+| Limit | Value | In practice |
+|---|---|---|
+| Access token | 15 min | Renewed automatically; you never see it. |
+| Idle window | 8 h | A session not used for 8 hours ends. Leave it overnight and the next morning's first command asks you to sign in again. Any command renews it. |
+| Maximum lifetime | 7 days from sign-in | However often you use it, sign in again once a week. |
+
+A workspace's authentication policy can only shorten these. The refresh token rotates on every renewal
+and, where the machine holds a DPoP key, is bound to it, so a copied token is useless elsewhere. Two commands that renew
+at the same moment are fine: the hub accepts the just-rotated token for 30 seconds and returns the same
+successor.
+
+When the hub ends the session, the CLI says why and when, from the hub's reason and the session's own
+tokens:
+
+```
+Your sign-in session has ended: it was not used within the hub's idle window (last renewed 2026-10-22 18:31 UTC, 12 h 48 min ago). Run `thoryn login --workspace thoryn` to sign in again.
+Your sign-in session has ended: it reached its maximum lifetime (signed in 2026-10-15 18:00 UTC, 7 d 0 h ago). Run `thoryn login --workspace thoryn` to sign in again.
+```
+
+A hub that gives no reason gets `the hub refused to renew it (invalid_grant)` with both times. A renewal
+that failed for any other reason (the hub unreachable, a `5xx`) did not end the session and keeps the
+neutral `Could not renew your sign-in session (…)`. If the token store cannot save a renewed session, the
+CLI warns that the next command will need a sign-in: the refresh token it replaced is spent.
 
 ## Examples (SSO-2830)
 

@@ -13,6 +13,7 @@ import com.devnow.thoryn.cli.auth.TokenExchangeException
 import com.devnow.thoryn.cli.auth.RevokedDevice
 import com.devnow.thoryn.cli.auth.ScopeRegistry
 import com.devnow.thoryn.cli.auth.TokenExchangeFlow
+import com.devnow.thoryn.cli.auth.SessionEnd
 import com.devnow.thoryn.cli.auth.TokenStoreFactory
 import com.devnow.thoryn.cli.auth.JwtClaims
 import com.devnow.thoryn.cli.auth.Tokens
@@ -399,16 +400,22 @@ internal object CommandSupport {
                 clientSecret = ThorynConfig.resolveClientSecret(),
             )
                 .refresh(refreshToken)
-                // Preserve the CLI-local session hosts + client (not returned by /oauth2/token).
-                .copy(
-                    issuer = current.issuer,
-                    gateway = current.gateway,
-                    platformIssuer = current.platformIssuer, // SSO-3379
-                    clientId = current.clientId,
-                    workspace = current.workspace,
-                )
-            runCatching { TokenStoreFactory.default().write(refreshed) }
-            refreshed
+            // SSO-3928 — the renewed session is the CURRENT one with only the token-response fields
+            // replaced. It used to be the token response with five CLI-local fields copied back, so every
+            // field added since (deviceId / deviceName, SSO-3228) was silently dropped at the first
+            // renewal — 15 minutes into a session, after which `thoryn logout --rotate-key` could no
+            // longer name the device to revoke. An ID token or scope the response omits is kept (RFC 6749
+            // §5.1: `scope` is omitted when unchanged), so the sign-in time stays readable.
+            val renewed = current.copy(
+                accessToken = refreshed.accessToken,
+                refreshToken = refreshed.refreshToken,
+                idToken = refreshed.idToken ?: current.idToken,
+                tokenType = refreshed.tokenType,
+                expiresAtEpochSecond = refreshed.expiresAtEpochSecond,
+                scope = refreshed.scope ?: current.scope,
+            )
+            persistRenewed(renewed, err)
+            renewed
         } catch (e: Exception) {
             warnOnce(err) {
                 // SSO-3282 — a renewal refused because this machine's DEVICE was revoked is not an
@@ -420,12 +427,42 @@ internal object CommandSupport {
                 } else if (e is RefreshTokenException && RetiredIssuer.isRetiredError(e.oauthError)) {
                     // SSO-3377 — `thoryn login` alone would reuse the retired issuer; name the successor.
                     retiredSessionGuidance(current)
+                } else if (e is RefreshTokenException && e.oauthError == OAUTH_INVALID_GRANT) {
+                    // SSO-3928 — the hub ENDED the session (idle window, maximum lifetime, …): say so,
+                    // with the reason it gave and when the session signed in / was last renewed.
+                    SessionEnd.guidance(e.oauthErrorDescription, current, LoginCommand.reLoginCommand(current))
                 } else {
+                    // Anything else (an unreachable hub, a 5xx, a client misconfiguration) may not
+                    // have ended anything — keep the neutral wording.
                     "Could not renew your sign-in session (${e.message}). " +
                         "Run `${LoginCommand.reLoginCommand(current)}` to sign in again."
                 }
             }
             null
+        }
+    }
+
+    /** RFC 6749 §5.2 — the refresh token is invalid, expired or revoked: the session is over. */
+    private const val OAUTH_INVALID_GRANT: String = "invalid_grant"
+
+    /**
+     * SSO-3928 — persist a renewed session, and say so when that fails.
+     *
+     * The refresh token rotates on every renewal (the `cli` client is one-time-use, V169), so the one
+     * just redeemed is spent: a renewal the store did not keep means the NEXT command presents a
+     * rotated token, which the hub treats as a replay outside its 30-second grace window and answers
+     * by revoking the whole session. That write failure used to be swallowed (`runCatching`), turning
+     * a keychain hiccup into an unexplained forced sign-in on the following command. This command can
+     * still finish with the renewed token it holds in memory; the warning says what will happen next.
+     */
+    private fun persistRenewed(renewed: Tokens, err: PrintStream) {
+        try {
+            TokenStoreFactory.default().write(renewed)
+        } catch (e: Exception) {
+            err.println(
+                "Warning: the renewed sign-in session could not be saved (${e.javaClass.simpleName}). " +
+                    "This command continues, but the next one will need `${LoginCommand.reLoginCommand(renewed)}`.",
+            )
         }
     }
 
