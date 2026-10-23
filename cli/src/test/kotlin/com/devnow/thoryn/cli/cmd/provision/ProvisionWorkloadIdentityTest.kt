@@ -56,12 +56,13 @@ class ProvisionWorkloadIdentityTest : CommandTestBase() {
         """.trimIndent(),
     )
 
+    // SSO-3926 — tenant:access.read: every plan asks POST /api/v1/access/check (the ownership gate), so a session without it is refused up front.
     private val workloadAuth = """
         {
           "method": "workload_identity",
           "clientId": "wi_0123456789abcdef01234567",
           "environment": "cli-wif",
-          "scopes": ["tenant:environments.read", "tenant:environments.write", "tenant:applications.read", "tenant:applications.write"]
+          "scopes": ["tenant:environments.read", "tenant:environments.write", "tenant:applications.read", "tenant:applications.write", "tenant:access.read"]
         }
     """.trimIndent()
 
@@ -86,7 +87,7 @@ class ProvisionWorkloadIdentityTest : CommandTestBase() {
         // The audience was derived: <workspace issuer>/<environment> (a local base keeps its host).
         assertThat(platform.exchanges.single())
             .containsEntry("client_id", "wi_0123456789abcdef01234567")
-            .containsEntry("scope", "tenant:environments.read tenant:environments.write tenant:applications.read tenant:applications.write")
+            .containsEntry("scope", "tenant:environments.read tenant:environments.write tenant:applications.read tenant:applications.write tenant:access.read")
             .doesNotContainKey("client_secret")
         val jobTokenRequest = server.takeRequest()
         assertThat(jobTokenRequest.requestUrl!!.queryParameter("audience")).isEqualTo("${baseUrl()}/cli-wif")

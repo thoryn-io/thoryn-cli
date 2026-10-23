@@ -62,11 +62,14 @@ class ProvisionAccessNotReachableTest : CommandTestBase() {
         System.clearProperty(FixRequest.CONSENT_URL_ENV)
     }
 
-    /** The plan-profile session of a brand-new repository identity (a JWT without `sub`, read scopes only). */
+    /**
+     * The plan-profile session of a brand-new repository identity (a JWT without `sub`, read scopes only). SSO-3926 — it
+     * carries tenant:users.read: one fixture declares a user, and a plan reads it.
+     */
     private fun session() {
         val enc = Base64.getUrlEncoder().withoutPadding()
         val header = enc.encodeToString("""{"alg":"none"}""".toByteArray())
-        val payload = enc.encodeToString("""{"client_id":"$clientId","scope":"tenant:environments.read tenant:applications.read tenant:access.read","tnt":"${api.tenantId}"}""".toByteArray())
+        val payload = enc.encodeToString("""{"client_id":"$clientId","scope":"tenant:environments.read tenant:applications.read tenant:users.read tenant:access.read","tnt":"${api.tenantId}"}""".toByteArray())
         seedTokens(
             Tokens(
                 accessToken = "$header.$payload.sig", authMode = Tokens.AUTH_MODE_WORKLOAD_IDENTITY, clientId = clientId,

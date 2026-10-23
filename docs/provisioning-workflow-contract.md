@@ -151,6 +151,16 @@ hosted runner with no kubeconfig, no `--secret-file` and no TTY, so an applicati
 `kubernetesSecret` sink has no cluster to reach; a `file` sink writes onto a runner that is gone when the job ends
 (green, the secret lost). A public or secret-less (`private_key_jwt`, `federated_assertion`) client passes.
 
+`config.trust-scopes` (SSO-3926) reads every configured `{file, connection}` pair that is committed and loads: the scopes
+the file needs (derived from its kinds, `grants:` blocks, bindings and secret sinks — each the `@PreAuthorize` gate of the
+product-api endpoint the engine calls; table in the README and in `ScopeRequirements`) are held against the connection's
+`auth.scopes` — the trust's apply profile, which the apply job requests exactly — and the PLAN scopes against the trust's
+plan profile as the connection implies it (a profile without explicit scopes is every `.read` scope of the trust; an
+explicit one is a subset of them). A missing scope fails the rule naming the scope, the resources that need it, and the
+profile to add it to. The repository identity cannot read its trust's profile (`tenant:workload-identity.read`), so the
+rule derives it; `provision plan` holds the plan scopes against the minted token before its first call, and maps a scope
+`403` (`access_denied` / `insufficient_scope`) to the same message. A file or connection that does not load gets no verdict.
+
 ## 6. A hand-written workflow (`custom.*`) — unsupported
 
 `thoryn provision workflow check` evaluates §1's rules plus one (`custom.jobs`: a job gated on each mode, in two different
@@ -173,3 +183,7 @@ SSO-3921 did **not** bump it either: the stub and the reusable workflow are unch
 which reads the provisioning FILES the configuration names — a repository whose file declares a secret-minting
 application without `secretSink: { kind: workloadPull }` now fails the check, which is what its first CI apply would
 have done (`undelivered_secrets`) or, with a `file` sink, silently lost.
+
+SSO-3926 did **not** bump it: the stub and the reusable workflow are unchanged. It adds `config.trust-scopes`, which reads
+the configured files AND their connections — a repository whose connection lacks a scope its file needs now fails the
+check, which is what its plan job would have done mid-plan with `403 access_denied` (thoryn-cicd run 39917407017).
