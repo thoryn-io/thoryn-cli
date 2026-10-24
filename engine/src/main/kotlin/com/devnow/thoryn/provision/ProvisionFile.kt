@@ -195,12 +195,19 @@ class ProvisionFile private constructor(
          * an `application` binds one by NAME through `spec.federatedTrust`. See [ProvisionEngine].
          */
         const val KIND_WORKLOAD_IDENTITY_TRUST = "workloadIdentityTrust"
+        /**
+         * SSO-3941 — an RBAC ROLE of the resource's environment (`/api/v1/roles`, product-api SSO-1891): its `name` IS the
+         * role's name (the converge key), `spec.permissions` the FULL set of permission strings it grants (converged as a set;
+         * a missing workspace permission is created), `spec.description` optional. Not a platform access object — product-api
+         * gates it on `tenant:roles.*` alone — so there is no ownership verdict and it cannot carry `grants:`. See [ProvisionEngine].
+         */
+        const val KIND_ROLE = "role"
 
         /** The CLOSED kind allowlist — must equal the schema's `kind` enum (asserted by the conformance test). */
         val KINDS: Set<String> = setOf(
             KIND_ENVIRONMENT, KIND_APPLICATION, KIND_EMAIL_PROVIDER, KIND_LOGIN_THEME,
             KIND_LOGIN_FLOW, KIND_LOGIN_METHODS, KIND_FEDERATION_MEMBER, KIND_USER, KIND_CUSTOM_DOMAIN,
-            KIND_WORKLOAD_IDENTITY_TRUST,
+            KIND_WORKLOAD_IDENTITY_TRUST, KIND_ROLE,
         )
 
         /**
@@ -227,7 +234,34 @@ class ProvisionFile private constructor(
             KIND_LOGIN_METHODS to setOf("methods"),
             KIND_CUSTOM_DOMAIN to setOf("host"),
             KIND_WORKLOAD_IDENTITY_TRUST to setOf("provider", "scopes"),
+            // `permissions` is required too, but `[]` (a role that grants nothing) is legal — checked by [validateRole].
+            KIND_ROLE to emptySet(),
         )
+
+        // ── SSO-3941 — `role` and an application's `tokenClaims` ──
+
+        const val ROLE_PERMISSIONS = "permissions"
+        const val ROLE_DESCRIPTION = "description"
+        /** The `spec` members a role accepts (the schema's `additionalProperties: false`). */
+        val ROLE_SPEC_KEYS: Set<String> = setOf(ROLE_PERMISSIONS, ROLE_DESCRIPTION)
+        /**
+         * product-api's `RbacService.RESERVED_PREFIX`: a permission whose first `:`-segment is `tenant`, `admin` or `holder`
+         * (case-insensitive) would be confusable with a platform scope, and is refused `400 permission_name_reserved`.
+         */
+        val RESERVED_PERMISSION_PREFIX = Regex("^(tenant|admin|holder):.*", RegexOption.IGNORE_CASE)
+        const val ERR_PERMISSION_NAME_RESERVED = "permission_name_reserved"
+
+        /** An application's claims-in-token toggle (`/api/v1/applications/{clientId}/token-claims`). */
+        const val SPEC_TOKEN_CLAIMS = "tokenClaims"
+        const val TOKEN_CLAIMS_SOURCES = "sources"
+        const val TOKEN_CLAIMS_ENABLED = "enabled"
+        val TOKEN_CLAIMS_KEYS: Set<String> = setOf(TOKEN_CLAIMS_SOURCES, TOKEN_CLAIMS_ENABLED)
+        /**
+         * product-api's default when `sources` is omitted. The source NAMES are deliberately not validated here: the file
+         * passes them through and product-api decides (`400 unsupported_claim_source`), so a source the server gains later
+         * (SSO-3943's `roles`) is declarable the day the server accepts it, without a CLI release.
+         */
+        val DEFAULT_TOKEN_CLAIM_SOURCES: List<String> = listOf("permissions")
 
         // ── SSO-3689 — secret-less clients: `clientAuthenticationMethods` / `jwksUri` / `jwks` / `federatedTrust` ──
 
@@ -719,6 +753,9 @@ class ProvisionFile private constructor(
                     ?.forEach { v += "$where spec.scopes: $ERR_RESERVED_SCOPE — '$it' is an operator-plane scope; a provisioning file cannot grant it (the hub refuses it). A platform: scope is declared in .thoryn/platform-scopes.yaml and applied by an operator with `thoryn operator platform-scopes apply`" }
                 // SSO-3689 — a workload-identity trust: the provider's pins, the scope grammar, the production rules.
                 if (kind == KIND_WORKLOAD_IDENTITY_TRUST) validateWorkloadIdentityTrust(spec, r, where, v)
+                // SSO-3941 — a role: its permission strings; an application's claims-in-token toggle.
+                if (kind == KIND_ROLE) validateRole(spec, r, where, v)
+                if (kind == KIND_APPLICATION) spec[SPEC_TOKEN_CLAIMS]?.takeIf { !it.isNull }?.let { validateTokenClaims(it, where, v) }
             }
             keys.groupBy { it }.filterValues { it.size > 1 }.keys.forEach { v += "duplicate resource '$it' — kind + name must be unique" }
             validateWorkloadPullTrusts(resources.toList(), v)
@@ -1161,6 +1198,65 @@ class ProvisionFile private constructor(
                     if (production && (namespace == null || sa == null)) v += "$where $ERR_PRODUCTION_REQUIRES_SERVICE_ACCOUNT — a production Kubernetes trust must pin spec.$block.namespace and spec.$block.serviceAccount"
                 }
             }
+        }
+
+        /**
+         * SSO-3941 — a `role`: exactly `{ permissions, description? }`. `permissions` is required (an empty list is a role that
+         * grants nothing) and lists permission strings — product-api's rules, mirrored: non-blank, not a reserved platform-scope
+         * namespace (`tenant:` / `admin:` / `holder:`, [ERR_PERMISSION_NAME_RESERVED]); no duplicates. A role is not a platform
+         * access object, so it cannot carry `grants:`.
+         */
+        private fun validateRole(spec: JsonNode, r: JsonNode, where: String, v: MutableList<String>) {
+            rejectUnknownKeys(spec, ROLE_SPEC_KEYS, "$where spec", v)
+            if (r["grants"]?.takeIf { !it.isNull } != null) {
+                v += "$where a $KIND_ROLE cannot carry 'grants' — a role is not a platform access object (product-api gates it on tenant:roles.* alone); assign it to people with `thoryn users roles add`"
+            }
+            spec[ROLE_DESCRIPTION]?.takeIf { !it.isNull && !it.isTextual() }?.let { v += "$where ($KIND_ROLE) spec.$ROLE_DESCRIPTION must be a string" }
+            val permissions = spec[ROLE_PERMISSIONS]?.takeIf { !it.isNull }
+            when {
+                permissions == null -> v += "$where ($KIND_ROLE) spec.$ROLE_PERMISSIONS is required — the FULL list of permissions the role grants ([] for none)"
+                !permissions.isArray() -> v += "$where ($KIND_ROLE) spec.$ROLE_PERMISSIONS must be a list of permission names"
+                else -> {
+                    val names = mutableListOf<String>()
+                    permissions.toList().forEachIndexed { i, p ->
+                        val name = p.takeIf { it.isTextual() }?.asString()?.trim()
+                        when {
+                            name.isNullOrEmpty() -> v += "$where ($KIND_ROLE) spec.$ROLE_PERMISSIONS[$i] must be a non-empty permission name (e.g. invoices:read)"
+                            RESERVED_PERMISSION_PREFIX.matches(name) -> v += "$where ($KIND_ROLE) spec.$ROLE_PERMISSIONS[$i]: $ERR_PERMISSION_NAME_RESERVED — '$name' begins with a reserved platform-scope namespace (tenant:, admin:, holder:)"
+                            else -> names += name
+                        }
+                    }
+                    names.groupBy { it }.filterValues { it.size > 1 }.keys.forEach { v += "$where ($KIND_ROLE) spec.$ROLE_PERMISSIONS lists '$it' twice" }
+                }
+            }
+        }
+
+        /**
+         * SSO-3941 — an application's `tokenClaims`: exactly `{ sources?, enabled? }`. `sources` (default `[permissions]`, the
+         * server's) is a non-empty list of non-empty source names, passed through as written — WHICH names exist is
+         * product-api's call ([DEFAULT_TOKEN_CLAIM_SOURCES]); `enabled: false` turns claims-in-token OFF and takes no `sources`.
+         */
+        private fun validateTokenClaims(node: JsonNode, where: String, v: MutableList<String>) {
+            val w = "$where spec.$SPEC_TOKEN_CLAIMS"
+            if (!node.isObject()) {
+                v += "$w must be an object { sources: [ … ] } (or { enabled: false } to turn claims in the token off)"
+                return
+            }
+            rejectUnknownKeys(node, TOKEN_CLAIMS_KEYS, w, v)
+            val enabled = node[TOKEN_CLAIMS_ENABLED]?.takeIf { !it.isNull }
+            if (enabled != null && !enabled.isBoolean()) v += "$w.$TOKEN_CLAIMS_ENABLED must be true or false"
+            val sources = node[TOKEN_CLAIMS_SOURCES]?.takeIf { !it.isNull } ?: return
+            if (enabled?.takeIf { it.isBoolean() }?.asBoolean() == false) {
+                v += "$w: `$TOKEN_CLAIMS_ENABLED: false` turns claims in the token off — it takes no $TOKEN_CLAIMS_SOURCES"
+                return
+            }
+            if (!sources.isArray() || sources.isEmpty()) {
+                v += "$w.$TOKEN_CLAIMS_SOURCES must be a non-empty list of claim source names (e.g. [permissions])"
+                return
+            }
+            val names = sources.toList().map { it.takeIf { n -> n.isTextual() }?.asString()?.trim() ?: "" }
+            names.forEachIndexed { i, n -> if (n.isEmpty()) v += "$w.$TOKEN_CLAIMS_SOURCES[$i] must be a non-empty source name" }
+            names.filter { it.isNotEmpty() }.groupBy { it }.filterValues { it.size > 1 }.keys.forEach { v += "$w.$TOKEN_CLAIMS_SOURCES lists '$it' twice" }
         }
 
         /** A required spec member is missing when absent, null, a blank scalar, or an empty array. */

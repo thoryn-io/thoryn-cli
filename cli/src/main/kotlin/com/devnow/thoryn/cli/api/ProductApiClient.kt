@@ -454,6 +454,64 @@ class ProductApiClient(
     override fun setWorkloadIdentityTrustScopes(id: String, body: Map<String, Any?>): JsonNode =
         put("/api/v1/workload-identity/trusts/${encode(id)}/scopes", mapper.valueToTree<JsonNode>(body.withoutNulls()))
 
+    // ── RBAC roles + permissions (SSO-3941; product-api SSO-1891 `/api/v1/roles`, `/api/v1/permissions`) ──
+    //
+    // A role is environment-scoped (the X-Thoryn-Environment header this client sends picks the plane); a
+    // permission is workspace-wide. read → tenant:roles.read; write → tenant:roles.write (granted to
+    // thoryn-cli by oathy hub V82). Lists are the cursor-paginated ListEnvelope. A role DELETE on the
+    // production plane is gated by the SSO-2413 confirmation (X-Thoryn-Confirm).
+
+    override fun listRoles(limit: Int?, cursor: String?): JsonNode = get("/api/v1/roles${pageQuery(limit, cursor)}")
+
+    override fun createRole(body: Map<String, Any?>): JsonNode =
+        post("/api/v1/roles", mapper.valueToTree<JsonNode>(body.withoutNulls()))
+
+    override fun updateRole(id: String, body: Map<String, Any?>): JsonNode =
+        patch("/api/v1/roles/${encode(id)}", mapper.valueToTree<JsonNode>(body))
+
+    override fun deleteRole(id: String, confirmSlug: String?): Unit =
+        deleteNoContent("/api/v1/roles/${encode(id)}", confirmSlug)
+
+    override fun listRolePermissions(id: String, limit: Int?, cursor: String?): JsonNode =
+        get("/api/v1/roles/${encode(id)}/permissions${pageQuery(limit, cursor)}")
+
+    override fun setRolePermissions(id: String, permissionIds: List<String>): JsonNode =
+        put("/api/v1/roles/${encode(id)}/permissions", mapper.createObjectNode().also { n -> n.putArray("permissionIds").also { a -> permissionIds.forEach { a.add(it) } } })
+
+    override fun listPermissions(limit: Int?, cursor: String?): JsonNode = get("/api/v1/permissions${pageQuery(limit, cursor)}")
+
+    override fun createPermission(body: Map<String, Any?>): JsonNode =
+        post("/api/v1/permissions", mapper.valueToTree<JsonNode>(body.withoutNulls()))
+
+    /** `GET /api/v1/users/{userId}/roles` — [userId] is the user's OAuth `sub` (product-api `UserRolesController`). */
+    fun listUserRoles(userId: String, limit: Int? = null, cursor: String? = null): JsonNode =
+        get("/api/v1/users/${encode(userId)}/roles${pageQuery(limit, cursor)}")
+
+    /** `POST /api/v1/users/{userId}/roles {roleId}` — `201`; `404 role_not_found`; `409 assignment_exists`. */
+    fun assignUserRole(userId: String, roleId: String): JsonNode =
+        post("/api/v1/users/${encode(userId)}/roles", mapper.createObjectNode().put("roleId", roleId))
+
+    /** `DELETE /api/v1/users/{userId}/roles/{roleId}` — `204`, idempotent (also when the user did not hold it). */
+    fun unassignUserRole(userId: String, roleId: String): Unit =
+        deleteNoContent("/api/v1/users/${encode(userId)}/roles/${encode(roleId)}")
+
+    // ── Claims in the token (SSO-3941; product-api SSO-1904 `/api/v1/applications/{clientId}/token-claims`) ──
+    // read → tenant:applications.read; write → tenant:applications.write. DELETE answers 204.
+
+    override fun getApplicationTokenClaims(clientId: String): JsonNode =
+        get("/api/v1/applications/${encode(clientId)}/token-claims")
+
+    override fun putApplicationTokenClaims(clientId: String, sources: List<String>): JsonNode =
+        put("/api/v1/applications/${encode(clientId)}/token-claims", mapper.createObjectNode().also { n -> n.putArray("sources").also { a -> sources.forEach { a.add(it) } } })
+
+    override fun deleteApplicationTokenClaims(clientId: String): Unit =
+        deleteNoContent("/api/v1/applications/${encode(clientId)}/token-claims")
+
+    private fun pageQuery(limit: Int?, cursor: String?): String = buildList {
+        limit?.let { add("limit=$it") }
+        cursor?.takeIf { it.isNotBlank() }?.let { add("cursor=${encode(it)}") }
+    }.joinToString("&").let { if (it.isEmpty()) "" else "?$it" }
+
     /** Drop null members (recursively through nested maps) so an omitted option is absent, not `null`. */
     private fun Map<String, Any?>.withoutNulls(): Map<String, Any?> =
         filterValues { it != null }.mapValues { (_, v) ->

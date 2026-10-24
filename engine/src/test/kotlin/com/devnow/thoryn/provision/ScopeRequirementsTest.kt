@@ -83,6 +83,24 @@ class ScopeRequirementsTest {
     }
 
     @Test
+    fun `a declared role needs roles read to plan and roles write to apply, and no ownership check`() {
+        val needs = ScopeRequirements.of(file("- { kind: role, name: forge-maintainer, spec: { permissions: [\"forge:maintain\"] } }"))
+        assertThat(scopes(needs, Phase.PLAN)).containsExactly("tenant:roles.read")
+        assertThat(scopes(needs, Phase.APPLY)).containsExactly("tenant:roles.write")
+        assertThat(needs.single { it.scope == "tenant:roles.read" }.resource).isEqualTo("role/forge-maintainer")
+        val r = file("- { kind: role, name: r, spec: { permissions: [] } }").resources.single()
+        val create = ProvisionPlan(listOf(PlannedChange(r.kind, r.name, ChangeAction.CREATE, "new", resource = r)))
+        assertThat(ScopeRequirements.forChanges(create).map { it.scope }).containsExactly("tenant:roles.write")
+    }
+
+    @Test
+    fun `an application's tokenClaims is covered by the applications scopes it already needs`() {
+        val needs = ScopeRequirements.of(file("- { kind: application, name: a, spec: { displayName: A, tokenClaims: { sources: [permissions] } } }"))
+        assertThat(scopes(needs, Phase.PLAN)).containsExactly("tenant:applications.read", "tenant:access.read")
+        assertThat(scopes(needs, Phase.APPLY)).containsExactly("tenant:applications.write")
+    }
+
+    @Test
     fun `the deprecated clients alias satisfies the applications scope`() {
         val needs = ScopeRequirements.of(file("- { kind: application, name: a, spec: { displayName: A } }"))
         assertThat(ScopeRequirements.missing(needs, setOf("tenant:clients.read", "tenant:clients.write", "tenant:access.read")).map { it.scope }).isEmpty()

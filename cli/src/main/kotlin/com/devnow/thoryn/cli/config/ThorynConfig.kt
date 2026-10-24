@@ -378,7 +378,9 @@ object ThorynConfig {
      * they are requested so a workspace admin who signs in with the CLI HOLDS the family and can grant it onward, e.g.
      * to `thoryn-starters` through provisioning-as-code; oathy ADR 2026-10-19-operator-grants-platform-client-scopes,
      * "The grant order" step 2. Granted to `cli` / `thoryn-cli` by oathy hub V206 (SSO-3855), which must be deployed
-     * before a release carrying this default — same rule).
+     * before a release carrying this default — same rule), SSO-3941 (`roles.*` for `thoryn users roles …` and the
+     * `kind: role` of a provisioning file; hub V82 granted them to `thoryn-cli` only — a hub migration granting them to
+     * `cli` must be deployed before a release carrying this default — same rule).
      */
     const val DEFAULT_SCOPE =
         "openid offline_access " +
@@ -394,7 +396,8 @@ object ThorynConfig {
             "tenant:domains.read tenant:domains.write " +
             "tenant:keys.read tenant:keys.rotate tenant:keys.retire " +
             "tenant:workload-identity.read tenant:workload-identity.write " +
-            "tenant:github-connections.read tenant:github-connections.write"
+            "tenant:github-connections.read tenant:github-connections.write " +
+            "tenant:roles.read tenant:roles.write"
 
     /**
      * The `--hub` / `--gateway` "not given" sentinel of the post-login commands (SSO-2827): they use the

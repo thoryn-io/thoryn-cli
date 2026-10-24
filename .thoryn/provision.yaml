@@ -162,6 +162,13 @@ resources:
         # V206 (SSO-3855) before any CLI release requests it, so converging this file finds it already present.
         - tenant:github-connections.read
         - tenant:github-connections.write
+        # SSO-3941 — `thoryn users roles …` and a provisioning file's `kind: role` (product-api RBAC, /api/v1/roles).
+        # MERGE PRECONDITION (the SSO-2278 grant order): an oathy hub migration must grant tenant:roles.read/.write to
+        # `cli` (hub V82 granted them to the seeded `thoryn-cli` only) and be deployed before this file is applied —
+        # the App-dispatched apply cannot add a scope the CI identity does not hold — and before a release carrying
+        # this default signs in (requested ⊄ registered is invalid_scope).
+        - tenant:roles.read
+        - tenant:roles.write
       requireAuthorizationConsent: false  # first-party: no consent screen for the platform's own CLI
 
   - kind: environment

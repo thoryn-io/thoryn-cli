@@ -27,21 +27,25 @@ import java.util.concurrent.Callable
  * (product-api answers `428` when absent, `422` on mismatch); a sandbox plane is ungated. Scopes:
  * `list` → `tenant:users.read`; `suspend` / `reactivate` → `tenant:users.write` (and `suspend`/
  * `reactivate` addressed by `--email` also need `tenant:users.read` to resolve the id).
+ *
+ * SSO-3941 — `roles list | add | remove` ([UsersRolesCommand]) manage the RBAC roles a user holds
+ * (`tenant:roles.*`).
  */
 @Command(
     name = "users",
-    description = ["Manage the directory users of your workspace (list, suspend, reactivate)."],
+    description = ["Manage the directory users of your workspace (list, suspend, reactivate, roles)."],
     mixinStandardHelpOptions = true,
     subcommands = [
         UsersCommand.ListSubcommand::class,
         UsersCommand.SuspendSubcommand::class,
         UsersCommand.ReactivateSubcommand::class,
+        UsersRolesCommand::class,
     ],
 )
 class UsersCommand : Callable<Int> {
     override fun call(): Int {
         System.err.println("Usage: thoryn users <subcommand>")
-        System.err.println("Subcommands: list | suspend | reactivate")
+        System.err.println("Subcommands: list | suspend | reactivate | roles")
         return CommandSupport.EXIT_USAGE
     }
 

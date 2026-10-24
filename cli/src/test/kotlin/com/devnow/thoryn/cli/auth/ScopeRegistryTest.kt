@@ -73,6 +73,14 @@ class ScopeRegistryTest {
     }
 
     @Test
+    fun `the default login scope requests the roles family that users roles and a provisioned role need`() {
+        // SSO-3941 — `thoryn users roles …` and `kind: role` call /api/v1/roles (tenant:roles.*). A hub migration granting
+        // the family to `cli` must be deployed before a release carrying this default (the SSO-2278 grant order).
+        val default = com.devnow.thoryn.cli.config.ThorynConfig.DEFAULT_SCOPE.split(' ')
+        assertThat(default).contains("tenant:roles.read", "tenant:roles.write")
+    }
+
+    @Test
     fun `non-wildcard scope passes through unchanged`() {
         assertThat(ScopeRegistry.expand("openid offline_access"))
             .isEqualTo("openid offline_access")
