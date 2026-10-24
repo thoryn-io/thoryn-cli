@@ -501,8 +501,15 @@ class ProductApiClient(
     override fun getApplicationTokenClaims(clientId: String): JsonNode =
         get("/api/v1/applications/${encode(clientId)}/token-claims")
 
-    override fun putApplicationTokenClaims(clientId: String, sources: List<String>): JsonNode =
-        put("/api/v1/applications/${encode(clientId)}/token-claims", mapper.createObjectNode().also { n -> n.putArray("sources").also { a -> sources.forEach { a.add(it) } } })
+    // SSO-3945 — `roleMapping` rides on EVERY PUT, as an explicit null when there is none: the PUT replaces the configuration.
+    override fun putApplicationTokenClaims(clientId: String, sources: List<String>, roleMapping: Map<String, String>?): JsonNode =
+        put(
+            "/api/v1/applications/${encode(clientId)}/token-claims",
+            mapper.createObjectNode().also { n ->
+                n.putArray("sources").also { a -> sources.forEach { a.add(it) } }
+                if (roleMapping == null) n.putNull("roleMapping") else n.putObject("roleMapping").also { m -> roleMapping.forEach { (k, v) -> m.put(k, v) } }
+            },
+        )
 
     override fun deleteApplicationTokenClaims(clientId: String): Unit =
         deleteNoContent("/api/v1/applications/${encode(clientId)}/token-claims")

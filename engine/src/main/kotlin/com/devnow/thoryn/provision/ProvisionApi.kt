@@ -164,11 +164,14 @@ interface ProvisionApi {
 
     // ── Claims in the token (`/api/v1/applications/{clientId}/token-claims`; SSO-3941, product-api SSO-1904) ──
     // Scopes `tenant:applications.read` (GET) and `tenant:applications.write` (PUT / DELETE). GET answers
-    // `{ clientId, enabled, sources, claimKeys, … }` (`enabled: false, sources: []` when never enabled); PUT `{ sources }`
-    // enables it with exactly those sources (`400 unsupported_claim_source`); DELETE disables it (`204`).
+    // `{ clientId, enabled, sources, claimKeys, roleMapping, … }` (`enabled: false, sources: []` when never enabled); PUT
+    // `{ sources, roleMapping }` enables it with exactly that configuration (`400 unsupported_claim_source` /
+    // `invalid_role_mapping`); DELETE disables it (`204`). SSO-3945 (oauthy SSO-3943): PUT REPLACES the configuration — a
+    // body without `roleMapping` stores no mapping — so [roleMapping] is not optional here: every caller states it (`null`
+    // = no mapping, sent as an explicit JSON null).
 
     fun getApplicationTokenClaims(clientId: String): JsonNode = throw unsupported("token claims")
-    fun putApplicationTokenClaims(clientId: String, sources: List<String>): JsonNode = throw unsupported("token claims")
+    fun putApplicationTokenClaims(clientId: String, sources: List<String>, roleMapping: Map<String, String>?): JsonNode = throw unsupported("token claims")
     fun deleteApplicationTokenClaims(clientId: String): Unit = throw unsupported("token claims")
 
     private fun unsupported(what: String): ProductApiException =

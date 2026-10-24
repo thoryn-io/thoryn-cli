@@ -73,10 +73,15 @@ internal class FakeProductApi : Dispatcher() {
     val userRoles = mutableListOf<MutableMap<String, Any?>>()
     /** Claims in the token per clientId: the enabled sources (absent ⇒ never enabled). */
     val tokenClaims = mutableMapOf<String, List<String>>()
+    /**
+     * SSO-3945 (oauthy SSO-3943) — the stored role mapping per clientId (absent ⇒ none). Like product-api, a PUT REPLACES it:
+     * a body without `roleMapping` (or with `null`) stores none. A DELETE keeps it, as product-api keeps the disabled row.
+     */
+    val roleMappings = mutableMapOf<String, Map<String, String>>()
     /** The page size of the roles / permissions lists (cursor = the offset), so a test can exercise paging. */
     var rbacPageSize = 500
     /** The claim sources product-api accepts today (a test widens it to model a server that gained one). */
-    var supportedClaimSources = setOf("permissions", "org", "org_roles", "pim", "entitlements", "guest")
+    var supportedClaimSources = setOf("permissions", "org", "org_roles", "roles", "pim", "entitlements", "guest")
 
     fun seedRole(env: String?, name: String, permissionNames: List<String> = emptyList(), description: String? = null): String {
         val id = "role-${++seq}"
@@ -156,18 +161,47 @@ internal class FakeProductApi : Dispatcher() {
     /** product-api's `TokenClaimsController` in miniature. */
     private fun tokenClaimsRoute(method: String, clientId: String, env: String?, b: Map<String, Any?>): MockResponse {
         if (applications.none { it["clientId"] == clientId && visible(it, env) }) return problem(404, "not_found")
-        fun view() = tokenClaims[clientId].let { s -> mapOf("clientId" to clientId, "enabled" to (s != null), "sources" to (s ?: emptyList()), "claimKeys" to (s ?: emptyList()).filter { it == "permissions" }, "webhookRegistered" to (s != null)) }
+        fun view() = tokenClaims[clientId].let { s ->
+            mapOf(
+                "clientId" to clientId, "enabled" to (s != null), "sources" to (s ?: emptyList()),
+                "claimKeys" to (s ?: emptyList()).filter { it == "permissions" || it == "roles" },
+                "roleMapping" to roleMappings[clientId], "webhookRegistered" to (s != null),
+            )
+        }
         return when (method) {
             "GET" -> json(200, view())
             "PUT" -> {
-                val sources = (b["sources"] as? List<*>)?.map { it.toString() } ?: listOf("permissions")
+                val sources = ((b["sources"] as? List<*>)?.map { it.toString() } ?: listOf("permissions")).distinct()
                 val unsupported = sources.filterNot { it in supportedClaimSources || it.startsWith("metadata:") }
                 if (sources.isEmpty() || unsupported.isNotEmpty()) return problem(400, "unsupported_claim_source")
-                tokenClaims[clientId] = sources.distinct(); json(200, view())
+                @Suppress("UNCHECKED_CAST")
+                val mapping = (b["roleMapping"] as? Map<String, Any?>)?.mapValues { it.value.toString() }
+                if (mapping != null) roleMappingProblem(mapping, sources)?.let { return problem(400, "invalid_role_mapping", mapOf("detail" to it)) }
+                tokenClaims[clientId] = sources
+                if (mapping == null) roleMappings.remove(clientId) else roleMappings[clientId] = mapping
+                json(200, view())
             }
             "DELETE" -> if (tokenClaims.remove(clientId) != null) MockResponse().setResponseCode(204) else problem(404, "not_found")
             else -> problem(405, "method")
         }
+    }
+
+    /** product-api's `RoleMappingRules.validate` (+ the `roles`-source precondition) in miniature, with its wording. */
+    private fun roleMappingProblem(mapping: Map<String, String>, sources: List<String>): String? {
+        if ("roles" !in sources) return "Field 'roleMapping' requires the 'roles' claim source."
+        if (mapping.size > 100) return "Field 'roleMapping' holds ${mapping.size} entries; at most 100 are allowed."
+        for ((role, value) in mapping) {
+            if (role.isBlank() || role.length > 200 || Regex("\\p{Cntrl}").containsMatchIn(role)) {
+                return "Every 'roleMapping' key must be a role name of 1 to 200 characters without control characters."
+            }
+            if (!Regex("^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,127}$").matches(value)) {
+                return "Every 'roleMapping' value must be 1 to 128 characters, start with a letter or digit, and contain only letters, digits and . _ - : @ /."
+            }
+            if (Regex("^(tenant|admin|holder):.*", RegexOption.IGNORE_CASE).matches(value)) {
+                return "A 'roleMapping' value may not start with a reserved platform scope prefix (tenant:, admin:, holder:)."
+            }
+        }
+        return null
     }
 
     /** SSO-3113 — the one-shot client secrets the fake minted for confidential applications, by clientId (test-side ledger only). */

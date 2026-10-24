@@ -255,7 +255,22 @@ class ProvisionFile private constructor(
         const val SPEC_TOKEN_CLAIMS = "tokenClaims"
         const val TOKEN_CLAIMS_SOURCES = "sources"
         const val TOKEN_CLAIMS_ENABLED = "enabled"
-        val TOKEN_CLAIMS_KEYS: Set<String> = setOf(TOKEN_CLAIMS_SOURCES, TOKEN_CLAIMS_ENABLED)
+        /**
+         * SSO-3945 (oauthy SSO-3943) — the optional role mapping: Thoryn role name → the value the application receives in its
+         * `roles` claim. `PUT …/token-claims` REPLACES the configuration, so the engine sends it with every PUT and an omitted
+         * one means "no mapping" (a live mapping is then removed — the plan says so).
+         */
+        const val TOKEN_CLAIMS_ROLE_MAPPING = "roleMapping"
+        val TOKEN_CLAIMS_KEYS: Set<String> = setOf(TOKEN_CLAIMS_SOURCES, TOKEN_CLAIMS_ENABLED, TOKEN_CLAIMS_ROLE_MAPPING)
+        /** The claim source a `roleMapping` translates; product-api refuses a mapping without it (`invalid_role_mapping`). */
+        const val TOKEN_CLAIMS_ROLES_SOURCE = "roles"
+        // product-api's `RoleMappingRules` (SSO-3943), mirrored exactly — no stricter: the server refuses the same with
+        // `400 invalid_role_mapping`, this only says so before any call, naming the field.
+        const val ROLE_MAPPING_MAX_ENTRIES = 100
+        const val ROLE_MAPPING_MAX_ROLE_NAME_LENGTH = 200
+        val ROLE_MAPPING_VALUE_GRAMMAR = Regex("^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,127}$")
+        /** `\p{Cntrl}` as product-api reads it (java.util.regex: ASCII control characters, U+0000–U+001F and U+007F). */
+        private val ROLE_MAPPING_CONTROL_CHARS = Regex("\\p{Cntrl}")
         /**
          * product-api's default when `sources` is omitted. The source NAMES are deliberately not validated here: the file
          * passes them through and product-api decides (`400 unsupported_claim_source`), so a source the server gains later
@@ -1232,7 +1247,7 @@ class ProvisionFile private constructor(
         }
 
         /**
-         * SSO-3941 — an application's `tokenClaims`: exactly `{ sources?, enabled? }`. `sources` (default `[permissions]`, the
+         * SSO-3941 — an application's `tokenClaims`: exactly `{ sources?, enabled?, roleMapping? }` (SSO-3945 — see [validateRoleMapping]). `sources` (default `[permissions]`, the
          * server's) is a non-empty list of non-empty source names, passed through as written — WHICH names exist is
          * product-api's call ([DEFAULT_TOKEN_CLAIM_SOURCES]); `enabled: false` turns claims-in-token OFF and takes no `sources`.
          */
@@ -1245,7 +1260,16 @@ class ProvisionFile private constructor(
             rejectUnknownKeys(node, TOKEN_CLAIMS_KEYS, w, v)
             val enabled = node[TOKEN_CLAIMS_ENABLED]?.takeIf { !it.isNull }
             if (enabled != null && !enabled.isBoolean()) v += "$w.$TOKEN_CLAIMS_ENABLED must be true or false"
-            val sources = node[TOKEN_CLAIMS_SOURCES]?.takeIf { !it.isNull } ?: return
+            val roleMapping = node[TOKEN_CLAIMS_ROLE_MAPPING]?.takeIf { !it.isNull }
+            if (enabled?.takeIf { it.isBoolean() }?.asBoolean() == false && roleMapping != null) {
+                v += "$w: `$TOKEN_CLAIMS_ENABLED: false` turns claims in the token off — it takes no $TOKEN_CLAIMS_ROLE_MAPPING"
+                return
+            }
+            val sources = node[TOKEN_CLAIMS_SOURCES]?.takeIf { !it.isNull }
+            if (sources == null) {
+                roleMapping?.let { validateRoleMapping(it, DEFAULT_TOKEN_CLAIM_SOURCES, w, v) }
+                return
+            }
             if (enabled?.takeIf { it.isBoolean() }?.asBoolean() == false) {
                 v += "$w: `$TOKEN_CLAIMS_ENABLED: false` turns claims in the token off — it takes no $TOKEN_CLAIMS_SOURCES"
                 return
@@ -1257,6 +1281,44 @@ class ProvisionFile private constructor(
             val names = sources.toList().map { it.takeIf { n -> n.isTextual() }?.asString()?.trim() ?: "" }
             names.forEachIndexed { i, n -> if (n.isEmpty()) v += "$w.$TOKEN_CLAIMS_SOURCES[$i] must be a non-empty source name" }
             names.filter { it.isNotEmpty() }.groupBy { it }.filterValues { it.size > 1 }.keys.forEach { v += "$w.$TOKEN_CLAIMS_SOURCES lists '$it' twice" }
+            roleMapping?.let { validateRoleMapping(it, names, w, v) }
+        }
+
+        /**
+         * SSO-3945 — `tokenClaims.roleMapping`: an object of role name → value, refused here on exactly what product-api's
+         * `RoleMappingRules.validate` refuses (`400 invalid_role_mapping`) and nothing more — at most
+         * [ROLE_MAPPING_MAX_ENTRIES] entries; a key 1..[ROLE_MAPPING_MAX_ROLE_NAME_LENGTH] characters, not blank, without
+         * control characters; a value matching [ROLE_MAPPING_VALUE_GRAMMAR] and not under a reserved platform-scope namespace
+         * (`tenant:` / `admin:` / `holder:`, any case); and the `roles` source among [sources] (default `[permissions]`). A
+         * YAML value must be a STRING: an unquoted `1.10` or `0123` would reach the server as something else, so it is
+         * refused with "quote it" rather than converted.
+         */
+        private fun validateRoleMapping(mapping: JsonNode, sources: List<String>, w: String, v: MutableList<String>) {
+            val f = "$w.$TOKEN_CLAIMS_ROLE_MAPPING"
+            if (!mapping.isObject()) {
+                v += "$f must be an object of role name → the value the application receives in its `roles` claim (e.g. { forge-maintainer: Maintainers })"
+                return
+            }
+            if (TOKEN_CLAIMS_ROLES_SOURCE !in sources) {
+                v += "$f requires the '$TOKEN_CLAIMS_ROLES_SOURCE' claim source — add it to $w.$TOKEN_CLAIMS_SOURCES (invalid_role_mapping)"
+            }
+            if (mapping.size() > ROLE_MAPPING_MAX_ENTRIES) {
+                v += "$f holds ${mapping.size()} entries; at most $ROLE_MAPPING_MAX_ENTRIES are allowed (invalid_role_mapping)"
+            }
+            mapping.properties().forEach { (role, value) ->
+                if (role.isBlank() || role.length > ROLE_MAPPING_MAX_ROLE_NAME_LENGTH || ROLE_MAPPING_CONTROL_CHARS.containsMatchIn(role)) {
+                    v += "$f: every key must be a role name of 1 to $ROLE_MAPPING_MAX_ROLE_NAME_LENGTH characters, not blank, without control characters (invalid_role_mapping)"
+                    return@forEach
+                }
+                when {
+                    !value.isTextual() ->
+                        v += "$f['$role'] must be a string — quote it (e.g. \"$role\": \"Maintainers\")"
+                    !ROLE_MAPPING_VALUE_GRAMMAR.matches(value.asString()) ->
+                        v += "$f['$role']: a value must be 1 to 128 characters, start with a letter or digit, and contain only letters, digits and . _ - : @ / (invalid_role_mapping)"
+                    RESERVED_PERMISSION_PREFIX.matches(value.asString()) ->
+                        v += "$f['$role']: a value may not start with a reserved platform scope prefix (tenant:, admin:, holder:) (invalid_role_mapping)"
+                }
+            }
         }
 
         /** A required spec member is missing when absent, null, a blank scalar, or an empty array. */

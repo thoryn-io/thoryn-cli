@@ -326,6 +326,8 @@ thoryn examples share    <name> [--output <file>]   # SSO-2876 — export the se
 # permission the workspace lacks is created); and an application's `tokenClaims: { sources: [permissions] }` — which claim
 # sources the hub adds to its tokens (`{ enabled: false }` switches it off; omitted keeps the live toggle). See "Roles and
 # claims in the token" below.
+# SSO-3945 (oauthy SSO-3943): `tokenClaims.roleMapping` — role name → the value the application receives in its `roles`
+# claim (source `roles`). Sent with EVERY PUT; omitted means NO mapping, so the plan shows a live one as removed.
 thoryn provision plan    [--file <path>] [--prune] [--fix-request <path>]  # read-only: what apply would create / remove (+ grant changes, pending publishes); exit 1 on an ownership error
                                              # SSO-3710 — --fix-request (env THORYN_FIX_REQUEST): a red plan also writes thoryn-provision-request.json — every missing RIGHT
                                              # (owner / manager / viewer) with the exact `thoryn access grant` command a workspace admin runs; a workflow uploads it
@@ -1644,11 +1646,12 @@ application: a sender constraint widens nothing.
 session_exceeds_tenant_policy — … cap of 86400 seconds …`), never the "Required scope" hint a bare `403` would
 otherwise print. Everything converged before it stays live; fix the cause and re-run.
 
-### Roles and claims in the token — `kind: role`, `tokenClaims` (SSO-3941)
+### Roles and claims in the token — `kind: role`, `tokenClaims` (SSO-3941, SSO-3945)
 
-The product API grants access through **RBAC roles** (`/api/v1/roles`) and puts a person's effective permissions into
-the tokens of an application that asks for them (`/api/v1/applications/{clientId}/token-claims`). A provisioning file
-declares both; who holds a role is a person-by-person act (`thoryn users roles add`, above).
+The product API grants access through **RBAC roles** (`/api/v1/roles`) and puts a person's effective permissions — or
+their role names, translated into the application's own vocabulary — into the tokens of an application that asks for
+them (`/api/v1/applications/{clientId}/token-claims`). A provisioning file declares both; who holds a role is a
+person-by-person act (`thoryn users roles add`, above).
 
 ```yaml
 resources:
@@ -1667,6 +1670,23 @@ resources:
       redirectUris: ["https://forge.acme.example/oauth2/callback"]
       tokenClaims:
         sources: [permissions]      # the user's effective permission names → claim `permissions`
+```
+
+An application that reads **roles** instead — the forge expects a `Maintainers` group, not Thoryn's role name — asks for the
+`roles` source and maps the role onto its own name (SSO-3945, oauthy SSO-3943):
+
+```yaml
+  - kind: application
+    name: forge
+    environment: staging
+    spec:
+      clientId: forge
+      displayName: "Forge"
+      redirectUris: ["https://forge.acme.example/oauth2/callback"]
+      tokenClaims:
+        sources: [roles]                     # the user's role names → ID-token claim `roles`
+        roleMapping:
+          forge-maintainer: Maintainers      # Thoryn role → the value the forge receives
 ```
 
 **`kind: role`.** Converged by `name` within its environment. `plan` reads the role and its permissions; the
@@ -1694,6 +1714,34 @@ gains is declarable without a new CLI. A name it refuses fails the apply with it
 ```text
 Error: application/forge: spec.tokenClaims refused by the platform — unsupported_claim_source: Unsupported claim sources: … (the application itself is converged)
 ```
+
+**`roleMapping` (SSO-3945).** Maps a Thoryn role name to the value the application receives in its `roles` claim. Without
+a mapping every role name the user holds is emitted as-is; **with** one it is an **allowlist** — only mapped roles are
+emitted, under their mapped values (`{}` lets none through), so an application never learns a role not meant for it. It
+needs the `roles` source in `sources` (the default `[permissions]` does not have it).
+
+**The platform's `PUT` replaces the whole configuration**, so the CLI sends `sources` AND `roleMapping` together on every
+write — `"roleMapping": null` when the file declares none. **Omitting `roleMapping` therefore means "no mapping"**: a live
+mapping the file does not declare is removed, and the plan says so before you apply:
+
+```text
+      application forge: tokenClaims: roleMapping removed — the file declares none and the PUT replaces the whole configuration: - forge-maintainer: Maintainers
+```
+
+The plan diffs `sources` (as a set) and `roleMapping` (as a map — key order is not drift) together and is a no-op only when
+both match. A changed mapping is shown entry by entry — `+ role: value` added, `- role: value` removed,
+`~ role: old → new` changed:
+
+```text
+      application forge: tokenClaims: sources [roles] → sources [roles,permissions]; roleMapping ~ forge-admin: admins → Admins, + forge-maintainer: Maintainers
+```
+
+The file refuses, before any call, exactly what product-api refuses (`400 invalid_role_mapping`), naming
+`spec.tokenClaims.roleMapping`: more than 100 entries; a key (a role name) that is blank, longer than 200 characters, or holds
+a control character; a value that does not match `^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,127}$` or starts with `tenant:`,
+`admin:` or `holder:` (any case); a mapping without the `roles` source; a mapping with `enabled: false`. A value must be a
+YAML **string**: quote anything YAML would read as a number or boolean (`"1.10"`, `"0123"`, `"true"`), because the CLI
+does not guess what you meant.
 
 | Declares | to plan | to apply |
 |---|---|---|
