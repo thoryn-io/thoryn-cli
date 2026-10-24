@@ -97,6 +97,26 @@ class SecretIoTest {
     }
 
     @Test
+    fun `emitSecret writes exactly the secret bytes with no trailing newline`() {
+        // SSO-3939: oauth2-proxy reads --client-secret-file verbatim; a trailing
+        // newline becomes part of the presented secret and the hub answers invalid_client.
+        val file = tmp.resolve("exact.txt").toFile()
+
+        val emitted = SecretIo.emitSecret(
+            label = "Client secret",
+            secret = "minted",
+            secretFile = file,
+            forceStdout = false,
+            stdoutIsTty = false,
+            out = PrintStream(out()),
+            err = PrintStream(out()),
+        )
+
+        assertThat(emitted).isTrue()
+        assertThat(Files.readAllBytes(file.toPath())).isEqualTo("minted".toByteArray(Charsets.UTF_8))
+    }
+
+    @Test
     fun `emitSecret refuses a non-TTY stdout without forceStdout`() {
         val out = out()
         val err = out()
