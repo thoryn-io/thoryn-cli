@@ -141,6 +141,39 @@ interface ProvisionApi {
     fun listApplicationSlots(): JsonNode =
         throw ProductApiException(404, "not_found", "this host does not read application creation slots", "")
 
+    // ── RBAC roles and permissions (`/api/v1/roles`, `/api/v1/permissions`; SSO-3941, product-api SSO-1891 R2) ──
+    // Scopes `tenant:roles.read` (every GET) and `tenant:roles.write` (POST / PATCH / PUT / DELETE, permissions included).
+    // A role is ENVIRONMENT-scoped (the `X-Thoryn-Environment` plane; its name is unique per environment); a permission is
+    // WORKSPACE-wide (one name per workspace, whatever the plane). Roles are not platform access objects: product-api gates
+    // them on the scope alone. Lists are the cursor-paginated ListEnvelope `{ data, pagination: { cursor, hasMore } }`.
+    // `PUT /roles/{id}/permissions` replaces the role's whole permission set and takes permission IDS (`permissionIds`).
+    //
+    // Defaulted (like [listApplicationSlots]) so a host that predates roles keeps compiling: the default answers `501`, which
+    // the engine surfaces as a failed read of the role (never as "absent").
+
+    fun listRoles(limit: Int? = null, cursor: String? = null): JsonNode = throw unsupported("roles")
+    fun createRole(body: Map<String, Any?>): JsonNode = throw unsupported("roles")
+    /** `PATCH /api/v1/roles/{id}` — the description only (a role's name is immutable). */
+    fun updateRole(id: String, body: Map<String, Any?>): JsonNode = throw unsupported("roles")
+    fun deleteRole(id: String, confirmSlug: String? = null): Unit = throw unsupported("roles")
+    fun listRolePermissions(id: String, limit: Int? = null, cursor: String? = null): JsonNode = throw unsupported("roles")
+    fun setRolePermissions(id: String, permissionIds: List<String>): JsonNode = throw unsupported("roles")
+    fun listPermissions(limit: Int? = null, cursor: String? = null): JsonNode = throw unsupported("permissions")
+    /** `POST /api/v1/permissions` — `400 permission_name_reserved` for a `tenant:` / `admin:` / `holder:` name, `409 permission_exists`. */
+    fun createPermission(body: Map<String, Any?>): JsonNode = throw unsupported("permissions")
+
+    // ── Claims in the token (`/api/v1/applications/{clientId}/token-claims`; SSO-3941, product-api SSO-1904) ──
+    // Scopes `tenant:applications.read` (GET) and `tenant:applications.write` (PUT / DELETE). GET answers
+    // `{ clientId, enabled, sources, claimKeys, … }` (`enabled: false, sources: []` when never enabled); PUT `{ sources }`
+    // enables it with exactly those sources (`400 unsupported_claim_source`); DELETE disables it (`204`).
+
+    fun getApplicationTokenClaims(clientId: String): JsonNode = throw unsupported("token claims")
+    fun putApplicationTokenClaims(clientId: String, sources: List<String>): JsonNode = throw unsupported("token claims")
+    fun deleteApplicationTokenClaims(clientId: String): Unit = throw unsupported("token claims")
+
+    private fun unsupported(what: String): ProductApiException =
+        ProductApiException(501, "not_implemented", "this host does not manage $what", "")
+
     companion object {
         /**
          * SSO-3667 / SSO-3673 — the platform `owner` of a resource as its response renders it

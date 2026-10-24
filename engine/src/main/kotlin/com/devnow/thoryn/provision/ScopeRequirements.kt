@@ -31,7 +31,12 @@ package com.devnow.thoryn.provision
  * | `loginMethods` | `tenant:idp.read` | `tenant:idp.write` | `LoginMethodPolicyController` |
  * | `customDomain` | `tenant:domains.read` | `tenant:domains.write` | `CustomDomainController` |
  * | `workloadIdentityTrust` | `tenant:workload-identity.read` | `tenant:workload-identity.write` (create, delete, plan profile) | `WorkloadIdentityTrustController` |
+ * | `role` (SSO-3941) | `tenant:roles.read` (roles, their permissions, the workspace permissions) | `tenant:roles.write` (create, description, permission set, a missing permission, delete) | `RolesController`, `PermissionsController` |
+ * | an application's `tokenClaims` (SSO-3941) | `tenant:applications.read` | `tenant:applications.write` | `TokenClaimsController` |
  * | access (`/access/check`, `/mine`, `/grants` GET, `/application-slots` GET) | `tenant:access.read` | `tenant:access.write` (`/grants` POST / DELETE) | `AccessController`, `ApplicationSlotController` |
+ *
+ * A `role` is the one kind that is NOT an object of the platform authorization graph — product-api gates it on the scope
+ * alone — so it needs no `tenant:access.read` (the engine asks no ownership check for it).
  *
  * A [ScopeNeed] marked [ScopeNeed.conditional] is asked for only on some plans (resolving a sandbox's id is needed for a
  * create in it, or when the identity's reach on an existing object is indirect): a static check ([of], `provision
@@ -77,6 +82,7 @@ object ScopeRequirements {
         ProvisionFile.KIND_LOGIN_METHODS to "idp",
         ProvisionFile.KIND_CUSTOM_DOMAIN to "domains",
         ProvisionFile.KIND_WORKLOAD_IDENTITY_TRUST to "workload-identity",
+        ProvisionFile.KIND_ROLE to "roles",
     )
 
     /**
@@ -122,7 +128,8 @@ object ScopeRequirements {
         }
         file.resources.forEach { r ->
             add(readScope(r.kind), Phase.PLAN, r, "read its live state")
-            add(AccessRefs.SCOPE_READ, Phase.PLAN, r, "the ownership check, POST /api/v1/access/check")
+            // SSO-3941 — a role is not a platform access object: no ownership check is asked for it.
+            if (r.kind != ProvisionFile.KIND_ROLE) add(AccessRefs.SCOPE_READ, Phase.PLAN, r, "the ownership check, POST /api/v1/access/check")
             if (r.kind != ProvisionFile.KIND_ENVIRONMENT && r.kind !in ProvisionFile.WORKSPACE_KINDS && !ProvisionFile.isProductionPlane(r.environment)) {
                 add(SCOPE_ENVIRONMENTS_READ, Phase.PLAN, r, "resolve environment '${r.environment}' to its id for the ownership check", conditional = true)
             }

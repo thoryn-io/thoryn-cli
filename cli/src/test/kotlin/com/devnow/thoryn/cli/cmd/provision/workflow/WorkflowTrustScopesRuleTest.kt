@@ -114,4 +114,34 @@ class WorkflowTrustScopesRuleTest {
     fun `a connection that does not load gets no verdict from this rule`() {
         assertThat(check(cicd, full, connection = "{}")).isNull()
     }
+
+    /** SSO-3941 — a file declaring a `role` needs `tenant:roles.read` to plan and `tenant:roles.write` to apply. */
+    private val withRole = """
+        - kind: role
+          name: forge-maintainer
+          spec: { permissions: ["forge:maintain"] }
+    """
+
+    @Test
+    fun `a declared role with a connection lacking roles read fails as a PLAN scope on the plan profile`() {
+        val r = check(withRole, listOf("tenant:roles.write"))!!
+        assertThat(r.status).isEqualTo(WorkflowCheck.Status.FAIL)
+        assertThat(r.detail)
+            .contains(".thoryn/provision.yaml needs tenant:roles.read to PLAN (role/forge-maintainer (read its live state))")
+            .contains("add tenant:roles.read to the plan profile of trust $wi")
+            // a role is not a platform access object — no ownership check, so no tenant:access.read
+            .doesNotContain("tenant:access.read")
+    }
+
+    @Test
+    fun `a declared role with a connection lacking roles write fails as an APPLY scope, and passes with both`() {
+        val r = check(withRole, listOf("tenant:roles.read"))!!
+        assertThat(r.status).isEqualTo(WorkflowCheck.Status.FAIL)
+        assertThat(r.detail)
+            .contains("needs tenant:roles.write to APPLY (role/forge-maintainer (create, update or remove it))")
+            .contains("add tenant:roles.write to the scopes of trust $wi (its apply profile)")
+        val ok = check(withRole, listOf("tenant:roles.read", "tenant:roles.write"))!!
+        assertThat(ok.status).withFailMessage("%s", ok.detail).isEqualTo(WorkflowCheck.Status.PASS)
+        assertThat(ok.detail).contains("needs to plan: tenant:roles.read; to apply, also: tenant:roles.write")
+    }
 }

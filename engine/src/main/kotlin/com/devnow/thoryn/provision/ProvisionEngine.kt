@@ -1120,6 +1120,8 @@ class ProvisionEngine(
         // SSO-3774 (oauthy ADR 2026-10-16 §4) — a trust is a platform object of its own (`trust:<id>`, S1 SSO-3772), gated
         // per object like an application; its own gate keeps the plane rules a trust still has (create, the pre-S1 platform).
         if (r.kind == ProvisionFile.KIND_WORKLOAD_IDENTITY_TRUST) return gateTrust(r, change, file, envSlugs, slug, reach)
+        // SSO-3941 — a role is not a platform access object: product-api gates it on `tenant:roles.*` alone.
+        if (r.kind == ProvisionFile.KIND_ROLE) return gateRole(r, change)
         val gated = gateObject(r, change, file, envSlugs, slug, reach)
         // SSO-3774 (ADR 2026-10-16 I4) — an application this identity may converge may still not BIND a trust it does not manage.
         if (r.kind != ProvisionFile.KIND_APPLICATION || gated.action == ChangeAction.ERROR || gated.readOnly) return gated
@@ -1250,6 +1252,28 @@ class ProvisionEngine(
         val fixedId = fixedClientId(r)
         fixedId?.let { id -> reach.slot(id, slug)?.let { return reservedCreate(r, change, slug, it) } }
         return refuseCreate(r, change, parent, slug, fixedId, reach, "creating a ${r.kind} here requires `manager` on its parent $parent, which this identity does not hold")
+    }
+
+    /**
+     * SSO-3941 — the verdict for a `role`. A role is NOT an object of the platform authorization graph (there is no `role:`
+     * type; product-api gates `/api/v1/roles` on the token's `tenant:roles.read` / `.write` alone, in the plane the caller
+     * reaches), so there is no relation to ask and no owner: the token's scope is the whole gate, and the plan preflight
+     * names it ([ScopeRequirements]). What remains is the file's own `readOnly` contract — a reference must exist and match.
+     */
+    private fun gateRole(r: ProvisionResource, change: PlannedChange): PlannedChange = when {
+        !r.readOnly -> change
+        change.liveId == null -> refuse(
+            r, change, ERROR_READ_ONLY, null,
+            "declared `readOnly: true` but nothing matches it live — a read-only reference is never created; declare it without `readOnly` to own it",
+            fixNote = FILE_FIX_NOTE,
+        )
+        change.diff.isNotEmpty() -> refuse(
+            r, change, ERROR_READ_ONLY, null,
+            "declared `readOnly: true` but differs from the live role in ${change.diff.size} field(s) (${change.diff.keys.joinToString(", ")}) — " +
+                "a read-only reference is never written; drop `readOnly` to converge it from this file, or align the file with what is live",
+            fixNote = FILE_FIX_NOTE,
+        )
+        else -> change.copy(action = ChangeAction.NOOP, reason = "read-only reference — exists and matches; this file does not own it", readOnly = true, diff = emptyMap())
     }
 
     /** SSO-3792 — the fixed `spec.clientId` of an application (the converge key and the slot's name), or null. */
@@ -1541,6 +1565,8 @@ class ProvisionEngine(
             ProvisionFile.KIND_LOGIN_FLOW -> "activate another login flow (no delete surface)$env"
             ProvisionFile.KIND_CUSTOM_DOMAIN -> "thoryn domain remove --yes"
             ProvisionFile.KIND_WORKLOAD_IDENTITY_TRUST -> "thoryn workload-identity trusts delete $id --yes${if (plane == null) " --confirm <workspace-slug>" else ""}$env"
+            // SSO-3941 — the CLI has no `roles delete`; the API call, with the production confirmation it needs.
+            ProvisionFile.KIND_ROLE -> "DELETE /api/v1/roles/$id (the CLI has no `roles delete`${if (plane == null) "; send X-Thoryn-Confirm: <workspace-slug>" else "; header X-Thoryn-Environment: $plane"})"
             else -> "remove it through the console"
         }
     }
@@ -1874,6 +1900,13 @@ class ProvisionEngine(
                 ChangeAction.CREATE -> writing(r, "create it") { create(r, file, applied, change.reservation) }.let { c ->
                     record(c.applied)
                     c.mintedSecret?.let { if (r.secretSink?.runtimePull == true) discardSecret(r) else deliverSecret(r, c.applied.id, it) }
+                    // SSO-3941 — claims in the token are switched on only once the client exists AND its one-time secret has
+                    // left: a refusal here can never cost the secret.
+                    if (r.kind == ProvisionFile.KIND_APPLICATION) {
+                        desiredTokenClaims(resolveSpec(r, strict = true))?.takeIf { it.enabled }?.let { want ->
+                            writing(r, "set its token claims") { convergeTokenClaims(r, c.applied.environment, c.applied.id, want) }
+                        }
+                    }
                     c.applied
                 }
                 ChangeAction.UPDATE -> writing(r, "update it") { update(r, file, applied, change) }.also { record(it) }
@@ -1979,7 +2012,22 @@ class ProvisionEngine(
                 val live = n.toMap(fields).mapValues { (field, value) -> if (field == "scopes") withoutOperatorPlaneScopes(value) else value }
                 val want = desired.filterKeys { it in fields }
                 val id = n.str("clientId") ?: n.str("client_id") ?: ""
-                Live(id, diffOf(want, live), buildMap { (plain(n["redirectUris"] ?: return@buildMap) as? List<*>)?.firstOrNull()?.toString()?.let { put("redirectUri", it) } }, owner = ProvisionApi.ownerOf(n))
+                // SSO-3941 — `tokenClaims` lives on its own sub-resource: read (and diffed) only when the file declares it.
+                val claims = desiredTokenClaims(desired)?.let { tokenClaimsDiff(client, id, it) }.orEmpty()
+                Live(id, diffOf(want, live) + claims, buildMap { (plain(n["redirectUris"] ?: return@buildMap) as? List<*>)?.firstOrNull()?.toString()?.let { put("redirectUri", it) } }, owner = ProvisionApi.ownerOf(n))
+            }
+        }
+        ProvisionFile.KIND_ROLE -> {
+            // SSO-3941 — a role converges by its NAME within its environment; its permissions as a SET of names. An omitted
+            // `description` keeps the live one.
+            val client = clients(slug)
+            val node = allPages { cursor -> client.listRoles(null, cursor) }.filter { it.str("name") == r.name }
+                .singleMatchOrNull("role name '${r.name}' in ${planeLabel(slug)}", "the platform holds one role per name and environment — remove the duplicate")
+            node?.let { n ->
+                val id = n.str("id") ?: ""
+                val livePermissions = allPages { cursor -> client.listRolePermissions(id, null, cursor) }.mapNotNull { it.str("name") }
+                val want = mapOf(ProvisionFile.ROLE_DESCRIPTION to desired[ProvisionFile.ROLE_DESCRIPTION], ProvisionFile.ROLE_PERMISSIONS to rolePermissions(desired))
+                Live(id, diffOf(want, mapOf(ProvisionFile.ROLE_DESCRIPTION to n.str("description"), ProvisionFile.ROLE_PERMISSIONS to livePermissions)))
             }
         }
         ProvisionFile.KIND_USER -> {
@@ -2077,6 +2125,7 @@ class ProvisionEngine(
             ProvisionFile.KIND_LOGIN_METHODS -> putLoginMethods(r, targetSlug(r, file, applied), spec, "+")
             ProvisionFile.KIND_CUSTOM_DOMAIN -> claimCustomDomain(r, spec)
             ProvisionFile.KIND_WORKLOAD_IDENTITY_TRUST -> createTrust(r, file, applied, spec)
+            ProvisionFile.KIND_ROLE -> createRole(r, targetSlug(r, file, applied), spec)
             else -> throw ProvisionException("${r.key}: unsupported kind '${r.kind}'")
         })
     }
@@ -2172,11 +2221,17 @@ class ProvisionEngine(
             ProvisionFile.KIND_APPLICATION -> {
                 // SSO-3715 — the key location rides on every update (idempotent): the API cannot tell us whether it changed.
                 val keyLocation = spec.filterKeys { it in KEY_LOCATION_FIELDS }
-                try {
-                    clients(slug).updateApplication(id, applicationBody(r, changed + keyLocation, slug))
-                } catch (ex: ProductApiException) {
-                    throw applicationSettingFailure(r, ex, slug) ?: ex
+                // SSO-3941 — `tokenClaims` is converged on its own sub-resource; the application itself is patched only
+                // when one of ITS fields (or the always-re-sent key location) is part of the update.
+                val fields = changed - ProvisionFile.SPEC_TOKEN_CLAIMS
+                if (fields.isNotEmpty() || keyLocation.isNotEmpty()) {
+                    try {
+                        clients(slug).updateApplication(id, applicationBody(r, fields + keyLocation, slug))
+                    } catch (ex: ProductApiException) {
+                        throw applicationSettingFailure(r, ex, slug) ?: ex
+                    }
                 }
+                if (ProvisionFile.SPEC_TOKEN_CLAIMS in change.diff) desiredTokenClaims(spec)?.let { convergeTokenClaims(r, slug, id, it) }
                 out.println("  ~ application ${r.name}: updated ${change.diff.keys}${if (keyLocation.isNotEmpty()) " + key location" else ""} (clientId $id)")
                 base.copy(attributes = applicationAttributes(spec))
             }
@@ -2187,6 +2242,13 @@ class ProvisionEngine(
                 isTrustScopeChange(change.diff.keys, livePlanScopes(change.trust) != null) -> setTrustScopes(r, change, slug, spec)
                 change.diff.keys.all { it.startsWith(PLAN_FIELD_PREFIX) } -> setTrustPlanProfile(r, change, slug, spec)
                 else -> throw ProvisionException("${r.key}: $ERROR_TRUST_IMMUTABLE — a trust's pins cannot be changed in place; delete it and re-apply, or declare what is live")
+            }
+            ProvisionFile.KIND_ROLE -> {
+                val client = clients(slug)
+                if (ProvisionFile.ROLE_DESCRIPTION in change.diff) client.updateRole(id, mapOf(ProvisionFile.ROLE_DESCRIPTION to spec[ProvisionFile.ROLE_DESCRIPTION]))
+                if (ProvisionFile.ROLE_PERMISSIONS in change.diff) client.setRolePermissions(id, permissionIds(r, client, rolePermissions(spec)))
+                out.println("  ~ role ${r.name}: updated ${change.diff.keys} (id $id)")
+                base
             }
             ProvisionFile.KIND_USER -> {
                 clients(slug).updateUser(id, changed)
@@ -2542,6 +2604,11 @@ class ProvisionEngine(
                 clients(c.environment).deleteWorkloadIdentityTrust(id, confirmSlug)
                 trustLists.remove(c.environment)
                 out.println("  - workloadIdentityTrust ${c.name}: deleted (id $id; its workload client ${c.attributes[ATTR_CLIENT_ID] ?: "wi_…"} stops authenticating at once)")
+            }
+            ProvisionFile.KIND_ROLE -> {
+                // SSO-3941 — the role and every assignment of it go (product-api's CASCADE); its permissions stay (workspace-wide).
+                clients(c.environment).deleteRole(id, confirmSlug)
+                out.println("  - role ${c.name}: deleted (id $id; every user's assignment of it goes with it)")
             }
             else -> throw ProvisionException("${c.key}: no delete API for kind '${c.kind}'")
         }
@@ -3202,7 +3269,8 @@ class ProvisionEngine(
 
     /** The application body the API takes: `federatedTrust` as the trust id, an inline `jwks` as its JSON text. */
     private fun applicationBody(r: ProvisionResource, spec: Map<String, Any?>, slug: String?): Map<String, Any?> {
-        val body = LinkedHashMap(spec)
+        // SSO-3941 — `tokenClaims` is not an application field: it is converged through `…/token-claims` ([convergeTokenClaims]).
+        val body = LinkedHashMap(spec - ProvisionFile.SPEC_TOKEN_CLAIMS)
         if (spec.containsKey(ProvisionFile.SPEC_FEDERATED_TRUST)) {
             // At apply the trust must be LIVE (this apply created it first, or it existed): the file is not consulted again.
             val ref = federatedTrustRef(r, file = null, slug = slug, atApply = true)
@@ -3215,6 +3283,97 @@ class ProvisionEngine(
     /** The attributes of an application a reader needs next to its id: its first redirect URI — never a key. */
     private fun applicationAttributes(spec: Map<String, Any?>): Map<String, String> = buildMap {
         (spec["redirectUris"] as? List<*>)?.firstOrNull()?.toString()?.let { put("redirectUri", it) }
+    }
+
+    // ── roles and claims in the token (SSO-3941) ─────────────────────────────────────────────────
+
+    /** The role create: `POST /api/v1/roles {name, description}`, then its permission set (missing permissions are created). */
+    private fun createRole(r: ProvisionResource, slug: String?, spec: Map<String, Any?>): AppliedResource {
+        val client = clients(slug)
+        val body = linkedMapOf<String, Any?>("name" to r.name)
+        spec[ProvisionFile.ROLE_DESCRIPTION]?.let { body[ProvisionFile.ROLE_DESCRIPTION] = it.toString() }
+        val resp = client.createRole(body)
+        val id = resp.str("id") ?: throw ProvisionException("${r.key}: the role create returned no id")
+        val permissions = rolePermissions(spec)
+        if (permissions.isNotEmpty()) client.setRolePermissions(id, permissionIds(r, client, permissions))
+        out.println("  + role ${r.name}: id=$id${slug?.let { " env=$it" } ?: ""} permissions=${permissions.joinToString(",", "[", "]")}")
+        return AppliedResource(r.kind, r.name, id, slug, action = ChangeAction.CREATE)
+    }
+
+    /** A role's declared permission names, trimmed and de-duplicated (the loader refuses blanks and reserved names). */
+    private fun rolePermissions(spec: Map<String, Any?>): List<String> =
+        (spec[ProvisionFile.ROLE_PERMISSIONS] as? List<*>).orEmpty().mapNotNull { it?.toString()?.trim()?.takeIf { p -> p.isNotEmpty() } }.distinct()
+
+    /**
+     * The ids of the workspace permissions named [names], in their order, creating each one the workspace does not have yet
+     * (`POST /api/v1/permissions`; permissions are workspace-wide, so one created here exists in every environment). A
+     * concurrent create of the same name (`409 permission_exists`) is read back, never a failure.
+     */
+    private fun permissionIds(r: ProvisionResource, client: ProvisionApi, names: List<String>): List<String> {
+        if (names.isEmpty()) return emptyList()
+        fun known(): Map<String, String> = allPages { cursor -> client.listPermissions(null, cursor) }
+            .mapNotNull { n -> n.str("name")?.let { name -> n.str("id")?.let { id -> name to id } } }.toMap()
+        var byName = known()
+        names.filter { it !in byName }.forEach { name ->
+            val id = try {
+                client.createPermission(mapOf("name" to name)).str("id")
+            } catch (ex: ProductApiException) {
+                if (ex.httpStatus != 409) throw ex
+                byName = known()
+                byName[name]
+            } ?: throw ProvisionException("${r.key}: permission '$name' could not be created or read back")
+            byName = byName + (name to id)
+            out.println("  + permission $name: id=$id (workspace-wide)")
+        }
+        return names.map { byName.getValue(it) }
+    }
+
+    /** What the file declares for an application's claims in the token, or null when it declares nothing (the live toggle is left as it is). */
+    private data class TokenClaims(val enabled: Boolean, val sources: List<String>) {
+        fun render(): String = if (enabled) "sources ${sources.joinToString(",", "[", "]")}" else "off"
+    }
+
+    private fun desiredTokenClaims(spec: Map<String, Any?>): TokenClaims? {
+        val declared = spec[ProvisionFile.SPEC_TOKEN_CLAIMS] as? Map<*, *> ?: return null
+        val enabled = declared[ProvisionFile.TOKEN_CLAIMS_ENABLED]?.let { coerceBool(it) } ?: true
+        val sources = (declared[ProvisionFile.TOKEN_CLAIMS_SOURCES] as? List<*>)?.mapNotNull { it?.toString()?.trim() }?.distinct()
+            ?: ProvisionFile.DEFAULT_TOKEN_CLAIM_SOURCES
+        return TokenClaims(enabled, if (enabled) sources else emptyList())
+    }
+
+    /** The `tokenClaims` diff entry when the live toggle differs from [want] (sources compared as a set), else nothing. */
+    private fun tokenClaimsDiff(client: ProvisionApi, clientId: String, want: TokenClaims): Map<String, String> {
+        val n = client.getApplicationTokenClaims(clientId)
+        val liveEnabled = n["enabled"]?.takeIf { it.isBoolean }?.asBoolean() ?: false
+        val live = TokenClaims(liveEnabled, if (liveEnabled) listItems(n["sources"] ?: n, "sources").map { it.asString() } else emptyList())
+        val same = if (want.enabled) live.enabled && live.sources.toSet() == want.sources.toSet() else !live.enabled
+        return if (same) emptyMap() else mapOf(ProvisionFile.SPEC_TOKEN_CLAIMS to "${live.render()} → ${want.render()}")
+    }
+
+    /** `PUT …/token-claims {sources}` to switch it on with exactly [want]'s sources, or `DELETE …/token-claims` to switch it off. */
+    private fun convergeTokenClaims(r: ProvisionResource, slug: String?, clientId: String, want: TokenClaims) {
+        val client = clients(slug)
+        try {
+            if (want.enabled) client.putApplicationTokenClaims(clientId, want.sources) else client.deleteApplicationTokenClaims(clientId)
+        } catch (ex: ProductApiException) {
+            // The source names are product-api's to judge (`400 unsupported_claim_source`): name the field, keep the server's words.
+            if (ex.httpStatus != 400) throw ex
+            throw ProvisionException("${r.key}: spec.${ProvisionFile.SPEC_TOKEN_CLAIMS} refused by the platform — ${ex.errorCode ?: "HTTP 400"}${ex.errorDescription?.let { ": $it" } ?: ""} (the application itself is converged)")
+        }
+        out.println("  ~ application ${r.name}: claims in the token ${want.render()} (clientId $clientId)")
+    }
+
+    /** Every item of a cursor-paginated ListEnvelope (`{ data, pagination: { cursor, hasMore } }`), page by page. */
+    private fun allPages(fetch: (cursor: String?) -> JsonNode): List<JsonNode> {
+        val items = mutableListOf<JsonNode>()
+        var cursor: String? = null
+        for (page in 0 until MAX_LIST_PAGES) {
+            val body = fetch(cursor)
+            items += listItems(body, "data")
+            cursor = body["pagination"]?.get("cursor")?.takeUnless { it.isNull }?.asString()?.takeIf { it.isNotBlank() }
+            if (cursor == null || body["pagination"]?.get("hasMore")?.asBoolean(true) == false) break
+        }
+        return items
     }
 
     // ── helpers ──────────────────────────────────────────────────────────────────────────────────
@@ -3495,6 +3654,8 @@ class ProvisionEngine(
         /** SSO-3715 — the `private_key_jwt` key location: never diffed until product-api renders it (SSO-3716); re-sent on every update. */
         val KEY_LOCATION_FIELDS: Set<String> = setOf(ProvisionFile.SPEC_JWKS_URI, ProvisionFile.SPEC_JWKS)
         private const val MAX_TRUST_PAGES = 50
+        /** SSO-3941 — the page ceiling of a role / permission listing (500 a page: 25 000 entries). */
+        private const val MAX_LIST_PAGES = 50
         private val json = tools.jackson.databind.json.JsonMapper.builder().build()
 
         /**

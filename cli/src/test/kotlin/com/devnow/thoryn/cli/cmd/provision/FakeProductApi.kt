@@ -64,6 +64,112 @@ internal class FakeProductApi : Dispatcher() {
     /** SSO-3113 — simulate a token WITHOUT `tenant:access.write` / `tenant:access.read` (403 insufficient_scope). */
     var denyGrantWrites = false
     var denyGrantReads = false
+    // ── SSO-3941 — RBAC (product-api /api/v1/roles, /api/v1/permissions, /api/v1/users/{sub}/roles) and claims in the token ──
+    /** Roles: `id`, `name`, `description`, `_env` (null ⇒ production), `permissions` (permission ids). */
+    val roles = mutableListOf<MutableMap<String, Any?>>()
+    /** Workspace-wide permissions: `id`, `name`. */
+    val permissions = mutableListOf<MutableMap<String, Any?>>()
+    /** Assignments: `userId` (the sub), `roleId`. */
+    val userRoles = mutableListOf<MutableMap<String, Any?>>()
+    /** Claims in the token per clientId: the enabled sources (absent ⇒ never enabled). */
+    val tokenClaims = mutableMapOf<String, List<String>>()
+    /** The page size of the roles / permissions lists (cursor = the offset), so a test can exercise paging. */
+    var rbacPageSize = 500
+    /** The claim sources product-api accepts today (a test widens it to model a server that gained one). */
+    var supportedClaimSources = setOf("permissions", "org", "org_roles", "pim", "entitlements", "guest")
+
+    fun seedRole(env: String?, name: String, permissionNames: List<String> = emptyList(), description: String? = null): String {
+        val id = "role-${++seq}"
+        roles += mutableMapOf("id" to id, "name" to name, "description" to description, "_env" to env, "permissions" to permissionNames.map { permissionId(it) }.toMutableList())
+        return id
+    }
+
+    fun permissionId(name: String): String =
+        permissions.firstOrNull { it["name"] == name }?.get("id")?.toString() ?: "perm-${++seq}".also { permissions += mutableMapOf("id" to it, "name" to name) }
+
+    fun rolePermissionNames(roleId: String): List<String> =
+        (roles.single { it["id"] == roleId }["permissions"] as List<*>).map { pid -> permissions.single { it["id"] == pid }["name"].toString() }
+
+    private fun page(items: List<Map<String, Any?>>, path: String): MockResponse {
+        val q = query(path)
+        val offset = q["cursor"]?.toIntOrNull() ?: 0
+        val size = q["limit"]?.toIntOrNull() ?: rbacPageSize
+        val next = (offset + size).takeIf { it < items.size }?.toString()
+        return json(200, mapOf("data" to items.drop(offset).take(size), "pagination" to mapOf("cursor" to next, "hasMore" to (next != null))))
+    }
+
+    private fun roleView(r: Map<String, Any?>) = mapOf("id" to r["id"], "name" to r["name"], "description" to r["description"], "createdAt" to "2026-10-24T00:00:00Z")
+
+    /** product-api's `RolesController` + `PermissionsController` + `UserRolesController` in miniature. */
+    private fun rbac(method: String, seg: List<String>, env: String?, confirm: String?, b: Map<String, Any?>, path: String): MockResponse {
+        val inPlane = roles.filter { it["_env"] == env }
+        return when {
+            seg[0] == "permissions" && seg.size == 1 && method == "GET" -> page(permissions.map { it + ("createdAt" to "2026-10-24T00:00:00Z") }, path)
+            seg[0] == "permissions" && seg.size == 1 && method == "POST" -> {
+                val name = (b["name"] as? String)?.trim()?.takeIf { it.isNotEmpty() } ?: return problem(400, "invalid_name")
+                if (Regex("^(tenant|admin|holder):.*", RegexOption.IGNORE_CASE).matches(name)) return problem(400, "permission_name_reserved")
+                if (permissions.any { it["name"] == name }) return problem(409, "permission_exists")
+                val id = permissionId(name); json(201, permissions.first { it["id"] == id })
+            }
+            seg[0] == "roles" && seg.size == 1 && method == "GET" -> page(inPlane.map { roleView(it) }, path)
+            seg[0] == "roles" && seg.size == 1 && method == "POST" -> {
+                val name = (b["name"] as? String)?.trim()?.takeIf { it.isNotEmpty() } ?: return problem(400, "invalid_name")
+                if (inPlane.any { it["name"] == name }) return problem(409, "role_exists")
+                val id = seedRole(env, name, description = b["description"] as? String)
+                json(201, roleView(roles.first { it["id"] == id }))
+            }
+            seg[0] == "roles" -> {
+                val r = inPlane.firstOrNull { it["id"] == seg[1] } ?: return problem(404, "not_found")
+                when {
+                    seg.size == 2 && method == "GET" -> json(200, roleView(r))
+                    seg.size == 2 && method == "PATCH" -> { r["description"] = b["description"]; json(200, roleView(r)) }
+                    seg.size == 2 && method == "DELETE" -> {
+                        if (env == null && confirm.isNullOrBlank()) return problem(428, "production_confirmation_required")
+                        roles.remove(r); userRoles.removeIf { it["roleId"] == r["id"] }; MockResponse().setResponseCode(204)
+                    }
+                    seg.size == 3 && seg[2] == "permissions" && method == "GET" ->
+                        page((r["permissions"] as List<*>).map { pid -> permissions.single { it["id"] == pid } }, path)
+                    seg.size == 3 && seg[2] == "permissions" && method == "PUT" -> {
+                        val ids = (b["permissionIds"] as? List<*>).orEmpty().map { it.toString() }
+                        if (ids.any { id -> permissions.none { it["id"] == id } }) return problem(404, "permission_not_found")
+                        r["permissions"] = ids.distinct().toMutableList()
+                        json(200, mapOf("data" to ids.distinct().map { id -> permissions.single { it["id"] == id } }))
+                    }
+                    else -> problem(405, "method")
+                }
+            }
+            // /users/{sub}/roles[/{roleId}]
+            seg.size == 3 && method == "GET" -> page(userRoles.filter { it["userId"] == seg[1] && inPlane.any { r -> r["id"] == it["roleId"] } }
+                .map { it + mapOf("id" to "ur-${it["roleId"]}", "orgId" to null, "assignedBy" to caller, "assignedAt" to "2026-10-24T00:00:00Z") }, path)
+            seg.size == 3 && method == "POST" -> {
+                val roleId = b["roleId"]?.toString() ?: return problem(400, "invalid_request")
+                if (inPlane.none { it["id"] == roleId }) return problem(404, "role_not_found")
+                if (userRoles.any { it["userId"] == seg[1] && it["roleId"] == roleId }) return problem(409, "assignment_exists")
+                userRoles += mutableMapOf("userId" to seg[1], "roleId" to roleId)
+                json(201, mapOf("id" to "ur-$roleId", "userId" to seg[1], "roleId" to roleId, "orgId" to null, "assignedBy" to caller, "assignedAt" to "2026-10-24T00:00:00Z"))
+            }
+            seg.size == 4 && method == "DELETE" -> { userRoles.removeIf { it["userId"] == seg[1] && it["roleId"] == seg[3] }; MockResponse().setResponseCode(204) }
+            else -> problem(405, "method")
+        }
+    }
+
+    /** product-api's `TokenClaimsController` in miniature. */
+    private fun tokenClaimsRoute(method: String, clientId: String, env: String?, b: Map<String, Any?>): MockResponse {
+        if (applications.none { it["clientId"] == clientId && visible(it, env) }) return problem(404, "not_found")
+        fun view() = tokenClaims[clientId].let { s -> mapOf("clientId" to clientId, "enabled" to (s != null), "sources" to (s ?: emptyList()), "claimKeys" to (s ?: emptyList()).filter { it == "permissions" }, "webhookRegistered" to (s != null)) }
+        return when (method) {
+            "GET" -> json(200, view())
+            "PUT" -> {
+                val sources = (b["sources"] as? List<*>)?.map { it.toString() } ?: listOf("permissions")
+                val unsupported = sources.filterNot { it in supportedClaimSources || it.startsWith("metadata:") }
+                if (sources.isEmpty() || unsupported.isNotEmpty()) return problem(400, "unsupported_claim_source")
+                tokenClaims[clientId] = sources.distinct(); json(200, view())
+            }
+            "DELETE" -> if (tokenClaims.remove(clientId) != null) MockResponse().setResponseCode(204) else problem(404, "not_found")
+            else -> problem(405, "method")
+        }
+    }
+
     /** SSO-3113 — the one-shot client secrets the fake minted for confidential applications, by clientId (test-side ledger only). */
     val mintedSecrets = mutableMapOf<String, String>()
     // ── SSO-3689 — workload-identity trusts (product-api /api/v1/workload-identity/trusts) ──
@@ -719,13 +825,15 @@ internal class FakeProductApi : Dispatcher() {
         val area = when (seg[0]) {
             "environments" -> "environments"
             "applications" -> "applications"
-            "users" -> "users"
+            "users" -> if (seg.getOrNull(2) == "roles") "roles" else "users"
             "federation-members" -> "federation"
             "email-provider" -> "email"
             "login-experience", "login-flows", "login-methods" -> "idp"
             "custom-domain" -> "domains"
             "workload-identity" -> "workload-identity"
             "access" -> "access"
+            // SSO-3941 — RolesController / PermissionsController / UserRolesController (/users/{sub}/roles).
+            "roles", "permissions" -> "roles"
             else -> return null
         }
         return "tenant:$area.$verb"
@@ -734,7 +842,7 @@ internal class FakeProductApi : Dispatcher() {
     /** SSO-3926 — product-api's `hasAnyAuthority` aliases: the deprecated `tenant:clients.*` still opens `/applications`. */
     private val SCOPE_ALIASES = mapOf("tenant:applications.read" to "tenant:clients.read", "tenant:applications.write" to "tenant:clients.write")
 
-    private val PLANE_SCOPED_ROUTES = setOf("applications", "users", "federation-members", "email-provider", "login-experience", "login-methods", "login-flows")
+    private val PLANE_SCOPED_ROUTES = setOf("applications", "users", "roles", "federation-members", "email-provider", "login-experience", "login-methods", "login-flows")
 
     private fun mintsSecret(b: Map<String, Any?>): Boolean {
         val methods = (b["clientAuthenticationMethods"] as? List<*>)?.map { it.toString() } ?: return true
@@ -821,6 +929,9 @@ internal class FakeProductApi : Dispatcher() {
                     else -> problem(405, "method")
                 }
             }
+            // ── SSO-3941 — RBAC + claims in the token ──
+            seg[0] == "roles" || seg[0] == "permissions" || (seg[0] == "users" && seg.getOrNull(2) == "roles") -> rbac(method, seg, env, confirm, b, path)
+            seg[0] == "applications" && seg.size == 3 && seg[2] == "token-claims" -> tokenClaimsRoute(method, seg[1], env, b)
             // ── users ──
             route == "/api/v1/users" && method == "GET" -> {
                 val email = path.substringAfter("email=", "").substringBefore('&').let { java.net.URLDecoder.decode(it, "UTF-8") }

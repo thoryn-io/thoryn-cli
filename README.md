@@ -203,6 +203,14 @@ thoryn env delete <id> --confirm <slug>      # hard-delete a sandbox (irreversib
 thoryn users list [--email <email>] [--status <ACTIVE|SUSPENDED>] [--limit <n>] [--environment <slug>]
 thoryn users suspend (<id> | --email <email>) [--confirm <workspace-slug>] [--environment <slug>]  # production plane needs --confirm
 thoryn users reactivate (<id> | --email <email>) [--environment <slug>]                            # clear a suspension
+# SSO-3941 — the RBAC roles a person holds in the selected environment (product-api /api/v1/users/{sub}/roles;
+# tenant:roles.read / tenant:roles.write). <user> is the person's SUBJECT (the `sub` claim of their tokens — what an
+# assignment is keyed on, not the directory id); <role> is the role's name (as declared with `kind: role`) or its id.
+# A bare `thoryn login` requests tenant:roles.read/.write (the `cli` login client carries them once the platform has
+# granted them to it — the SSO-2278 grant order); the hub mints them only to an admin who holds them.
+thoryn users roles list   <user> [--environment <slug>] [--output json|yaml|table]
+thoryn users roles add    <user> <role> [--environment <slug>]       # already held ⇒ success, "unchanged"
+thoryn users roles remove <user> <role> [--environment <slug>]       # idempotent; no --confirm (the API does not gate it)
 # --environment targets a plane directly (rides X-Thoryn-Environment) for a client-credentials/CI
 # session that hasn't run `workspace switch` + `env use` (SSO-3068); e.g. `--environment production`.
 
@@ -314,6 +322,10 @@ thoryn examples share    <name> [--output <file>]   # SSO-2876 — export the se
 # SSO-3810 / SSO-3807 (oauthy): also `allowTokenIntrospection` (RFC 7662; turning it ON needs `manager` on the
 # environment — else token_introspection_not_grantable), `accessTokenFormat` (self-contained | reference) and the
 # DPoP rungs `dpopAllowed` / `dpopRequired` (SSO-3811).
+# SSO-3941: new kind `role` — an RBAC role of its environment, converged by name with its FULL permission set (a
+# permission the workspace lacks is created); and an application's `tokenClaims: { sources: [permissions] }` — which claim
+# sources the hub adds to its tokens (`{ enabled: false }` switches it off; omitted keeps the live toggle). See "Roles and
+# claims in the token" below.
 thoryn provision plan    [--file <path>] [--prune] [--fix-request <path>]  # read-only: what apply would create / remove (+ grant changes, pending publishes); exit 1 on an ownership error
                                              # SSO-3710 — --fix-request (env THORYN_FIX_REQUEST): a red plan also writes thoryn-provision-request.json — every missing RIGHT
                                              # (owner / manager / viewer) with the exact `thoryn access grant` command a workspace admin runs; a workflow uploads it
@@ -1632,6 +1644,62 @@ application: a sender constraint widens nothing.
 session_exceeds_tenant_policy — … cap of 86400 seconds …`), never the "Required scope" hint a bare `403` would
 otherwise print. Everything converged before it stays live; fix the cause and re-run.
 
+### Roles and claims in the token — `kind: role`, `tokenClaims` (SSO-3941)
+
+The product API grants access through **RBAC roles** (`/api/v1/roles`) and puts a person's effective permissions into
+the tokens of an application that asks for them (`/api/v1/applications/{clientId}/token-claims`). A provisioning file
+declares both; who holds a role is a person-by-person act (`thoryn users roles add`, above).
+
+```yaml
+resources:
+  - kind: role
+    name: forge-maintainer          # the role's name — the converge key, unique per environment
+    environment: staging            # omit for the production plane
+    spec:
+      description: "Maintains the forge"   # optional; omitted keeps the live description
+      permissions: ["forge:maintain", "forge:read"]   # the FULL set ([] grants nothing)
+  - kind: application
+    name: forge
+    environment: staging
+    spec:
+      clientId: forge
+      displayName: "Forge"
+      redirectUris: ["https://forge.acme.example/oauth2/callback"]
+      tokenClaims:
+        sources: [permissions]      # the user's effective permission names → claim `permissions`
+```
+
+**`kind: role`.** Converged by `name` within its environment. `plan` reads the role and its permissions; the
+permission set is compared as a **set** (order is not drift) and an `update` replaces it with exactly the declared list
+(`PUT /api/v1/roles/{id}/permissions`). A permission the workspace does not have yet is **created** — permissions are
+workspace-wide, so it then exists in every environment, and a removed role never deletes one. A permission is any
+non-empty string except a reserved platform-scope namespace: a name whose first `:`-segment is `tenant`, `admin` or
+`holder` (any case) is refused `permission_name_reserved`, by the file before any call and by product-api. So
+`forge:maintain` and `invoices:read` are valid; `tenant:roles.write` is not.
+
+A role is **not a platform access object** — product-api gates it on the token's `tenant:roles.read` / `.write` alone —
+so the plan asks no ownership check for it, it cannot carry `grants:`, and `--prune` never finds one to remove. Like a
+`user`, it goes **with its sandbox** (the environment hard-delete cascades) and `destroy` never removes one on the
+production plane: the row names the call a person makes. `readOnly: true` works as for any kind: the role must exist and
+match.
+
+**`tokenClaims` on an application.** `sources` is the FULL set of claim sources, compared as a set; omitted ⇒
+`[permissions]` (the server's default). `{ enabled: false }` switches claims in the token off. **An omitted `tokenClaims`
+leaves whatever the platform holds** — like the other application settings, the file only changes what it declares.
+On create it is switched on once the client exists (and its one-time secret has been delivered); on update only the
+toggle is written, never the application. The source **names are passed through**: product-api decides which exist
+(today `permissions`, `org`, `org_roles`, `pim`, `entitlements`, `guest`, `metadata:<key>`), so a source the platform
+gains is declarable without a new CLI. A name it refuses fails the apply with its code, naming the field:
+
+```text
+Error: application/forge: spec.tokenClaims refused by the platform — unsupported_claim_source: Unsupported claim sources: … (the application itself is converged)
+```
+
+| Declares | to plan | to apply |
+|---|---|---|
+| `kind: role` | `tenant:roles.read` (no `tenant:access.read` — there is no ownership check) | `tenant:roles.write` (create, description, permission set, a missing permission) |
+| `tokenClaims` | `tenant:applications.read` | `tenant:applications.write` |
+
 ### Declaring a workload-identity trust — `kind: workloadIdentityTrust` (SSO-3689)
 
 The imperative twin is `thoryn workload-identity trusts create` (above). Declared, a trust is a resource
@@ -2263,6 +2331,8 @@ CLI derives it — every scope is the gate product-api puts on the endpoint the 
 | `environment` / `application` / `user` / `federationMember` | `tenant:environments.read` / `tenant:applications.read` / `tenant:users.read` / `tenant:federation.read` | the matching `.write` |
 | `emailProvider` / `loginTheme`, `loginFlow`, `loginMethods` / `customDomain` | `tenant:email.read` / `tenant:idp.read` / `tenant:domains.read` | the matching `.write` |
 | `workloadIdentityTrust` | `tenant:workload-identity.read` | `tenant:workload-identity.write`, and every scope the trust carries (`spec.scopes` — the hub's ceiling, `scope_not_grantable`) |
+| `role` (SSO-3941) | `tenant:roles.read` — and NOT `tenant:access.read`: a role is not a platform access object, so no ownership check is asked | `tenant:roles.write` |
+| an application's `tokenClaims` | `tenant:applications.read` (already needed by the application) | `tenant:applications.write` |
 | a `grants:` block | `tenant:access.read` | `tenant:access.write` |
 | `secretSink: { kind: workloadPull }` | `tenant:workload-identity.read` (the trust, by name) | `tenant:access.write` (the workload client's `manager` grant) |
 | `spec.federatedTrust` | `tenant:workload-identity.read` (the trust, by name) | — |
@@ -2418,7 +2488,7 @@ Commands that run on a session remembered from a retired issuer (a refresh, an A
 ```bash
 # Default scopes (SSO-3182): EXACTLY the `cli` login client's registered set — openid,
 # offline_access and the whole tenant-config surface (applications, clients, users,
-# federation, audit, environments, email, idp, access, domains, keys, workload-identity, github-connections).
+# federation, audit, environments, email, idp, access, domains, keys, workload-identity, github-connections, roles).
 # SSO-3856 — `tenant:github-connections.read|write` has no `thoryn` command yet: it is requested so a workspace
 # admin HOLDS the family and can grant it onward (e.g. to a starter's client in a provisioning file; the hub grants
 # it to `cli` in V206, which must be deployed before a CLI release requesting it). A bare login therefore authorizes
