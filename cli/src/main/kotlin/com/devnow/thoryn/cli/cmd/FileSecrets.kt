@@ -17,16 +17,21 @@ import java.nio.file.attribute.PosixFilePermission
 internal object FileSecrets {
 
     /**
-     * Write [content] (plus a trailing newline so the file is shell-friendly)
-     * to [file], truncating any existing content, then tighten permissions to
-     * owner-only on POSIX systems.
+     * Write exactly [content] to [file], truncating any existing content, then
+     * tighten permissions to owner-only on POSIX systems.
+     *
+     * SSO-3939 — no trailing newline. A consumer that reads the file verbatim
+     * (oauth2-proxy `--client-secret-file`, `kubectl create secret --from-file`)
+     * presents every byte as the secret, so an appended `\n` made the hub refuse
+     * the client with `invalid_client`. Shell `$(cat …)` and
+     * [SecretIo.readSecretInput] still read files that do end in a newline.
      */
     fun writeOwnerOnly(file: File, content: String) {
         val path = file.toPath()
         path.parent?.let { Files.createDirectories(it) }
         Files.writeString(
             path,
-            content + "\n",
+            content,
             StandardOpenOption.CREATE,
             StandardOpenOption.TRUNCATE_EXISTING,
             StandardOpenOption.WRITE,
