@@ -3328,9 +3328,13 @@ class ProvisionEngine(
         return names.map { byName.getValue(it) }
     }
 
-    /** What the file declares for an application's claims in the token, or null when it declares nothing (the live toggle is left as it is). */
-    private data class TokenClaims(val enabled: Boolean, val sources: List<String>) {
-        fun render(): String = if (enabled) "sources ${sources.joinToString(",", "[", "]")}" else "off"
+    /**
+     * What the file declares for an application's claims in the token, or null when it declares nothing (the live toggle is
+     * left as it is). SSO-3945 — [roleMapping] is part of the configuration: `null` means NO mapping (every role name is
+     * emitted as-is), which is what product-api stores for a PUT without one, because PUT replaces the whole configuration.
+     */
+    private data class TokenClaims(val enabled: Boolean, val sources: List<String>, val roleMapping: Map<String, String>? = null) {
+        fun render(): String = if (enabled) "sources ${sources.joinToString(",", "[", "]")}${roleMapping?.let { " roleMapping ${renderMapping(it)}" } ?: ""}" else "off"
     }
 
     private fun desiredTokenClaims(spec: Map<String, Any?>): TokenClaims? {
@@ -3338,25 +3342,76 @@ class ProvisionEngine(
         val enabled = declared[ProvisionFile.TOKEN_CLAIMS_ENABLED]?.let { coerceBool(it) } ?: true
         val sources = (declared[ProvisionFile.TOKEN_CLAIMS_SOURCES] as? List<*>)?.mapNotNull { it?.toString()?.trim() }?.distinct()
             ?: ProvisionFile.DEFAULT_TOKEN_CLAIM_SOURCES
-        return TokenClaims(enabled, if (enabled) sources else emptyList())
+        // Keys and values exactly as written (the file refuses a non-string value): product-api does not trim them either.
+        val roleMapping = (declared[ProvisionFile.TOKEN_CLAIMS_ROLE_MAPPING] as? Map<*, *>)
+            ?.entries?.associate { (k, v) -> k.toString() to v.toString() }
+        return if (enabled) TokenClaims(true, sources, roleMapping) else TokenClaims(false, emptyList())
     }
 
-    /** The `tokenClaims` diff entry when the live toggle differs from [want] (sources compared as a set), else nothing. */
+    /**
+     * The `tokenClaims` diff entry when the live configuration differs from [want], else nothing. The sources are compared as a
+     * SET and the role mapping as a MAP — a noop only when both match. With claims on at both ends the entry names only what
+     * changes: `sources [a] → sources [b]` and/or the mapping entries added (`+ role: value`), removed (`- role: value`) and
+     * changed (`~ role: old → new`). A live mapping the file does not declare is spelled out as a removal, because the PUT
+     * that converges the sources stores no mapping.
+     */
     private fun tokenClaimsDiff(client: ProvisionApi, clientId: String, want: TokenClaims): Map<String, String> {
         val n = client.getApplicationTokenClaims(clientId)
         val liveEnabled = n["enabled"]?.takeIf { it.isBoolean }?.asBoolean() ?: false
-        val live = TokenClaims(liveEnabled, if (liveEnabled) listItems(n["sources"] ?: n, "sources").map { it.asString() } else emptyList())
-        val same = if (want.enabled) live.enabled && live.sources.toSet() == want.sources.toSet() else !live.enabled
-        return if (same) emptyMap() else mapOf(ProvisionFile.SPEC_TOKEN_CLAIMS to "${live.render()} → ${want.render()}")
+        val live = if (liveEnabled) {
+            TokenClaims(true, listItems(n["sources"] ?: n, "sources").map { it.asString() }, liveRoleMapping(n))
+        } else {
+            TokenClaims(false, emptyList())
+        }
+        if (!want.enabled) return if (live.enabled) mapOf(ProvisionFile.SPEC_TOKEN_CLAIMS to "${live.render()} → off") else emptyMap()
+        if (!live.enabled) return mapOf(ProvisionFile.SPEC_TOKEN_CLAIMS to "off → ${want.render()}")
+        val parts = buildList {
+            if (live.sources.toSet() != want.sources.toSet()) {
+                add("sources ${live.sources.joinToString(",", "[", "]")} → sources ${want.sources.joinToString(",", "[", "]")}")
+            }
+            roleMappingDiff(live.roleMapping, want.roleMapping)?.let { add(it) }
+        }
+        return if (parts.isEmpty()) emptyMap() else mapOf(ProvisionFile.SPEC_TOKEN_CLAIMS to parts.joinToString("; "))
     }
 
-    /** `PUT …/token-claims {sources}` to switch it on with exactly [want]'s sources, or `DELETE …/token-claims` to switch it off. */
+    /** The live `roleMapping` (`null` / absent ⇒ none — also what a product-api older than SSO-3943 answers). */
+    private fun liveRoleMapping(n: JsonNode): Map<String, String>? =
+        n[ProvisionFile.TOKEN_CLAIMS_ROLE_MAPPING]?.takeIf { it.isObject }?.properties()?.associate { (k, v) -> k to v.asString() }
+
+    /** SSO-3945 — a readable, per-entry rendering of how the role mapping changes, or null when it does not. */
+    private fun roleMappingDiff(live: Map<String, String>?, want: Map<String, String>?): String? {
+        if (live == want) return null
+        if (want == null) {
+            return "roleMapping removed — the file declares none and the PUT replaces the whole configuration: " +
+                (live.orEmpty().toSortedMap().entries.joinToString(", ") { (k, v) -> "- $k: $v" }.ifEmpty { "{}" })
+        }
+        if (live == null && want.isEmpty()) return "roleMapping none → {} (an empty mapping lets no role through)"
+        val before = live.orEmpty()
+        val entries = (before.keys + want.keys).toSortedSet().mapNotNull { k ->
+            val old = before[k]
+            val new = want[k]
+            when {
+                old == null -> "+ $k: $new"
+                new == null -> "- $k: $old"
+                old != new -> "~ $k: $old → $new"
+                else -> null
+            }
+        }
+        return "roleMapping ${entries.joinToString(", ")}"
+    }
+
+    /**
+     * `PUT …/token-claims {sources, roleMapping}` to switch it on with exactly [want]'s configuration, or `DELETE …/token-claims`
+     * to switch it off. SSO-3945: EVERY PUT carries the role mapping (`null` when the file declares none) — PUT replaces the
+     * whole configuration, so a PUT of the sources alone would erase a live mapping the file declares.
+     */
     private fun convergeTokenClaims(r: ProvisionResource, slug: String?, clientId: String, want: TokenClaims) {
         val client = clients(slug)
         try {
-            if (want.enabled) client.putApplicationTokenClaims(clientId, want.sources) else client.deleteApplicationTokenClaims(clientId)
+            if (want.enabled) client.putApplicationTokenClaims(clientId, want.sources, want.roleMapping) else client.deleteApplicationTokenClaims(clientId)
         } catch (ex: ProductApiException) {
-            // The source names are product-api's to judge (`400 unsupported_claim_source`): name the field, keep the server's words.
+            // The source names and the mapping are product-api's to judge (`400 unsupported_claim_source` /
+            // `invalid_role_mapping`): name the field, keep the server's words.
             if (ex.httpStatus != 400) throw ex
             throw ProvisionException("${r.key}: spec.${ProvisionFile.SPEC_TOKEN_CLAIMS} refused by the platform — ${ex.errorCode ?: "HTTP 400"}${ex.errorDescription?.let { ": $it" } ?: ""} (the application itself is converged)")
         }
@@ -3782,3 +3837,6 @@ class ProvisionEngine(
         }
     }
 }
+
+/** SSO-3945 — a role mapping as `{a: x, b: y}`, keys sorted, for the plan and the apply log. */
+private fun renderMapping(m: Map<String, String>): String = m.toSortedMap().entries.joinToString(", ", "{", "}") { (k, v) -> "$k: $v" }

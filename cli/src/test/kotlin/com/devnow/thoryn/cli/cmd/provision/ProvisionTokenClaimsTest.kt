@@ -67,7 +67,8 @@ class ProvisionTokenClaimsTest : CommandTestBase() {
             "PUT /api/v1/applications/portal/token-claims",
         )
         assertThat(api.writes.first().body).doesNotContainKey("tokenClaims")
-        assertThat(api.writes.last().body).isEqualTo(mapOf("sources" to listOf("permissions", "org")))
+        // SSO-3945 — the PUT replaces the configuration, so it always states the mapping: here, explicitly none.
+        assertThat(api.writes.last().body).isEqualTo(mapOf("sources" to listOf("permissions", "org"), "roleMapping" to null))
         assertThat(api.tokenClaims["portal"]).containsExactly("permissions", "org")
 
         api.reset()
@@ -128,19 +129,19 @@ class ProvisionTokenClaimsTest : CommandTestBase() {
     @Test
     fun `a source name is passed through to the platform, which decides — refused by name today, converged the day it is accepted`() {
         api.seedApplication(null, "Acme Portal", listOf("https://app.acme.example/cb"), clientId = "portal")
-        val f = portal("{ sources: [permissions, roles] }")
+        val f = portal("{ sources: [permissions, risk] }")
         // The file accepts it: the CLI holds no list of sources.
         assertThat(engine().plan(f, false).changes.single().diff.keys).containsExactly("tokenClaims")
 
         assertThatThrownBy { apply(f) }
             .isInstanceOf(ProvisionException::class.java)
             .hasMessageContaining("application/portal: spec.tokenClaims refused by the platform — unsupported_claim_source")
-        assertThat(api.writes.single().body).isEqualTo(mapOf("sources" to listOf("permissions", "roles")))
+        assertThat(api.writes.single().body).isEqualTo(mapOf("sources" to listOf("permissions", "risk"), "roleMapping" to null))
 
-        api.supportedClaimSources = api.supportedClaimSources + "roles"
+        api.supportedClaimSources = api.supportedClaimSources + "risk"
         api.reset()
         apply(f)
-        assertThat(api.tokenClaims["portal"]).containsExactly("permissions", "roles")
+        assertThat(api.tokenClaims["portal"]).containsExactly("permissions", "risk")
     }
 
     @Test
@@ -155,6 +156,7 @@ class ProvisionTokenClaimsTest : CommandTestBase() {
         assertThat(violations("{ sources: [org, org] }")).anyMatch { it.contains("lists 'org' twice") }
         assertThat(violations("{ enabled: false, sources: [org] }")).anyMatch { it.contains("takes no sources") }
         assertThat(violations("{ mapping: {} }")).anyMatch { it.contains("unknown property 'mapping'") }
+        assertThat(violations("{ enabled: false, roleMapping: { a: b } }")).anyMatch { it.contains("takes no roleMapping") }
         assertThat(violations("[permissions]")).anyMatch { it.contains("must be an object") }
     }
 }
