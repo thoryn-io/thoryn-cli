@@ -143,18 +143,23 @@ object WorkflowCheck {
     }
 
     /**
-     * SSO-3921 — `config.secret-delivery`: the reusable workflow's apply job runs on a hosted runner with no kubeconfig, no
-     * `--secret-file` and no TTY. So a confidential application that MINTS a secret on create (`client_secret_basic`, or no
-     * declared method) can only be created green there with `secretSink: { kind: workloadPull, trust }` (oauthy ADR
-     * 2026-10-14 credential ladder, rung 3 — the pod mints its own): without a sink the create ends in `undelivered_secrets`
-     * (exit 65, the secret lost), a `kubernetesSecret` sink has no cluster to reach, and a `file` sink writes onto a runner
-     * that is gone when the job ends — green, and the secret lost all the same. A `readOnly` reference, a public client and a
-     * secret-less one (`private_key_jwt`, `federated_assertion`) mint nothing and pass. A file that does not load is not
-     * judged here (`thoryn provision plan` names every violation); null when no configured file could be read.
+     * SSO-3921 / SSO-3954 — `config.secret-delivery`: the reusable workflow's apply job runs on a hosted runner with no
+     * kubeconfig, no `--secret-file` and no TTY. A confidential application that MINTS a secret on create (`client_secret_basic`,
+     * or no declared method) is created green there because, since SSO-3954 (oauthy ADR 2026-10-14 amended 2026-10-25,
+     * SSO-3951), **the customer manages its secret by default**: with no `secretSink` — or `secretSink: { kind:
+     * customerManaged }` — `apply` discards the create's one-time value, grants nothing, and a person mints the secret the
+     * runtime gets (`thoryn clients rotate-secret <clientId> --secret-file …`) and stores it in the customer's own secret
+     * infrastructure. The rule PASSES such a file and says so (the notice is where the semantics are explained). Still red:
+     * a `kubernetesSecret` sink has no cluster to reach on that runner, and a `file` sink writes onto a runner that is gone
+     * when the job ends — green, and the secret lost all the same. A `workloadPull` sink (SSO-3921, rung 3) passes but is
+     * reported DEPRECATED (SSO-3951 / SSO-3953). A `readOnly` reference, a public client and a secret-less one
+     * (`private_key_jwt`, `federated_assertion`) mint nothing and pass. A file that does not load is not judged here
+     * (`thoryn provision plan` names every violation); null when no configured file could be read.
      */
     private fun secretDeliveryRule(config: WorkflowConfig, root: File): RuleResult? {
         val title = "a CI apply can create every declared application"
         val problems = mutableListOf<String>()
+        val notices = mutableListOf<String>()
         val unreadable = mutableListOf<String>()
         var checked = 0
         config.files.map { it.file }.distinct().forEach { path ->
@@ -167,10 +172,12 @@ object WorkflowCheck {
             }
             checked++
             file.resources.filter { it.kind == ProvisionFile.KIND_APPLICATION && !it.readOnly && mintsSecret(it.spec) }.forEach { r ->
-                val sink = r.secretSink
-                when (sink?.kind) {
-                    ProvisionFile.SECRET_SINK_KIND_WORKLOAD_PULL -> Unit
-                    null -> problems += "$path application ${r.name} mints a client secret on create and declares no secretSink — the apply job has no --secret-file and no TTY, so creating it ends in undelivered_secrets (exit 65) with the secret lost"
+                val sink = r.effectiveSecretSink ?: return@forEach
+                when (sink.kind) {
+                    ProvisionFile.SECRET_SINK_KIND_CUSTOMER_MANAGED -> notices += "$path application ${r.name}: its client secret is managed by the customer" +
+                        (if (r.secretSink == null) " (no secretSink — the default)" else " (secretSink customerManaged)") +
+                        " — apply discards the create's value; ${ProvisionFile.CUSTOMER_MANAGED_RUNBOOK}"
+                    ProvisionFile.SECRET_SINK_KIND_WORKLOAD_PULL -> notices += "$path application ${r.name}: ${ProvisionFile.WORKLOAD_PULL_DEPRECATION}"
                     ProvisionFile.SECRET_SINK_KIND_KUBERNETES_SECRET -> problems += "$path application ${r.name} delivers its secret to ${sink.label} — the apply job's runner has no kubeconfig, so it cannot reach a cluster (undelivered_secrets, exit 65)"
                     else -> problems += "$path application ${r.name} delivers its secret to ${sink.label} — the file lands on the runner and is gone when the job ends: green, and the secret lost"
                 }
@@ -179,12 +186,15 @@ object WorkflowCheck {
         if (checked == 0) return null
         val skipped = unreadable.takeIf { it.isNotEmpty() }?.let { " (not checked — does not load, see `thoryn provision plan`: ${it.joinToString(", ")})" } ?: ""
         return if (problems.isEmpty()) {
-            RuleResult("config.secret-delivery", title, Status.PASS, "no application in the configured file(s) needs a secret delivered by the job (none minted, or pulled at runtime by its workload)$skipped")
+            RuleResult(
+                "config.secret-delivery", title, Status.PASS,
+                (if (notices.isEmpty()) "no application in the configured file(s) is minted a secret the job would have to deliver" else notices.joinToString("; ")) + skipped,
+            )
         } else {
             RuleResult(
-                "config.secret-delivery", title, Status.FAIL, problems.joinToString("; ") + skipped,
-                "declare `secretSink: { kind: ${ProvisionFile.SECRET_SINK_KIND_WORKLOAD_PULL}, trust: <a kubernetes workloadIdentityTrust> }` so the pod mints its own secret at start " +
-                    "(oauthy ADR 2026-10-14 credential ladder, rung 3), or authenticate without a minted secret (clientAuthenticationMethods: [private_key_jwt] / [federated_assertion])",
+                "config.secret-delivery", title, Status.FAIL, (problems + notices).joinToString("; ") + skipped,
+                "drop the `secretSink:` — the default is `${ProvisionFile.SECRET_SINK_KIND_CUSTOMER_MANAGED}` (apply discards the create's value; ${ProvisionFile.CUSTOMER_MANAGED_RUNBOOK}) — " +
+                    "or authenticate without a minted secret (clientAuthenticationMethods: [private_key_jwt]); a kubernetesSecret or file sink is for an operator's own apply with the cluster or disk at hand",
             )
         }
     }
@@ -232,12 +242,8 @@ object WorkflowCheck {
         }
     }
 
-    /** Whether creating [spec]'s application mints a secret: confidential, and a secret-bearing method declared (or none — product-api's default). */
-    private fun mintsSecret(spec: Map<String, Any?>): Boolean {
-        if (spec[ProvisionFile.SPEC_CLIENT_TYPE]?.toString()?.trim().equals(ProvisionFile.CLIENT_TYPE_PUBLIC, ignoreCase = true)) return false
-        val methods = (spec[ProvisionFile.SPEC_CLIENT_AUTHENTICATION_METHODS] as? List<*>)?.map { it.toString().trim() } ?: return true
-        return methods.any { it in ProvisionFile.SECRET_BEARING_METHODS }
-    }
+    /** Whether creating [spec]'s application mints a secret ([ProvisionFile.mintsSecret]: confidential, and a secret-bearing method declared or none). */
+    private fun mintsSecret(spec: Map<String, Any?>): Boolean = ProvisionFile.mintsSecret(spec)
 
     // ── shape ───────────────────────────────────────────────────────────────────────────────────────────────────
 

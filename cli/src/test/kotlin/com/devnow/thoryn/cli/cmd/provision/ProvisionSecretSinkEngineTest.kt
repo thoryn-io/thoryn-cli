@@ -105,12 +105,14 @@ class ProvisionSecretSinkEngineTest : CommandTestBase() {
     }
 
     @Test
-    fun `a plan without a secretSink keeps the shown-once note and renders no delivery`() {
+    fun `a plan without a secretSink is customerManaged by default — discarded by apply, no delivery`() {
+        // SSO-3954 — the default sink: the create's value is discarded, a person mints the real one.
         val plain = ProvisionFile.parse(yaml.substringBefore("secretSink:").toByteArray(), "provision.yaml")
         val plan = engine(RecordingDeclaredSink()).plan(plain, false)
-        assertThat(plan.changes.single().secretSink).isNull()
-        assertThat(plan.changes.single().reason).contains("minted and shown once")
+        assertThat(plan.changes.single().secretSink).isEqualTo(SecretTarget.CUSTOMER_MANAGED)
+        assertThat(plan.changes.single().reason).contains("minted and discarded — managed by the customer").doesNotContain("shown once")
         assertThat(plan.deliveries).isZero()
+        assertThat(plan.customerManaged).isEqualTo(1)
     }
 
     @Test
@@ -215,7 +217,7 @@ class ProvisionSecretSinkEngineTest : CommandTestBase() {
     }
 
     @Test
-    fun `a public client with no secret and an application without a sink are untouched by the delivery port`() {
+    fun `a public client with no secret and an application without a sink reach neither the delivery port nor the generic channel`() {
         val mixed = ProvisionFile.parse(
             """
             apiVersion: thoryn.io/provision/v1
@@ -234,8 +236,10 @@ class ProvisionSecretSinkEngineTest : CommandTestBase() {
         val e = engine(sink, generic)
         val receipt = e.apply(mixed, e.plan(mixed, false), "acme", null)
         val workerId = receipt.resources.first { it.name == "worker" }.id
-        assertThat(sink.calls).isEmpty() // no secretSink declared ⇒ the declared port is never reached for
-        assertThat(generic.calls).containsExactly(workerId to mintedFor(workerId)) // the confidential one, through the generic channel
+        assertThat(sink.calls).isEmpty() // no secretSink declared ⇒ the declared port is never reached
+        // SSO-3954 — nor the generic channel: the worker's secret is the customer's; apply discards the create's value.
+        assertThat(generic.calls).isEmpty()
         assertThat(e.undeliveredSecrets).isEmpty()
+        assertThat(api.mintedSecrets).containsOnlyKeys(workerId)
     }
 }

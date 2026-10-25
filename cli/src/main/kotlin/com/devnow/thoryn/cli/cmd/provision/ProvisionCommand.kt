@@ -52,8 +52,8 @@ import java.util.concurrent.Callable
  *    (manager alone never suffices for automation), a person removes what they manage and nobody owns,
  *    non-ownable kinds go with their sandbox and never on the production plane; `retain: true` keeps a
  *    resource regardless. Every refusal is a `skip` row with the reason and the command a human runs.
- *    SSO-3113: `apply --secret-file <path>` / `--force-stdout` deliver a confidential application's
- *    one-time client secret through [SecretIo] (exactly as `clients create`); an undeliverable secret
+ *    SSO-3113: `apply --secret-file <path>` / `--force-stdout` are the fallback channel ([SecretIo], exactly as
+ *    `clients create`) for a declared `kubernetesSecret` / `file` sink that cannot be reached; an undeliverable secret
  *    still leaves the resource in place and exits [SecretIo.EXIT_NO_SECRET]. A resource's `grants:` block is
  *    converged with it (`thoryn access` is the imperative twin).
  *  - SSO-3659 (ADR 2026-10-13 §1/§2): ownership is decided by the signed-in identity's platform reach —
@@ -82,6 +82,12 @@ import java.util.concurrent.Callable
  *    nothing is delivered. `apply` discards the minted value and converges `manager` on the application for the named
  *    `kubernetes` trust's workload client; the pod's init container mints its own secret at start. No channel is
  *    needed, so a CI apply with no kubeconfig creates the application and exits 0. `plan` prints who pulls it.
+ *    **DEPRECATED** since SSO-3951 (removed by SSO-3953): still converged, with a warning on every plan and apply.
+ *  - **SSO-3954 (oauthy ADR 2026-10-14 amended 2026-10-25, SSO-3951 — Thoryn owns the secret lifecycle, the customer owns
+ *    delivery)** — `secretSink: { kind: customerManaged }`, THE DEFAULT for a confidential application without a sink:
+ *    `apply` discards the create's one-time value (never shown, written or handed anywhere), grants nothing, and exits 0
+ *    with no channel at all; `plan` prints the runbook — a person mints the secret with `thoryn clients rotate-secret
+ *    <clientId> --secret-file <path>` and stores it in the customer's secret manager or an operator-created Secret.
  */
 @Command(
     name = "provision",
@@ -279,11 +285,12 @@ class ProvisionCommand : Callable<Int> {
             // SSO-3659 — where apply will deliver the minted client secret (a line; no secret exists at plan time).
             plan.changes.forEach { c ->
                 c.secretSink?.let { t ->
-                    // SSO-3921 — a runtime pull delivers nothing: the line says WHO mints the secret, and with which workload client.
-                    if (t.runtimePull) {
-                        println("      ${c.kind} ${c.name}: secret: pulled at runtime by trust ${t.trust} (workload client ${c.pullClientId ?: "created by this apply"}; apply discards the minted value)")
-                    } else {
-                        println("      ${c.kind} ${c.name}: deliver client secret → ${t.label}")
+                    when {
+                        // SSO-3921 — a runtime pull delivers nothing: the line says WHO mints the secret, and with which workload client.
+                        t.runtimePull -> println("      ${c.kind} ${c.name}: secret: pulled at runtime by trust ${t.trust} (workload client ${c.pullClientId ?: "created by this apply"}; apply discards the minted value) — DEPRECATED, SSO-3951")
+                        // SSO-3954 — the customer manages the secret (the default): apply discards the create's value; a person mints the real one.
+                        t.customerManaged -> println("      ${c.kind} ${c.name}: secret: managed by the customer (apply discards the minted value; ${ProvisionFile.CUSTOMER_MANAGED_RUNBOOK})")
+                        else -> println("      ${c.kind} ${c.name}: deliver client secret → ${t.label}")
                     }
                 }
             }
@@ -313,6 +320,7 @@ class ProvisionCommand : Callable<Int> {
                     (if (plan.publishes > 0) ", ${plan.publishes} output(s) to publish" else "") +
                     (if (plan.deliveries > 0) ", ${plan.deliveries} client secret(s) to deliver" else "") +
                     (if (plan.runtimePulls > 0) ", ${plan.runtimePulls} client secret(s) pulled at runtime" else "") +
+                    (if (plan.customerManaged > 0) ", ${plan.customerManaged} client secret(s) managed by the customer" else "") +
                     (if (plan.hasErrors) ", ${plan.errors.size} ownership error(s)." else "."),
             )
         }
@@ -408,10 +416,10 @@ class ProvisionCommand : Callable<Int> {
         @Option(names = ["--yes", "-y"], description = ["Skip the confirmation prompt (non-interactive use)."])
         var yes: Boolean = false
 
-        @Option(names = ["--secret-file"], description = ["Write a created confidential application's one-time client secret to this file (owner-only) instead of a TTY/pipe."])
+        @Option(names = ["--secret-file"], description = ["SSO-3659 — the fallback for a `secretSink: { kind: kubernetesSecret | file }` that cannot be reached: write the created application's one-time client secret to this file (owner-only) instead of a TTY/pipe. An application without a sink is `customerManaged` (SSO-3954): apply discards the value; mint one with `thoryn clients rotate-secret`."])
         var secretFile: File? = null
 
-        @Option(names = ["--force-stdout"], description = ["Allow printing a minted client secret to a non-interactive stdout (pipe/redirect). Off by default."])
+        @Option(names = ["--force-stdout"], description = ["Allow printing a minted client secret to a non-interactive stdout (pipe/redirect) when a declared kubernetesSecret / file sink cannot be reached. Off by default."])
         var forceStdout: Boolean = false
 
         @Option(names = ["--force"], description = ["SSO-3659 — overwrite an existing file named by a resource's `secretSink: { kind: file, path }`. Off by default."])

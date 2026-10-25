@@ -118,14 +118,13 @@ class ProvisionCommandTest : CommandTestBase() {
                 spec: { displayName: "Web app", redirectUris: ["https://app.example.com/cb"] }
             """.trimIndent(),
         )
-        // `web` has no clientType ⇒ confidential (product-api's default) ⇒ a one-time secret is minted; deliver it to a file.
-        val secretFile = File(tempHome.toFile(), "web.secret")
-        val applied = runCli("provision", "apply", "--file", file.path, "--gateway", baseUrl(), "--yes", "--secret-file", secretFile.path)
+        // `web` has no clientType ⇒ confidential (product-api's default) ⇒ a one-time secret is minted — and, with no sink,
+        // SSO-3954 makes it the customer's: apply discards it, needs no channel, and exits 0.
+        val applied = runCli("provision", "apply", "--file", file.path, "--gateway", baseUrl(), "--yes")
         assertThat(applied.exit).isEqualTo(0)
         assertThat(api.writes.single().env).isNull()
         val id = api.applications.single()["clientId"]
-        assertThat(secretFile.readText().trim()).isEqualTo(api.mintedSecrets[id])
-        assertThat(applied.out).doesNotContain(api.mintedSecrets[id])
+        assertThat(applied.out).doesNotContain(api.mintedSecrets[id]).contains("client secret discarded (never shown or stored) — managed by the customer")
         api.reset()
 
         val refused = runCli("provision", "destroy", "--file", file.path, "--gateway", baseUrl(), "--yes")
@@ -183,8 +182,9 @@ class ProvisionCommandTest : CommandTestBase() {
     }
 
     @Test
-    fun `apply delivers a minted client secret through --secret-file and exits EXIT_NO_SECRET when it cannot`() {
+    fun `apply discards a minted client secret by default — the customer manages it — and --secret-file is the fallback of a declared file sink`() {
         // SSO-3113 — a confidential client_credentials application (a least-privilege CI identity).
+        // SSO-3954 — with no `secretSink:` the secret is customerManaged: never shown, never undelivered, exit 0.
         val file = writeFile(
             "provision.yaml",
             """
@@ -200,25 +200,33 @@ class ProvisionCommandTest : CommandTestBase() {
             """.trimIndent(),
         )
         val plan = runCli("provision", "plan", "--file", file.path, "--gateway", baseUrl())
-        assertThat(plan.out).contains("(a client secret will be minted and shown once)")
+        assertThat(plan.out)
+            .contains("(a client secret will be minted and discarded — managed by the customer: a person mints it with `thoryn clients rotate-secret <clientId> --secret-file <path>`")
+            .contains("application ci-worker: secret: managed by the customer (apply discards the minted value;")
+            .contains("1 client secret(s) managed by the customer")
+            .doesNotContain("shown once")
 
-        // No --secret-file and a non-TTY stdout ⇒ SecretIo refuses; the client is still created + owned; exit 65.
-        val refused = runCli("provision", "apply", "--file", file.path, "--gateway", baseUrl(), "--yes")
-        assertThat(refused.exit).isEqualTo(com.devnow.thoryn.cli.cmd.SecretIo.EXIT_NO_SECRET)
+        // No --secret-file and a non-TTY stdout: nothing is needed — the value is discarded with the runbook, exit 0, nothing undelivered.
+        val applied = runCli("provision", "apply", "--file", file.path, "--gateway", baseUrl(), "--yes")
+        assertThat(applied.exit).isEqualTo(0)
         val clientId = api.applications.single()["clientId"].toString()
         val secret = api.mintedSecrets.getValue(clientId)
-        assertThat(refused.out).doesNotContain(secret)
-        assertThat(refused.err).doesNotContain(secret).contains("thoryn clients rotate-secret $clientId")
+        assertThat(applied.out).doesNotContain(secret)
+            .contains("application ci-worker: client secret discarded (never shown or stored) — managed by the customer: mint it with `thoryn clients rotate-secret $clientId --secret-file <path>` and store it in your secret manager")
+        assertThat(applied.err).doesNotContain(secret).doesNotContain("undelivered_secrets")
         assertThat(api.applications.map { it["displayName"] }).containsExactly("CI worker")
         assertThat(File(file.parentFile, "provision.receipt.json")).doesNotExist()
 
-        // A second confidential client, this time with --secret-file: delivered to the owner-only file, never stdout.
+        // A second confidential client with a declared `file` sink whose path already exists (no --force ⇒ a reason):
+        // --secret-file is the fallback, the owner-only file holds the value, never stdout.
+        val occupied = File(tempHome.toFile(), "occupied.secret").also { it.writeText("left by an earlier apply") }
         file.appendText(
             "\n" + """
             - kind: application
               name: reporter
               environment: ci
               spec: { displayName: "Reporter", grantTypes: [client_credentials] }
+              secretSink: { kind: file, path: ${occupied.path} }
             """.trimIndent().prependIndent("  ") + "\n",
         )
         val secretFile = File(tempHome.toFile(), "reporter.secret")
@@ -227,7 +235,8 @@ class ProvisionCommandTest : CommandTestBase() {
         val reporterId = api.applications.last()["clientId"].toString()
         assertThat(secretFile.readText().trim()).isEqualTo(api.mintedSecrets.getValue(reporterId))
         assertThat(delivered.out).doesNotContain(api.mintedSecrets.getValue(reporterId)).contains("Applied. 3 resource(s) converged (1 created, 0 updated)")
-        assertThat(delivered.err).contains("written to").doesNotContain(api.mintedSecrets.getValue(reporterId))
+        assertThat(delivered.err).contains("already exists — re-run with --force").contains("written to").doesNotContain(api.mintedSecrets.getValue(reporterId))
+        assertThat(occupied.readText()).isEqualTo("left by an earlier apply")
     }
 
     @Test

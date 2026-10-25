@@ -1,7 +1,6 @@
 package com.devnow.thoryn.cli.cmd.provision
 
 import com.devnow.thoryn.cli.cmd.CommandTestBase
-import com.devnow.thoryn.cli.cmd.SecretIo
 import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.BeforeEach
@@ -11,8 +10,9 @@ import java.io.File
 /**
  * SSO-3921 — `thoryn provision` with `secretSink: { kind: workloadPull }`, run the way the reusable provisioning workflow
  * runs it: no `--secret-file`, no TTY, no kubeconfig. `plan` says who pulls the secret; `apply` creating the confidential
- * application exits 0 (where the same file without the sink is `undelivered_secrets`, exit 65), never runs `kubectl`, and
- * the minted value reaches neither stdout nor stderr.
+ * application exits 0, never runs `kubectl`, and the minted value reaches neither stdout nor stderr. SSO-3954 — the sink is
+ * DEPRECATED: plan and apply print the warning naming SSO-3951, and the same file without the sink is now `customerManaged`
+ * (exit 0 too, no grant; `ProvisionCustomerManagedSecretTest`).
  */
 class ProvisionWorkloadPullCliTest : CommandTestBase() {
 
@@ -59,29 +59,27 @@ class ProvisionWorkloadPullCliTest : CommandTestBase() {
         assertThat(plan.exit).isEqualTo(0)
         assertThat(plan.out)
             .contains("application  forge-login  create")
-            .contains("application forge-login: secret: pulled at runtime by trust forge-pods (workload client $wi; apply discards the minted value)")
+            .contains("application forge-login: secret: pulled at runtime by trust forge-pods (workload client $wi; apply discards the minted value) — DEPRECATED, SSO-3951")
             .contains("application forge-login: grant + client:$wi manager")
             .contains("1 client secret(s) pulled at runtime")
             .doesNotContain("to deliver")
+        // SSO-3954 — the deprecation, once per application, on stderr (stdout stays the plan).
+        assertThat(plan.err).contains("! application forge-login: secretSink workloadPull is DEPRECATED (product-owner decision SSO-3951").contains("SSO-3953 removes it")
         assertThat(api.writes).isEmpty()
 
         val json = runCli("provision", "plan", "--file", f.path, "--gateway", baseUrl(), "--output", "json")
         assertThat(json.out).contains("\"kind\" : \"workloadPull\"").contains("\"workloadClientId\" : \"$wi\"").contains("\"pull\" : 1").contains("\"deliver\" : 0")
+            .contains("\"warnings\"").contains("secretSink workloadPull is DEPRECATED")
     }
 
     @Test
-    fun `a CI apply with no secret channel creates the application and exits 0 — the same file without the sink exits 65`() {
-        // The control: no sink, no --secret-file, no TTY ⇒ the secret is minted and lost, apply is red.
-        val bare = runCli("provision", "apply", "--file", writeFile("\n").path, "--gateway", baseUrl(), "--yes")
-        assertThat(bare.exit).isEqualTo(SecretIo.EXIT_NO_SECRET)
-        assertThat(bare.err).contains("undelivered_secrets")
-        api.applications.clear(); api.mintedSecrets.clear(); api.grants.clear()
-
+    fun `a CI apply with no secret channel still converges the deprecated sink — exit 0, the grant made, the warning printed`() {
         val apply = runCli("provision", "apply", "--file", writeFile(pull).path, "--gateway", baseUrl(), "--yes")
         assertThat(apply.exit).isEqualTo(0)
         val id = api.applications.single()["clientId"].toString()
         val secret = api.mintedSecrets.getValue(id)
         assertThat(apply.err).doesNotContain("undelivered_secrets").doesNotContain(secret)
+            .contains("! application forge-login: secretSink workloadPull is DEPRECATED (product-owner decision SSO-3951")
         assertThat(apply.out).doesNotContain(secret)
             .contains("client secret discarded (never shown or stored) — pulled at runtime by the pods of trust forge-pods")
             .contains("Applied. 1 resource(s) converged")
