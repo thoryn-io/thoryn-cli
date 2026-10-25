@@ -159,6 +159,17 @@ class ProductApiClient(
         post("/api/v1/applications/${encode(clientId)}/secret/rotate", emptyBody(), confirmSlug)
 
     /**
+     * SSO-3957 — `GET /api/v1/applications/{id}/secrets/state`: the live rotation state of a
+     * client's secret (product-api `SecretStateResponse`, SSO-1028). Four fields:
+     * `previousSecretId` + `previousExpiresAt` (the overlap entry still validating after a rotation,
+     * both null when no rotation is in flight), `rotationAvailable` (whether a new rotation may start
+     * now) and `rotationAvailableAt` (the earliest moment it may, null when it may now). A read:
+     * `tenant:applications.read`; 404 cross-tenant / unknown id.
+     */
+    fun getApplicationSecretState(clientId: String): JsonNode =
+        get("/api/v1/applications/${encode(clientId)}/secrets/state")
+
+    /**
      * SSO-3683 — `POST /api/v1/applications/registration-tokens`: mints a Dynamic Client Registration
      * (RFC 7591) Initial Access Token for the signed-in workspace, pinned to the SELECTED environment
      * (the `X-Thoryn-Environment` header this client sends). [body] may carry `ttlSeconds` (default and

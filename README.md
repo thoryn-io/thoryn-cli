@@ -168,6 +168,7 @@ thoryn clients create --display-name <n> --redirect-uri <uri> [--scope <s>]... \
                       [--client-type confidential|public] [--secret-file <path>]
 thoryn clients update <clientId> [--display-name <n>] [--redirect-uri <uri>]... [--scope <s>]...
 thoryn clients rotate-secret <clientId> [--secret-file <path>] [--confirm <workspace-slug>]
+thoryn clients secret-state <clientId>       # SSO-3957 — is a previous secret still working, until when, and can you rotate now (from when)
 thoryn clients delete <clientId> [--confirm <workspace-slug>]
 thoryn clients registration-token [--software-id <id>] [--ttl <seconds>] [--out-file <path>]
                                              # SSO-3683 — a single-use RFC 7591 token a THIRD PARTY redeems at your
@@ -484,6 +485,65 @@ ungated** — no `--confirm` needed there.
    the gateway); `create` also registers the new tenant in product-api.
  - `audit query` targets product-api's `/audit/events` surface
    (`tenant:audit.read`).
+
+### Rotation state (SSO-3957)
+
+`thoryn clients rotate-secret` mints a new secret and keeps the previous one working for a
+**24 h overlap** so a deployment can switch over without a gap. The response says so once, at
+rotation time; the overlap is a *state* you may need to look at later — from another machine,
+after the terminal is gone, or when a rotation is refused. `thoryn clients secret-state` reads it
+from the server (`GET /api/v1/applications/{clientId}/secrets/state`, `tenant:applications.read`):
+
+```bash
+thoryn clients secret-state 7f1c…
+#   previousSecretId    = 9b2e…
+#   previousExpiresAt   = 2026-06-10T10:00:00Z (in 23h 41m)
+#   rotationAvailable   = false
+#   rotationAvailableAt = 2026-06-10T10:00:00Z (in 23h 41m)
+# A rotation is in flight: the previous secret keeps working until 2026-06-10T10:00:00Z (in 23h 41m). The next rotation is allowed from then.
+
+thoryn clients secret-state 7f1c…            # once the window has closed
+#   previousSecretId    = -
+#   previousExpiresAt   = -
+#   rotationAvailable   = true
+#   rotationAvailableAt = -
+# No rotation is in flight: only the current secret works, and you can rotate now.
+```
+
+Four fields, straight from the server: `previousSecretId` / `previousExpiresAt` (the secret still
+validating after the last rotation and when it stops; both `null` when none is), `rotationAvailable`
+(whether a new rotation may start right now) and `rotationAvailableAt` (the earliest moment it may;
+`null` when it may now). `--output json|yaml` prints exactly that body; the table adds each time's
+age and the one-line reading.
+
+**One rotation at a time.** While the window is open the server refuses a second rotation with
+`409 rotation_in_flight`. The CLI renders that as the state it is rather than a bare error — the
+time the next rotation is allowed (from the 409's own hint when product-api could read it from the
+hub, otherwise by reading `secret-state` for you), the fact that the previous secret keeps working
+until then, and where the incident path is:
+
+```bash
+thoryn clients rotate-secret 7f1c…
+# Error: rotation_in_flight — A rotation is already in flight for this client. The next rotation is available at 2026-06-10T10:00:00Z.
+# The previous secret keeps working until 2026-06-10T10:00:00Z (in 23h 41m). The next rotation is allowed from then.
+# To end the previous secret now, or to replace a lost new secret, see "Rotation state" in the thoryn CLI README (incident paths, SSO-3956).
+# ⇒ exit 2 (the server refused the call — the same code every non-2xx answer has always had)
+```
+
+With `--output json` the same arrives as `{"error":"rotation_in_flight","httpStatus":409,
+"rotationAvailableAt":"2026-06-10T10:00:00Z","hint":"…"}`, so a script can wait for the time
+instead of parsing prose.
+
+**Incident paths — ending the previous secret early, replacing a lost new secret.** A 409 is the
+normal case: wait for the window, or read `secret-state` to see how long. Two situations cannot
+wait: the previous secret is known to have leaked and must stop working *now*, or the new secret
+was lost before it reached the deployment and a replacement is needed inside the window. Those are
+server-side capabilities **being built under SSO-3956** (oauthy); this CLI will grow commands for
+them once that API exists and does not claim them yet. Until then the CLI has no command that ends
+the previous secret early or re-mints inside the window: a lost new secret means waiting for the
+window and rotating again, and a leaked previous secret is an incident for as long as the window
+says it still works. `rotate-secret` on a production workspace still needs `--confirm` (see above);
+`secret-state` is a read and needs nothing beyond `tenant:applications.read`.
 
 ### Register a third-party client (Dynamic Client Registration, SSO-3683)
 
@@ -3431,7 +3491,7 @@ thoryn-cli/
     │   │   ├── CommandSupport.kt                            # SSO-1552 shared token/output/error helpers
     │   │   ├── SecretIo.kt + FileSecrets.kt                 # SSO-1552 secret-safety (no-echo / --secret-file)
     │   │   ├── AccessCommand.kt                             # SSO-3113 `access grant|revoke|list|mine` (least-privilege grants)
-    │   │   ├── ClientsCommand.kt                            # SSO-1552 clients CRUD + rotate-secret
+    │   │   ├── ClientsCommand.kt                            # SSO-1552 clients CRUD + rotate-secret; SSO-3957 secret-state + a legible 409
     │   │   ├── FederationCommand.kt                         # SSO-1552 federation list/create/delete
     │   │   ├── WorkspaceCommand.kt                          # SSO-1552 workspace create/list/switch
     │   │   ├── TenantCommand.kt                             # SSO-1553 tenant seed (non-interactive provisioner)
