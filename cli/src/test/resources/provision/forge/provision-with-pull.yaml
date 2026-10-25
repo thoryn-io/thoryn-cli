@@ -1,0 +1,80 @@
+# SSO-3954 test fixture — thoryn-cicd's `.thoryn/provision.yaml` as it stood on main on 2026-10-25 (after SSO-3952,
+# before SSO-3954): the forge's two confidential login clients still carry the `workloadPull` sinks the lint demanded,
+# naming two `kubernetes` trusts nothing uses any more. Comments trimmed; resources verbatim.
+apiVersion: thoryn.io/provision/v1
+resources:
+  - kind: application
+    name: forge-oauth2-proxy
+    spec:
+      clientId: forge-oauth2-proxy
+      displayName: "Thoryn Forge (operator UI)"
+      clientType: confidential
+      grantTypes: [authorization_code]
+      scopes: [openid, profile, email]
+      redirectUris: ["https://forge.stg.thoryn.org/oauth2/callback"]
+      requireAuthorizationConsent: false
+    secretSink:
+      kind: workloadPull
+      trust: forge-oauth2-proxy-pod
+
+  - kind: application
+    name: forge-forgejo-login
+    spec:
+      clientId: forge-forgejo-login
+      displayName: "Thoryn Forge (Forgejo sign-in)"
+      clientType: confidential
+      grantTypes: [authorization_code]
+      scopes: [openid, profile, email]
+      redirectUris: ["https://forge.stg.thoryn.org/user/oauth2/thoryn/callback"]
+      requireAuthorizationConsent: false
+      tokenClaims:
+        sources: [roles]
+        roleMapping:
+          forge-maintainer: Maintainers
+    secretSink:
+      kind: workloadPull
+      trust: forge-forgejo-login-pod
+
+  - kind: role
+    name: forge-maintainer
+    spec:
+      description: "Maintains the Thoryn forge: cancels and re-runs CI on thoryn-io repositories (Forgejo team Maintainers)"
+      permissions: []
+
+  - kind: workloadIdentityTrust
+    name: forge-oauth2-proxy-pod
+    spec:
+      provider: kubernetes
+      kubernetes:
+        issuer: "https://kubernetes.default.svc.cluster.local"
+        namespace: forge
+        serviceAccount: forge-oauth2-proxy
+        jwks:
+          keys:
+            - kty: RSA
+              use: sig
+              alg: RS256
+              kid: 24YbUPgZU4ZwaZwgulqzCG-IBNoCgy8nM3cLT4zlX9g
+              n: "y7_iJ1tK9auWhSw_C5oQmrxCCR1APPwTtP9S8Tk7a9C-YemAzM8SxHah8ODeAf1uXx5Kr00XXGDC6tnF3mz_dlDt0Mw4QtAyDwCK-KTc1oWzqihAoWZiU5FmpDVFwGhEs7ys9eWlszXNFK3DCvHgYusfDPQUSw-FLGGqJ8NuIPOpwIQIKBd3ILcdGButLvua2LcKIcY9glheJBq7BjIYfQhIWVZWqw7ceMceQHY2UdsMo0zDBGQr9Zdrx86ExPST0kVVHoQ6KNphwKg8QfkCqnzVZkJY3T1K51M8lhQfqLJ7YBddPPvJCAdpBC8YnhhDGNGLVFqujRUbetL6s0C12w"
+              e: AQAB
+      scopes: [tenant:applications.write]
+      confirmProduction: true
+
+  - kind: workloadIdentityTrust
+    name: forge-forgejo-login-pod
+    spec:
+      provider: kubernetes
+      kubernetes:
+        issuer: "https://kubernetes.default.svc.cluster.local"
+        namespace: forge
+        serviceAccount: forge-forgejo-login
+        jwks:
+          keys:
+            - kty: RSA
+              use: sig
+              alg: RS256
+              kid: 24YbUPgZU4ZwaZwgulqzCG-IBNoCgy8nM3cLT4zlX9g
+              n: "y7_iJ1tK9auWhSw_C5oQmrxCCR1APPwTtP9S8Tk7a9C-YemAzM8SxHah8ODeAf1uXx5Kr00XXGDC6tnF3mz_dlDt0Mw4QtAyDwCK-KTc1oWzqihAoWZiU5FmpDVFwGhEs7ys9eWlszXNFK3DCvHgYusfDPQUSw-FLGGqJ8NuIPOpwIQIKBd3ILcdGButLvua2LcKIcY9glheJBq7BjIYfQhIWVZWqw7ceMceQHY2UdsMo0zDBGQr9Zdrx86ExPST0kVVHoQ6KNphwKg8QfkCqnzVZkJY3T1K51M8lhQfqLJ7YBddPPvJCAdpBC8YnhhDGNGLVFqujRUbetL6s0C12w"
+              e: AQAB
+      scopes: [tenant:applications.write]
+      confirmProduction: true

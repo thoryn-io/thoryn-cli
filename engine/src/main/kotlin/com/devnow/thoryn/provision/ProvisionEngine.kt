@@ -91,9 +91,11 @@ data class PlannedChange(
     /**
      * SSO-3659 (ADR 2026-10-13 §5) — where `apply` will DELIVER the client secret this CREATE mints, the moment the
      * client is converged. Shown as a line of the plan (a pull-request check shows where the secret will land);
-     * nothing is minted by `plan`. Only on a CREATE of a confidential application with a `secretSink:`. SSO-3921 — a
-     * `workloadPull` sink is shown on EVERY converging row of its application (nothing is delivered; the line says who
-     * pulls the secret at runtime), with the workload client in [pullClientId].
+     * nothing is minted by `plan`. Only on a CREATE of a confidential application that mints a secret: its declared sink,
+     * or — with none declared — [SecretTarget.CUSTOMER_MANAGED] (SSO-3954, the default: the create's value is discarded and
+     * a person mints the secret). SSO-3921 — a `workloadPull` sink (DEPRECATED, SSO-3951) is shown on EVERY converging row of
+     * its application (nothing is delivered; the line says who pulls the secret at runtime), with the workload client in
+     * [pullClientId].
      */
     val secretSink: SecretTarget? = null,
     /**
@@ -187,9 +189,20 @@ class ProvisionPlan(val changes: List<PlannedChange>) {
      */
     val publishes: Int get() = changes.sumOf { it.publishTo.size }
     /** SSO-3659 — client secrets `apply` will mint AND deliver to a declared `secretSink:` (a CREATE each; never by plan). */
-    val deliveries: Int get() = changes.count { it.secretSink != null && !it.secretSink.runtimePull }
+    val deliveries: Int get() = changes.count { it.secretSink != null && !it.secretSink.discardsMintedSecret }
     /** SSO-3921 — applications whose secret a workload pulls at runtime (`secretSink: { kind: workloadPull }`): nothing is delivered. */
     val runtimePulls: Int get() = changes.count { it.secretSink?.runtimePull == true }
+    /**
+     * SSO-3954 — CREATEs whose client secret the CUSTOMER manages (`secretSink: { kind: customerManaged }`, or no sink — the
+     * default): `apply` discards the minted value and a person mints the one the runtime gets.
+     */
+    val customerManaged: Int get() = changes.count { it.secretSink?.customerManaged == true }
+    /**
+     * SSO-3954 — what a reader of this plan must know beyond the rows: today the `workloadPull` deprecation, once per
+     * application that declares it ([ProvisionFile.WORKLOAD_PULL_DEPRECATION]). Printed by the engine on plan and apply.
+     */
+    val warnings: List<String>
+        get() = changes.filter { it.resource?.secretSink?.runtimePull == true }.map { "${it.kind} ${it.name}: ${ProvisionFile.WORKLOAD_PULL_DEPRECATION}" }
     val hasChanges: Boolean get() = creates.isNotEmpty() || updates.isNotEmpty() || removes.isNotEmpty() || grantChanges > 0 || publishes > 0
     /** SSO-3659 — resources that failed the ownership gate; a plan with one is red and `apply` refuses it. */
     val errors: List<PlannedChange> get() = changes.filter { it.action == ChangeAction.ERROR }
@@ -218,7 +231,9 @@ class ProvisionPlan(val changes: List<PlannedChange>) {
             "publish" to publishes,
             "deliver" to deliveries,
             "pull" to runtimePulls,
+            "customerManaged" to customerManaged,
         ),
+        "warnings" to warnings,
     )
 }
 
@@ -586,7 +601,8 @@ class ProvisionEngine(
                 // SSO-3668 — a resource that will be converged publishes its id afterwards (every apply); shown, never done, by plan.
                 .let { c -> if (c.action == ChangeAction.ERROR || c.readOnly || r.publishTo.isEmpty()) c else c.copy(publishTo = r.publishTo, reason = c.reason + "; publishes its id to ${r.publishTo.size} target(s)") }
                 // SSO-3659 — a CREATE of a confidential application mints a secret; where it will be delivered is shown, never done, by plan.
-                .let { c -> if (c.action == ChangeAction.CREATE && !c.readOnly && r.secretSink != null && !r.secretSink.runtimePull && mintsSecret(r.spec)) c.copy(secretSink = r.secretSink) else c }
+                // SSO-3954 — with no sink declared that is `customerManaged` (the default): discarded by apply, minted by a person.
+                .let { c -> val sink = r.effectiveSecretSink; if (c.action == ChangeAction.CREATE && !c.readOnly && sink != null && !sink.runtimePull) c.copy(secretSink = sink) else c }
             changes += change
             if (r.kind == ProvisionFile.KIND_ENVIRONMENT && change.liveId != null) {
                 // The RESOLVED slug (a `{{env.NAME}}` placeholder names a per-run sandbox), never the raw spec.
@@ -594,7 +610,12 @@ class ProvisionEngine(
             }
         }
         if (prune) changes += planPruneOwned(file, changes, reach)
-        return ProvisionPlan(changes)
+        return ProvisionPlan(changes).also { warn(it) }
+    }
+
+    /** SSO-3954 — print a plan's [ProvisionPlan.warnings] (the `workloadPull` deprecation) on [err], once per plan and once per apply. */
+    private fun warn(plan: ProvisionPlan) {
+        plan.warnings.forEach { err.println("  ! $it") }
     }
 
     /**
@@ -826,29 +847,23 @@ class ProvisionEngine(
         if (r.kind == ProvisionFile.KIND_APPLICATION && KEY_LOCATION_FIELDS.any { r.spec[it] != null }) " (key location declared — not readable from the API, re-sent with any update; SSO-3716)" else ""
 
     /** SSO-3113 — the plan marker for a confidential application about to be created (its secret is shown once). */
-    private fun mintNote(r: ProvisionResource): String = when {
-        r.kind != ProvisionFile.KIND_APPLICATION || !mintsSecret(r.spec) -> ""
-        // SSO-3921 — a runtime pull: the one-time value is discarded; the trust's pod mints its own at start.
-        r.secretSink?.runtimePull == true -> " (a client secret will be minted and discarded — the pods of trust ${r.secretSink.trust} mint their own at start)"
-        // SSO-3659 — with a declared sink the secret is delivered, not shown.
-        r.secretSink != null -> " (a client secret will be minted and delivered to ${r.secretSink.label})"
-        else -> " (a client secret will be minted and shown once)"
+    private fun mintNote(r: ProvisionResource): String {
+        val sink = r.effectiveSecretSink ?: return ""
+        return when {
+            // SSO-3921 — a runtime pull: the one-time value is discarded; the trust's pod mints its own at start.
+            sink.runtimePull -> " (a client secret will be minted and discarded — the pods of trust ${sink.trust} mint their own at start)"
+            // SSO-3954 — the customer manages the secret (the default): the one-time value is discarded; a person mints the real one.
+            sink.customerManaged -> " (a client secret will be minted and discarded — managed by the customer: ${ProvisionFile.CUSTOMER_MANAGED_RUNBOOK})"
+            // SSO-3659 — with a declared sink the secret is delivered, not shown.
+            else -> " (a client secret will be minted and delivered to ${sink.label})"
+        }
     }
 
     /** product-api's `clientType` defaults to `confidential`; only an explicit `public` client is secret-less. */
-    private fun isConfidential(spec: Map<String, Any?>): Boolean =
-        !spec["clientType"]?.toString()?.trim().equals("public", ignoreCase = true)
+    private fun isConfidential(spec: Map<String, Any?>): Boolean = ProvisionFile.isConfidential(spec)
 
-    /**
-     * SSO-3689 — whether the create MINTS a client secret: a confidential client whose declared methods include a
-     * secret-bearing one (or declare none — product-api then defaults to `client_secret_basic`). A `private_key_jwt`
-     * or `federated_assertion` client is confidential and minted nothing (`clientSecret: null` on the response).
-     */
-    private fun mintsSecret(spec: Map<String, Any?>): Boolean {
-        if (!isConfidential(spec)) return false
-        val methods = (spec[ProvisionFile.SPEC_CLIENT_AUTHENTICATION_METHODS] as? List<*>)?.map { it.toString().trim() } ?: return true
-        return methods.any { it in ProvisionFile.SECRET_BEARING_METHODS }
-    }
+    /** SSO-3689 — whether the create MINTS a client secret ([ProvisionFile.mintsSecret]). */
+    private fun mintsSecret(spec: Map<String, Any?>): Boolean = ProvisionFile.mintsSecret(spec)
 
     /**
      * SSO-3113 — attach the grant diff to a planned change: for a CREATE every declared grant is an add
@@ -1878,6 +1893,7 @@ class ProvisionEngine(
             if (i >= 0) applied[i] = a else applied += a
         }
         undelivered.clear()
+        warn(plan)
         // SSO-3119 — grants converge in a SECOND pass, after EVERY resource in the file exists.
         // product-api resolves a grant's SUBJECT (`client:<clientId>`, `member:<sub>`) in the workspace
         // before it writes the tuple, and [orderForApply] converges environments ahead of applications —
@@ -1897,9 +1913,17 @@ class ProvisionEngine(
             val resolved: AppliedResource? = when (change.action) {
                 // SSO-3659 — a minted client secret is delivered AFTER the client exists; an unreachable sink costs nothing.
                 // SSO-3921 — a `workloadPull` sink: the value is dropped here, unseen; the trust's pod mints its own at start.
+                // SSO-3954 — `customerManaged` (the default): dropped here too, unseen; a person mints the one the runtime gets.
                 ChangeAction.CREATE -> writing(r, "create it") { create(r, file, applied, change.reservation) }.let { c ->
                     record(c.applied)
-                    c.mintedSecret?.let { if (r.secretSink?.runtimePull == true) discardSecret(r) else deliverSecret(r, c.applied.id, it) }
+                    c.mintedSecret?.let {
+                        val sink = r.effectiveSecretSink
+                        when {
+                            sink?.runtimePull == true -> discardSecret(r)
+                            sink?.customerManaged == true -> discardForCustomer(r, c.applied.id)
+                            else -> deliverSecret(r, c.applied.id, it)
+                        }
+                    }
                     // SSO-3941 — claims in the token are switched on only once the client exists AND its one-time secret has
                     // left: a refusal here can never cost the secret.
                     if (r.kind == ProvisionFile.KIND_APPLICATION) {
@@ -2148,11 +2172,8 @@ class ProvisionEngine(
         // or a log. The response node is not retained. SSO-3659 — it is handed back to [apply], which delivers it only
         // once the client exists ([deliverSecret]).
         val secret = (resp.str("clientSecret") ?: resp.str("client_secret"))?.takeIf { it.isNotEmpty() }
-        val note = when {
-            secret == null -> ""
-            r.secretSink != null -> " (client secret minted)"
-            else -> " (client secret minted — shown once)"
-        }
+        // SSO-3954 — every minted secret has a sink now (the default is `customerManaged`): nothing is "shown once" by apply.
+        val note = if (secret == null) "" else " (client secret minted)"
         out.println("  + application ${r.name}: clientId=$id${slug?.let { " env=$it" } ?: ""}$note")
         // SSO-3673 — the owner the create established (creator-becomes-owner for a `client:` caller), as reported.
         val created = AppliedResource(r.kind, r.name, id, slug, applicationAttributes(spec), owner = ProvisionApi.ownerOf(resp), action = ChangeAction.CREATE)
@@ -2203,6 +2224,17 @@ class ProvisionEngine(
      */
     private fun discardSecret(r: ProvisionResource) {
         out.println("  > application ${r.name}: client secret discarded (never shown or stored) — pulled at runtime by the pods of trust ${r.secretSink?.trust}")
+    }
+
+    /**
+     * SSO-3954 (oauthy ADR 2026-10-14 amended 2026-10-25, SSO-3951 — Thoryn owns the lifecycle, the customer owns delivery) —
+     * a `customerManaged` sink, declared or the default: the one-time secret the create returned is DROPPED — never printed,
+     * written, logged or handed to any sink or channel — and nothing is undelivered and nothing is granted. The line names
+     * the person's step, with the real client id: mint with `thoryn clients rotate-secret` and store it where the runtime
+     * reads it. The unseen create-time secret stays valid until that rotation's overlap expires it; nobody holds it.
+     */
+    private fun discardForCustomer(r: ProvisionResource, clientId: String) {
+        out.println("  > application ${r.name}: client secret discarded (never shown or stored) — managed by the customer: mint it with `${recoverSecret(clientId)}` and store it in your secret manager")
     }
 
     /** Converge an existing resource: send exactly the changed (non-secret) fields plus any write-only secret. */

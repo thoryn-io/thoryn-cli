@@ -1,0 +1,36 @@
+# SSO-3954 test fixture — thoryn-cicd's `.thoryn/provision.yaml` as the SSO-3954 follow-up leaves it: the two
+# `workloadPull` sinks and the two `kubernetes` trusts are gone. No `secretSink` on either application ⇒ the customer
+# manages the secret (the default): a person mints it and stores it in the operator-created Kubernetes Secret.
+apiVersion: thoryn.io/provision/v1
+resources:
+  - kind: application
+    name: forge-oauth2-proxy
+    spec:
+      clientId: forge-oauth2-proxy
+      displayName: "Thoryn Forge (operator UI)"
+      clientType: confidential
+      grantTypes: [authorization_code]
+      scopes: [openid, profile, email]
+      redirectUris: ["https://forge.stg.thoryn.org/oauth2/callback"]
+      requireAuthorizationConsent: false
+
+  - kind: application
+    name: forge-forgejo-login
+    spec:
+      clientId: forge-forgejo-login
+      displayName: "Thoryn Forge (Forgejo sign-in)"
+      clientType: confidential
+      grantTypes: [authorization_code]
+      scopes: [openid, profile, email]
+      redirectUris: ["https://forge.stg.thoryn.org/user/oauth2/thoryn/callback"]
+      requireAuthorizationConsent: false
+      tokenClaims:
+        sources: [roles]
+        roleMapping:
+          forge-maintainer: Maintainers
+
+  - kind: role
+    name: forge-maintainer
+    spec:
+      description: "Maintains the Thoryn forge: cancels and re-runs CI on thoryn-io repositories (Forgejo team Maintainers)"
+      permissions: []

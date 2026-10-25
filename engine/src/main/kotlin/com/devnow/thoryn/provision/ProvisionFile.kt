@@ -53,13 +53,24 @@ data class ProvisionResource(
      * one-time `client_secret` a confidential `application` is minted with (see [SecretTarget]): the moment the
      * client is converged and recorded, into the place that consumes it — never a CI secret store, never the
      * console. `null` ⇒ the host's generic channel (the CLI's `--secret-file` / guarded TTY). Refused on a
-     * public client (nothing is minted), on any other kind, and together with [readOnly]. SSO-3921 — or that NOTHING
-     * delivers it: `workloadPull` names the Kubernetes workload identity that mints its own at start ([SecretTarget]).
+     * public client (nothing is minted), on any other kind, and together with [readOnly]. SSO-3954 (oauthy ADR 2026-10-14
+     * amended 2026-10-25, SSO-3951) — `null` ⇒ **the customer manages the secret** ([effectiveSecretSink] is
+     * [SecretTarget.CUSTOMER_MANAGED]): the create's one-time value is discarded, a person mints one with
+     * `thoryn clients rotate-secret` and stores it in the customer's own secret infrastructure. SSO-3921 — `workloadPull`
+     * (DEPRECATED, SSO-3951 / SSO-3953) names the Kubernetes workload identity that mints its own at start ([SecretTarget]).
      */
     val secretSink: SecretTarget? = null,
 ) {
     val isSingleton: Boolean get() = kind in ProvisionFile.SINGLETON_KINDS
     val key: String get() = "$kind/$name"
+
+    /**
+     * SSO-3954 — the sink `apply` acts on: the declared one, or — for a confidential application that MINTS a secret on
+     * create and declares none — [SecretTarget.CUSTOMER_MANAGED], the default. Null when nothing is minted (a public or
+     * secret-less client, a read-only reference, another kind): there is nothing to deliver or discard.
+     */
+    val effectiveSecretSink: SecretTarget?
+        get() = secretSink ?: SecretTarget.CUSTOMER_MANAGED.takeIf { kind == ProvisionFile.KIND_APPLICATION && !readOnly && ProvisionFile.mintsSecret(spec) }
 }
 
 /**
@@ -89,12 +100,19 @@ data class PublishTarget(val kind: String, val repository: String, val environme
  *    the value rides on stdin, never on argv). The namespace must already exist — it is never created.
  *  - [ProvisionFile.SECRET_SINK_KIND_FILE] — an owner-only (`0600`) file at [path], never overwritten unless
  *    the host is told to.
+ *  - [ProvisionFile.SECRET_SINK_KIND_CUSTOMER_MANAGED] (SSO-3954; oauthy ADR 2026-10-14 amended 2026-10-25, SSO-3951:
+ *    "Thoryn owns the secret lifecycle, the customer owns delivery") — **the default** for a confidential application
+ *    that declares no sink ([ProvisionResource.effectiveSecretSink]). Delivered NOWHERE by `apply`: the one-time value
+ *    the create returns is discarded (never printed, written, logged or handed to a sink), no grant is made to anyone,
+ *    and the plan names the runbook — a PERSON mints the secret (`thoryn clients rotate-secret <clientId> --secret-file
+ *    <path>`, [ProvisionFile.CUSTOMER_MANAGED_RUNBOOK]) and stores it in the customer's own secret infrastructure (a
+ *    secret manager, an operator-created Kubernetes Secret). Nothing is undelivered, so a CI apply with no secret
+ *    channel creates the application and stays green.
  *  - [ProvisionFile.SECRET_SINK_KIND_WORKLOAD_PULL] (SSO-3921; oauthy ADR 2026-10-14 credential ladder, rung 3 "runtime
- *    pull") — delivered NOWHERE: `apply` discards the one-time value the create returns (never printed, never written,
- *    never handed to a sink) and converges `manager` on the application for the `wi_` workload client of the
+ *    pull") — **DEPRECATED** (SSO-3951; removed by SSO-3953; still converged). Delivered NOWHERE: `apply` discards the
+ *    one-time value the create returns and converges `manager` on the application for the `wi_` workload client of the
  *    `kubernetes` workload-identity [trust] named here, so the workload's init container signs in with its projected
- *    ServiceAccount token and mints its own (`thoryn clients rotate-secret`). Nothing is undelivered: no secret
- *    channel is needed, which is what lets a CI apply with no cluster credential create the application.
+ *    ServiceAccount token and mints its own (`thoryn clients rotate-secret`). Nothing is undelivered.
  *
  * The engine hands the minted value to its [ProvisionEngine.DeclaredSecretSink] right after the client is
  * converged and recorded; the value itself never enters the file, the plan, the receipt, a log or argv. A
@@ -110,14 +128,26 @@ data class SecretTarget(
     /** SSO-3921 — `workloadPull`: the NAME of the `workloadIdentityTrust` whose workload pulls the secret at runtime. */
     val trust: String? = null,
 ) {
-    /** SSO-3921 — nothing is delivered: the named trust's workload mints its own secret when it starts. */
+    /** SSO-3921 — nothing is delivered: the named trust's workload mints its own secret when it starts. DEPRECATED (SSO-3951). */
     val runtimePull: Boolean get() = kind == ProvisionFile.SECRET_SINK_KIND_WORKLOAD_PULL
 
-    /** `kubernetesSecret <ns>/<name> key <key>` | `file <path>` | `workloadPull by trust <name>` — the display form in plans and messages. */
+    /** SSO-3954 — nothing is delivered and nothing is granted: a person mints the secret and the customer stores it. */
+    val customerManaged: Boolean get() = kind == ProvisionFile.SECRET_SINK_KIND_CUSTOMER_MANAGED
+
+    /** SSO-3954 — the engine DISCARDS the create's one-time value for this target (it reaches no sink and no channel). */
+    val discardsMintedSecret: Boolean get() = runtimePull || customerManaged
+
+    /** `kubernetesSecret <ns>/<name> key <key>` | `file <path>` | `workloadPull by trust <name>` | `customerManaged` — the display form in plans and messages. */
     val label: String get() = when (kind) {
         ProvisionFile.SECRET_SINK_KIND_KUBERNETES_SECRET -> "$kind $namespace/$name key $key"
         ProvisionFile.SECRET_SINK_KIND_WORKLOAD_PULL -> "$kind by trust $trust"
+        ProvisionFile.SECRET_SINK_KIND_CUSTOMER_MANAGED -> kind
         else -> "$kind $path"
+    }
+
+    companion object {
+        /** SSO-3954 — the one `customerManaged` target (it has no members): the default of a confidential application. */
+        val CUSTOMER_MANAGED: SecretTarget = SecretTarget(kind = ProvisionFile.SECRET_SINK_KIND_CUSTOMER_MANAGED)
     }
 
     /** The target as a plan's `--output json` renders it — the declaration only, never a value. */
@@ -304,6 +334,21 @@ class ProvisionFile private constructor(
         val CLIENT_AUTHENTICATION_METHODS: Set<String> = setOf(METHOD_PRIVATE_KEY_JWT, METHOD_FEDERATED_ASSERTION, METHOD_CLIENT_SECRET_BASIC, METHOD_NONE)
         /** The methods a Thoryn-minted secret exists for: a `secretSink:` is legal only when the declared methods include one. */
         val SECRET_BEARING_METHODS: Set<String> = setOf(METHOD_CLIENT_SECRET_BASIC)
+
+        /** product-api's `clientType` defaults to `confidential`; only an explicit `public` client is secret-less. */
+        fun isConfidential(spec: Map<String, Any?>): Boolean =
+            !spec[SPEC_CLIENT_TYPE]?.toString()?.trim().equals(CLIENT_TYPE_PUBLIC, ignoreCase = true)
+
+        /**
+         * SSO-3689 — whether creating an application with [spec] MINTS a client secret: a confidential client whose declared
+         * methods include a secret-bearing one (or declare none — product-api then defaults to `client_secret_basic`). A
+         * `private_key_jwt` or `federated_assertion` client is confidential and minted nothing (`clientSecret: null`).
+         */
+        fun mintsSecret(spec: Map<String, Any?>): Boolean {
+            if (!isConfidential(spec)) return false
+            val methods = (spec[SPEC_CLIENT_AUTHENTICATION_METHODS] as? List<*>)?.map { it.toString().trim() } ?: return true
+            return methods.any { it in SECRET_BEARING_METHODS }
+        }
         /** The grants a federated login client may register (ADR 2026-10-14 §2) — never `client_credentials`. */
         val FEDERATED_GRANT_TYPES: Set<String> = setOf("authorization_code", "refresh_token")
         /** JWK members that carry PRIVATE key material (RFC 7518 §6.2.2 / §6.3.2 / §6.4) — refused in any inline `jwks`. */
@@ -511,8 +556,19 @@ class ProvisionFile private constructor(
          * named `kubernetes` trust's workload client is converged `manager` on the application, so the pod mints its own.
          */
         const val SECRET_SINK_KIND_WORKLOAD_PULL = "workloadPull"
+        /**
+         * SSO-3954 (oauthy ADR 2026-10-14 amended 2026-10-25, SSO-3951) — THE DEFAULT: the customer manages the secret. `apply`
+         * discards the create's one-time value, grants nothing, and the plan names the runbook ([CUSTOMER_MANAGED_RUNBOOK]).
+         */
+        const val SECRET_SINK_KIND_CUSTOMER_MANAGED = "customerManaged"
+        /** SSO-3954 — the person's step a `customerManaged` secret takes: minted by Thoryn, stored by the customer. */
+        const val CUSTOMER_MANAGED_RUNBOOK = "a person mints it with `thoryn clients rotate-secret <clientId> --secret-file <path>` and stores it in your secret manager (or an operator-created Kubernetes Secret)"
+        /** SSO-3954 — the deprecation every `workloadPull` sink is reported with (plan, apply, `provision workflow check`). */
+        const val WORKLOAD_PULL_DEPRECATION = "secretSink workloadPull is DEPRECATED (product-owner decision SSO-3951, 2026-10-25: Thoryn owns the secret lifecycle, the customer owns delivery; SSO-3953 removes it) — drop the sink (the default is $SECRET_SINK_KIND_CUSTOMER_MANAGED), then revoke the pod trust's manager grant and delete the trust by hand"
         /** The CLOSED sink kind allowlist — must equal the schema's `secretSink.oneOf[*].kind` consts. */
-        val SECRET_SINK_KINDS: Set<String> = setOf(SECRET_SINK_KIND_KUBERNETES_SECRET, SECRET_SINK_KIND_FILE, SECRET_SINK_KIND_WORKLOAD_PULL)
+        val SECRET_SINK_KINDS: Set<String> = setOf(SECRET_SINK_KIND_KUBERNETES_SECRET, SECRET_SINK_KIND_FILE, SECRET_SINK_KIND_WORKLOAD_PULL, SECRET_SINK_KIND_CUSTOMER_MANAGED)
+        /** SSO-3954 — the members of a `customerManaged` target — the kind alone. */
+        val SECRET_SINK_CUSTOMER_MANAGED_KEYS: Set<String> = setOf("kind")
         /** The kinds a `secretSink:` may sit on: only a (confidential) application is minted a secret. */
         val SECRET_SINK_KINDS_ALLOWED_ON: Set<String> = setOf(KIND_APPLICATION)
         /** The members of a `kubernetesSecret` target — exactly these four (the schema's `additionalProperties: false`). */
@@ -881,7 +937,7 @@ class ProvisionFile private constructor(
                 v += "$where a read-only reference cannot carry '$SECRET_SINK' — nothing is minted for it; the repository that owns the application delivers its secret"
             }
             if (!target.isObject()) {
-                v += "$where $SECRET_SINK must be an object { kind: $SECRET_SINK_KIND_KUBERNETES_SECRET, namespace, name, key }, { kind: $SECRET_SINK_KIND_FILE, path } or { kind: $SECRET_SINK_KIND_WORKLOAD_PULL, trust }"
+                v += "$where $SECRET_SINK must be an object { kind: $SECRET_SINK_KIND_CUSTOMER_MANAGED }, { kind: $SECRET_SINK_KIND_KUBERNETES_SECRET, namespace, name, key }, { kind: $SECRET_SINK_KIND_FILE, path } or { kind: $SECRET_SINK_KIND_WORKLOAD_PULL, trust }"
                 return
             }
             fun text(field: String): String? = target[field]?.takeIf { it.isTextual() }?.asString()?.trim()?.takeIf { it.isNotEmpty() }
@@ -910,6 +966,8 @@ class ProvisionFile private constructor(
                     rejectUnknownKeys(target, SECRET_SINK_FILE_KEYS, tw, v)
                     if (text("path") == null) v += "$tw path is required (the owner-only file the secret is written to)"
                 }
+                // SSO-3954 — `customerManaged` is the kind alone: there is nowhere to name, a person delivers.
+                SECRET_SINK_KIND_CUSTOMER_MANAGED -> rejectUnknownKeys(target, SECRET_SINK_CUSTOMER_MANAGED_KEYS, tw, v)
                 SECRET_SINK_KIND_WORKLOAD_PULL -> {
                     rejectUnknownKeys(target, SECRET_SINK_WORKLOAD_PULL_KEYS, tw, v)
                     val trust = text("trust")

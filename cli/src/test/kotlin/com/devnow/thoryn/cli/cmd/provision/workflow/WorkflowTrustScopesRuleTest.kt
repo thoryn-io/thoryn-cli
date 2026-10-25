@@ -102,6 +102,26 @@ class WorkflowTrustScopesRuleTest {
     }
 
     @Test
+    fun `a file of confidential applications whose secrets the customer manages needs applications read and write plus access read only`() {
+        // SSO-3954 — no sink (the default) and an explicit customerManaged sink: no trust is named, no grant is converged.
+        val apps = """
+            - kind: application
+              name: forge-oauth2-proxy
+              spec: { clientId: forge-oauth2-proxy, displayName: Forge, clientType: confidential, grantTypes: [authorization_code], redirectUris: ["https://forge.example/oauth2/callback"] }
+            - kind: application
+              name: forge-forgejo-login
+              spec: { clientId: forge-forgejo-login, displayName: Forgejo, grantTypes: [authorization_code], redirectUris: ["https://forge.example/user/oauth2/thoryn/callback"] }
+              secretSink: { kind: customerManaged }
+        """
+        val r = check(apps, listOf("tenant:applications.read", "tenant:applications.write", "tenant:access.read"))!!
+        assertThat(r.status).withFailMessage("%s", r.detail).isEqualTo(WorkflowCheck.Status.PASS)
+        assertThat(r.detail).contains("needs to plan: tenant:applications.read tenant:access.read; to apply, also: tenant:applications.write")
+        // The control: without access read the ownership check cannot be asked; without applications write nothing can be created.
+        assertThat(check(apps, listOf("tenant:applications.read", "tenant:applications.write"))!!.status).isEqualTo(WorkflowCheck.Status.FAIL)
+        assertThat(check(apps, listOf("tenant:applications.read", "tenant:access.read"))!!.detail).contains("needs tenant:applications.write to APPLY")
+    }
+
+    @Test
     fun `the deprecated clients alias satisfies applications, and a read-only reference needs no write scope`() {
         val r = check(
             "- { kind: application, name: shared, readOnly: true, spec: { clientId: shared, displayName: shared } }",

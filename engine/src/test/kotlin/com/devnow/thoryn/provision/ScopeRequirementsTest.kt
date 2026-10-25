@@ -58,6 +58,27 @@ class ScopeRequirementsTest {
     }
 
     @Test
+    fun `a customer-managed secret — declared or the default — adds no scope — applications read and access read to plan, applications write to apply`() {
+        // SSO-3954 — nothing is resolved by name and nothing is granted, so neither workload-identity read nor access write is needed.
+        val needs = ScopeRequirements.of(
+            file(
+                """
+                - kind: application
+                  name: login
+                  spec: { displayName: Login, redirectUris: ["https://x.example/cb"] }
+                - kind: application
+                  name: proxy
+                  spec: { displayName: Proxy, redirectUris: ["https://x.example/oauth2/callback"] }
+                  secretSink: { kind: customerManaged }
+                """,
+            ),
+        )
+        assertThat(scopes(needs, Phase.PLAN)).containsExactly("tenant:applications.read", "tenant:access.read")
+        assertThat(scopes(needs, Phase.APPLY)).containsExactly("tenant:applications.write")
+        assertThat(needs.map { it.why }).noneMatch { it.contains("secretSink") }
+    }
+
+    @Test
     fun `grants need access read and write, a sandbox resource a conditional environments read, a read-only reference nothing to write`() {
         val needs = ScopeRequirements.of(
             file(
