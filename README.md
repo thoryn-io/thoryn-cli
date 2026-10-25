@@ -172,6 +172,12 @@ thoryn clients create --display-name <n> --redirect-uri <uri> [--scope <s>]... \
                       [--client-type confidential|public] [--secret-file <path>]
 thoryn clients update <clientId> [--display-name <n>] [--redirect-uri <uri>]... [--scope <s>]...
 thoryn clients rotate-secret <clientId> [--secret-file <path>] [--confirm <workspace-slug>]
+thoryn clients rotate-secret <clientId> --replace [--secret-file <path>] [--confirm <workspace-slug>]
+                                             # SSO-3967 — the NEW secret was lost inside the window: mint a replacement; the superseded
+                                             # one stops at once, the previous keeps its expiry. Passkey sign-in ≤ 5 min (RFC 9470).
+thoryn clients revoke-previous-secret <clientId> [--revoke-tokens] [--confirm <workspace-slug>]
+                                             # SSO-3967 — the PREVIOUS secret leaked: end it now, not at the end of its 24 h window.
+                                             # --revoke-tokens also ends the client's live sessions/tokens. Passkey sign-in ≤ 5 min.
 thoryn clients secret-state <clientId>       # SSO-3957 — is a previous secret still working, until when, and can you rotate now (from when)
 thoryn clients delete <clientId> [--confirm <workspace-slug>]
 thoryn clients registration-token [--software-id <id>] [--ttl <seconds>] [--out-file <path>]
@@ -478,7 +484,7 @@ Destructive actions on a **production** workspace are gated by product-api's
 `ProductionConfirmationInterceptor`. Since the CLI calls the gateway directly
 with a bearer (no BFF to mediate), it must send the confirmation itself:
 `--confirm <your-workspace-slug>` on `clients delete`, `clients rotate-secret`,
-and `federation delete` sets the `X-Thoryn-Confirm` header. When it is absent on
+`clients revoke-previous-secret`, and `federation delete` sets the `X-Thoryn-Confirm` header. When it is absent on
 a production workspace the server answers `428 production_confirmation_required`
 and the CLI prints a re-run hint; a wrong value answers
 `422 production_confirmation_mismatch`. **Sandbox / non-production actions are
@@ -529,30 +535,79 @@ age and the one-line reading.
 `409 rotation_in_flight`. The CLI renders that as the state it is rather than a bare error — the
 time the next rotation is allowed (from the 409's own hint when product-api could read it from the
 hub, otherwise by reading `secret-state` for you), the fact that the previous secret keeps working
-until then, and where the incident path is:
+until then, and the two commands that end the window early:
 
 ```bash
 thoryn clients rotate-secret 7f1c…
 # Error: rotation_in_flight — A rotation is already in flight for this client. The next rotation is available at 2026-06-10T10:00:00Z.
 # The previous secret keeps working until 2026-06-10T10:00:00Z (in 23h 41m). The next rotation is allowed from then.
-# To end the previous secret now, or to replace a lost new secret, see "Rotation state" in the thoryn CLI README (incident paths, SSO-3956).
+# To end the previous secret now: `thoryn clients revoke-previous-secret 7f1c…`. To replace a lost new secret: `thoryn clients rotate-secret 7f1c… --replace`.
 # ⇒ exit 2 (the server refused the call — the same code every non-2xx answer has always had)
 ```
 
 With `--output json` the same arrives as `{"error":"rotation_in_flight","httpStatus":409,
 "rotationAvailableAt":"2026-06-10T10:00:00Z","hint":"…"}`, so a script can wait for the time
-instead of parsing prose.
+instead of parsing prose. An in-flight `secret-state` prints the same two commands under its
+reading.
 
-**Incident paths — ending the previous secret early, replacing a lost new secret.** A 409 is the
-normal case: wait for the window, or read `secret-state` to see how long. Two situations cannot
-wait: the previous secret is known to have leaked and must stop working *now*, or the new secret
-was lost before it reached the deployment and a replacement is needed inside the window. Those are
-server-side capabilities **being built under SSO-3956** (oauthy); this CLI will grow commands for
-them once that API exists and does not claim them yet. Until then the CLI has no command that ends
-the previous secret early or re-mints inside the window: a lost new secret means waiting for the
-window and rotating again, and a leaked previous secret is an incident for as long as the window
-says it still works. `rotate-secret` on a production workspace still needs `--confirm` (see above);
-`secret-state` is a read and needs nothing beyond `tenant:applications.read`.
+#### Incident: a secret leaked / I lost the new secret (SSO-3967)
+
+A 409 is the normal case: wait for the window, or read `secret-state` to see how long. Two
+situations cannot wait, and each has one command (product-api SSO-3956,
+`POST /api/v1/applications/{clientId}/secret/revoke-previous` and `…/secret/rotate` with
+`{"replaceInFlight": true}`; both `tenant:applications.write`):
+
+| Situation | Command | What happens |
+|---|---|---|
+| The **previous** secret leaked (or a leaver still holds it) | `thoryn clients revoke-previous-secret <clientId> [--revoke-tokens]` | The previous secret stops working **now**; only the current secret signs in; the next rotation is allowed at once. `--revoke-tokens` also ends the client's live sessions/tokens. Idempotent: nothing in flight ⇒ `200`, "nothing changed". |
+| The **new** secret was lost before it reached the deployment | `thoryn clients rotate-secret <clientId> --replace [--secret-file <path>]` | A replacement is minted and shown once (the same `--secret-file` / TTY / `--force-stdout` path as any rotation); the superseded in-flight secret stops at once; the previous secret keeps its **original** expiry — there are never three valid secrets. |
+
+```bash
+# 1. The previous secret leaked — end it now.
+thoryn clients revoke-previous-secret 7f1c… --confirm acme-prod
+# The previous secret no longer works. Only the current secret signs in.
+
+thoryn clients revoke-previous-secret 7f1c… --revoke-tokens --confirm acme-prod
+# The previous secret no longer works. Only the current secret signs in.
+# 3 live sessions/tokens of this client were revoked (self-contained access tokens already issued stay valid until they expire).
+
+thoryn clients revoke-previous-secret 7f1c…      # nothing in flight — idempotent
+# There was no previous secret; nothing changed.
+
+# 2. The new secret was lost — replace it inside the window.
+thoryn clients rotate-secret 7f1c… --replace --secret-file ./client-secret --confirm acme-prod
+#   newSecretId        = 3c0d…
+#   previousSecretId   = 9b2e…                  # the UNCHANGED previous secret …
+#   oldSecretExpiresAt = 2026-06-10T10:00:00Z   # … which keeps its original expiry
+```
+
+`--output json|yaml` on `revoke-previous-secret` prints the server body as it arrived
+(`previousSecretId`, `previousSecretRevoked`, `tokensRevoked`, `revokedAuthorizations`,
+`rotationAvailable`). What `--revoke-tokens` revokes: refresh tokens, stored reference access
+tokens and device codes of this client in your workspace — **not** self-contained JWT access
+tokens already issued, which verify by signature until they expire (at most the application's
+access-token TTL); the output says exactly this.
+
+**Both are elevated acts.** The server grants them only to a *person* whose sign-in used a passkey
+within the last five minutes (RFC 9470 step-up — the same rule as widening a workload-identity
+trust or retiring a signing key). Two refusals, each rendered in words:
+
+```bash
+thoryn clients revoke-previous-secret 7f1c…      # signed in with a password, or a passkey > 5 min ago
+# Error: insufficient_user_authentication — A higher level of authentication is required
+# Ending the previous secret now needs a passkey sign-in from the last 5 minutes. Sign in again, then retry:
+#   thoryn login --acr-values urn:thoryn:acr:phishing_resistant --max-age 300
+
+thoryn clients rotate-secret 7f1c… --replace      # as an API key or a workload identity
+# Error: elevated_action_requires_person — …
+# Replacing a rotation in flight is a person's act: a machine identity (API key, workload identity) cannot do this. A workspace admin must run it, signed in with a passkey (thoryn login --acr-values urn:thoryn:acr:phishing_resistant --max-age 300).
+```
+
+On a production workspace both need `--confirm <workspace-slug>` like `delete` and
+`rotate-secret` (`428 production_confirmation_required` without it); a cross-tenant or unknown
+client is `404 not_found`, never 403. An ordinary `rotate-secret` (no `--replace`) is unchanged
+and asks for no step-up. `secret-state` is a read and needs nothing beyond
+`tenant:applications.read`.
 
 ### Register a third-party client (Dynamic Client Registration, SSO-3683)
 
@@ -3558,7 +3613,7 @@ thoryn-cli/
     │   │   ├── CommandSupport.kt                            # SSO-1552 shared token/output/error helpers
     │   │   ├── SecretIo.kt + FileSecrets.kt                 # SSO-1552 secret-safety (no-echo / --secret-file)
     │   │   ├── AccessCommand.kt                             # SSO-3113 `access grant|revoke|list|mine` (least-privilege grants)
-    │   │   ├── ClientsCommand.kt                            # SSO-1552 clients CRUD + rotate-secret; SSO-3957 secret-state + a legible 409
+    │   │   ├── ClientsCommand.kt                            # SSO-1552 clients CRUD + rotate-secret; SSO-3957 secret-state + a legible 409; SSO-3967 revoke-previous-secret + rotate-secret --replace
     │   │   ├── FederationCommand.kt                         # SSO-1552 federation list/create/delete
     │   │   ├── WorkspaceCommand.kt                          # SSO-1552 workspace create/list/switch
     │   │   ├── TenantCommand.kt                             # SSO-1553 tenant seed (non-interactive provisioner)
