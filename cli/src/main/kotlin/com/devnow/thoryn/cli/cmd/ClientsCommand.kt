@@ -3,11 +3,15 @@ package com.devnow.thoryn.cli.cmd
 import com.devnow.thoryn.cli.api.ProductApiException
 import com.devnow.thoryn.cli.config.ThorynConfig
 import com.devnow.thoryn.cli.output.OutputFormat
+import com.devnow.thoryn.cli.output.Printers
+import com.devnow.thoryn.cli.output.Timestamps
 import picocli.CommandLine.Command
 import picocli.CommandLine.Option
 import picocli.CommandLine.Parameters
 import tools.jackson.databind.JsonNode
 import java.io.File
+import java.io.PrintStream
+import java.time.Instant
 import java.util.concurrent.Callable
 
 /**
@@ -35,12 +39,14 @@ import java.util.concurrent.Callable
  *  - `create`        — POST /api/v1/applications  (secret emitted via SecretIo)
  *  - `update`        — PATCH /api/v1/applications/{clientId}
  *  - `rotate-secret` — POST /api/v1/applications/{clientId}/secret/rotate
+ *  - `secret-state`  — GET  /api/v1/applications/{clientId}/secrets/state (SSO-3957; the rotation
+ *    state in plain words — see [SecretStateSubcommand])
  *  - `delete`        — DELETE /api/v1/applications/{clientId}
  *  - `registration-token` — POST /api/v1/applications/registration-tokens (SSO-3683; the
  *    Initial Access Token emitted via SecretIo — see [RegistrationTokenSubcommand])
  *
- * Scopes: GET → `tenant:applications.read`; create/update/rotate/delete/registration-token →
- * `tenant:applications.write`.
+ * Scopes: GET (incl. `secret-state`) → `tenant:applications.read`; create/update/rotate/delete/
+ * registration-token → `tenant:applications.write`.
  */
 @Command(
     name = "clients",
@@ -52,6 +58,7 @@ import java.util.concurrent.Callable
         ClientsCommand.CreateSubcommand::class,
         ClientsCommand.UpdateSubcommand::class,
         ClientsCommand.RotateSecretSubcommand::class,
+        ClientsCommand.SecretStateSubcommand::class,
         ClientsCommand.DeleteSubcommand::class,
         ClientsCommand.RegistrationTokenSubcommand::class,
     ],
@@ -60,7 +67,7 @@ class ClientsCommand : Callable<Int> {
 
     override fun call(): Int {
         System.err.println("Usage: thoryn clients <subcommand>")
-        System.err.println("Subcommands: list | get | create | update | rotate-secret | delete | registration-token")
+        System.err.println("Subcommands: list | get | create | update | rotate-secret | secret-state | delete | registration-token")
         return CommandSupport.EXIT_USAGE
     }
 
@@ -362,8 +369,24 @@ class ClientsCommand : Callable<Int> {
      * The new secret is returned once and emitted via [SecretIo]. The previous
      * secret keeps validating for a 24h overlap (the response carries
      * `oldSecretExpiresAt`).
+     *
+     * **A rotation already in flight (SSO-3957).** The server refuses a second rotation while the
+     * previous secret is still in its overlap window (`409 rotation_in_flight`). That is a state, not
+     * a fault, so instead of the generic error line the command says when the next rotation is
+     * allowed — from the server's hint when the 409 carries one, otherwise by reading
+     * `secret-state` — that the previous secret keeps working until then, and where the incident
+     * path is. Exit code stays [CommandSupport.EXIT_HTTP_ERROR]: the server refused the call, which
+     * is what that code has always meant to scripts.
      */
-    @Command(name = "rotate-secret", description = ["Rotate a client's secret. The new secret is shown once; the old one stays valid for 24h."], mixinStandardHelpOptions = true)
+    @Command(
+        name = "rotate-secret",
+        description = [
+            "Rotate a client's secret. The new secret is shown once; the old one stays valid for 24h. " +
+                "While that window is open a second rotation is refused (409) and the command says from when " +
+                "it is allowed again — see `thoryn clients secret-state`.",
+        ],
+        mixinStandardHelpOptions = true,
+    )
     class RotateSecretSubcommand : Callable<Int> {
 
         @Parameters(index = "0", description = ["Client ID."])
@@ -405,7 +428,66 @@ class ClientsCommand : Callable<Int> {
                 }
                 CommandSupport.EXIT_OK
             } catch (ex: ProductApiException) {
+                if (ex.errorCode == ERROR_CODE_ROTATION_IN_FLIGHT) {
+                    // SSO-3957 — the hint rides the 409 when product-api could read the hub's state; when
+                    // it could not, ask for the state ourselves. Either failing leaves the time unknown
+                    // and the message still names the command that shows it.
+                    val availableAt = rotationAvailableAtFrom(ex)
+                        ?: runCatching { Timestamps.instantOf(client.getApplicationSecretState(clientId)["rotationAvailableAt"]) }
+                            .getOrNull()
+                    return renderRotationInFlight(format, ex, clientId, availableAt)
+                }
                 CommandSupport.renderError(format, ex, requiredScope = "tenant:applications.write")
+            } catch (ex: Exception) {
+                CommandSupport.renderRequestFailure(ex, gateway)
+            }
+        }
+    }
+
+    /**
+     * `thoryn clients secret-state <clientId>`
+     *
+     * SSO-3957 — the live rotation state of a client's secret, read from
+     * `GET /api/v1/applications/{clientId}/secrets/state` (SSO-1028). `rotate-secret` prints the
+     * overlap window once, at rotation time; this shows it again, from the server, whenever you ask:
+     * whether a previous secret is still working and until when, whether a new rotation is allowed
+     * right now, and if not, from when. `--output json|yaml` prints the server's body as it arrived
+     * (`previousSecretId`, `previousExpiresAt`, `rotationAvailable`, `rotationAvailableAt`); the table
+     * adds the age of each time and a one-line reading of the state.
+     *
+     * A read: `tenant:applications.read`.
+     */
+    @Command(
+        name = "secret-state",
+        description = [
+            "Show a client's secret rotation state: whether the previous secret still works and until when, " +
+                "and whether (or from when) a new rotation is allowed.",
+        ],
+        mixinStandardHelpOptions = true,
+    )
+    class SecretStateSubcommand : Callable<Int> {
+
+        @Parameters(index = "0", description = ["Client ID."])
+        lateinit var clientId: String
+
+        @Option(names = ["--gateway"], defaultValue = ThorynConfig.DEFAULT_GATEWAY)
+        var gateway: String = ThorynConfig.DEFAULT_GATEWAY
+
+        @Option(names = ["--output"], description = ["Output format: json|yaml|table (default: table)."])
+        var outputRaw: String? = null
+
+        override fun call(): Int {
+            val format = CommandSupport.parseFormat(outputRaw) ?: return CommandSupport.EXIT_USAGE
+            val tokens = CommandSupport.readTokens() ?: return CommandSupport.EXIT_NOT_SIGNED_IN
+            gateway = CommandSupport.resolveGateway(gateway, tokens) // SSO-2827 — default to the gateway you signed into
+            val client = CommandSupport.gatewayClient(gateway, tokens)
+            return try {
+                val body = client.getApplicationSecretState(clientId)
+                CommandSupport.emitRecord(format, body, ::secretStateRecordFields)
+                if (format == OutputFormat.TABLE) println(secretStateSummary(body))
+                CommandSupport.EXIT_OK
+            } catch (ex: ProductApiException) {
+                CommandSupport.renderError(format, ex, requiredScope = "tenant:applications.read")
             } catch (ex: Exception) {
                 CommandSupport.renderRequestFailure(ex, gateway)
             }
@@ -501,6 +583,116 @@ class ClientsCommand : Callable<Int> {
             "previousSecretId" to node["previousSecretId"]?.asString(),
             "oldSecretExpiresAt" to node["oldSecretExpiresAt"]?.asString(),
         )
+
+        // ── SSO-3957: secret rotation state ─────────────────────────────────────────────────────────
+
+        /** RFC 9457 `errorCode` product-api emits with 409 while a previous secret's overlap window is open. */
+        internal const val ERROR_CODE_ROTATION_IN_FLIGHT: String = "rotation_in_flight"
+
+        /**
+         * Where to read about ending the previous secret now or replacing a lost new secret. Those are
+         * incident paths SSO-3956 is building on the server; this CLI does not claim commands for them
+         * yet, so the pointer is to the README, which says what exists and what is planned.
+         */
+        internal const val ROTATION_INCIDENT_PATH_HINT: String =
+            "To end the previous secret now, or to replace a lost new secret, see \"Rotation state\" in the thoryn CLI " +
+                "README (incident paths, SSO-3956)."
+
+        /**
+         * The `secret-state` table: the four server fields, times rendered with their age
+         * (`2026-06-10T10:00:00Z (in 23h 59m)`), absent values as `-`.
+         */
+        internal fun secretStateRecordFields(node: JsonNode, now: Instant = Instant.now()): List<Pair<String, Any?>> = listOf(
+            "previousSecretId" to (node["previousSecretId"]?.takeIf { !it.isNull }?.asString() ?: "-"),
+            "previousExpiresAt" to (Timestamps.render(node["previousExpiresAt"], now) ?: "-"),
+            "rotationAvailable" to (node["rotationAvailable"]?.takeIf { !it.isNull }?.asBoolean() ?: "-"),
+            "rotationAvailableAt" to (Timestamps.render(node["rotationAvailableAt"], now) ?: "-"),
+        )
+
+        /**
+         * One line that reads the state out in plain words. `rotationAvailable` decides which: when it
+         * is false the previous secret is still working and the window end is the moment a rotation is
+         * allowed again (the hub sets both from the same overlap row).
+         */
+        internal fun secretStateSummary(node: JsonNode, now: Instant = Instant.now()): String {
+            val available = node["rotationAvailable"]?.takeIf { !it.isNull }?.asBoolean()
+            val until = Timestamps.render(node["previousExpiresAt"], now)
+                ?: Timestamps.render(node["rotationAvailableAt"], now)
+            return when {
+                available == true ->
+                    "No rotation is in flight: only the current secret works, and you can rotate now."
+                available == false && until != null ->
+                    "A rotation is in flight: the previous secret keeps working until $until. " +
+                        "The next rotation is allowed from then."
+                available == false ->
+                    "A rotation is in flight: the previous secret still works and a new rotation is not allowed yet."
+                else -> "The server did not say whether a rotation is allowed."
+            }
+        }
+
+        /**
+         * The moment the next rotation is allowed, as the 409 itself carries it: a structured
+         * `rotationAvailableAt` member of the problem body when product-api sends one (the SSO-3956
+         * schema), otherwise the ISO instant inside the `detail` sentence
+         * (`… The next rotation is available at 2026-06-10T10:00:00Z.`). Null when the 409 carries
+         * neither — the caller then asks `secret-state`.
+         */
+        internal fun rotationAvailableAtFrom(ex: ProductApiException): Instant? {
+            val structured = runCatching { PROBLEM_MAPPER.readTree(ex.rawBody)["rotationAvailableAt"] }.getOrNull()
+            Timestamps.instantOf(structured)?.let { return it }
+            val inDetail = ex.errorDescription?.let { ISO_INSTANT_IN_TEXT.find(it)?.value } ?: return null
+            return runCatching { Instant.parse(inDetail) }.getOrNull()
+                ?: runCatching { java.time.OffsetDateTime.parse(inDetail).toInstant() }.getOrNull()
+        }
+
+        /**
+         * Render `409 rotation_in_flight` as the state it is. TABLE prints, to stderr: the error line
+         * (so `rotation_in_flight` stays greppable), when the next rotation is allowed and that the
+         * previous secret keeps working until then (or, when the time is unknown, the command that
+         * shows it), and the incident-path pointer. JSON/YAML carry the same as `rotationAvailableAt`
+         * + `hint` next to the stable `error`, so a script can wait for the time rather than parse
+         * prose. Returns [CommandSupport.EXIT_HTTP_ERROR] — the server refused the call.
+         */
+        internal fun renderRotationInFlight(
+            format: OutputFormat,
+            ex: ProductApiException,
+            clientId: String,
+            availableAt: Instant?,
+            now: Instant = Instant.now(),
+            out: PrintStream = System.out,
+            err: PrintStream = System.err,
+        ): Int {
+            val whenLine = if (availableAt != null) {
+                val at = "${availableAt.truncatedTo(java.time.temporal.ChronoUnit.SECONDS)} (${Timestamps.age(availableAt, now)})"
+                "The previous secret keeps working until $at. The next rotation is allowed from then."
+            } else {
+                "The previous secret keeps working until its overlap window ends; `thoryn clients secret-state $clientId` " +
+                    "shows when, and from when the next rotation is allowed."
+            }
+            val structured = linkedMapOf<String, Any?>(
+                "error" to ERROR_CODE_ROTATION_IN_FLIGHT,
+                "errorDescription" to ex.errorDescription,
+                "httpStatus" to ex.httpStatus,
+                "rotationAvailableAt" to availableAt?.truncatedTo(java.time.temporal.ChronoUnit.SECONDS)?.toString(),
+                "hint" to "$whenLine $ROTATION_INCIDENT_PATH_HINT",
+            )
+            when (format) {
+                OutputFormat.JSON -> Printers.json(structured, out)
+                OutputFormat.YAML -> Printers.yaml(structured, out)
+                OutputFormat.TABLE -> {
+                    val description = ex.errorDescription?.let { " — $it" } ?: ""
+                    err.println("Error: $ERROR_CODE_ROTATION_IN_FLIGHT$description")
+                    err.println(whenLine)
+                    err.println(ROTATION_INCIDENT_PATH_HINT)
+                }
+            }
+            return CommandSupport.EXIT_HTTP_ERROR
+        }
+
+        /** An ISO-8601 instant inside prose: `2026-06-10T10:00:00Z`, with an optional fraction or offset. */
+        private val ISO_INSTANT_IN_TEXT = Regex("""\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})""")
+
+        private val PROBLEM_MAPPER: tools.jackson.databind.ObjectMapper = tools.jackson.databind.json.JsonMapper.builder().build()
 
         private fun joinArray(node: JsonNode): String? =
             if (node.isArray) node.joinToString(",") { it.asString() } else node.asString()
