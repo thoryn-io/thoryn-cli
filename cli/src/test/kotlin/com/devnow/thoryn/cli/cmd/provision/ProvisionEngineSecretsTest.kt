@@ -75,44 +75,47 @@ class ProvisionEngineSecretsTest : CommandTestBase() {
     )
 
     @Test
-    fun `a minted client secret leaves ONLY through the sink — never the apply output, the plan, or the console`() {
+    fun `a minted client secret without a sink is the customer's — it reaches no channel, not the apply output, the plan or the console`() {
+        // SSO-3954 — no `secretSink:` ⇒ customerManaged: the generic channel is offered the value NEVER, even when it would accept it.
         val console = ByteArrayOutputStream()
         val captured = mutableListOf<Pair<String, String>>()
         val engine = engine(emptyMap(), PrintStream(console), ProvisionEngine.SecretSink { id, secret -> captured += id to secret; true })
         val plan = engine.plan(confidentialApp, false)
-        assertThat(plan.changes[0].reason).contains("(a client secret will be minted and shown once)")
+        assertThat(plan.changes[0].reason).contains("(a client secret will be minted and discarded — managed by the customer: a person mints it with `thoryn clients rotate-secret <clientId> --secret-file <path>`")
         assertThat(plan.changes[1].reason).doesNotContain("minted") // public: no secret
         val receipt = engine.apply(confidentialApp, plan, "acme", null)
 
         val clientId = receipt.resources[0].id
         val secret = api.mintedSecrets.getValue(clientId)
-        assertThat(captured).containsExactly(clientId to secret) // exactly once, the confidential client only
+        assertThat(captured).isEmpty()
         assertThat(engine.undeliveredSecrets).isEmpty()
         val mapper = jacksonObjectMapper()
         assertThat(mapper.writeValueAsString(receipt.toStructured())).doesNotContain(secret)
         assertThat(mapper.writeValueAsString(plan.toStructured())).doesNotContain(secret)
-        assertThat(console.toString()).doesNotContain(secret).contains("client secret minted — shown once")
+        assertThat(console.toString()).doesNotContain(secret).doesNotContain("shown once")
+            .contains("application ci-worker: client secret discarded (never shown or stored) — managed by the customer: mint it with `thoryn clients rotate-secret $clientId --secret-file <path>` and store it in your secret manager")
         assertThat(receipt.resources.map { it.key }).containsExactly("application/ci-worker", "application/spa")
     }
 
     @Test
-    fun `an undeliverable secret still leaves the resource in place and names the client for rotate-secret`() {
+    fun `without any channel the resource is created, nothing is undelivered, and a later apply mints nothing`() {
         val console = ByteArrayOutputStream()
-        val engine = engine(emptyMap(), PrintStream(console)) // default sink: delivers nothing
+        val engine = engine(emptyMap(), PrintStream(console)) // default sink: delivers nothing — and is not asked to
         val receipt = engine.apply(confidentialApp, engine.plan(confidentialApp, false), "acme", null)
 
         val clientId = receipt.resources[0].id
-        assertThat(engine.undeliveredSecrets).containsExactly(clientId)
+        assertThat(engine.undeliveredSecrets).isEmpty()
         assertThat(receipt.resources[0].id).isEqualTo(api.applications[0]["clientId"]) // exists
         assertThat(console.toString())
-            .contains("could NOT be delivered")
+            .doesNotContain("could NOT be delivered")
             .contains("thoryn clients rotate-secret $clientId")
             .doesNotContain(api.mintedSecrets.getValue(clientId))
-        // A later apply that creates nothing reports nothing undelivered.
+        // A later apply creates nothing, so it mints nothing and discards nothing.
         api.reset()
         engine.apply(confidentialApp, engine.plan(confidentialApp, false), "acme", null)
         assertThat(engine.undeliveredSecrets).isEmpty()
         assertThat(api.writes).isEmpty()
+        assertThat(api.mintedSecrets).hasSize(1)
     }
 
     @Test

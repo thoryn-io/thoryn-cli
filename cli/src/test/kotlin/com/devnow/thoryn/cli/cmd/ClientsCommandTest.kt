@@ -202,6 +202,15 @@ class ClientsCommandTest : CommandTestBase() {
                 """{"errorCode":"rotation_in_flight","detail":"A rotation is already in flight for this client."}""",
             ),
         )
+        // SSO-3957 — a 409 without a time hint makes the CLI read `secrets/state` for it; give that read an
+        // answer so the test exercises the fallback instead of waiting out the HTTP timeout on an empty queue.
+        // The legible rendering itself is covered by `ClientsSecretStateCommandTest`.
+        server.enqueue(
+            jsonResponse(
+                200,
+                """{"previousSecretId":"sid-1","previousExpiresAt":"2026-06-10T10:00:00Z","rotationAvailable":false,"rotationAvailableAt":"2026-06-10T10:00:00Z"}""",
+            ),
+        )
 
         val (exit, _, err) = runCli("clients", "rotate-secret", "app-1", "--gateway", baseUrl())
 

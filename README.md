@@ -86,11 +86,15 @@ uid/gid `65532`, `ENTRYPOINT ["/usr/local/bin/thoryn"]` — so a manifest passes
 `image` job builds, smoke-runs, pushes, signs, and then **fails unless an anonymous client can pull
 what it pushed** (`scripts/release/check-anonymous-pull.sh`).
 
-**The Thoryn init container** — an application in Kubernetes fetches its own client secret with its
-projected ServiceAccount token (oauthy ADR `2026-10-14-kubernetes-workload-identity-and-runtime-credential-pull`;
-the trust is `thoryn workload-identity trusts create --provider kubernetes`). The image has no shell to
-chain `login && rotate-secret`, so it is **two init containers** that share the CLI's session on a RAM
-volume only they mount:
+**The Thoryn init container — DEPRECATED (SSO-3951, 2026-10-25; removed by SSO-3953).** An application in
+Kubernetes used to fetch its own client secret with its projected ServiceAccount token (oauthy ADR
+`2026-10-14-kubernetes-workload-identity-and-runtime-credential-pull`, rung 3; the trust is `thoryn workload-identity
+trusts create --provider kubernetes`). The product owner withdrew that path: Thoryn owns the secret's lifecycle
+(mint, show once, rotate with the 24 h overlap, revoke, audit), **the customer owns delivery** — a person mints the
+secret (`thoryn clients rotate-secret <clientId> --secret-file <path>`) and stores it in the customer's secret manager
+or an operator-created Kubernetes Secret the pod mounts (see "Where a minted secret goes" below). The shape below
+still works and is kept for the record only; the image has no shell to chain `login && rotate-secret`, so it is **two
+init containers** that share the CLI's session on a RAM volume only they mount:
 
 ```yaml
 spec:
@@ -168,6 +172,7 @@ thoryn clients create --display-name <n> --redirect-uri <uri> [--scope <s>]... \
                       [--client-type confidential|public] [--secret-file <path>]
 thoryn clients update <clientId> [--display-name <n>] [--redirect-uri <uri>]... [--scope <s>]...
 thoryn clients rotate-secret <clientId> [--secret-file <path>] [--confirm <workspace-slug>]
+thoryn clients secret-state <clientId>       # SSO-3957 — is a previous secret still working, until when, and can you rotate now (from when)
 thoryn clients delete <clientId> [--confirm <workspace-slug>]
 thoryn clients registration-token [--software-id <id>] [--ttl <seconds>] [--out-file <path>]
                                              # SSO-3683 — a single-use RFC 7591 token a THIRD PARTY redeems at your
@@ -296,15 +301,18 @@ thoryn examples share    <name> [--output <file>]   # SSO-2876 — export the se
 # plan prints the pending publish as a line; an unreachable target is `publish_target_unreachable` AFTER the client
 # exists, naming the one `gh variable set` to run by hand. See "Publishing an application's
 # client id to the repository that deploys it" below.
-# SSO-3659 (ADR 2026-10-13 converge §5): a confidential application's `secretSink:` says WHERE its minted client
-# secret is delivered — `kind: kubernetesSecret` (your own `kubectl`, value on stdin, namespace never created) or
-# `kind: file` (owner-only, no overwrite without --force) — right after apply recorded the client. Nothing reaches
-# ⇒ exit 65 `undelivered_secrets` naming `thoryn clients rotate-secret <id> --secret-file <path>`. See "Where a
-# minted secret goes" below.
-# SSO-3921 (oauthy ADR 2026-10-14 credential ladder, rung 3): `secretSink: { kind: workloadPull, trust: <name> }` delivers
-# NOTHING — apply discards the minted value and converges `manager` on the application for the named kubernetes trust's
-# wi_ client, whose pod mints its own secret at start. The way a CI apply (no kubeconfig, no TTY) creates a confidential
-# application and stays green. plan prints `secret: pulled at runtime by trust <name>`.
+# SSO-3954 (oauthy ADR 2026-10-14 amended 2026-10-25, SSO-3951 — Thoryn owns the secret lifecycle, the customer owns
+# delivery): a confidential application WITHOUT a `secretSink:` — or with `secretSink: { kind: customerManaged }` — is
+# created and its one-time secret DISCARDED (never shown, written or granted to anyone); a person mints the real one with
+# `thoryn clients rotate-secret <id> --secret-file <path>` and stores it in the customer's secret manager. plan prints
+# `secret: managed by the customer (…)`. The way a CI apply (no kubeconfig, no TTY) creates a confidential application.
+# SSO-3659 (ADR 2026-10-13 converge §5): an OPERATOR's apply can instead deliver — `kind: kubernetesSecret` (your own
+# `kubectl`, value on stdin, namespace never created) or `kind: file` (owner-only, no overwrite without --force) — right
+# after apply recorded the client. Nothing reaches ⇒ exit 65 `undelivered_secrets` naming the rotate-secret recovery.
+# See "Where a minted secret goes" below.
+# SSO-3921 (rung 3) — DEPRECATED since SSO-3951, removed by SSO-3953: `secretSink: { kind: workloadPull, trust: <name> }`
+# discards the minted value and converges `manager` on the application for the named kubernetes trust's wi_ client, whose
+# pod mints its own secret at start. Still converged; every plan and apply prints the deprecation.
 # SSO-3689 (ADR 2026-10-14 credential ladder; ADR 2026-10-14 federated client authentication): an application declares HOW it
 # authenticates — `clientAuthenticationMethods: [private_key_jwt]` with `jwksUri` or an inline public `jwks` (rung 1), or
 # `[federated_assertion]` with `federatedTrust: <trust name>` (rung 2: the pod's / job's platform token IS the client
@@ -341,10 +349,12 @@ thoryn provision import  [--file <path>] [--write]                       # SSO-3
                                              # provision.yaml entries (manager ⇒ an entry the file converges; viewer or owned by another repository ⇒ `readOnly: true`); --write appends them (the file only)
                                              # converge; environments first, dependants into them.
                                              # SSO-3414 — --wait blocks until the file's customDomain is ACTIVE (or VERIFIED), verifying each round.
-                                             # SSO-3113 — a confidential application it CREATES gets a one-time client secret, delivered via
-                                             # SecretIo (--secret-file, or an interactive TTY; a pipe is refused unless --force-stdout); undeliverable
-                                             # ⇒ the client is still recorded, exit 65, `thoryn clients rotate-secret <id>` named. A resource's
-                                             # `grants:` block is converged with it (see "Least-privilege access grants").
+                                             # SSO-3113 / SSO-3954 — a confidential application it CREATES gets a one-time client secret: DISCARDED by
+                                             # default (the customer manages it — `thoryn clients rotate-secret <id> --secret-file <path>` by a person,
+                                             # stored in your secret manager), or delivered to a declared kubernetesSecret / file sink, with
+                                             # SecretIo (--secret-file, or an interactive TTY; a pipe is refused unless --force-stdout) as that sink's
+                                             # fallback; undeliverable ⇒ the client is still recorded, exit 65, the rotate-secret recovery named.
+                                             # A resource's `grants:` block is converged with it (see "Least-privilege access grants").
 thoryn provision destroy [--file <path>] [--confirm <ws>] [--yes] # remove what the file declares AND this identity may remove (owner-gated), child-first; prints the destroy plan first
 # SSO-3962 (oauthy ADR 2026-10-25): provisioning is TWO PARTS, declared by `apiVersion` — `thoryn.io/tenant/v1` (what the
 # tenant IS; the workspace's ONE config project) and `thoryn.io/application/v1` (how ONE client uses it; an app project).
@@ -489,6 +499,65 @@ ungated** — no `--confirm` needed there.
    the gateway); `create` also registers the new tenant in product-api.
  - `audit query` targets product-api's `/audit/events` surface
    (`tenant:audit.read`).
+
+### Rotation state (SSO-3957)
+
+`thoryn clients rotate-secret` mints a new secret and keeps the previous one working for a
+**24 h overlap** so a deployment can switch over without a gap. The response says so once, at
+rotation time; the overlap is a *state* you may need to look at later — from another machine,
+after the terminal is gone, or when a rotation is refused. `thoryn clients secret-state` reads it
+from the server (`GET /api/v1/applications/{clientId}/secrets/state`, `tenant:applications.read`):
+
+```bash
+thoryn clients secret-state 7f1c…
+#   previousSecretId    = 9b2e…
+#   previousExpiresAt   = 2026-06-10T10:00:00Z (in 23h 41m)
+#   rotationAvailable   = false
+#   rotationAvailableAt = 2026-06-10T10:00:00Z (in 23h 41m)
+# A rotation is in flight: the previous secret keeps working until 2026-06-10T10:00:00Z (in 23h 41m). The next rotation is allowed from then.
+
+thoryn clients secret-state 7f1c…            # once the window has closed
+#   previousSecretId    = -
+#   previousExpiresAt   = -
+#   rotationAvailable   = true
+#   rotationAvailableAt = -
+# No rotation is in flight: only the current secret works, and you can rotate now.
+```
+
+Four fields, straight from the server: `previousSecretId` / `previousExpiresAt` (the secret still
+validating after the last rotation and when it stops; both `null` when none is), `rotationAvailable`
+(whether a new rotation may start right now) and `rotationAvailableAt` (the earliest moment it may;
+`null` when it may now). `--output json|yaml` prints exactly that body; the table adds each time's
+age and the one-line reading.
+
+**One rotation at a time.** While the window is open the server refuses a second rotation with
+`409 rotation_in_flight`. The CLI renders that as the state it is rather than a bare error — the
+time the next rotation is allowed (from the 409's own hint when product-api could read it from the
+hub, otherwise by reading `secret-state` for you), the fact that the previous secret keeps working
+until then, and where the incident path is:
+
+```bash
+thoryn clients rotate-secret 7f1c…
+# Error: rotation_in_flight — A rotation is already in flight for this client. The next rotation is available at 2026-06-10T10:00:00Z.
+# The previous secret keeps working until 2026-06-10T10:00:00Z (in 23h 41m). The next rotation is allowed from then.
+# To end the previous secret now, or to replace a lost new secret, see "Rotation state" in the thoryn CLI README (incident paths, SSO-3956).
+# ⇒ exit 2 (the server refused the call — the same code every non-2xx answer has always had)
+```
+
+With `--output json` the same arrives as `{"error":"rotation_in_flight","httpStatus":409,
+"rotationAvailableAt":"2026-06-10T10:00:00Z","hint":"…"}`, so a script can wait for the time
+instead of parsing prose.
+
+**Incident paths — ending the previous secret early, replacing a lost new secret.** A 409 is the
+normal case: wait for the window, or read `secret-state` to see how long. Two situations cannot
+wait: the previous secret is known to have leaked and must stop working *now*, or the new secret
+was lost before it reached the deployment and a replacement is needed inside the window. Those are
+server-side capabilities **being built under SSO-3956** (oauthy); this CLI will grow commands for
+them once that API exists and does not claim them yet. Until then the CLI has no command that ends
+the previous secret early or re-mints inside the window: a lost new secret means waiting for the
+window and rotating again, and a leaked previous secret is an incident for as long as the window
+says it still works. `rotate-secret` on a production workspace still needs `--confirm` (see above);
+`secret-state` is a read and needs nothing beyond `tenant:applications.read`.
 
 ### Register a third-party client (Dynamic Client Registration, SSO-3683)
 
@@ -901,8 +970,8 @@ The connection contract gains a **token source**: the identity token is read fro
   workspace audit log.
 - The trust's client needs `manager` on the application whose secret it rotates (`thoryn access grant`) — or,
   with provisioning-as-code, declare `secretSink: { kind: workloadPull, trust: <trust name> }` on the
-  application and `apply` converges that grant (and creates the application from CI without delivering its
-  secret anywhere; SSO-3921, "Where a minted secret goes" below).
+  application and `apply` converges that grant (SSO-3921; **deprecated** with the whole pod-pull path since
+  SSO-3951 — see "Where a minted secret goes" below for the customer-managed default that replaces it).
   Rotation is a pod restart: the previous secret stays valid for 24 hours.
 
 The complete, applyable manifest — ServiceAccount, the connection ConfigMap, the projected token volume
@@ -1412,30 +1481,34 @@ with `grants:` — no hand-typed `--scope` list.
 ### A provisioned confidential client's secret (SSO-3113)
 
 A confidential `application` (product-api's default `clientType`; a `client_credentials` machine
-identity) is minted a **one-time `client_secret`** on create. `provision apply` routes it through
-the same `SecretIo` channel as `thoryn clients create`: written to `--secret-file <path>`
-(owner-only `0600`; a second confidential client in the same apply lands at `<path>.<clientId>`),
-or printed to an interactive TTY with a `WARNING`; a non-interactive stdout is refused unless
-`--force-stdout`. The secret never enters the plan or a log. If it cannot be delivered the client
-is **still created** (it exists), and `apply` exits **65** naming
-`thoryn clients rotate-secret <clientId> --secret-file <path>` to mint a fresh one. `plan` marks
-such a create with `(a client secret will be minted and shown once)`.
+identity) is minted a **one-time `client_secret`** on create. Since SSO-3954 (oauthy ADR 2026-10-14 amended
+2026-10-25, SSO-3951 — Thoryn owns the secret lifecycle, **the customer owns delivery**) `provision apply`
+**discards** that value unless the resource declares a sink that delivers it (`kubernetesSecret` / `file`,
+next section): the client is created, nothing is shown, written or granted, nothing is undelivered, and the apply
+prints the person's step with the real id — `thoryn clients rotate-secret <clientId> --secret-file <path>`, then
+store it in your secret manager or an operator-created Kubernetes Secret. `plan` marks such a create with
+`(a client secret will be minted and discarded — managed by the customer: …)` and prints
+`application <name>: secret: managed by the customer (…)`. The value never enters the plan, a log, or any channel.
+
+`--secret-file <path>` / `--force-stdout` are the **fallback** of a declared `kubernetesSecret` / `file` sink that
+cannot be reached (the same `SecretIo` channel as `thoryn clients create`: owner-only `0600`, a second one at
+`<path>.<clientId>`, an interactive TTY with a `WARNING`, a non-interactive stdout refused without `--force-stdout`).
+When a declared sink reaches neither, the client is **still created** and `apply` exits **65** naming
+`thoryn clients rotate-secret <clientId> --secret-file <path>`.
 
 ### Where a minted secret goes — `secretSink:` (SSO-3659)
 
 Per oauthy ADR `2026-10-13-provisioning-as-code-converge-github-app-and-fga-ownership.md` §5, **a secret is
-delivered where it is consumed, never into a CI secret store**: a confidential application declares a
-`secretSink:`, and `apply` hands the one-time client secret to that place the moment the client is
-converged. The `--secret-file` / TTY channel above stays the default when no sink is declared, and the
-fallback when the declared one cannot be reached. The value never enters the file, the plan, a log, or a
-`kubectl` argument.
+delivered where it is consumed, never into a CI secret store**, and per the 2026-10-25 amendment of oauthy ADR
+`2026-10-14-kubernetes-workload-identity-and-runtime-credential-pull` (product-owner decision SSO-3951) **Thoryn
+owns an application's client-secret lifecycle — mint, show once, rotate with the 24 h overlap, revoke, audit — and
+the customer owns delivery into its runtime** (Vault / OpenBao, a cloud secret manager, External Secrets, an
+operator-created Kubernetes Secret). A `secretSink:` says which of the four shapes a confidential application takes;
+the value never enters the file, the plan, a log, or a `kubectl` argument.
 
-**From CI, nothing delivers: the pod pulls (SSO-3921).** oauthy ADR
-`2026-10-14-kubernetes-workload-identity-and-runtime-credential-pull` rules out a CI job pushing a client secret
-into a cluster (rung 4, "courier: never"): the application's own pod mints its secret at start, signed in with
-its projected ServiceAccount token under a `kubernetes` workload-identity trust (see "Kubernetes — a pod pulls its
-own client secret" above). The forge's Forgejo login client (`thoryn-cicd/.thoryn/provision.yaml`, the ADR's
-first consumer), created by the repository's CI apply on a runner with no kubeconfig:
+**The default — the customer manages the secret (`customerManaged`, SSO-3954).** The forge's two login clients
+(`thoryn-cicd/.thoryn/provision.yaml`), created by the repository's CI apply on a runner with no kubeconfig, no
+`--secret-file` and no TTY:
 
 ```yaml
 apiVersion: thoryn.io/provision/v1
@@ -1446,6 +1519,38 @@ resources:
       displayName: "Forgejo login"
       grantTypes: ["authorization_code"]           # no clientType ⇒ confidential ⇒ a secret is minted on create
       redirectUris: ["https://forge.thoryn.org/user/oauth2/thoryn/callback"]
+    # no secretSink ⇒ { kind: customerManaged } — the same, written out:
+    # secretSink: { kind: customerManaged }
+```
+
+- **`plan`** marks the create `(a client secret will be minted and discarded — managed by the customer: a person mints
+  it with `thoryn clients rotate-secret <clientId> --secret-file <path>` and stores it in your secret manager …)` and
+  prints `application forge-forgejo-login: secret: managed by the customer (…)`; the summary counts
+  `N client secret(s) managed by the customer`. In `--output json`: `changes[].secretSink = { kind: customerManaged }`
+  and `summary.customerManaged`.
+- **`apply`** creates the client and **discards** the one-time value — never shown, written, logged or handed to a sink
+  or channel (not even a `--secret-file` that is given) — grants nothing to anyone, reports nothing undelivered, and
+  prints `application forge-forgejo-login: client secret discarded (never shown or stored) — managed by the customer:
+  mint it with `thoryn clients rotate-secret <clientId> --secret-file <path>` and store it in your secret manager`.
+  Exit 0 with no secret channel at all. A re-apply mints nothing. The unseen create-time secret is replaced by the
+  person's rotation and expires with its 24 h overlap; nobody holds it.
+- **The person's step (the runbook):** on a machine that reaches Thoryn and your secret store,
+  `thoryn clients rotate-secret <clientId> --secret-file ./s --confirm <workspace-slug>`, store the file's value where
+  the runtime reads it — e.g. `kubectl -n <ns> create secret generic <name> --from-file=client-secret=./s` — then delete
+  the local file. Rotation: the same, then a rollout, inside the 24 h overlap.
+- `thoryn provision workflow check` **passes** such a file on `config.secret-delivery`, with a notice per application
+  that says exactly the above; a `kubernetesSecret` or `file` sink still fails that rule (nothing on a hosted runner
+  can reach them). `config.trust-scopes`: a file of such applications needs `tenant:applications.read` /
+  `tenant:applications.write` and `tenant:access.read` only.
+
+**`workloadPull` — DEPRECATED (SSO-3921 → SSO-3951; removed by SSO-3953).** Rung 3 of the credential ladder — the
+application's own pod minting its secret at start under a `kubernetes` workload-identity trust (see "The Thoryn init
+container" above) — is no longer the customer story: it couples Thoryn to the customer's deployment platform (cluster
+issuers, keys, namespaces, service accounts, manifests). The engine **still converges it** unchanged, and every `plan`
+and `apply` prints `! application <name>: secretSink workloadPull is DEPRECATED (product-owner decision SSO-3951 …)`
+on stderr (`--output json`: `warnings[]`; the workflow check: the rule's detail). What it did, for the record:
+
+```yaml
     secretSink:
       kind: workloadPull
       trust: forge-forgejo                         # a kubernetes trust on the same plane, pinning the Forgejo pod's
@@ -1469,16 +1574,37 @@ already live — a **production** trust is created once by a person (`thoryn wor
   block, so `--prune` never revokes it; without one it is the only grant touched). A re-apply mints nothing and,
   with the grant in place, writes nothing.
 - **The pod** signs in and runs `thoryn clients rotate-secret <clientId> --secret-file /shared/client-secret`
-  (the init containers of [`examples/kubernetes/`](examples/kubernetes/README.md)); its rotation replaces the
-  unseen secret the create minted.
+  (the init containers of [`examples/kubernetes/`](examples/kubernetes/README.md), deprecated with it); its
+  rotation replaces the unseen secret the create minted.
 - **Refused** at plan time, before any write: a trust that is neither declared nor visible in the application's
   plane (`workload_pull_trust_not_found`; a declared one this identity cannot see is `access_not_reachable`,
   `viewer` on it by name); a trust declared for ANOTHER plane (`workload_pull_trust_other_plane`); a trust that
   is not `provider: kubernetes` (`workload_pull_trust_not_kubernetes` — a CI job that fetches a secret to hand
   on is the courier again); a trust without `tenant:applications.write` (`workload_pull_scope_missing` — its
   pod's rotation would be a `403`). A `workloadPull` sink on a public or secret-less client is refused like any
-  `secretSink:`. `thoryn provision workflow check` fails (`config.secret-delivery`) a CI-applied file whose
-  secret-minting application declares no sink, a `kubernetesSecret` sink or a `file` sink.
+  `secretSink:`.
+
+**Leaving `workloadPull` — what the file does and what a person does (SSO-3954).** Dropping the sink from an
+application, and the `workloadIdentityTrust` it named from the file, changes **nothing live by itself** when `prune`
+and `destroy` are off (the reusable workflow's defaults): the application plans `noop` with no sink line (nothing is
+minted for an existing client), the `manager` grant the sink converged is **not revoked** (the file declares no
+`grants:`, so it manages none — not even `--prune` touches them), and the live trust is left alone. The grant and the
+trust are a person's to remove, after the pull request that dropped them has merged and applied — the forge's own
+sequence (`thoryn-cicd/.thoryn/README.md`, "Retiring the pod trusts"):
+
+```bash
+thoryn login --workspace <slug> --issuer <issuer>            # a workspace admin
+thoryn workload-identity trusts list                         # the ids and wi_ clients of the pod trusts
+thoryn access list --object application:<clientId>           # the manager relation the sink converged
+thoryn access revoke client:<wi_ of the pod trust> manager application:<clientId>
+thoryn workload-identity trusts delete <trust id> --yes --confirm <slug>
+```
+
+Do it in that order: a trust is deleted only once nothing in the file names it, and a production trust cannot be
+re-created by the repository's identity. Then narrow the repository trust: with no trust declared and no sink, the
+file no longer needs `tenant:workload-identity.read` / `.write` or `tenant:access.write`
+(`thoryn workload-identity trusts set-scopes <trust> --scope …`, and `auth.scopes` of `connection.json` to match —
+`config.trust-scopes` says which). The lint and the engine never make a person's deletion for them.
 
 **From your own workstation, a sink can deliver.** A `kubernetesSecret` sink is for an apply an OPERATOR runs
 with a `kubectl` context for the cluster (the reusable provisioning workflow has none):
@@ -1530,11 +1656,11 @@ What `thoryn provision` does with it:
 
 Rules the schema and the loader both enforce: `secretSink` sits on `kind: application` only and only on a
 confidential one (`clientType: public` is minted nothing and is refused); it is refused on a `readOnly: true`
-reference (nothing is minted for a dependency — the owning repository delivers); a `kubernetesSecret` is
-exactly `{ kind, namespace, name, key }` with Kubernetes grammars (namespace: RFC 1123 label; name: RFC 1123
-subdomain; key: `[-._a-zA-Z0-9]+`); a `file` is exactly `{ kind, path }`; a `workloadPull` is exactly
-`{ kind, trust }` with `trust` a resource name, and a trust declared in the same file must sit on the
-application's plane, be `provider: kubernetes` and carry `tenant:applications.write`.
+reference (nothing is minted for a dependency — the owning repository delivers); a `customerManaged` is exactly
+`{ kind }`; a `kubernetesSecret` is exactly `{ kind, namespace, name, key }` with Kubernetes grammars (namespace:
+RFC 1123 label; name: RFC 1123 subdomain; key: `[-._a-zA-Z0-9]+`); a `file` is exactly `{ kind, path }`; a
+`workloadPull` is exactly `{ kind, trust }` with `trust` a resource name, and a trust declared in the same file must
+sit on the application's plane, be `provider: kubernetes` and carry `tenant:applications.write`.
 
 ### Publishing an application's client id to the repository that deploys it (SSO-3668) — DEPRECATED
 
@@ -2525,7 +2651,8 @@ CLI derives it — every scope is the gate product-api puts on the endpoint the 
 | `role` (SSO-3941) | `tenant:roles.read` — and NOT `tenant:access.read`: a role is not a platform access object, so no ownership check is asked | `tenant:roles.write` |
 | an application's `tokenClaims` | `tenant:applications.read` (already needed by the application) | `tenant:applications.write` |
 | a `grants:` block | `tenant:access.read` | `tenant:access.write` |
-| `secretSink: { kind: workloadPull }` | `tenant:workload-identity.read` (the trust, by name) | `tenant:access.write` (the workload client's `manager` grant) |
+| no `secretSink`, or `secretSink: { kind: customerManaged }` (SSO-3954, the default) | — (nothing beyond the application's own) | — (nothing is granted) |
+| `secretSink: { kind: workloadPull }` (deprecated, SSO-3951) | `tenant:workload-identity.read` (the trust, by name) | `tenant:access.write` (the workload client's `manager` grant) |
 | `spec.federatedTrust` | `tenant:workload-identity.read` (the trust, by name) | — |
 | a resource in a sandbox | `tenant:environments.read` (to resolve the sandbox, for a create) | — |
 
@@ -3583,7 +3710,7 @@ thoryn-cli/
     │   │   ├── CommandSupport.kt                            # SSO-1552 shared token/output/error helpers
     │   │   ├── SecretIo.kt + FileSecrets.kt                 # SSO-1552 secret-safety (no-echo / --secret-file)
     │   │   ├── AccessCommand.kt                             # SSO-3113 `access grant|revoke|list|mine` (least-privilege grants)
-    │   │   ├── ClientsCommand.kt                            # SSO-1552 clients CRUD + rotate-secret
+    │   │   ├── ClientsCommand.kt                            # SSO-1552 clients CRUD + rotate-secret; SSO-3957 secret-state + a legible 409
     │   │   ├── FederationCommand.kt                         # SSO-1552 federation list/create/delete
     │   │   ├── WorkspaceCommand.kt                          # SSO-1552 workspace create/list/switch
     │   │   ├── TenantCommand.kt                             # SSO-1553 tenant seed (non-interactive provisioner)

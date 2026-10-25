@@ -1,0 +1,26 @@
+{
+  "apiVersion": "thoryn.io/connection/v1",
+  "workspace": { "slug": "thoryn" },
+  "auth": {
+    "method": "workload_identity",
+    "provider": "github_actions",
+    "clientId": "wi_5f403f663c028b9cb6c9e86f",
+    "audience": "https://thoryn.auth.stg.thoryn.org",
+    "scopes": [
+      "tenant:applications.read",
+      "tenant:applications.write",
+      "tenant:access.read",
+      "tenant:roles.read",
+      "tenant:roles.write"
+    ],
+    "github": {
+      "owner": "thoryn-io",
+      "repository": "thoryn-cicd",
+      "ownerId": 229451779,
+      "repositoryId": 1410142539,
+      "environment": "forge",
+      "ref": "refs/heads/main",
+      "githubHostedRunnersOnly": true
+    }
+  }
+}

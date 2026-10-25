@@ -1,5 +1,18 @@
 # An application in Kubernetes fetches its own Thoryn client secret
 
+> **DEPRECATED — product-owner decision 2026-10-25 (oauthy SSO-3951; this path is removed by SSO-3953).** Thoryn owns an
+> application's client-secret lifecycle (mint, show once, rotate with the 24 h overlap, revoke, audit); **the customer
+> owns delivery** into its runtime. Trusting individual pods to pull their sign-in secret (the `kubernetes` trust and
+> these init containers) couples Thoryn to the customer's deployment platform and is no longer the customer story. New
+> deployments: a person mints the secret — `thoryn clients rotate-secret <clientId> --secret-file ./s --confirm
+> <workspace-slug>` — and stores it in the secret manager or an **operator-created Kubernetes Secret** the pod mounts
+> (`kubectl -n <ns> create secret generic <name> --from-file=client-secret=./s`, then delete the local file; rotate the
+> same way, then roll the deployment inside the 24 h overlap). The runbook is oauthy
+> `docs/content/guides/application-credentials-ladder.mdx`, "A client secret in your secret store"; the forge's own
+> migration off this manifest is thoryn-cicd SSO-3952. With provisioning-as-code, declare the application with **no
+> `secretSink`** (the default, `customerManaged`, SSO-3954) instead of `workloadPull`; `thoryn provision` still converges a
+> `workloadPull` sink, with a deprecation warning, until SSO-3953. What follows is kept for the record.
+
 SSO-3684 (parent [SSO-3678](https://thoryn.atlassian.net/browse/SSO-3678), epic SSO-3304). The hub and
 product-api half is oauthy #4095; the design is oauthy ADR
 `adrs/2026-10-14-kubernetes-workload-identity-and-runtime-credential-pull.md`, the user guide the
