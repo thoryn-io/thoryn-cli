@@ -346,6 +346,11 @@ thoryn provision import  [--file <path>] [--write]                       # SSO-3
                                              # ⇒ the client is still recorded, exit 65, `thoryn clients rotate-secret <id>` named. A resource's
                                              # `grants:` block is converged with it (see "Least-privilege access grants").
 thoryn provision destroy [--file <path>] [--confirm <ws>] [--yes] # remove what the file declares AND this identity may remove (owner-gated), child-first; prints the destroy plan first
+# SSO-3962 (oauthy ADR 2026-10-25): provisioning is TWO PARTS, declared by `apiVersion` — `thoryn.io/tenant/v1` (what the
+# tenant IS; the workspace's ONE config project) and `thoryn.io/application/v1` (how ONE client uses it; an app project).
+# A kind from the other part is refused before any call; the mixed `thoryn.io/provision/v1` warns for one release.
+# See "Two file parts — tenant and application" below.
+thoryn provision split   [--file <path>] [--tenant-file <path>] [--application-file <path>] [--force]   # a mixed file → tenant.provision.yaml + application.provision.yaml beside it; the source is left alone
 thoryn provision workflow check [--file <stub>] [--config <.thoryn/workflow.yaml>] [--root <dir>] [--output json]
                                              # SSO-3719 — lint the App-dispatched STUB (.github/workflows/thoryn-provisioning.yml) and .thoryn/workflow.yaml
                                              # against the provisioning workflow contract: every rule PASS/FAIL with its fix + the EFFECTIVE configuration;
@@ -911,11 +916,14 @@ The complete, applyable manifest — ServiceAccount, the connection ConfigMap, t
 `thoryn project init` sets up a GitHub repository for Thoryn from the command line, with **your own
 GitHub CLI (`gh`) and no GitHub App**. There are two kinds:
 
-- **config** — the repository that manages your workspace's configuration. It gets two secret-less
+- **config** — the repository that manages your workspace's configuration: **tenant provisioning**
+  (`apiVersion: thoryn.io/tenant/v1`, SSO-3962 — see "Two file parts" below). It gets two secret-less
   workload identity connections: **production** (manager of the workspace; a change reaches it only
   through a pull request a reviewer approved) and one **sandbox** (manager of that sandbox).
-- **app** — a repository that connects one application to an existing **sandbox**. It gets one
-  connection to that sandbox. It never gets a production trust.
+- **app** — a repository that connects one application to an existing **sandbox**: **application
+  provisioning** (`apiVersion: thoryn.io/application/v1`). It gets one connection to that sandbox. It never
+  gets a production trust; its production client is created from its own file under a creation slot a
+  workspace admin approves.
 
 What each connection gets comes from the template's `.thoryn/template.json`
 (`thoryn.io/starter-template/v2`, published by thoryn-io/thoryn-starters): its exact scopes, its access
@@ -1018,7 +1026,15 @@ thoryn project init app --stack express --environment dev --repo acme/web \
   --config-repo acme/thoryn-config --production-url https://web.acme.example
 ```
 
-#### The app's production client — `--config-repo` + `--production-url` (SSO-3669)
+#### The app's production client — `--config-repo` + `--production-url` (SSO-3669) — DEPRECATED
+
+> **Superseded (SSO-3962, oauthy ADR 2026-10-25 decision 1).** The app project owns its production client in its own
+> `thoryn.io/application/v1` file — a second `kind: application` without `environment:` — created by its reviewed apply
+> once a workspace admin approves a **creation slot** for the repository's identity (`thoryn access reserve
+> client:<wi_…> application:<clientId>`, or the consent screen via `thoryn access approve`). The deploy reads the id
+> from `thoryn provision apply --output json` / `thoryn clients list`. The two flags below still work for one release,
+> against a config file still on `thoryn.io/provision/v1` (a `thoryn.io/tenant/v1` file refuses an `application`, exit 4
+> `config_provision_file_unusable`); `publishTo` prints a `Warning:`. See "Two file parts" below.
 
 An app repository is **sandbox-only**: it never gets a production trust, and its `.thoryn/provision.yaml` declares
 only its sandbox client. Its **production** OAuth client is declared in the workspace's **config repository**, in
@@ -1221,6 +1237,125 @@ step reads before it writes, and the report says `Checked the … project` inste
 | `Production client pending review: <url>` (app, success) | The entry went to the config repository as a pull request from `thoryn/app-<name>`. A reviewer of the config project merges it; the approved production run creates the client and publishes its id to this repository's `production` GitHub environment as `THORYN_PRODUCTION_CLIENT_ID`. If that publish cannot reach this repository, the output names the one `gh variable set` to run with the id from the production run's `apply --output json`. |
 | `… the file was re-rendered and its comments are not kept` (app, success) | The config repository already declared this client with other values (another `--production-url`, say). Replacing an entry re-renders the file from its parsed tree, so its comments are lost on the branch; review the diff in the pull request. Adding an entry keeps every existing line. |
 
+### Two file parts — tenant and application (SSO-3962, epic SSO-3960)
+
+Per oauthy ADR `2026-10-25-provisioning-is-tenant-and-applications.md`, Thoryn's scope is two halves that are not
+symmetric: a workspace **configures its tenant** (who can sign in, where users come from, how sign-in looks and
+behaves, which policies apply) and lets **applications use that tenant** through standard OAuth 2.0 / OIDC. **An
+application is a user of the tenant** — it references the tenant's roles and environments by name and defines nothing
+about them. Provisioning as code is therefore two parts, and a project belongs to exactly one:
+
+| | **Tenant provisioning** | **Application provisioning** |
+|---|---|---|
+| `apiVersion` | `thoryn.io/tenant/v1` | `thoryn.io/application/v1` |
+| Owner | ONE config project per workspace | MANY app projects per workspace |
+| Kinds | `environment`, `federationMember`, `user` (sandbox test users included), `loginMethods`, `loginFlow`, `loginTheme`, `emailProvider`, `customDomain`, `role`, `workloadIdentityTrust` | `application` (with `tokenClaims` + `roleMapping`, and the applications-API settings) |
+| Relation | **defines** the tenant | **uses** the tenant: names roles / environments, never defines them |
+| Identity | the config project's trust: broad `tenant:*` write; production through a reviewed PR | the app project's trust, confined to `tenant:applications.read`, `tenant:applications.write`, `tenant:access.read`; its production client created under a consent-approved **creation slot** (`thoryn access reserve` / `thoryn access approve`) |
+| Who declares its trust | a person, once; the config project then owns and converges it | **the config project** (one `kind: workloadIdentityTrust` per app repository) — an app project never declares a trust, not even its own |
+
+**A tenant file** (the config project's `.thoryn/environments/<section>/provision.yaml`):
+
+```yaml
+apiVersion: thoryn.io/tenant/v1
+resources:
+  - kind: environment
+    name: dev
+    spec: { slug: dev, displayName: "Sandbox dev" }
+  - kind: loginMethods
+    environment: dev
+    spec: { methods: [password, passkey] }
+  - kind: role
+    name: editor
+    environment: dev
+    spec: { permissions: [docs:write] }
+  - kind: user                                   # a sandbox TEST USER is tenant provisioning: who may sign in
+    name: tester
+    environment: dev
+    spec: { email: tester@example.com, passwordEnv: TEST_USER_PASSWORD, emailVerified: true }
+  - kind: workloadIdentityTrust                  # the CI identity of the app project acme/web, declared HERE
+    name: web-ci
+    environment: dev
+    spec:
+      provider: github_actions
+      github: { repository: acme/web, environment: dev }
+      scopes: [tenant:applications.read, tenant:applications.write, tenant:access.read, tenant:environments.read]
+```
+
+**An application file** (the app project's `.thoryn/provision.yaml`):
+
+```yaml
+apiVersion: thoryn.io/application/v1
+resources:
+  - kind: application
+    name: web
+    environment: dev                             # names the tenant's sandbox; never declares it
+    spec:
+      displayName: "acme/web"
+      clientType: public
+      grantTypes: [authorization_code, refresh_token]
+      redirectUris: ["https://web.acme.example/callback"]
+      tokenClaims:
+        sources: [permissions, roles]
+        roleMapping: { editor: Editors }         # role NAMES the tenant defines (kind: role in the config project)
+  - kind: application                            # its PRODUCTION client — no `environment:` — created under a creation slot
+    name: web-production
+    spec:
+      clientId: web-production
+      displayName: "acme/web"
+      clientType: public
+      grantTypes: [authorization_code]
+      redirectUris: ["https://web.acme.example/callback"]
+```
+
+**The engine refuses a kind from the other part before any call** (exit 64), naming the file's part, the kind's part
+and the project it belongs in:
+
+```text
+Error: invalid provisioning file '.thoryn/provision.yaml':
+  - resources[1] `role` is tenant provisioning; this is an application file (thoryn.io/application/v1). Declare it in the workspace's config project (it defines the tenant, and an application is a user of the tenant).
+```
+
+and the other way round: `` `application` is application provisioning; this is a tenant file (thoryn.io/tenant/v1).
+Declare it in the application's own project ``. `thoryn project init config` seeds tenant files, `thoryn project init app`
+an application file. The bundled schema is part-aware (`apiVersion` enum + a per-part `kind` enum).
+
+**The trust-scopes rule follows the part** (`config.trust-scopes`, SSO-3926): an application file needs
+`tenant:applications.read` + `tenant:access.read` to plan and `tenant:applications.write` to apply, **and nothing else**
+— the workflow check and the plan preflight say so. A declared mechanism of the application's *own* object adds what it
+strictly needs, and the rule names it: `tenant:environments.read` for a client in a sandbox (the sandbox's id for the
+ownership check), `tenant:workload-identity.read` for a `federatedTrust` / `workloadPull` trust resolved by name,
+`tenant:access.write` for a `grants:` block or a `workloadPull` sink's `manager` grant. A connection that declares a scope
+an application file never needs (`tenant:users.write` on an app project, say) **fails** the check: the identity is wider
+than its file — narrow the trust with `thoryn workload-identity trusts set-scopes`. A tenant file needs the union of its
+kinds' scopes, as before.
+
+**Migration — `thoryn.io/provision/v1` keeps working for one release.** `plan` / `apply` / `import` / `destroy` print a
+`Warning:` on stderr naming the part the file should declare (all tenant kinds → `thoryn.io/tenant/v1`; only
+applications → `thoryn.io/application/v1`), or — when it declares both — which resources are tenant provisioning and
+which are application provisioning, and that it is two files. `thoryn provision split` writes them:
+
+```bash
+thoryn provision split                      # .thoryn/provision.yaml → .thoryn/tenant.provision.yaml + .thoryn/application.provision.yaml
+# the tenant file goes to the workspace's config project, the application file stays in the app project;
+# the source is left as it is (delete it once both are committed where they belong). Outputs are re-rendered,
+# so the source's comments are not carried over; `thoryn provision plan --file <path>` on each is the check.
+```
+
+By hand, the recipe is the same: copy the `resources:` entries whose kind is in the tenant column into a file with
+`apiVersion: thoryn.io/tenant/v1` in the config project, the `application` entries into a file with
+`apiVersion: thoryn.io/application/v1` in the app project, and keep `environment:` / `secretSink.trust` / `federatedTrust`
+as they are — they name the tenant's objects by slug / name, which is how an application file references what the tenant
+defines. A fresh file written by `thoryn provision import --write` declares the part of its entries (both parts ⇒ the
+mixed format, which warns).
+
+**`publishTo:` is deprecated** (SSO-3668, ADR 2026-10-13 §2 — superseded by ADR 2026-10-25 decision 1): the app
+project owns its production client in every environment, created under a creation slot, and its deploy reads the client
+id from its own apply (`thoryn provision apply --output json`, `thoryn clients list`), not from a variable another
+repository publishes. A file carrying it still publishes today and prints a `Warning:`; a later release refuses it. The
+same goes for `thoryn project init app --config-repo` / `--production-url`, which propose the superseded shape (and only
+work against a config file still on `thoryn.io/provision/v1` — a tenant file refuses an `application`).
+
 ### Least-privilege access grants (SSO-3113, epic SSO-3108)
 
 A **grant** is `subject → relation → object`: `client:cli-ci manager environment:<id>` says the
@@ -1401,7 +1536,15 @@ subdomain; key: `[-._a-zA-Z0-9]+`); a `file` is exactly `{ kind, path }`; a `wor
 `{ kind, trust }` with `trust` a resource name, and a trust declared in the same file must sit on the
 application's plane, be `provider: kubernetes` and carry `tenant:applications.write`.
 
-### Publishing an application's client id to the repository that deploys it (SSO-3668)
+### Publishing an application's client id to the repository that deploys it (SSO-3668) — DEPRECATED
+
+> **`publishTo:` is deprecated (SSO-3962; oauthy ADR 2026-10-25 supersedes ADR 2026-10-13 §1–§2) — accepted for one
+> more release, then refused.** The application project owns its production client in every environment (created under
+> a consent-approved creation slot), so there is no id to carry back: the deploy reads it from the app's own
+> `thoryn provision apply --output json` or `thoryn clients list`. A file carrying `publishTo` still publishes today and
+> `plan` / `apply` print a `Warning:` naming the resources; move the client to the app project's
+> `thoryn.io/application/v1` file and drop the block. See "Two file parts — tenant and application" above. What follows
+> describes the shipped-and-retiring behaviour.
 
 Per oauthy ADR `2026-10-13-production-clients-declared-in-the-config-project.md` (SSO-3444), an
 application repository stays sandbox-only: its **production** OAuth client is declared in the
@@ -2327,7 +2470,7 @@ Committed beside your provisioning files; absent ⇒ the defaults below; schema
 | Key | Default | What it does |
 |---|---|---|
 | `apiVersion` | required | `thoryn.io/workflow/v1` |
-| `files[]` | `[{file: .thoryn/provision.yaml, connection: .thoryn/connection.json}]` | **one or many** provisioning files, planned and applied in order, each signed in with its own connection (`connection` defaults to the `connection.json` beside the file — the layout `thoryn project init` and the App seed) |
+| `files[]` | `[{file: .thoryn/provision.yaml, connection: .thoryn/connection.json}]` | **one or many** provisioning files — each a tenant file (`thoryn.io/tenant/v1`) or an application file (`thoryn.io/application/v1`, SSO-3962; the mixed `thoryn.io/provision/v1` warns for one release) — planned and applied in order, each signed in with its own connection (`connection` defaults to the `connection.json` beside the file — the layout `thoryn project init` and the App seed) |
 | `env` | `{}` | extra environment variables for the CLI: **`THORYN_*` names only** (the CLI's own variables, and the `{{env.NAME}}` placeholders a provisioning file reads — SSO-3430), never one the workflow sets itself (`THORYN_ISSUER`, `THORYN_HUB`, `THORYN_FIX_REQUEST`, `THORYN_CONSENT_URL`, `THORYN_CI_PLAINTEXT_TOKENS`), never credential-shaped (`*_SECRET`, `*_PASSWORD`, `*_TOKEN`, `*_KEY` — this file is committed plaintext). Values are exported, never evaluated |
 | `fixRequest` | `true` | upload the SSO-3710 fix request (`thoryn-provision-request`) when a job is red on a missing right, so the App names the fix on the check run |
 | `consentUrl` | `""` | SSO-3723 — the base URL of the App's browser consent, exported to the CLI as `THORYN_CONSENT_URL` when the `consent-url` input is empty; every `To fix` block then carries `Option 2, in the browser: <consentUrl>/github/consent/run/<owner>/<repository>/<run_id>` and the fix request `options.consentUrl`, and Option 1 becomes `thoryn access approve <owner>/<repository>/<run_id>` (SSO-3738; the raw grant lines are printed only without it). `https://`, no query or fragment. Configuration — never guessed from the issuer |
@@ -2388,6 +2531,15 @@ CLI derives it — every scope is the gate product-api puts on the endpoint the 
 
 `tenant:clients.read` / `.write` still satisfy `tenant:applications.*` (product-api's deprecated alias). Because `apply`
 plans first, the trust's scopes must hold **both** columns; a plan profile can only hold scopes the trust holds.
+
+**The rule follows the file's part (SSO-3962).** An **application file** (`thoryn.io/application/v1`) needs
+`tenant:applications.read` + `tenant:access.read` to plan and `tenant:applications.write` to apply, and nothing else: the
+verdict says so, names what a mechanism of the application's own object adds (a sandbox client's
+`tenant:environments.read`, a `workloadPull` / `federatedTrust` trust's `tenant:workload-identity.read`, a `grants:`
+block's `tenant:access.write`), and **fails a connection that declares a scope the file never needs** — an app project's
+identity wider than its file (`tenant:users.write` on an application repository, say): narrow the trust with
+`thoryn workload-identity trusts set-scopes`. A **tenant file** is the union of its kinds' scopes, the table above; a
+mixed `thoryn.io/provision/v1` file is judged as a tenant file is.
 
 **Three places say it, in one wording:**
 

@@ -23,7 +23,7 @@
         "additionalProperties": false,
         "required": ["file"],
         "properties": {
-          "file": { "description": "Relative path of a thoryn.io/provision/v1 file.", "type": "string", "pattern": "^(?!/)[A-Za-z0-9_./@-]{1,512}$" },
+          "file": { "description": "Relative path of a provisioning file: thoryn.io/tenant/v1 (the config project) or thoryn.io/application/v1 (an app project) — SSO-3962; thoryn.io/provision/v1 is accepted for one more release.", "type": "string", "pattern": "^(?!/)[A-Za-z0-9_./@-]{1,512}$" },
           "connection": { "description": "Relative path of the connection contract that signs in for this file. Default: connection.json beside the file (the layout the Thoryn GitHub App seeds).", "type": "string", "pattern": "^(?!/)[A-Za-z0-9_./@-]{1,512}$" }
         }
       }

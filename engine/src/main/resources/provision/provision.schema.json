@@ -7,13 +7,52 @@
   "additionalProperties": false,
   "required": ["apiVersion", "resources"],
   "properties": {
-    "apiVersion": { "const": "thoryn.io/provision/v1" },
+    "apiVersion": {
+      "description": "The PART this file is (SSO-3962, oauthy ADR 2026-10-25 provisioning-is-tenant-and-applications): `thoryn.io/tenant/v1` — TENANT provisioning, written by the workspace's ONE config project (environments, identity sources, users incl. sandbox test users, login methods / flows / theme, email provider, custom domain, roles, and the workload identity trusts of the workspace's app projects); `thoryn.io/application/v1` — APPLICATION provisioning, written by an app project (its `application`, with `tokenClaims` / `roleMapping` naming roles the tenant defines). An application is a USER of the tenant: it references roles and environments by name and defines nothing about them; a kind from the other part is refused. `thoryn.io/provision/v1` is the original mixed format, accepted for one more release with a warning naming the part the file should declare (`thoryn provision split` writes the two files).",
+      "enum": ["thoryn.io/tenant/v1", "thoryn.io/application/v1", "thoryn.io/provision/v1"]
+    },
     "resources": {
       "type": "array",
       "minItems": 1,
       "items": { "$ref": "#/$defs/resource" }
     }
   },
+  "allOf": [
+    {
+      "if": { "properties": { "apiVersion": { "const": "thoryn.io/tenant/v1" } } },
+      "then": {
+        "properties": {
+          "resources": {
+            "items": {
+              "properties": {
+                "kind": {
+                  "description": "SSO-3962 — a TENANT file declares tenant kinds only; `application` is application provisioning and belongs in the app project's own thoryn.io/application/v1 file.",
+                  "enum": ["environment", "federationMember", "user", "loginMethods", "loginFlow", "loginTheme", "emailProvider", "customDomain", "role", "workloadIdentityTrust"]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "apiVersion": { "const": "thoryn.io/application/v1" } } },
+      "then": {
+        "properties": {
+          "resources": {
+            "items": {
+              "properties": {
+                "kind": {
+                  "description": "SSO-3962 — an APPLICATION file declares `application` only; every other kind is tenant provisioning and belongs in the workspace's config project (thoryn.io/tenant/v1).",
+                  "enum": ["application"]
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
   "$defs": {
     "resource": {
       "type": "object",

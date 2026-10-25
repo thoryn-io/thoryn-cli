@@ -179,7 +179,7 @@ class ProvisionPublishTest : CommandTestBase() {
         assertThat(gh.calls).isEmpty()
 
         val apply = runCli("provision", "apply", "--file", f.path, "--gateway", baseUrl(), "--yes")
-        assertThat(apply.err).isEmpty()
+        assertThat(apply.err).doesNotContain("Error")
         assertThat(apply.exit).isEqualTo(0)
         val id = api.applications.single()["clientId"].toString()
         assertThat(gh.variables).containsEntry("acme/billing-web@production:THORYN_PRODUCTION_CLIENT_ID", id)

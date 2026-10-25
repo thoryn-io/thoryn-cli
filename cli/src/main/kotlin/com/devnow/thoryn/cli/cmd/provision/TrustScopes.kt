@@ -2,8 +2,10 @@ package com.devnow.thoryn.cli.cmd.provision
 
 import com.devnow.thoryn.cli.auth.Tokens
 import com.devnow.thoryn.cli.cmd.connection.Connection
+import com.devnow.thoryn.provision.AccessRefs
 import com.devnow.thoryn.provision.MissingScopeException
 import com.devnow.thoryn.provision.ProvisionFile
+import com.devnow.thoryn.provision.ProvisionPart
 import com.devnow.thoryn.provision.ProvisionPlan
 import com.devnow.thoryn.provision.ScopeRequirements
 import com.devnow.thoryn.provision.ScopeRequirements.Phase
@@ -93,9 +95,25 @@ internal object TrustScopes {
         return buildString {
             appendLine("Error: $RULE_ID — this session's token does not carry ${grouped.size} scope(s) ${file.source} needs to $verb:")
             grouped.forEach { (scope, why) -> appendLine("  - $scope — ${why.joinToString("; ") { it.label }}") }
+            // SSO-3962 — an application file states its ceiling: the three, and why this file asks for anything beyond them.
+            partNote(file, ScopeRequirements.of(file, prune))?.let { appendLine(it) }
             appendLine("To fix: ${where(grouped.keys.toList(), phase, session)}")
             append(if (phase == Phase.PLAN) "Nothing was read or written." else "Nothing was changed.")
         }
+    }
+
+    /**
+     * SSO-3962 (ADR 2026-10-25 §1 "Identity", §3) — the sentence an APPLICATION file's rule carries: it needs
+     * `tenant:applications.read` + `tenant:access.read` to plan and `tenant:applications.write` to apply, and nothing else —
+     * plus, when a declared mechanism of its own object asks for more ([ScopeRequirements.beyondBaseline]), exactly which
+     * scope and why. Null for a tenant or mixed file (the union of its kinds' scopes decides, as before).
+     */
+    fun partNote(file: ProvisionFile, needs: List<ScopeRequirements.ScopeNeed>): String? {
+        if (file.part != ProvisionPart.APPLICATION) return null
+        val beyond = ScopeRequirements.byScope(ScopeRequirements.beyondBaseline(file, needs))
+        return "An application file (${file.part.apiVersion}) needs ${ScopeRequirements.SCOPE_APPLICATIONS_READ} + ${AccessRefs.SCOPE_READ} to plan and " +
+            "${ScopeRequirements.SCOPE_APPLICATIONS_WRITE} to apply, and nothing else" +
+            if (beyond.isEmpty()) "." else " — this file also asks for ${beyond.entries.joinToString("; ") { (s, why) -> "$s (${why.joinToString(", ") { it.label }})" }}."
     }
 
     /** A [MissingScopeException] the engine raised from a `403`, with the profile to add the scope to. */
@@ -137,10 +155,18 @@ internal object TrustScopes {
                         "${if (connection.isWorkloadIdentity) "$trust (its apply profile)" else "API key client ${connection.clientId}"} and to auth.scopes of $connectionPath"
             }
         }
+        // SSO-3962 — an APPLICATION file's identity is confined to what the file needs: a scope the connection declares and the
+        // file never asks for (tenant:users.write on an app project, say) is the blur the two parts remove — a FAIL, naming it.
+        ScopeRequirements.unneeded(file, needs, declared).takeIf { it.isNotEmpty() }?.let { wider ->
+            problems += "$connectionPath declares ${wider.joinToString(" ")}, which $filePath (an application file, ${file.part.apiVersion}) never needs — " +
+                "the identity of an app project is wider than its file: ${partNote(file, needs)} Narrow the trust (`thoryn workload-identity trusts set-scopes` " +
+                "drops a scope from CI) and auth.scopes of $connectionPath to what the file needs"
+        }
         val planScopes = needs.filter { it.phase == Phase.PLAN }.map { it.scope }.distinct()
         val applyScopes = needs.filter { it.phase == Phase.APPLY }.map { it.scope }.distinct()
         val satisfied = "$filePath needs to plan: ${planScopes.joinToString(" ").ifEmpty { "nothing" }}; to apply, also: " +
             "${applyScopes.filterNot { it in planScopes }.joinToString(" ").ifEmpty { "nothing" }} — $connectionPath declares every one" +
+            (partNote(file, needs)?.let { " and nothing the file does not need. $it" } ?: "") +
             (if (planProfile) " (the plan profile of $trust must carry the plan scopes: one set without explicit scopes derives every .read scope of the trust; `provision plan` re-checks the minted token)" else "")
         return Verdict(problems, satisfied)
     }
@@ -148,5 +174,6 @@ internal object TrustScopes {
     /** The fix line of a failing [RULE_ID] verdict. */
     const val FIX: String =
         "add each named scope where the line says: a PLAN scope to the trust's plan profile (and so its scopes), an APPLY scope to the trust's " +
-            "scopes, and both to connection.json auth.scopes — or drop the resource that needs it. $TRUST_FIXED_NOTE"
+            "scopes, and both to connection.json auth.scopes — or drop the resource that needs it; a scope an application file never needs comes OFF " +
+            "the trust and the connection. $TRUST_FIXED_NOTE"
 }

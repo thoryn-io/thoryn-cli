@@ -2,6 +2,7 @@ package com.devnow.thoryn.cli.cmd.project
 
 import com.devnow.thoryn.cli.cmd.connection.Connection
 import com.devnow.thoryn.provision.ProvisionFile
+import com.devnow.thoryn.provision.ProvisionPart
 import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.api.Test
 import tools.jackson.databind.json.JsonMapper
@@ -47,6 +48,10 @@ class ProjectInitSeedTest : ProjectTestBase() {
         assertThat(connection.github!!.ref).isNull()
 
         val provision = ProvisionFile.load(dir.resolve(".thoryn/provision.yaml").toFile())
+        // SSO-3962 — an app project's seed is an APPLICATION file: it declares how the app uses the tenant, nothing about the tenant.
+        assertThat(provision.part).isEqualTo(ProvisionPart.APPLICATION)
+        assertThat(provision.warnings).isEmpty()
+        assertThat(Files.readString(dir.resolve(".thoryn/provision.yaml"))).contains("apiVersion: thoryn.io/application/v1").contains("creation slot")
         val app = provision.resources.single()
         assertThat(app.kind).isEqualTo("application")
         assertThat(app.name).isEqualTo("web")
@@ -82,7 +87,13 @@ class ProjectInitSeedTest : ProjectTestBase() {
         assertThat(sandbox.github!!.environment).isNull()
 
         // Production owns the workspace's sandbox (adopted by slug, named as it is); the sandbox section anchors on it by slug only.
-        val productionFile = ProvisionFile.load(dir.resolve(".thoryn/environments/production/provision.yaml").toFile()).resources.single()
+        // SSO-3962 — a config project's seeds are TENANT files (both sections).
+        val productionLoaded = ProvisionFile.load(dir.resolve(".thoryn/environments/production/provision.yaml").toFile())
+        assertThat(productionLoaded.part).isEqualTo(ProvisionPart.TENANT)
+        assertThat(productionLoaded.warnings).isEmpty()
+        assertThat(ProvisionFile.load(dir.resolve(".thoryn/environments/sandbox/provision.yaml").toFile()).part).isEqualTo(ProvisionPart.TENANT)
+        assertThat(Files.readString(dir.resolve(".thoryn/environments/sandbox/provision.yaml"))).contains("apiVersion: thoryn.io/tenant/v1").contains("kind: user").contains("kind: workloadIdentityTrust")
+        val productionFile = productionLoaded.resources.single()
         assertThat(productionFile.kind).isEqualTo("environment")
         assertThat(productionFile.name).isEqualTo("qa")
         assertThat(productionFile.spec).containsEntry("slug", "qa").containsEntry("displayName", "Sandbox qa")

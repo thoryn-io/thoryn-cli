@@ -69,7 +69,14 @@ class ProvisionSchemaConformanceTest {
     fun `the schema kind enum equals the loader's closed allowlist`() {
         val enum = schema["\$defs"]["resource"]["properties"]["kind"]["enum"].toList().map { it.asString() }.toSet()
         assertThat(enum).isEqualTo(ProvisionFile.KINDS)
-        assertThat(schema["properties"]["apiVersion"]["const"].asString()).isEqualTo(ProvisionFile.API_VERSION)
+        // SSO-3962 — the three apiVersions, and each PART's kind enum (the root `allOf` conditionals) equal the loader's sets.
+        assertThat(schema["properties"]["apiVersion"]["enum"].toList().map { it.asString() }).isEqualTo(ProvisionFile.API_VERSIONS)
+        val perPart = schema["allOf"].toList().associate { c ->
+            c["if"]["properties"]["apiVersion"]["const"].asString() to c["then"]["properties"]["resources"]["items"]["properties"]["kind"]["enum"].toList().map { it.asString() }.toSet()
+        }
+        assertThat(perPart).containsOnlyKeys(ProvisionFile.API_VERSION_TENANT, ProvisionFile.API_VERSION_APPLICATION)
+        assertThat(perPart[ProvisionFile.API_VERSION_TENANT]).isEqualTo(ProvisionFile.TENANT_KINDS)
+        assertThat(perPart[ProvisionFile.API_VERSION_APPLICATION]).isEqualTo(ProvisionFile.APPLICATION_KINDS)
     }
 
     @Test
@@ -441,8 +448,8 @@ class ProvisionSchemaConformanceTest {
             resources: []
             """.trimIndent(),
         )
+        assertThat(ProvisionFile.validate(bad)).anyMatch { it.startsWith("apiVersion must be '${ProvisionFile.API_VERSION_TENANT}'") && it.contains("(was 'thoryn.io/provision/v2')") }
         assertThat(ProvisionFile.validate(bad)).contains(
-            "apiVersion must be '${ProvisionFile.API_VERSION}'",
             "(root) has unknown property 'steps' (additionalProperties:false)",
             "resources must be non-empty",
         )

@@ -2,6 +2,7 @@ package com.devnow.thoryn.cli.cmd.project
 
 import com.devnow.thoryn.cli.auth.WorkloadIdentityFlow
 import com.devnow.thoryn.cli.cmd.connection.Connection
+import com.devnow.thoryn.provision.ProvisionFile
 import tools.jackson.databind.JsonNode
 import tools.jackson.databind.json.JsonMapper
 
@@ -99,11 +100,18 @@ internal object ProjectSeeds {
             |# next to connection.json ("who I am"). The repository converges this file: `thoryn provision plan` on a pull
             |# request, `thoryn provision apply` on ${repository.defaultBranch} (oauthy ADR 2026-10-13, provisioning-as-code converge).
             |# From here on this file is in control — edit it freely; `thoryn project init` never overwrites it.
-            |apiVersion: thoryn.io/provision/v1
+            |#
+            |# APPLICATION provisioning (SSO-3962, oauthy ADR 2026-10-25): this file declares how THIS application uses the
+            |# tenant — its OAuth client (and its `tokenClaims` / `roleMapping`, naming roles the tenant defines). It defines
+            |# nothing about the tenant: environments, users (test users included), sign-in configuration, roles and this
+            |# repository's own workload identity trust are declared in the workspace's CONFIG project (a thoryn.io/tenant/v1 file).
+            |apiVersion: ${ProvisionFile.API_VERSION_APPLICATION}
             |resources:
             |  # The application's OAuth client in sandbox `$sandboxSlug`: the sandbox this repository's workload identity
             |  # ($clientId) is trusted in and manages. A public client with PKCE needs no secret; adjust the redirect
             |  # URIs to where the app runs (the same sandbox slug can also be read from CI as "{{env.THORYN_ENVIRONMENT}}").
+            |  # Its PRODUCTION client is declared HERE too, without `environment:` — created once a workspace admin approves a
+            |  # creation slot for this repository's identity (`thoryn access reserve client:$clientId application:<clientId>`).
             |  - kind: application
             |    name: $name
             |    environment: $sandboxSlug
@@ -124,7 +132,14 @@ internal object ProjectSeeds {
         |# in only from the GitHub environment `$githubEnvironment` on ${repository.defaultBranch}). `thoryn provision plan` on a
         |# pull request, `thoryn provision apply` on ${repository.defaultBranch} (oauthy ADR 2026-10-13, provisioning-as-code converge).
         |# From here on this file is in control — edit it freely; `thoryn project init` never overwrites it.
-        |apiVersion: thoryn.io/provision/v1
+        |#
+        |# TENANT provisioning (SSO-3962, oauthy ADR 2026-10-25): the config project is the ONE place that defines what the tenant
+        |# IS — its environments, identity sources (federationMember), users, sign-in (loginMethods, loginFlow, loginTheme),
+        |# email provider, custom domain, roles, and the workload identity trusts of the workspace's APP projects (one
+        |# `kind: workloadIdentityTrust` per app repository: a repository never declares its own authority). Applications are
+        |# USERS of the tenant: each app project declares its own OAuth client in its own thoryn.io/application/v1 file,
+        |# production client included (created under a creation slot a workspace admin approves) — never here.
+        |apiVersion: ${ProvisionFile.API_VERSION_TENANT}
         |resources:
         |  # The workspace's sandbox, adopted by its slug (created by `thoryn project init`, or already there). Declare further
         |  # sandboxes here; each gets its own section under .thoryn/environments/<name>/ with its own connection.
@@ -142,12 +157,19 @@ internal object ProjectSeeds {
         |# connection ($clientId, manager of sandbox `$sandboxSlug`) configures inside that sandbox. `thoryn provision plan`
         |# on a pull request, `thoryn provision apply` on ${repository.defaultBranch} (oauthy ADR 2026-10-13, provisioning-as-code converge).
         |# From here on this file is in control — edit it freely; `thoryn project init` never overwrites it.
-        |apiVersion: thoryn.io/provision/v1
+        |#
+        |# TENANT provisioning (SSO-3962, oauthy ADR 2026-10-25): what the sandbox IS — its sign-in configuration, its test
+        |# users, its roles, and the workload identity trusts of the app projects bound to it. The applications that USE the
+        |# sandbox declare their own OAuth clients in their own thoryn.io/application/v1 files, never here.
+        |apiVersion: ${ProvisionFile.API_VERSION_TENANT}
         |resources:
         |  # The sandbox itself, adopted by slug — the anchor its configuration hangs off. This connection holds
         |  # tenant:environments.read, so only the slug is declared (nothing here can need a write). Add the sandbox's
-        |  # sign-in configuration below: loginMethods, federationMember, emailProvider, loginTheme, loginFlow — each with
-        |  # `environment: ${resourceName(sandboxSlug, "sandbox")}`.
+        |  # configuration below, each with `environment: ${resourceName(sandboxSlug, "sandbox")}`: loginMethods, federationMember,
+        |  # emailProvider, loginTheme, loginFlow, role; `kind: user` for the sandbox's TEST USERS (an app project references
+        |  # one by email in its test configuration, it never creates one); and `kind: workloadIdentityTrust` for each app
+        |  # project's CI identity (its scopes: tenant:applications.read tenant:applications.write tenant:access.read — plus
+        |  # tenant:environments.read for a sandbox client — and nothing wider).
         |  - kind: environment
         |    name: ${resourceName(sandboxSlug, "sandbox")}
         |    spec:
@@ -220,6 +242,9 @@ internal object ProjectSeeds {
     fun productionClientHeader(appRepository: String): String = """
         |
         |  # Production OAuth client of the application repository $appRepository (proposed by `thoryn project init app`).
+        |  # DEPRECATED SHAPE (SSO-3962, oauthy ADR 2026-10-25 supersedes ADR 2026-10-13 §1–§2): the app project owns its production
+        |  # client in its own thoryn.io/application/v1 file, created under a creation slot a workspace admin approves
+        |  # (`thoryn access reserve`); `publishTo` is accepted for one more release. Move this entry there and drop it here.
         |  # Owned by this repository: changing a redirect URI is a reviewed pull request here plus an approved production run.
         |  # A public client with PKCE — no secret exists anywhere. Its id is published to $appRepository's GitHub
         |  # environment `$PRODUCTION_GITHUB_ENVIRONMENT` as the Actions variable $PRODUCTION_CLIENT_ID_VARIABLE on every production apply.

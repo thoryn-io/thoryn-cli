@@ -144,6 +144,54 @@ data class ProvisionGrant(val subject: String, val relation: String) {
 }
 
 /**
+ * SSO-3962 (epic SSO-3960; oauthy ADR `2026-10-25-provisioning-is-tenant-and-applications`) — the PART of provisioning
+ * a file belongs to, declared by its `apiVersion`. Thoryn's scope is two halves that are not symmetric: a workspace
+ * CONFIGURES ITS TENANT (who can sign in, where users come from, how sign-in looks and behaves, which policies apply)
+ * and lets APPLICATIONS USE that tenant through standard OAuth 2.0 / OIDC. An application is a USER of the tenant: it
+ * references the tenant's roles and environments by name and defines nothing about them. So a project belongs to
+ * exactly one part — ONE config project per workspace writes tenant files, MANY app projects write application files —
+ * and the engine refuses a kind from the other part before any call is made.
+ *
+ *  - [TENANT] — `thoryn.io/tenant/v1`: [TENANT_KINDS] (environments, identity sources, users — sandbox test users
+ *    included —, login methods / flows / theme, email provider, custom domain, roles, and the workload identity trusts
+ *    of the workspace's app projects: a repository never describes its own authority).
+ *  - [APPLICATION] — `thoryn.io/application/v1`: [APPLICATION_KINDS] (`application`, with its `tokenClaims` and
+ *    `roleMapping` and the settings the applications API carries). Its identity is confined to
+ *    [ScopeRequirements.APPLICATION_FILE_SCOPES].
+ *  - [MIXED] — `thoryn.io/provision/v1`: the one format that existed before the parts (SSO-3088), accepted for ONE more
+ *    release with a warning that names the part the file should declare and which resources would have to move
+ *    ([ProvisionFile.warnings]); `thoryn provision split` writes the two files.
+ */
+enum class ProvisionPart(val apiVersion: String, val label: String, val kinds: Set<String>) {
+    TENANT(ProvisionFile.API_VERSION_TENANT, "tenant", ProvisionFile.TENANT_KINDS),
+    APPLICATION(ProvisionFile.API_VERSION_APPLICATION, "application", ProvisionFile.APPLICATION_KINDS),
+    MIXED(ProvisionFile.API_VERSION, "mixed", ProvisionFile.KINDS),
+    ;
+
+    /** `thoryn.io/<part>/v1` as it is written in a file. */
+    override fun toString(): String = apiVersion
+
+    /** Which project kind owns the file: the workspace's one config project, or an application's own project. */
+    val owner: String get() = when (this) {
+        TENANT -> "the workspace's config project"
+        APPLICATION -> "the application's own project"
+        MIXED -> "a project of either part"
+    }
+
+    companion object {
+        /** The part a file declaring [apiVersion] belongs to, or null for a string that is none of the three. */
+        fun of(apiVersion: String?): ProvisionPart? = entries.firstOrNull { it.apiVersion == apiVersion }
+
+        /** The part a KIND is provisioning of (never [MIXED]), or null for a kind outside the allowlist. */
+        fun ofKind(kind: String): ProvisionPart? = when (kind) {
+            in ProvisionFile.TENANT_KINDS -> TENANT
+            in ProvisionFile.APPLICATION_KINDS -> APPLICATION
+            else -> null
+        }
+    }
+}
+
+/**
  * SSO-3088 (epic SSO-3087) — a parsed **provisioning file** (`.thoryn/provision.yaml`): the DESIRED
  * STATE of a repository's Thoryn resources, the "what I own" half of the `.thoryn/` folder next to
  * `connection.json` ("who I am", SSO-2948). DATA, not code, validated against the bundled
@@ -152,6 +200,9 @@ data class ProvisionGrant(val subject: String, val relation: String) {
  * Secrets NEVER enter the file: a `spec` key that carries a secret VALUE (`password`, `smtpPassword`,
  * `clientSecret`, …) is rejected; the file names the ENV VAR instead (`passwordEnv: SMTP_PASSWORD`),
  * which the engine resolves at apply time and never records.
+ *
+ * SSO-3962 — a file belongs to one [ProvisionPart], declared by its `apiVersion` ([part]); a kind from the other part is
+ * a validation violation. [warnings] carries what is accepted today and refused in a later release.
  */
 class ProvisionFile private constructor(
     /** Where the file was read from (error messages, the plan header). */
@@ -159,13 +210,31 @@ class ProvisionFile private constructor(
     /** `sha256:<hex>` over the raw bytes — shown in the plan header so a reader knows which file was planned. */
     val digest: String,
     val resources: List<ProvisionResource>,
+    /** SSO-3962 — the part the file's `apiVersion` declares (see [ProvisionPart]). */
+    val part: ProvisionPart = ProvisionPart.MIXED,
+    /**
+     * SSO-3962 — deprecations the file carries, each one sentence a host prints (the CLI: `Warning: …` on stderr before a
+     * plan / apply): the mixed `thoryn.io/provision/v1` format (names the part the file should declare, or that it must be
+     * split), and `publishTo:` (ADR 2026-10-13 §2, superseded). Empty for a file nothing is deprecated in.
+     */
+    val warnings: List<String> = emptyList(),
 ) {
     /** The `environment` resource declared under [name], if any. */
     fun environmentResource(name: String): ProvisionResource? =
         resources.firstOrNull { it.kind == KIND_ENVIRONMENT && it.name == name }
 
     companion object {
+        /**
+         * SSO-3088 — the ORIGINAL, mixed format: every kind. SSO-3962 deprecates it (accepted for one more release with a
+         * warning, see [ProvisionPart.MIXED]); a new file declares [API_VERSION_TENANT] or [API_VERSION_APPLICATION].
+         */
         const val API_VERSION = "thoryn.io/provision/v1"
+        /** SSO-3962 — a TENANT file (the workspace's config project): [TENANT_KINDS]. */
+        const val API_VERSION_TENANT = "thoryn.io/tenant/v1"
+        /** SSO-3962 — an APPLICATION file (an app project): [APPLICATION_KINDS]. */
+        const val API_VERSION_APPLICATION = "thoryn.io/application/v1"
+        /** Every `apiVersion` the loader accepts — must equal the schema's `apiVersion` enum (asserted by the conformance test). */
+        val API_VERSIONS: List<String> = listOf(API_VERSION_TENANT, API_VERSION_APPLICATION, API_VERSION)
 
         /** Bundled schema resource — the documented contract this loader validates against. */
         const val SCHEMA_RESOURCE = "/provision/provision.schema.json"
@@ -203,12 +272,27 @@ class ProvisionFile private constructor(
          */
         const val KIND_ROLE = "role"
 
-        /** The CLOSED kind allowlist — must equal the schema's `kind` enum (asserted by the conformance test). */
-        val KINDS: Set<String> = setOf(
-            KIND_ENVIRONMENT, KIND_APPLICATION, KIND_EMAIL_PROVIDER, KIND_LOGIN_THEME,
-            KIND_LOGIN_FLOW, KIND_LOGIN_METHODS, KIND_FEDERATION_MEMBER, KIND_USER, KIND_CUSTOM_DOMAIN,
-            KIND_WORKLOAD_IDENTITY_TRUST, KIND_ROLE,
+        /**
+         * SSO-3962 — TENANT provisioning: what defines the tenant. Every kind added later (SSO-3965: directories / SCIM,
+         * organizations, security policies, hooks, …) joins this set unless it describes one client's connection. Includes
+         * `user` (a sandbox test user is a fact about who may sign in — the tenant's decision, visible to every application
+         * of the environment) and `workloadIdentityTrust` (the config project declares the trusts of the workspace's app
+         * projects; a repository never declares its own authority). Must equal the schema's tenant `kind` enum.
+         */
+        val TENANT_KINDS: Set<String> = setOf(
+            KIND_ENVIRONMENT, KIND_FEDERATION_MEMBER, KIND_USER, KIND_LOGIN_METHODS, KIND_LOGIN_FLOW, KIND_LOGIN_THEME,
+            KIND_EMAIL_PROVIDER, KIND_CUSTOM_DOMAIN, KIND_ROLE, KIND_WORKLOAD_IDENTITY_TRUST,
         )
+
+        /**
+         * SSO-3962 — APPLICATION provisioning: how ONE client connects — its OAuth client with `tokenClaims` / `roleMapping`
+         * (role NAMES the tenant defines) and the settings the applications API carries. Must equal the schema's application
+         * `kind` enum.
+         */
+        val APPLICATION_KINDS: Set<String> = setOf(KIND_APPLICATION)
+
+        /** The CLOSED kind allowlist — must equal the schema's `kind` enum (asserted by the conformance test); the union of the two parts. */
+        val KINDS: Set<String> = TENANT_KINDS + APPLICATION_KINDS
 
         /**
          * One-per-environment kinds — and, SSO-3413, the one-per-WORKSPACE [KIND_CUSTOM_DOMAIN]: `name` is
@@ -626,7 +710,49 @@ class ProvisionFile private constructor(
             if (unresolved.isNotEmpty()) {
                 throw ProvisionException("invalid provisioning file '$source':\n  - " + unresolved.joinToString("\n  - "))
             }
-            return ProvisionFile(source = source, digest = sha256(bytes), resources = resources)
+            val part = ProvisionPart.of(root["apiVersion"].asString()) ?: ProvisionPart.MIXED
+            return ProvisionFile(source = source, digest = sha256(bytes), resources = resources, part = part, warnings = warnings(part, resources))
+        }
+
+        // ── SSO-3962 — what is accepted today and refused in a later release ──
+
+        /** The release line a deprecation names: the mixed format and `publishTo` are accepted through it and refused after. */
+        const val DEPRECATION_WINDOW: String = "accepted for one more release"
+
+        /**
+         * The deprecations [resources] under [part] carry, each one sentence (see [ProvisionFile.warnings]):
+         *  - a [ProvisionPart.MIXED] file: which part it should declare — tenant when it declares only tenant kinds,
+         *    application when only application kinds, and when it declares both, that it is two files (the tenant
+         *    resources belong in the workspace's config project, the application resources in the app project —
+         *    `thoryn provision split` writes them);
+         *  - `publishTo:` (SSO-3668, ADR 2026-10-13 §2 — superseded by ADR 2026-10-25 decision 1): the app project owns its
+         *    production client in every environment, created under a consent-approved creation slot, so no variable sink is
+         *    needed; the targets still publish today.
+         */
+        fun warnings(part: ProvisionPart, resources: List<ProvisionResource>): List<String> {
+            val w = mutableListOf<String>()
+            if (part == ProvisionPart.MIXED) {
+                val tenant = resources.filter { it.kind in TENANT_KINDS }
+                val application = resources.filter { it.kind in APPLICATION_KINDS }
+                val head = "apiVersion $API_VERSION is deprecated ($DEPRECATION_WINDOW; SSO-3962, oauthy ADR 2026-10-25 provisioning-is-tenant-and-applications): " +
+                    "a file is tenant provisioning (${ProvisionPart.TENANT.apiVersion}, the workspace's ONE config project) or application provisioning " +
+                    "(${ProvisionPart.APPLICATION.apiVersion}, an app project). "
+                w += when {
+                    application.isEmpty() -> head + "This file declares only tenant kinds — declare `apiVersion: ${ProvisionPart.TENANT.apiVersion}`."
+                    tenant.isEmpty() -> head + "This file declares only application kinds — declare `apiVersion: ${ProvisionPart.APPLICATION.apiVersion}`."
+                    else -> head + "This file declares BOTH: ${tenant.joinToString(", ") { it.key }} are tenant provisioning (the config project) and " +
+                        "${application.joinToString(", ") { it.key }} are application provisioning (the app project) — split it into two files " +
+                        "(`thoryn provision split`), each converged by its own project's identity."
+                }
+            }
+            resources.filter { it.publishTo.isNotEmpty() }.takeIf { it.isNotEmpty() }?.let { publishing ->
+                w += "$PUBLISH_TO is deprecated ($DEPRECATION_WINDOW; SSO-3962 — oauthy ADR 2026-10-25 supersedes ADR 2026-10-13 §1–§2): the application project " +
+                    "owns its production client in every environment, created under a consent-approved creation slot (`thoryn access reserve` / " +
+                    "`thoryn access approve`), and its deploy reads the client id from its own apply (`apply --output json`, `thoryn clients list`) — " +
+                    "no variable another repository publishes. Declared on: ${publishing.joinToString(", ") { it.key }}. The targets are still published today; " +
+                    "move the client to the app project's ${ProvisionPart.APPLICATION.apiVersion} file and drop the block."
+            }
+            return w
         }
 
         /**
@@ -663,7 +789,13 @@ class ProvisionFile private constructor(
             val v = mutableListOf<String>()
             if (!root.isObject()) return listOf("provisioning file must be an object")
             rejectUnknownKeys(root, setOf("apiVersion", "resources"), "(root)", v)
-            if (root["apiVersion"]?.asString() != API_VERSION) v += "apiVersion must be '$API_VERSION'"
+            // SSO-3962 — the part the file declares; an unknown string names the two parts (and the deprecated mixed one) it may be.
+            val declared = root["apiVersion"]?.takeIf { it.isTextual() }?.asString()
+            val part = ProvisionPart.of(declared)
+            if (part == null) {
+                v += "apiVersion must be '$API_VERSION_TENANT' (tenant provisioning: the workspace's config project) or '$API_VERSION_APPLICATION' " +
+                    "(application provisioning: an app project); '$API_VERSION' is accepted for one more release" + (declared?.let { " (was '$it')" } ?: "")
+            }
 
             val resources = root["resources"]
             if (resources == null || !resources.isArray()) {
@@ -693,6 +825,12 @@ class ProvisionFile private constructor(
                 val kind = r["kind"]?.takeIf { !it.isNull }?.asString()
                 if (kind == null || kind !in KINDS) {
                     v += "$where kind '$kind' not in the allowlist $KINDS"
+                    return@forEachIndexed
+                }
+                // SSO-3962 — a kind from the OTHER part is refused before any call: the message names the file's part, the
+                // kind's part, and the project the declaration belongs in.
+                if (part != null && part != ProvisionPart.MIXED && kind !in part.kinds) {
+                    v += "$where ${crossPartRefusal(kind, part)}"
                     return@forEachIndexed
                 }
                 val name = r["name"]?.takeIf { !it.isNull }?.asString()
@@ -1320,6 +1458,23 @@ class ProvisionFile private constructor(
                 }
             }
         }
+
+        /**
+         * SSO-3962 — the violation text for a [kind] declared in a file of [part] (never [ProvisionPart.MIXED]): e.g.
+         * "`role` is tenant provisioning; this is an application file (thoryn.io/application/v1). Declare it in the
+         * workspace's config project." — the kind's part, the file's part, the project it belongs in.
+         */
+        fun crossPartRefusal(kind: String, part: ProvisionPart): String {
+            val kindPart = ProvisionPart.ofKind(kind) ?: return "kind '$kind' not in the allowlist $KINDS"
+            val relation = when (kindPart) {
+                ProvisionPart.TENANT -> "it defines the tenant, and an application is a user of the tenant"
+                else -> "it is how one client uses the tenant, which the tenant's config project does not decide"
+            }
+            return "`$kind` is ${kindPart.label} provisioning; this is ${article(part.label)} ${part.label} file (${part.apiVersion}). " +
+                "Declare it in ${kindPart.owner} ($relation)."
+        }
+
+        private fun article(word: String): String = if (word.first() in "aeiou") "an" else "a"
 
         /** A required spec member is missing when absent, null, a blank scalar, or an empty array. */
         private fun isMissing(node: JsonNode?): Boolean = when {

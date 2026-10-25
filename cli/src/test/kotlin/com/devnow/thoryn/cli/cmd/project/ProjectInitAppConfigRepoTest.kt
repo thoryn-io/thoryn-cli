@@ -224,4 +224,22 @@ class ProjectInitAppConfigRepoTest : ProjectTestBase() {
         assertThat(gh.calls).isEmpty()
         assertThat(api.requests).isEmpty()
     }
+
+    @Test
+    fun `a config repository whose production file is a TENANT file refuses the production client — an application belongs in the app project (SSO-3962)`() {
+        gh.files["acme/platform"] = mutableMapOf(path to production.replace("apiVersion: thoryn.io/provision/v1", "apiVersion: thoryn.io/tenant/v1"))
+
+        val (exit, out, _) = runCli(*args, "--json")
+
+        assertThat(exit).isEqualTo(ProjectInit.EXIT_CHECK)
+        val body = parseJson(out)
+        assertThat(body).containsEntry("error", "config_provision_file_unusable").containsEntry("changed", false)
+        assertThat(body["errorDescription"] as String)
+            .contains("`application` is application provisioning; this is a tenant file (thoryn.io/tenant/v1)")
+            .contains("Declare it in the application's own project")
+        // Nothing was proposed: no branch, no pull request, the default branch as it was.
+        assertThat(gh.pulls["acme/platform"].orEmpty()).isEmpty()
+        assertThat(gh.mutations).isEmpty()
+        assertThat(api.writes).isEmpty()
+    }
 }
