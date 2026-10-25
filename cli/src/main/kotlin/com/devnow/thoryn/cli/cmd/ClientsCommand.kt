@@ -38,15 +38,25 @@ import java.util.concurrent.Callable
  *  - `get`           — GET  /api/v1/applications/{clientId}
  *  - `create`        — POST /api/v1/applications  (secret emitted via SecretIo)
  *  - `update`        — PATCH /api/v1/applications/{clientId}
- *  - `rotate-secret` — POST /api/v1/applications/{clientId}/secret/rotate
+ *  - `rotate-secret` — POST /api/v1/applications/{clientId}/secret/rotate (`--replace` sends
+ *    `replaceInFlight: true`, SSO-3967 — replace a lost new secret inside the overlap window)
+ *  - `revoke-previous-secret` — POST /api/v1/applications/{clientId}/secret/revoke-previous
+ *    (SSO-3967; end the previous secret now — see [RevokePreviousSecretSubcommand])
  *  - `secret-state`  — GET  /api/v1/applications/{clientId}/secrets/state (SSO-3957; the rotation
  *    state in plain words — see [SecretStateSubcommand])
  *  - `delete`        — DELETE /api/v1/applications/{clientId}
  *  - `registration-token` — POST /api/v1/applications/registration-tokens (SSO-3683; the
  *    Initial Access Token emitted via SecretIo — see [RegistrationTokenSubcommand])
  *
- * Scopes: GET (incl. `secret-state`) → `tenant:applications.read`; create/update/rotate/delete/
- * registration-token → `tenant:applications.write`.
+ * Scopes: GET (incl. `secret-state`) → `tenant:applications.read`; create/update/rotate/
+ * revoke-previous-secret/delete/registration-token → `tenant:applications.write`.
+ *
+ * **Elevated acts (SSO-3967, product-api SSO-3956).** `revoke-previous-secret` and
+ * `rotate-secret --replace` are incident-response acts the server grants only to a PERSON whose
+ * sign-in used a passkey within the last five minutes (RFC 9470 step-up). The CLI renders the two
+ * refusals in words: `403 insufficient_user_authentication` → the exact `thoryn login --acr-values …
+ * --max-age …` to run and retry; `403 elevated_action_requires_person` → a machine identity cannot
+ * do this, a workspace admin must. See [renderElevatedActError].
  */
 @Command(
     name = "clients",
@@ -58,6 +68,7 @@ import java.util.concurrent.Callable
         ClientsCommand.CreateSubcommand::class,
         ClientsCommand.UpdateSubcommand::class,
         ClientsCommand.RotateSecretSubcommand::class,
+        ClientsCommand.RevokePreviousSecretSubcommand::class,
         ClientsCommand.SecretStateSubcommand::class,
         ClientsCommand.DeleteSubcommand::class,
         ClientsCommand.RegistrationTokenSubcommand::class,
@@ -67,7 +78,9 @@ class ClientsCommand : Callable<Int> {
 
     override fun call(): Int {
         System.err.println("Usage: thoryn clients <subcommand>")
-        System.err.println("Subcommands: list | get | create | update | rotate-secret | secret-state | delete | registration-token")
+        System.err.println(
+            "Subcommands: list | get | create | update | rotate-secret | revoke-previous-secret | secret-state | delete | registration-token",
+        )
         return CommandSupport.EXIT_USAGE
     }
 
@@ -374,16 +387,23 @@ class ClientsCommand : Callable<Int> {
      * previous secret is still in its overlap window (`409 rotation_in_flight`). That is a state, not
      * a fault, so instead of the generic error line the command says when the next rotation is
      * allowed — from the server's hint when the 409 carries one, otherwise by reading
-     * `secret-state` — that the previous secret keeps working until then, and where the incident
-     * path is. Exit code stays [CommandSupport.EXIT_HTTP_ERROR]: the server refused the call, which
-     * is what that code has always meant to scripts.
+     * `secret-state` — that the previous secret keeps working until then, and the two commands that
+     * end the window early. Exit code stays [CommandSupport.EXIT_HTTP_ERROR]: the server refused the
+     * call, which is what that code has always meant to scripts.
+     *
+     * **`--replace` (SSO-3967; product-api SSO-3956).** Inside an open window, when the NEW secret was
+     * lost before it reached the deployment, `--replace` sends `replaceInFlight: true`: the server mints
+     * a replacement, the superseded in-flight secret stops working at once, and the previous secret
+     * keeps its original expiry (so there are never three valid secrets). The secret output path is
+     * the same [SecretIo] one. It is an elevated act — see [renderElevatedActError].
      */
     @Command(
         name = "rotate-secret",
         description = [
             "Rotate a client's secret. The new secret is shown once; the old one stays valid for 24h. " +
                 "While that window is open a second rotation is refused (409) and the command says from when " +
-                "it is allowed again — see `thoryn clients secret-state`.",
+                "it is allowed again — see `thoryn clients secret-state`. To replace a new secret that was lost " +
+                "inside the window, add --replace (needs a passkey sign-in from the last 5 minutes).",
         ],
         mixinStandardHelpOptions = true,
     )
@@ -397,6 +417,15 @@ class ClientsCommand : Callable<Int> {
 
         @Option(names = ["--force-stdout"], description = ["Allow printing the secret to a non-interactive stdout. Off by default."])
         var forceStdout: Boolean = false
+
+        @Option(
+            names = ["--replace"],
+            description = [
+                "Replace a rotation that is in flight (for example a new secret that was lost): the superseded " +
+                    "secret stops working at once; the previous one keeps its expiry.",
+            ],
+        )
+        var replace: Boolean = false
 
         @Option(names = ["--confirm"], description = [CommandSupport.CONFIRM_OPTION_DESC])
         var confirm: String? = null
@@ -413,7 +442,7 @@ class ClientsCommand : Callable<Int> {
             gateway = CommandSupport.resolveGateway(gateway, tokens) // SSO-2827 — default to the gateway you signed into
             val client = CommandSupport.gatewayClient(gateway, tokens)
             return try {
-                val response = client.rotateApplicationSecret(clientId, confirm)
+                val response = client.rotateApplicationSecret(clientId, confirm, replaceInFlight = replace)
                 val secret = response["newSecret"]?.asString()
                 val safe = stripNewSecret(response)
                 CommandSupport.emitRecord(format, safe, ::rotateRecordFields)
@@ -437,7 +466,81 @@ class ClientsCommand : Callable<Int> {
                             .getOrNull()
                     return renderRotationInFlight(format, ex, clientId, availableAt)
                 }
-                CommandSupport.renderError(format, ex, requiredScope = "tenant:applications.write")
+                // SSO-3967 — only `--replace` is an elevated act; the two 403s below never come without it.
+                renderElevatedActError(format, ex, requiredScope = "tenant:applications.write", act = ACT_REPLACE)
+            } catch (ex: Exception) {
+                CommandSupport.renderRequestFailure(ex, gateway)
+            }
+        }
+    }
+
+    /**
+     * `thoryn clients revoke-previous-secret <clientId> [--revoke-tokens] [--confirm <workspace-slug>]`
+     *
+     * SSO-3967 (product-api SSO-3956) — end the PREVIOUS secret of a rotation in flight now, instead
+     * of at the end of its 24 h overlap window: the incident response to a leaked previous secret.
+     * `POST /api/v1/applications/{clientId}/secret/revoke-previous`, body `{ "revokeTokens": <bool> }`.
+     * Idempotent — with nothing in flight the server answers `200` with `previousSecretRevoked: false`
+     * and the command says nothing changed. `--revoke-tokens` also revokes the client's live
+     * authorizations (refresh tokens, stored reference tokens, device codes); self-contained access
+     * tokens already issued verify by signature until they expire, and the output says so.
+     *
+     * The table output is plain words (what no longer works, what still does); `--output json|yaml`
+     * is the server body as it arrived (`previousSecretId`, `previousSecretRevoked`, `tokensRevoked`,
+     * `revokedAuthorizations`, `rotationAvailable`). After a revoke the next rotation is available at
+     * once (`rotationAvailable: true`).
+     *
+     * Destructive on the production plane: `--confirm <workspace-slug>` as `delete` / `rotate-secret`
+     * (`428 production_confirmation_required` without it). An elevated act — see
+     * [renderElevatedActError]. Scope `tenant:applications.write`.
+     */
+    @Command(
+        name = "revoke-previous-secret",
+        description = [
+            "End the previous secret of a rotation in flight NOW (for example after it leaked) instead of at the end " +
+                "of its 24h window. Only the current secret signs in afterwards; the next rotation is allowed at once. " +
+                "Needs a passkey sign-in from the last 5 minutes. Idempotent when nothing is in flight.",
+        ],
+        mixinStandardHelpOptions = true,
+    )
+    class RevokePreviousSecretSubcommand : Callable<Int> {
+
+        @Parameters(index = "0", description = ["Client ID."])
+        lateinit var clientId: String
+
+        @Option(
+            names = ["--revoke-tokens"],
+            description = [
+                "Also revoke this client's live sessions/tokens (refresh tokens, stored reference tokens, device codes). " +
+                    "Self-contained access tokens already issued stay valid until they expire.",
+            ],
+        )
+        var revokeTokens: Boolean = false
+
+        @Option(names = ["--confirm"], description = [CommandSupport.CONFIRM_OPTION_DESC])
+        var confirm: String? = null
+
+        @Option(names = ["--gateway"], defaultValue = ThorynConfig.DEFAULT_GATEWAY)
+        var gateway: String = ThorynConfig.DEFAULT_GATEWAY
+
+        @Option(names = ["--output"], description = ["Output format: json|yaml|table (default: table)."])
+        var outputRaw: String? = null
+
+        override fun call(): Int {
+            val format = CommandSupport.parseFormat(outputRaw) ?: return CommandSupport.EXIT_USAGE
+            val tokens = CommandSupport.readTokens() ?: return CommandSupport.EXIT_NOT_SIGNED_IN
+            gateway = CommandSupport.resolveGateway(gateway, tokens) // SSO-2827 — default to the gateway you signed into
+            val client = CommandSupport.gatewayClient(gateway, tokens)
+            return try {
+                val body = client.revokePreviousApplicationSecret(clientId, confirm, revokeTokens = revokeTokens)
+                when (format) {
+                    OutputFormat.JSON -> Printers.json(body)
+                    OutputFormat.YAML -> Printers.yaml(body)
+                    OutputFormat.TABLE -> revokePreviousSecretSummary(body).forEach(::println)
+                }
+                CommandSupport.EXIT_OK
+            } catch (ex: ProductApiException) {
+                renderElevatedActError(format, ex, requiredScope = "tenant:applications.write", act = ACT_REVOKE_PREVIOUS)
             } catch (ex: Exception) {
                 CommandSupport.renderRequestFailure(ex, gateway)
             }
@@ -484,7 +587,7 @@ class ClientsCommand : Callable<Int> {
             return try {
                 val body = client.getApplicationSecretState(clientId)
                 CommandSupport.emitRecord(format, body, ::secretStateRecordFields)
-                if (format == OutputFormat.TABLE) println(secretStateSummary(body))
+                if (format == OutputFormat.TABLE) println(secretStateSummary(body, clientId = clientId))
                 CommandSupport.EXIT_OK
             } catch (ex: ProductApiException) {
                 CommandSupport.renderError(format, ex, requiredScope = "tenant:applications.read")
@@ -590,13 +693,14 @@ class ClientsCommand : Callable<Int> {
         internal const val ERROR_CODE_ROTATION_IN_FLIGHT: String = "rotation_in_flight"
 
         /**
-         * Where to read about ending the previous secret now or replacing a lost new secret. Those are
-         * incident paths SSO-3956 is building on the server; this CLI does not claim commands for them
-         * yet, so the pointer is to the README, which says what exists and what is planned.
+         * SSO-3967 — the two ways out of an open overlap window, named with the client at hand: end the
+         * previous secret now (it leaked), or replace a new secret that was lost before it reached the
+         * deployment. Printed on `409 rotation_in_flight` and under an in-flight `secret-state`.
+         * (Replaces the SSO-3957 README pointer that stood here while the server side was being built.)
          */
-        internal const val ROTATION_INCIDENT_PATH_HINT: String =
-            "To end the previous secret now, or to replace a lost new secret, see \"Rotation state\" in the thoryn CLI " +
-                "README (incident paths, SSO-3956)."
+        internal fun rotationIncidentPathHint(clientId: String): String =
+            "To end the previous secret now: `thoryn clients revoke-previous-secret $clientId`. " +
+                "To replace a lost new secret: `thoryn clients rotate-secret $clientId --replace`."
 
         /**
          * The `secret-state` table: the four server fields, times rendered with their age
@@ -612,13 +716,14 @@ class ClientsCommand : Callable<Int> {
         /**
          * One line that reads the state out in plain words. `rotationAvailable` decides which: when it
          * is false the previous secret is still working and the window end is the moment a rotation is
-         * allowed again (the hub sets both from the same overlap row).
+         * allowed again (the hub sets both from the same overlap row). While a rotation is in flight
+         * and a [clientId] is known, a second line names the two commands that end the window early.
          */
-        internal fun secretStateSummary(node: JsonNode, now: Instant = Instant.now()): String {
+        internal fun secretStateSummary(node: JsonNode, now: Instant = Instant.now(), clientId: String? = null): String {
             val available = node["rotationAvailable"]?.takeIf { !it.isNull }?.asBoolean()
             val until = Timestamps.render(node["previousExpiresAt"], now)
                 ?: Timestamps.render(node["rotationAvailableAt"], now)
-            return when {
+            val reading = when {
                 available == true ->
                     "No rotation is in flight: only the current secret works, and you can rotate now."
                 available == false && until != null ->
@@ -628,7 +733,83 @@ class ClientsCommand : Callable<Int> {
                     "A rotation is in flight: the previous secret still works and a new rotation is not allowed yet."
                 else -> "The server did not say whether a rotation is allowed."
             }
+            return if (available == false && clientId != null) "$reading\n${rotationIncidentPathHint(clientId)}" else reading
         }
+
+        // ── SSO-3967: the two incident-response acts ────────────────────────────────────────────────
+
+        /** What the act is called in the step-up / person-only guidance. */
+        internal const val ACT_REVOKE_PREVIOUS: String = "Ending the previous secret now"
+        internal const val ACT_REPLACE: String = "Replacing a rotation in flight"
+
+        /**
+         * The `revoke-previous-secret` table output, in plain words and from the server's booleans — never
+         * from what the caller asked for: `--revoke-tokens` is reported only when the server says it did.
+         */
+        internal fun revokePreviousSecretSummary(node: JsonNode): List<String> {
+            val lines = mutableListOf<String>()
+            val revoked = node["previousSecretRevoked"]?.takeIf { !it.isNull }?.asBoolean()
+            lines += when (revoked) {
+                true -> "The previous secret no longer works. Only the current secret signs in."
+                false -> "There was no previous secret; nothing changed."
+                null -> "The server did not say whether a previous secret was revoked."
+            }
+            if (node["tokensRevoked"]?.takeIf { !it.isNull }?.asBoolean() == true) {
+                val n = node["revokedAuthorizations"]?.takeIf { !it.isNull }?.asInt() ?: 0
+                lines += "$n live sessions/tokens of this client were revoked (self-contained access tokens already " +
+                    "issued stay valid until they expire)."
+            }
+            return lines
+        }
+
+        /**
+         * Error rendering for the two elevated acts, on top of [CommandSupport.renderError]. The server
+         * grants them only to a PERSON with a passkey sign-in from the last five minutes (RFC 9470):
+         *
+         *  - `403 insufficient_user_authentication` (recognised by its `WWW-Authenticate` challenge) — the
+         *    same guidance `thoryn workload-identity trusts set-scopes` prints: what [act] needs, then the
+         *    exact `thoryn login --acr-values <acr> --max-age <s>` to run, then retry. The challenge's own
+         *    `acr_values` / `max_age` are used when it carries them.
+         *  - `403 elevated_action_requires_person` — a machine identity (API key, workload identity) cannot
+         *    do this; a workspace admin must, signed in with a passkey.
+         *
+         * Neither is a missing CALLER scope, so neither gets the `thoryn login --scope` line
+         * ([ProductApiException.isInsufficientScope] would otherwise claim the person-only 403). Every
+         * other refusal keeps [CommandSupport.renderError] with [requiredScope].
+         */
+        internal fun renderElevatedActError(
+            format: OutputFormat,
+            ex: ProductApiException,
+            requiredScope: String,
+            act: String,
+            err: PrintStream = System.err,
+        ): Int {
+            if (ex.isStepUpRequired) {
+                val exit = CommandSupport.renderError(format, ex, requiredScope = null, err = err)
+                if (format == OutputFormat.TABLE) {
+                    val acr = ex.stepUpAcrValues ?: WorkloadIdentityCommand.PASSKEY_ACR
+                    val maxAge = ex.stepUpMaxAge ?: 300
+                    err.println("$act needs a passkey sign-in from the last ${maxAge / 60} minutes. Sign in again, then retry:")
+                    err.println("  thoryn login --acr-values $acr --max-age $maxAge")
+                }
+                return exit
+            }
+            if (ex.errorCode == ERROR_CODE_ELEVATED_ACTION_REQUIRES_PERSON) {
+                val exit = CommandSupport.renderError(format, ex, requiredScope = null, err = err)
+                if (format == OutputFormat.TABLE) {
+                    err.println(
+                        "$act is a person's act: a machine identity (API key, workload identity) cannot do this. " +
+                            "A workspace admin must run it, signed in with a passkey " +
+                            "(thoryn login --acr-values ${WorkloadIdentityCommand.PASSKEY_ACR} --max-age 300).",
+                    )
+                }
+                return exit
+            }
+            return CommandSupport.renderError(format, ex, requiredScope = requiredScope, err = err)
+        }
+
+        /** RFC 9457 `errorCode` product-api emits (403) when a machine token attempts an elevated act. */
+        internal const val ERROR_CODE_ELEVATED_ACTION_REQUIRES_PERSON: String = "elevated_action_requires_person"
 
         /**
          * The moment the next rotation is allowed, as the 409 itself carries it: a structured
@@ -674,7 +855,7 @@ class ClientsCommand : Callable<Int> {
                 "errorDescription" to ex.errorDescription,
                 "httpStatus" to ex.httpStatus,
                 "rotationAvailableAt" to availableAt?.truncatedTo(java.time.temporal.ChronoUnit.SECONDS)?.toString(),
-                "hint" to "$whenLine $ROTATION_INCIDENT_PATH_HINT",
+                "hint" to "$whenLine ${rotationIncidentPathHint(clientId)}",
             )
             when (format) {
                 OutputFormat.JSON -> Printers.json(structured, out)
@@ -683,7 +864,7 @@ class ClientsCommand : Callable<Int> {
                     val description = ex.errorDescription?.let { " — $it" } ?: ""
                     err.println("Error: $ERROR_CODE_ROTATION_IN_FLIGHT$description")
                     err.println(whenLine)
-                    err.println(ROTATION_INCIDENT_PATH_HINT)
+                    err.println(rotationIncidentPathHint(clientId))
                 }
             }
             return CommandSupport.EXIT_HTTP_ERROR

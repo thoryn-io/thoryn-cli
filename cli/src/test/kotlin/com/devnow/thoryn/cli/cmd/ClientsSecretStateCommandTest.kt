@@ -123,8 +123,9 @@ class ClientsSecretStateCommandTest : CommandTestBase() {
         assertThat(err).contains("rotation_in_flight")
         assertThat(err).contains("The previous secret keeps working until 2026-06-10T10:00:00Z")
         assertThat(err).contains("The next rotation is allowed from then")
-        assertThat(err).contains("To end the previous secret now, or to replace a lost new secret")
-        assertThat(err).contains("SSO-3956")
+        assertThat(err).contains("To end the previous secret now: `thoryn clients revoke-previous-secret app-1`")
+        assertThat(err).contains("To replace a lost new secret: `thoryn clients rotate-secret app-1 --replace`")
+        assertThat(err).doesNotContain("README").doesNotContain("SSO-3956")
         // The hint was in the 409 itself — the CLI did not go back for the state.
         assertThat(server.takeRequest().path).isEqualTo("/api/v1/applications/app-1/secret/rotate")
         assertThat(server.takeRequest(200, TimeUnit.MILLISECONDS)).isNull()
@@ -157,7 +158,7 @@ class ClientsSecretStateCommandTest : CommandTestBase() {
         assertThat(err).contains("rotation_in_flight")
         assertThat(err).contains("The previous secret keeps working until its overlap window ends")
         assertThat(err).contains("thoryn clients secret-state app-1")
-        assertThat(err).contains("To end the previous secret now, or to replace a lost new secret")
+        assertThat(err).contains("To end the previous secret now: `thoryn clients revoke-previous-secret app-1`")
         // The failed state read is not a second error story.
         assertThat(err).doesNotContain("hub_unavailable")
     }
@@ -200,7 +201,8 @@ class ClientsSecretStateCommandTest : CommandTestBase() {
         assertThat(body["rotationAvailableAt"]).isEqualTo("2026-06-10T10:00:00Z")
         assertThat(body["hint"].toString())
             .contains("keeps working until 2026-06-10T10:00:00Z")
-            .contains("To end the previous secret now")
+            .contains("To end the previous secret now: `thoryn clients revoke-previous-secret app-1`")
+            .contains("To replace a lost new secret: `thoryn clients rotate-secret app-1 --replace`")
     }
 
     @Test
