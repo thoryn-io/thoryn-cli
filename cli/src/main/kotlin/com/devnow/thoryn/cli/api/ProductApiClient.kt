@@ -154,9 +154,39 @@ class ProductApiClient(
      *
      * [confirmSlug] (SSO-2413) — see [deleteApplication]; a production-plane
      * rotation is gated the same way.
+     *
+     * [replaceInFlight] (SSO-3967; product-api SSO-3956) — `true` sends the body
+     * `{"replaceInFlight": true}`: inside an open overlap window the superseded in-flight
+     * secret stops working at once and the previous secret keeps its ORIGINAL expiry (the
+     * response's `previousSecretId` / `oldSecretExpiresAt` name that unchanged previous
+     * secret). An elevated act: the server answers `403 insufficient_user_authentication`
+     * (RFC 9470, with `WWW-Authenticate`) without a passkey sign-in from the last five
+     * minutes, and `403 elevated_action_requires_person` to a machine identity. `false`
+     * sends the empty body the ordinary rotation has always sent — byte-identical.
      */
-    fun rotateApplicationSecret(clientId: String, confirmSlug: String? = null): JsonNode =
-        post("/api/v1/applications/${encode(clientId)}/secret/rotate", emptyBody(), confirmSlug)
+    fun rotateApplicationSecret(clientId: String, confirmSlug: String? = null, replaceInFlight: Boolean = false): JsonNode {
+        val body: Any = if (replaceInFlight) mapOf("replaceInFlight" to true) else emptyBody()
+        return post("/api/v1/applications/${encode(clientId)}/secret/rotate", body, confirmSlug)
+    }
+
+    /**
+     * SSO-3967 (product-api SSO-3956) — `POST /api/v1/applications/{id}/secret/revoke-previous`:
+     * end the previous secret of a rotation in flight NOW instead of at the end of its 24 h overlap
+     * window. Body `{"revokeTokens": <bool>}`; with `true` the client's live authorizations (refresh
+     * tokens, stored reference tokens, device codes) are revoked too — self-contained access tokens
+     * already issued stay valid until they expire. Idempotent: `200` with `previousSecretRevoked:
+     * false` when nothing was in flight. Response `RevokePreviousSecretResponse`:
+     * `previousSecretId` (or null), `previousSecretRevoked`, `tokensRevoked`,
+     * `revokedAuthorizations`, `rotationAvailable`.
+     *
+     * An elevated act like [rotateApplicationSecret]'s `replaceInFlight`: `403
+     * insufficient_user_authentication` (+ `WWW-Authenticate`, RFC 9470) without a passkey sign-in
+     * from the last five minutes, `403 elevated_action_requires_person` for a machine identity,
+     * `404` cross-tenant / unknown id. [confirmSlug] (SSO-2413) — see [deleteApplication]; a
+     * production-plane revoke is gated the same way. Scope `tenant:applications.write`.
+     */
+    fun revokePreviousApplicationSecret(clientId: String, confirmSlug: String? = null, revokeTokens: Boolean = false): JsonNode =
+        post("/api/v1/applications/${encode(clientId)}/secret/revoke-previous", mapOf("revokeTokens" to revokeTokens), confirmSlug)
 
     /**
      * SSO-3957 — `GET /api/v1/applications/{id}/secrets/state`: the live rotation state of a
