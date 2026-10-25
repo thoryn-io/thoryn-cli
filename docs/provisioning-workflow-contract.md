@@ -143,13 +143,17 @@ consent base URL, `https://` without query or fragment; `THORYN_CONSENT_URL` for
 empty; default empty ⇒ the raw CLI commands alone, under a check-each-line warning; set ⇒ Option 1 is `thoryn access approve`, SSO-3738), `apply.prune` / `apply.destroy` (default false) / `apply.confirm`
 (workspace slug). The check also confirms every configured file is committed.
 
-`config.secret-delivery` (SSO-3921) reads every configured provisioning file that is committed: the apply job runs on a
-hosted runner with no kubeconfig, no `--secret-file` and no TTY, so an application that MINTS a client secret on create
-(confidential, `client_secret_basic` or no declared method; not `readOnly`) fails the rule unless it declares
-`secretSink: { kind: workloadPull, trust: <kubernetes trust> }` — its pod mints its own secret at start (oauthy ADR
-2026-10-14 credential ladder, rung 3). Without a sink the create ends in `undelivered_secrets` (exit 65); a
-`kubernetesSecret` sink has no cluster to reach; a `file` sink writes onto a runner that is gone when the job ends
-(green, the secret lost). A public or secret-less (`private_key_jwt`, `federated_assertion`) client passes.
+`config.secret-delivery` (SSO-3921, reshaped by SSO-3954) reads every configured provisioning file that is committed: the
+apply job runs on a hosted runner with no kubeconfig, no `--secret-file` and no TTY. An application that MINTS a client
+secret on create (confidential, `client_secret_basic` or no declared method; not `readOnly`) **passes** with no
+`secretSink` or with `secretSink: { kind: customerManaged }` — the default since SSO-3954 (oauthy ADR 2026-10-14 amended
+2026-10-25, SSO-3951: Thoryn owns the secret lifecycle, the customer owns delivery): `apply` discards the create's value,
+grants nothing, and a person mints the secret (`thoryn clients rotate-secret <clientId> --secret-file …`) and stores it in
+the customer's secret infrastructure. The rule's detail carries that notice per application — it is where the semantics are
+explained, not a failure. Still red: a `kubernetesSecret` sink has no cluster to reach; a `file` sink writes onto a runner
+that is gone when the job ends (green, the secret lost); the fix is to drop the sink. A `workloadPull` sink (rung 3, the
+pod pull) passes but is reported DEPRECATED (SSO-3951; SSO-3953 removes it). A public or secret-less (`private_key_jwt`,
+`federated_assertion`) client passes silently.
 
 `config.trust-scopes` (SSO-3926) reads every configured `{file, connection}` pair that is committed and loads: the scopes
 the file needs (derived from its kinds, `grants:` blocks, bindings and secret sinks — each the `@PreAuthorize` gate of the
@@ -183,6 +187,12 @@ SSO-3921 did **not** bump it either: the stub and the reusable workflow are unch
 which reads the provisioning FILES the configuration names — a repository whose file declares a secret-minting
 application without `secretSink: { kind: workloadPull }` now fails the check, which is what its first CI apply would
 have done (`undelivered_secrets`) or, with a `file` sink, silently lost.
+
+SSO-3954 did **not** bump it: the stub and the reusable workflow are unchanged. It turns `config.secret-delivery`'s
+no-sink case from a failure into a PASS with a notice (the customer manages the secret — the default), keeps the
+`kubernetesSecret` / `file` failures, and reports `workloadPull` deprecated. A repository that was red only for lacking a
+sink is green on the next run with no edit; one that declared `workloadPull` to satisfy the old rule can now drop the sink
+(and the trust it named) and have a person revoke the grant and delete the trust — the README's "Leaving `workloadPull`".
 
 SSO-3926 did **not** bump it: the stub and the reusable workflow are unchanged. It adds `config.trust-scopes`, which reads
 the configured files AND their connections — a repository whose connection lacks a scope its file needs now fails the
