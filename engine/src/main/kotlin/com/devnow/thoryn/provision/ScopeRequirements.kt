@@ -69,6 +69,40 @@ object ScopeRequirements {
     const val SCOPE_ENVIRONMENTS_READ = "tenant:environments.read"
     const val SCOPE_WORKLOAD_IDENTITY_READ = "tenant:workload-identity.read"
     const val SCOPE_WORKLOAD_IDENTITY_WRITE = "tenant:workload-identity.write"
+    const val SCOPE_APPLICATIONS_READ = "tenant:applications.read"
+    const val SCOPE_APPLICATIONS_WRITE = "tenant:applications.write"
+
+    /**
+     * SSO-3962 (ADR 2026-10-25 §1 "Identity") — the BASELINE of an APPLICATION file: `tenant:applications.read` and
+     * `tenant:access.read` (its ownership check) to plan, `tenant:applications.write` to apply, and nothing else — an
+     * application is a user of the tenant, so its identity never holds a tenant-defining scope. What a declared mechanism
+     * of the application's OWN object adds on top is derived by [of] like any other need and named by [beyondBaseline], so
+     * the rule says exactly why a file asks for more than the three: `tenant:environments.read` for an application in a
+     * sandbox (the sandbox's id for the ownership check — conditional), `tenant:workload-identity.read` for a
+     * `federatedTrust` / `workloadPull` trust resolved by name, `tenant:access.write` for a `grants:` block or a
+     * `workloadPull` sink's `manager` grant. A tenant-defining scope (`tenant:users.*`, `tenant:idp.*`, …) can never be
+     * among an application file's needs, because the kinds that need them are refused in it ([ProvisionFile.validate]).
+     */
+    val APPLICATION_FILE_SCOPES: Set<String> = setOf(SCOPE_APPLICATIONS_READ, SCOPE_APPLICATIONS_WRITE, AccessRefs.SCOPE_READ)
+
+    /**
+     * SSO-3962 — the needs of an application file that lie OUTSIDE [APPLICATION_FILE_SCOPES] (empty for a tenant or mixed
+     * file, and for a plain application file): each names the resource and the mechanism that asks for the scope.
+     */
+    fun beyondBaseline(file: ProvisionFile, needs: List<ScopeNeed>): List<ScopeNeed> =
+        if (file.part != ProvisionPart.APPLICATION) emptyList() else needs.filterNot { it.scope in APPLICATION_FILE_SCOPES }
+
+    /**
+     * SSO-3962 — the scopes [held] (a trust's scopes, a connection's `auth.scopes`) that an APPLICATION file does not need:
+     * the identity is wider than its file — a tenant-defining scope on an app project's trust is the blur the parts remove.
+     * Empty for a tenant or mixed file (their union of kinds decides, as before). Compared with [holds] in reverse: a held
+     * deprecated alias (`tenant:clients.read`) of a needed scope counts as needed.
+     */
+    fun unneeded(file: ProvisionFile, needs: List<ScopeNeed>, held: Set<String>): List<String> {
+        if (file.part != ProvisionPart.APPLICATION) return emptyList()
+        val needed = needs.map { it.scope }.toSet()
+        return held.filter { h -> h !in needed && needed.none { aliasOf(it) == h } }.sorted()
+    }
 
     /** The scope area each kind's endpoint is gated on (`tenant:<area>.read` / `.write`) — the table above. */
     val AREAS: Map<String, String> = mapOf(

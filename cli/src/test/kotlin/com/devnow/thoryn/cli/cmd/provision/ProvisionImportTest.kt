@@ -157,7 +157,7 @@ class ProvisionImportTest : CommandTestBase() {
         // The appended file describes exactly what is live: every imported entry is a no-op (the hand-written sandbox the
         // import left alone included), and a second import adds nothing.
         val plan = runCli("provision", "plan", "--file", file.path, "--gateway", baseUrl())
-        assertThat(plan.err).isEmpty()
+        assertThat(plan.err).doesNotContain("Error")
         assertThat(plan.exit).isEqualTo(0)
         assertThat(plan.out).contains("0 to create, 0 to update, 0 to remove, 5 unchanged.")
         val again = runCli("provision", "import", "--file", file.path, "--gateway", baseUrl(), "--write")

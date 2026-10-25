@@ -98,6 +98,8 @@ import java.util.concurrent.Callable
         ProvisionCommand.ApplySubcommand::class,
         ProvisionCommand.ImportSubcommand::class,
         ProvisionCommand.DestroySubcommand::class,
+        // SSO-3962 — `thoryn provision split`: a mixed thoryn.io/provision/v1 file into its tenant and application files.
+        ProvisionCommand.SplitSubcommand::class,
         // SSO-3719 — `thoryn provision workflow check`: the stub + .thoryn/workflow.yaml against the workflow contract.
         com.devnow.thoryn.cli.cmd.provision.workflow.ProvisionWorkflowCommand::class,
     ],
@@ -106,7 +108,7 @@ class ProvisionCommand : Callable<Int> {
 
     override fun call(): Int {
         System.err.println("Usage: thoryn provision <subcommand>")
-        System.err.println("Subcommands: plan, apply, import, destroy, workflow")
+        System.err.println("Subcommands: plan, apply, import, destroy, split, workflow")
         return CommandSupport.EXIT_USAGE
     }
 
@@ -143,11 +145,20 @@ class ProvisionCommand : Callable<Int> {
                 System.err.println("No provisioning file found — expected ${ProvisionFile.DEFAULT_DIR}/${ProvisionFile.DEFAULT_FILES.first()} (or pass --file).")
                 return null
             }
-            return ProvisionFile.load(target)
+            return ProvisionFile.load(target).also { printWarnings(it) }
         }
     }
 
     internal companion object {
+        /**
+         * SSO-3962 — what the file carries that is accepted today and refused in a later release ([ProvisionFile.warnings]: the
+         * mixed `thoryn.io/provision/v1` format, `publishTo:`), one `Warning:` line each on stderr before the work — never on
+         * stdout, which `--output json|yaml` reserves for the one document.
+         */
+        fun printWarnings(file: ProvisionFile) {
+            file.warnings.forEach { System.err.println("Warning: ${file.source}: $it") }
+        }
+
         /** An engine whose clients target the file's per-resource environment on the caller's session. */
         fun engine(
             gateway: String,
@@ -591,7 +602,7 @@ class ProvisionCommand : Callable<Int> {
             val format = CommandSupport.parseFormat(outputRaw) ?: return CommandSupport.EXIT_USAGE
             val target = file ?: ProvisionFile.resolveDefault() ?: File(ProvisionFile.DEFAULT_DIR, ProvisionFile.DEFAULT_FILES.first())
             val existing = try {
-                if (target.isFile) ProvisionFile.load(target) else null
+                if (target.isFile) ProvisionFile.load(target).also { printWarnings(it) } else null
             } catch (ex: ProvisionException) {
                 System.err.println("Error: ${ex.message}"); return CommandSupport.EXIT_USAGE
             }
@@ -620,7 +631,7 @@ class ProvisionCommand : Callable<Int> {
                     if (!write && result.resources.isNotEmpty()) System.err.println("Printed ${result.resources.size} entry(ies) — nothing was written; re-run with --write to append them to ${target.path}.")
                     return CommandSupport.EXIT_OK
                 }
-                appendEntries(target, yaml, existing)
+                appendEntries(target, yaml, existing, result.resources.map { it.resource.kind })
                 val readOnly = result.resources.count { it.resource.readOnly }
                 if (format == OutputFormat.TABLE) {
                     println("Imported ${result.resources.size} entry(ies) into ${target.path}: ${result.resources.size - readOnly} to converge, $readOnly read-only. Nothing else was written — the platform is the ledger.")
@@ -644,10 +655,11 @@ class ProvisionCommand : Callable<Int> {
          * through [ProvisionFile] and the original bytes restored when it does not validate, so `--write` can never
          * leave an invalid file behind.
          */
-        private fun appendEntries(target: File, fragment: String, existing: ProvisionFile?) {
+        private fun appendEntries(target: File, fragment: String, existing: ProvisionFile?, kinds: List<String>) {
             if (existing == null) {
                 target.absoluteFile.parentFile?.mkdirs()
-                target.writeText(ProvisionYamlEdit.fresh(fragment))
+                // SSO-3962 — a fresh file declares the part its entries belong to (both parts ⇒ the mixed format, which warns to split).
+                target.writeText(ProvisionYamlEdit.fresh(fragment, ProvisionYamlEdit.apiVersionFor(kinds)))
             } else {
                 val original = target.readBytes()
                 // The shared edit rule (ProvisionYamlEdit): append under `resources:` only when it is the last top-level key.
@@ -659,6 +671,53 @@ class ProvisionCommand : Callable<Int> {
                     throw ProvisionException("the appended entries did not validate (${ex.message}); ${target.path} was left unchanged")
                 }
             }
+        }
+    }
+
+    /**
+     * SSO-3962 — `thoryn provision split [--file] [--tenant-file <path>] [--application-file <path>] [--force]`: the one-time
+     * move from the mixed `thoryn.io/provision/v1` format to the two parts ([ProvisionSplit]). Reads the mixed file,
+     * writes `.thoryn/tenant.provision.yaml` (every tenant kind — for the workspace's config project) and
+     * `.thoryn/application.provision.yaml` (every `application` — for the app project) next to it, each re-loaded through
+     * the loader before it is written, and prints which resource went where. The source file is never modified; the
+     * outputs are re-rendered, so its comments are not carried over (the output says so). No session is needed.
+     */
+    @Command(name = "split", description = ["SSO-3962 — write a mixed thoryn.io/provision/v1 file as a tenant file (thoryn.io/tenant/v1) and an application file (thoryn.io/application/v1); the source is left as it is."], mixinStandardHelpOptions = true)
+    internal class SplitSubcommand : Callable<Int> {
+        @Option(names = ["--file", "-f"], description = ["The mixed provisioning file to split (default: .thoryn/provision.yaml, .yml or .json)."])
+        var file: File? = null
+
+        @Option(names = ["--tenant-file"], description = ["Where the tenant file is written (default: <dir of the source>/tenant.provision.yaml). Not written when the source declares no tenant kind."])
+        var tenantFile: File? = null
+
+        @Option(names = ["--application-file"], description = ["Where the application file is written (default: <dir of the source>/application.provision.yaml). Not written when the source declares no application."])
+        var applicationFile: File? = null
+
+        @Option(names = ["--force"], description = ["Overwrite an output file that already exists. Off by default."])
+        var force: Boolean = false
+
+        override fun call(): Int {
+            val source = file ?: ProvisionFile.resolveDefault() ?: run {
+                System.err.println("No provisioning file found — expected ${ProvisionFile.DEFAULT_DIR}/${ProvisionFile.DEFAULT_FILES.first()} (or pass --file).")
+                return CommandSupport.EXIT_USAGE
+            }
+            val dir = source.absoluteFile.parentFile
+            val outputs = try {
+                ProvisionSplit.split(source, tenantFile ?: File(dir, "tenant.provision.yaml"), applicationFile ?: File(dir, "application.provision.yaml"), force)
+            } catch (ex: ProvisionException) {
+                System.err.println("Error: ${ex.message}"); return CommandSupport.EXIT_USAGE
+            }
+            println("Split ${source.path} (${ProvisionFile.API_VERSION}) into its two parts:")
+            outputs.forEach { o ->
+                if (o.written) {
+                    println("  ${o.part.label.padEnd(11)}  ${o.file.path}  (${o.part.apiVersion}): ${o.resources.joinToString(", ")}")
+                } else {
+                    println("  ${o.part.label.padEnd(11)}  not written — the source declares no ${o.part.label} kind")
+                }
+            }
+            println("${source.path} was not changed; the outputs are re-rendered, so its comments are not carried over.")
+            println("Next: the tenant file belongs in the workspace's config project, the application file in the app project — each converged by its own identity (`thoryn provision plan --file <path>` is the check).")
+            return CommandSupport.EXIT_OK
         }
     }
 

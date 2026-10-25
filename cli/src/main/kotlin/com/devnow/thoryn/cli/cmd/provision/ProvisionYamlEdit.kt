@@ -22,8 +22,11 @@ internal object ProvisionYamlEdit {
     private val json = JsonMapper.builder().build()
     private val yaml = YAMLMapper.builder().build()
 
-    /** `apiVersion: …\nresources:\n` — the header of a fresh file. */
+    /** `apiVersion: …\nresources:\n` — the header of a fresh MIXED file (SSO-3962: a fresh file of one part uses [header]). */
     const val HEADER: String = "apiVersion: ${ProvisionFile.API_VERSION}\nresources:\n"
+
+    /** SSO-3962 — the header of a fresh file declaring [apiVersion] (`thoryn.io/tenant/v1` | `thoryn.io/application/v1` | the mixed one). */
+    fun header(apiVersion: String): String = "apiVersion: $apiVersion\nresources:\n"
 
     /** [entries] (an array node) as a `resources:` list fragment, indented for the file (two spaces, as the schema examples are written). */
     fun fragment(entries: JsonNode): String {
@@ -31,8 +34,18 @@ internal object ProvisionYamlEdit {
         return YamlWriter.write(entries).lines().filter { it.isNotEmpty() }.joinToString("\n") { "  $it" } + "\n"
     }
 
-    /** A fresh file carrying [fragment]. */
-    fun fresh(fragment: String): String = HEADER + fragment
+    /** A fresh file carrying [fragment], declaring [apiVersion] (SSO-3962; the mixed format when the caller does not say). */
+    fun fresh(fragment: String, apiVersion: String = ProvisionFile.API_VERSION): String = header(apiVersion) + fragment
+
+    /**
+     * SSO-3962 — the `apiVersion` a fresh file for [kinds] declares: the tenant part when every kind is tenant provisioning,
+     * the application part when every kind is `application`, the deprecated mixed format when both are present (the
+     * loader then warns that the file is two files — `thoryn provision split`).
+     */
+    fun apiVersionFor(kinds: Collection<String>): String {
+        val parts = kinds.mapNotNull { com.devnow.thoryn.provision.ProvisionPart.ofKind(it) }.toSet()
+        return parts.singleOrNull()?.apiVersion ?: ProvisionFile.API_VERSION
+    }
 
     /**
      * [text] with [fragment] appended under its `resources:` list. Throws [ProvisionException] when `resources` is

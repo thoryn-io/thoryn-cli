@@ -58,7 +58,7 @@ class ProvisionCommandTest : CommandTestBase() {
 
         // apply: env, then app + user INTO the created sandbox.
         val apply = runCli("provision", "apply", "--file", file.path, "--gateway", baseUrl(), "--yes")
-        assertThat(apply.err).isEmpty()
+        assertThat(apply.err).doesNotContain("Error")
         assertThat(apply.exit).isEqualTo(0)
         assertThat(apply.out).contains("Applied. 3 resource(s) converged (3 created, 0 updated)")
         assertThat(paths()).containsExactly("POST /api/v1/environments", "POST /api/v1/applications", "POST /api/v1/users")
@@ -96,7 +96,7 @@ class ProvisionCommandTest : CommandTestBase() {
         // destroy (SSO-3715): the founder manages the client and the sandbox and nobody owns them ⇒ the app first, then
         // the sandbox confirmed with its OWN slug; the user goes WITH its sandbox (a skip row says so — the cascade).
         val destroy = runCli("provision", "destroy", "--file", file.path, "--gateway", baseUrl(), "--yes")
-        assertThat(destroy.err).isEmpty()
+        assertThat(destroy.err).doesNotContain("Error")
         assertThat(destroy.exit).isEqualTo(0)
         assertThat(destroy.out).contains("skip    removed with its sandbox 'ci-sbx'").contains("2 to remove, 1 left in place")
         assertThat(paths()).containsExactly("DELETE /api/v1/applications/${ids[1]}", "DELETE /api/v1/environments/${ids[0]}")
@@ -174,7 +174,7 @@ class ProvisionCommandTest : CommandTestBase() {
         assertThat(api.writes).isEmpty()
 
         val pruned = runCli("provision", "apply", "--file", file.path, "--gateway", baseUrl(), "--yes", "--prune")
-        assertThat(pruned.err).isEmpty()
+        assertThat(pruned.err).doesNotContain("Error")
         assertThat(pruned.exit).isEqualTo(0)
         assertThat(paths()).containsExactly("DELETE /api/v1/applications/$clientId")
         assertThat(api.applications).isEmpty()
@@ -261,7 +261,7 @@ class ProvisionCommandTest : CommandTestBase() {
         assertThat(plan.out).contains("environment ci: grant + client:cli-ci manager").contains("1 grant change(s).")
 
         val apply = runCli("provision", "apply", "--file", file.path, "--gateway", baseUrl(), "--yes")
-        assertThat(apply.err).isEmpty()
+        assertThat(apply.err).doesNotContain("Error")
         assertThat(apply.exit).isEqualTo(0)
         val envId = api.environments.single()["id"]
         assertThat(paths()).containsExactly("POST /api/v1/environments", "POST /api/v1/access/grants")
@@ -318,7 +318,7 @@ class ProvisionCommandTest : CommandTestBase() {
         // Declared as the dependency it is, the same file is green and owns nothing.
         file.writeText(file.readText().replace("    name: shared\n", "    name: shared\n    readOnly: true\n"))
         val green = runCli("provision", "apply", "--file", file.path, "--gateway", baseUrl(), "--yes")
-        assertThat(green.err).isEmpty()
+        assertThat(green.err).doesNotContain("Error")
         assertThat(green.exit).isEqualTo(0)
         assertThat(green.out).contains("read-only reference (viewer)").contains("No changes.")
         assertThat(api.writes).isEmpty()

@@ -955,9 +955,12 @@ internal class ProjectInit(
             }
         }
         if (!config && request.configRepo == null) {
+            // SSO-3962 (oauthy ADR 2026-10-25 decision 1) — the app project owns its production client; the tenant-side act is the slot.
             add(
-                "No production client was proposed. Re-run with --config-repo <owner>/<config-repo> --production-url https://<where the app runs> to open a " +
-                    "pull request on the workspace's config repository declaring one (public, PKCE; its id is published to this repository's `production` GitHub environment).",
+                "Its PRODUCTION client is declared in this repository's own .thoryn/provision.yaml too (a second `kind: application`, without `environment:`), " +
+                    "once a workspace admin approves a creation slot for this repository's identity: " +
+                    "`thoryn access reserve client:<this repository's wi_ client> application:<clientId>` (or the consent screen, `thoryn access approve`). " +
+                    "The reviewed apply then creates and owns it; the deploy reads the id from `thoryn provision apply --output json` / `thoryn clients list`.",
             )
         }
         if (config) {
@@ -1145,7 +1148,7 @@ internal class ProjectInit(
             add(
                 "# .thoryn/connection.json next to each connection's provision.yaml: {\"apiVersion\":\"thoryn.io/connection/v1\",\"workspace\":{\"slug\":\"$workspaceSlug\"}," +
                     "\"auth\":{\"method\":\"workload_identity\",\"clientId\":\"<client id>\",\"audience\":\"<the trust's audience>\",\"scopes\":[<the trust's scopes>]}} " +
-                    "— and a starter provision.yaml (apiVersion thoryn.io/provision/v1) declaring what the connection owns; commit both",
+                    "— and a starter provision.yaml (apiVersion ${if (request.kind == Kind.CONFIG) ProvisionFile.API_VERSION_TENANT else ProvisionFile.API_VERSION_APPLICATION}) declaring what the connection owns; commit both",
             )
         }.toMutableList()
         request.configRepo?.let { manual.addAll(configProjectManualSteps(it, repo)) }

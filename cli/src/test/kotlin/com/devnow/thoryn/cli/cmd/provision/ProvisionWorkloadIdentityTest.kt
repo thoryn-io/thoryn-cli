@@ -98,7 +98,7 @@ class ProvisionWorkloadIdentityTest : CommandTestBase() {
 
         val file = write("provision.yaml", provisionFile)
         val apply = runCli("provision", "apply", "--file", file.path, "--gateway", baseUrl(), "--yes")
-        assertThat(apply.err).isEmpty()
+        assertThat(apply.err).doesNotContain("Error")
         assertThat(apply.exit).isEqualTo(0)
         assertThat(api.writes.map { it.method + " " + it.path }).containsExactly("POST /api/v1/environments", "POST /api/v1/applications")
         assertThat(platform.apiAuthorizations).isNotEmpty.containsOnly("Bearer AT-wif-1")

@@ -287,8 +287,11 @@ class ProjectCommand : Callable<Int> {
             names = ["--config-repo"],
             paramLabel = "<owner/name>",
             description = [
-                "The workspace's config repository. After the sandbox steps, a pull request on it (branch thoryn/app-<name>, reused on a re-run)",
-                "declares the app's PRODUCTION client — public with PKCE, its id published to this repository's `production` GitHub environment.",
+                "DEPRECATED (SSO-3962, oauthy ADR 2026-10-25): the app project owns its production client in its own thoryn.io/application/v1 file,",
+                "created under a creation slot a workspace admin approves (`thoryn access reserve`) — declare it there, without `environment:`.",
+                "Until then: the workspace's config repository. After the sandbox steps, a pull request on it (branch thoryn/app-<name>, reused on a re-run)",
+                "declares the app's PRODUCTION client — public with PKCE, its id published to this repository's `production` GitHub environment (`publishTo`,",
+                "accepted for one more release). Works only against a config file still on thoryn.io/provision/v1: a thoryn.io/tenant/v1 file refuses an application.",
                 "Needs --production-url. Never merged, never on the config repository's default branch; it is never created here.",
             ],
         )
@@ -297,7 +300,7 @@ class ProjectCommand : Callable<Int> {
         @Option(
             names = ["--production-url"],
             paramLabel = "<https://…>",
-            description = ["Where the app runs in production: the client's redirect URIs are <url>/callback and <url>/signed-out (the starters' paths). With --config-repo."],
+            description = ["DEPRECATED with --config-repo (SSO-3962). Where the app runs in production: the client's redirect URIs are <url>/callback and <url>/signed-out (the starters' paths)."],
         )
         var productionUrlArg: String? = null
 
