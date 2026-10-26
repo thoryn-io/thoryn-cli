@@ -351,8 +351,12 @@ thoryn provision plan    [--file <path>] [--prune] [--fix-request <path>]  # rea
 thoryn provision apply   [--file <path>] [--prune] [--confirm <ws>] [--yes] [--fix-request <path>] \
                          [--secret-file <path>] [--force-stdout] [--force] \
                          [--wait [--wait-until ACTIVE|VERIFIED] [--wait-timeout 15m] [--wait-interval 20s]]
-thoryn provision import  [--file <path>] [--write]                       # SSO-3659 — the inverse of plan: render what this identity may reach as
+thoryn provision import  [--file <path>] [--write] [--part tenant|application] \
+                         [--for-workflow <configured-file> [--root <dir>] [--config <path>]]
+                                             # SSO-3659 — the inverse of plan: render what this identity may reach as
                                              # provision.yaml entries (manager ⇒ an entry the file converges; viewer or owned by another repository ⇒ `readOnly: true`); --write appends them (the file only)
+                                             # SSO-3990 — part-aware (a tenant file never gets `application`), scope-aware (unreadable kind ⇒ listed, not a 403;
+                                             # unwritable ⇒ readOnly); --for-workflow: that configured file's connection decides scopes, objects routed by plane
                                              # converge; environments first, dependants into them.
                                              # SSO-3414 — --wait blocks until the file's customDomain is ACTIVE (or VERIFIED), verifying each round.
                                              # SSO-3113 / SSO-3954 — a confidential application it CREATES gets a one-time client secret: DISCARDED by
@@ -1499,8 +1503,9 @@ By hand, the recipe is the same: copy the `resources:` entries whose kind is in 
 `apiVersion: thoryn.io/tenant/v1` in the config project, the `application` entries into a file with
 `apiVersion: thoryn.io/application/v1` in the app project, and keep `environment:` / `secretSink.trust` / `federatedTrust`
 as they are — they name the tenant's objects by slug / name, which is how an application file references what the tenant
-defines. A fresh file written by `thoryn provision import --write` declares the part of its entries (both parts ⇒ the
-mixed format, which warns).
+defines. A fresh file written by `thoryn provision import --write` declares the part `--part` names (only that part's
+kinds are imported), or else the part of its entries (both parts ⇒ the mixed format, which warns). An existing file's own
+`apiVersion` decides: `import` never adds `application` to a tenant file, nor a tenant kind to an application file (SSO-3990).
 
 **`publishTo:` is deprecated** (SSO-3668, ADR 2026-10-13 §2 — superseded by ADR 2026-10-25 decision 1): the app
 project owns its production client in every environment, created under a creation slot, and its deploy reads the client
@@ -2329,8 +2334,47 @@ Nothing the identity has no relation to is listed, so nothing it has no relation
 the hub's rows stay the authority. Without `--write` it prints the YAML it would add (notes and
 unrenderable objects on stderr); `--write` appends under the file's `resources:` list (the file is
 created when absent) and re-validates it — the file is the only thing written. A `loginFlow` cannot be
-rendered (its `templateId` is not recoverable from the active flow); write-only secrets
-(`smtpPasswordEnv`, `clientSecretEnv`) must be added by hand before an update is converged.
+rendered (its `templateId` is not recoverable from the active flow).
+
+**What `import` writes plans as all `noop` (SSO-3990; thoryn-provisioning ADR 2026-09-30, amendment 2026-10-26 §13.5).**
+It exists so a config project can take over a workspace that is already configured: the import pull request changes
+nothing when merged. The rules, in every mode:
+
+| Object | Rendered as | Why |
+|---|---|---|
+| A kind of the file's part the identity may read and write | an entry the file converges | the file owns it |
+| A kind of the other part (`application` in a tenant file; any tenant kind in an application file) | not imported — each object listed (`skipped …`) | the engine refuses the kind in that file (SSO-3962) |
+| A kind whose read scope the identity lacks | not imported — one line naming the scope; the kind is never read | no `403` aborts the run (one that happens anyway is listed the same way) |
+| An entry whose write scope (or, for a trust, scope ceiling) the identity lacks | `readOnly: true`, with a note naming the scope | a plan of the file cannot need a right its identity does not have |
+| Viewed only, or owned by another repository | `readOnly: true` | SSO-3659 / SSO-3673 |
+| `emailProvider`, `federationMember` | **always** `readOnly: true`, with a note | their secret is write-only and a provisioning workflow carries none; to manage one from the file, drop `readOnly` and add `smtpPasswordEnv` / `clientSecretEnv` to an apply that holds the secret |
+| `loginFlow` | not imported, listed | the active flow does not record its `templateId` |
+| The repository's own trusts | not imported, listed | the signed-in client's, and with `--for-workflow` every configured connection's — no file declares its own authority |
+| Production-plane users | **not imported** — counted in one line | people who sign up are not configuration, and a git history cannot honour an erasure request |
+| Sandbox test users | an entry | a fact about who may sign in to the sandbox |
+| `role` | an entry: `name`, `description`, the full `permissions` set | a role converges by its name; one whose name is not a resource name is listed instead |
+
+A per-environment singleton reached on several planes gets a distinct `name` per plane (`loginmethods-<plane>`); it
+converges by its environment, not by its name.
+
+**`--for-workflow <configured-file>`** imports for one `files[]` entry of `.thoryn/workflow.yaml` (`--root`, default the
+current directory; `--config`, default `<root>/.thoryn/workflow.yaml`) — what the reusable workflow's import job runs, once
+per configured file, signed in with that file's connection (`thoryn login --connection`, the trust's read-only plan profile):
+
+- **scopes** — the entry's connection `auth.scopes` are the scopes the file is applied with (an entry outside them is
+  `readOnly`), and, narrowed by the session's token, the scopes it is planned with (a kind outside them is listed). So every
+  file it writes passes `thoryn provision workflow check`'s `config.trust-scopes` with that connection, and a person's broad
+  session renders what the workflow's own identity would;
+- **plane routing** — each object lands in exactly one configured file: a sandbox's objects in the file whose connection
+  signs in to that sandbox (`auth.environment`, or the `/{environment}` segment of `auth.audience`), everything else — the
+  environments themselves, the custom domain, the production plane, a sandbox no connection covers — in the file planned
+  with the production connection. Two files on one plane are refused (an object would have no single home);
+- `--file` defaults to `<root>/<configured-file>`; pass `--file <copy>` to import into a copy (the workflow writes under
+  `$RUNNER_TEMP` and uploads it). Signed in as anyone other than the connection's client, it warns: the scopes are the
+  connection's, but what is read-only for being only viewed or owned elsewhere follows the signed-in identity.
+
+Without `--for-workflow` the session token's scopes play both roles (an opaque token: unknown — every read is attempted).
+A fresh workspace imports nothing; its founder, a production-plane user, is counted and never imported.
 
 Two facts worth knowing when reading the ADRs against the code: the public `POST /api/v1/fga/check` /
 `list-objects` evaluate the **tenant's own** authorization model over the environment-partitioned
