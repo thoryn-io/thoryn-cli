@@ -61,7 +61,7 @@ class ProvisionWorkflowCheckUnloadedFileTest : CommandTestBase() {
         val table = runCli("provision", "workflow", "check", "--root", root.path)
         assertThat(table.exit).isEqualTo(CommandSupport.EXIT_CHECK_FAILED)
         assertThat(table.out).contains("FAIL  config.valid").contains("FAIL  config.secret-delivery").contains("FAIL  config.trust-scopes")
-            .contains("fix: correct .thoryn/provision.yaml").contains("FAILED — 3 of 15 rule(s): config.valid, config.secret-delivery, config.trust-scopes.")
+            .contains("fix: correct .thoryn/provision.yaml").contains("FAILED — 3 of 16 rule(s): config.valid, config.secret-delivery, config.trust-scopes.")
             .doesNotContain("OK —")
     }
 
@@ -115,6 +115,6 @@ class ProvisionWorkflowCheckUnloadedFileTest : CommandTestBase() {
         val r = runCli("provision", "workflow", "check", "--root", root.path)
         assertThat(r.exit).withFailMessage("%s", r.out).isEqualTo(CommandSupport.EXIT_OK)
         assertThat(r.out).contains("PASS  config.valid").contains("every configured file loads")
-            .contains("PASS  config.secret-delivery").contains("PASS  config.trust-scopes").contains("OK — 15 rule(s) pass.")
+            .contains("PASS  config.secret-delivery").contains("PASS  config.trust-scopes").contains("OK — 16 rule(s) pass.")
     }
 }

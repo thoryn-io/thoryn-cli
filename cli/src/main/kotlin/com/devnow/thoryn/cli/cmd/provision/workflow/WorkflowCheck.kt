@@ -3,7 +3,11 @@ package com.devnow.thoryn.cli.cmd.provision.workflow
 import com.devnow.thoryn.cli.cmd.provision.workflow.ProvisioningWorkflowContract.APPLY_JOB_MARKER
 import com.devnow.thoryn.cli.cmd.provision.workflow.ProvisioningWorkflowContract.CONCURRENCY_MODE_FRAGMENT
 import com.devnow.thoryn.cli.cmd.provision.workflow.ProvisioningWorkflowContract.DISPATCH_INPUTS
+import com.devnow.thoryn.cli.cmd.provision.workflow.ProvisioningWorkflowContract.ALLOWED_MODE_OPTIONS
 import com.devnow.thoryn.cli.cmd.provision.workflow.ProvisioningWorkflowContract.FIX_REQUEST_ARTIFACT
+import com.devnow.thoryn.cli.cmd.provision.workflow.ProvisioningWorkflowContract.IMPORT_ARTIFACT
+import com.devnow.thoryn.cli.cmd.provision.workflow.ProvisioningWorkflowContract.IMPORT_MINIMUM_RELEASE
+import com.devnow.thoryn.cli.cmd.provision.workflow.ProvisioningWorkflowContract.IMPORT_MODE
 import com.devnow.thoryn.cli.cmd.provision.workflow.ProvisioningWorkflowContract.JOB_PERMISSIONS
 import com.devnow.thoryn.cli.cmd.provision.workflow.ProvisioningWorkflowContract.MINIMUM_RELEASE
 import com.devnow.thoryn.cli.cmd.provision.workflow.ProvisioningWorkflowContract.REUSABLE_INPUTS
@@ -33,6 +37,10 @@ import java.io.File
  *  - [Shape.CUSTOM] — a hand-written workflow with its own jobs: NOT the supported shape. The check reports only what the
  *    App needs to dispatch it (`dispatch.*`, `custom.*`) and says so; it is documented as unsupported, not promoted.
  *  A `uses:` of a workflow that is not ours is [Shape.FOREIGN_STUB]: nothing can be verified about the called side.
+ *
+ * Contract v2 (SSO-3991): a stub's `mode` may also offer `import`. `dispatch.import-capable` says whether the App may
+ * dispatch `import` to the file ([Report.importCapable]) — and FAILS a file that offers `import` but could not honour it,
+ * because an import dispatched to a reusable workflow without the `import` job runs zero jobs and reports green.
  */
 object WorkflowCheck {
 
@@ -45,7 +53,15 @@ object WorkflowCheck {
 
     enum class Status { PASS, FAIL, UNVERIFIABLE }
 
-    data class RuleResult(val id: String, val title: String, val status: Status, val detail: String, val fix: String? = null) {
+    data class RuleResult(
+        val id: String,
+        val title: String,
+        val status: Status,
+        val detail: String,
+        val fix: String? = null,
+        /** `dispatch.import-capable` / `reusable.import-job` only: the file offers (or carries) `import`. */
+        val offersImport: Boolean = false,
+    ) {
         val failed: Boolean get() = status != Status.PASS
     }
 
@@ -61,12 +77,21 @@ object WorkflowCheck {
         val ok: Boolean get() = rules.none { it.failed } && configError == null
         val supported: Boolean get() = shape.supported
 
+        /**
+         * SSO-3991 (contract v2 §1) — may the App dispatch `mode: import` to this file? Only when it offers `import` (a
+         * dispatched workflow) or carries the `import` job (the reusable workflow) AND the rule that pins it passes. A v1
+         * stub is never import-capable; the App relies on this ("dispatch import only to a stub that offers it").
+         */
+        val importCapable: Boolean
+            get() = rules.any { (it.id == IMPORT_CAPABLE_RULE || it.id == IMPORT_JOB_RULE) && it.status == Status.PASS && it.offersImport }
+
         fun toStructured(): Map<String, Any?> = linkedMapOf(
             "contractVersion" to ProvisioningWorkflowContract.CONTRACT_VERSION,
             "file" to file,
             "shape" to shape.name.lowercase(),
             "supported" to supported,
             "ok" to ok,
+            "importCapable" to importCapable,
             "rules" to rules.map { r -> linkedMapOf("id" to r.id, "title" to r.title, "status" to r.status.name, "detail" to r.detail, "fix" to r.fix) },
             "inputs" to inputs,
             "config" to config?.toStructured(),
@@ -75,6 +100,12 @@ object WorkflowCheck {
     }
 
     private val yaml = YAMLMapper.builder().build()
+
+    /** SSO-3991 — the rule that says whether the App may dispatch `import` to a dispatched workflow. */
+    const val IMPORT_CAPABLE_RULE: String = "dispatch.import-capable"
+
+    /** SSO-3991 — the rule that pins the reusable workflow's `import` job. */
+    const val IMPORT_JOB_RULE: String = "reusable.import-job"
 
     /**
      * Evaluate [text] (the workflow at [path]). [configFile] is the run-time configuration a stub / the reusable workflow
@@ -100,12 +131,18 @@ object WorkflowCheck {
             Shape.STUB -> {
                 rules += dispatchRules(doc, text)
                 val (stubRules, effective) = stubRules(doc)
+                rules += stubImportCapableRule(doc, effective)
                 rules += stubRules
                 inputs = effective
                 rules += commonRules(doc, text)
             }
             Shape.FOREIGN_STUB -> {
                 rules += dispatchRules(doc, text)
+                rules += if (IMPORT_MODE in offeredModes(doc)) {
+                    RuleResult(IMPORT_CAPABLE_RULE, IMPORT_CAPABLE_TITLE, Status.UNVERIFIABLE, "the stub offers `import`, but the workflow it calls is not $REUSABLE_WORKFLOW — nothing says it has an `import` job", "call $REUSABLE_WORKFLOW@$IMPORT_MINIMUM_RELEASE (or newer), or drop `import` from `mode`'s options", offersImport = true)
+                } else {
+                    notOffered()
+                }
                 val job = singleUsesJob(doc)!!
                 rules += RuleResult(
                     "stub.uses", "the stub calls the reusable workflow", Status.UNVERIFIABLE,
@@ -116,6 +153,7 @@ object WorkflowCheck {
             }
             Shape.CUSTOM -> {
                 rules += dispatchRules(doc, text)
+                rules += customImportCapableRule(doc)
                 rules += customRules(doc)
                 rules += commonRules(doc, text)
             }
@@ -369,10 +407,15 @@ object WorkflowCheck {
             val node = inputs?.get(name) ?: return@forEach
             if ((node["required"]?.asBoolean() ?: false) != spec.required) problems += "input `$name` must be required: ${spec.required}"
             if (node["type"].str() != spec.type) problems += "input `$name` must be type: ${spec.type}"
-            spec.options?.let { opts -> if (node["options"]?.toList()?.map { it.asString() } != opts) problems += "input `$name` options must be [${opts.joinToString(", ")}]" }
+            // SSO-3991 — `mode` offers v1's [plan, apply] or v2's [plan, apply, import]; nothing else (ALLOWED_MODE_OPTIONS).
+            if (spec.options != null) {
+                val declared = node["options"]?.toList()?.map { it.asString() }
+                val allowed = if (name == "mode") ALLOWED_MODE_OPTIONS else listOf(spec.options)
+                if (declared !in allowed) problems += "input `$name` options must be ${allowed.joinToString(" or ") { "[${it.joinToString(", ")}]" }}"
+            }
         }
-        out += if (problems.isEmpty()) pass("dispatch.inputs", "workflow_dispatch with the App's four inputs", "mode (choice: plan, apply), head_sha, check_run_id required; pr_number optional")
-        else fail("dispatch.inputs", "workflow_dispatch with the App's four inputs", problems.joinToString("; "), "declare `on.workflow_dispatch.inputs` exactly as the stub does: mode {required, type: choice, options: [plan, apply]}, head_sha {required, type: string}, check_run_id {required, type: string}, pr_number {required: false, type: string, default: \"\"}")
+        out += if (problems.isEmpty()) pass("dispatch.inputs", "workflow_dispatch with the App's four inputs", "mode (choice: ${offeredModes(doc).joinToString(", ")}), head_sha, check_run_id required; pr_number optional")
+        else fail("dispatch.inputs", "workflow_dispatch with the App's four inputs", problems.joinToString("; "), "declare `on.workflow_dispatch.inputs` exactly as the stub does: mode {required, type: choice, options: [plan, apply] — or [plan, apply, import] to receive the configuration import}, head_sha {required, type: string}, check_run_id {required, type: string}, pr_number {required: false, type: string, default: \"\"}")
 
         val runName = doc["run-name"].str() ?: ""
         out += if (runName.contains(RUN_NAME_MARKER)) pass("dispatch.run-name", "the run-name carries the check-run id", "`$RUN_NAME_MARKER` present — how the App finds the run to complete its check")
@@ -391,6 +434,62 @@ object WorkflowCheck {
         out += if (markerPresent(text)) pass("dispatch.apply-job-marker", "the apply-job marker is present", "`$APPLY_JOB_MARKER` — the App dispatches `apply` only when it sees this line")
         else fail("dispatch.apply-job-marker", "the apply-job marker is present", "no line `$APPLY_JOB_MARKER`", "add the comment line `$APPLY_JOB_MARKER` above the job that applies (in a stub: above the `uses:` job — the reusable workflow carries the apply job)")
         return out
+    }
+
+    // ── dispatch.import-capable — may the App dispatch `import` (contract v2, SSO-3991) ─────────────────────────
+
+    private const val IMPORT_CAPABLE_TITLE = "the App may dispatch import only if the workflow can run it"
+
+    /** The `mode` options a dispatched workflow declares (empty when there are none). */
+    internal fun offeredModes(doc: JsonNode): List<String> =
+        doc["on"]?.get("workflow_dispatch")?.get("inputs")?.get("mode")?.get("options")?.takeIf { it.isArray }?.toList()?.map { it.asString() } ?: emptyList()
+
+    private fun notOffered() = RuleResult(
+        IMPORT_CAPABLE_RULE, IMPORT_CAPABLE_TITLE, Status.PASS,
+        "`mode` does not offer `import` (contract v1): the App never dispatches the configuration import to this file — to receive it, add `import` to `mode`'s options and call $REUSABLE_WORKFLOW@$IMPORT_MINIMUM_RELEASE or newer",
+    )
+
+    /**
+     * A stub that offers `import` must call a reusable workflow that has the `import` job — [IMPORT_MINIMUM_RELEASE] or newer —
+     * and must not override `cli-version` to a CLI older than that. Otherwise an import dispatch runs zero jobs (no job of the
+     * called workflow is gated on `import`) and the run reports green with nothing imported. A commit SHA or a branch cannot be
+     * dated, so it is UNVERIFIABLE rather than a pass. A stub that does not offer `import` passes: the App never sends it one.
+     */
+    private fun stubImportCapableRule(doc: JsonNode, effective: Map<String, String>): RuleResult {
+        if (IMPORT_MODE !in offeredModes(doc)) return notOffered()
+        val ref = singleUsesJob(doc)!!["uses"].asString().substringAfter('@', "")
+        val fix = "call $REUSABLE_WORKFLOW@$IMPORT_MINIMUM_RELEASE or newer (the first release whose reusable workflow has the `import` job), or drop `import` from `mode`'s options until you do"
+        if (ProvisioningWorkflowContract.releaseVersion(ref) == null) {
+            return RuleResult(IMPORT_CAPABLE_RULE, IMPORT_CAPABLE_TITLE, Status.UNVERIFIABLE, "the stub offers `import`, but `@$ref` is not a cli-v* release, so the check cannot tell whether the called workflow has the `import` job", fix, offersImport = true)
+        }
+        if (!ProvisioningWorkflowContract.shipsImportJob(ref)) {
+            return RuleResult(IMPORT_CAPABLE_RULE, IMPORT_CAPABLE_TITLE, Status.FAIL, "the stub offers `import`, but the reusable workflow at `@$ref` has no `import` job: an import dispatch would run zero jobs and report green with nothing imported", fix, offersImport = true)
+        }
+        effective["cli-version"]?.takeIf { it.isNotEmpty() && ProvisioningWorkflowContract.releaseVersion(it) != null && !ProvisioningWorkflowContract.shipsImportJob(it) }?.let { v ->
+            return RuleResult(IMPORT_CAPABLE_RULE, IMPORT_CAPABLE_TITLE, Status.FAIL, "the stub offers `import`, but `with.cli-version: $v` runs a CLI without `provision import --for-workflow`", "set `with.cli-version` to $IMPORT_MINIMUM_RELEASE or newer, or omit it (the called release's own CLI is used)", offersImport = true)
+        }
+        return RuleResult(IMPORT_CAPABLE_RULE, IMPORT_CAPABLE_TITLE, Status.PASS, "`mode` offers `import` and the reusable workflow at `@$ref` has the `import` job: the App may dispatch the configuration import (contract v2)", offersImport = true)
+    }
+
+    /** A hand-written workflow that offers `import` must carry a job gated on it, in a plan environment, uploading [IMPORT_ARTIFACT]. */
+    private fun customImportCapableRule(doc: JsonNode): RuleResult {
+        if (IMPORT_MODE !in offeredModes(doc)) return notOffered()
+        val jobs = doc["jobs"]
+        fun gated(mode: String) = jobs.keys().filter { jobs[it]["if"].str()?.replace(" ", "") == "inputs.mode=='$mode'" }
+        fun envOf(name: String) = jobs[name]["environment"].str() ?: jobs[name]["environment"]?.get("name").str()
+        val importJobs = gated(IMPORT_MODE)
+        val applyEnvs = gated("apply").mapNotNull { envOf(it) }.toSet()
+        val planEnvs = gated("plan").mapNotNull { envOf(it) }.toSet()
+        val problems = mutableListOf<String>()
+        if (importJobs.isEmpty()) problems += "no job gated `if: inputs.mode == '$IMPORT_MODE'` — an import dispatch would run zero jobs and report green"
+        importJobs.forEach { name ->
+            val env = envOf(name)
+            if (env == null || env !in planEnvs) problems += "job `$name` must run in the plan job's environment (the trust's read-only plan profile)"
+            if (env != null && env in applyEnvs) problems += "job `$name` runs in the apply environment — the import must never be minted write scopes"
+            if (jobs[name].steps().none { it["uses"].str()?.startsWith("actions/upload-artifact@") == true && it["with"]?.get("name").str() == IMPORT_ARTIFACT }) problems += "job `$name` uploads no `$IMPORT_ARTIFACT` artifact"
+        }
+        return if (problems.isEmpty()) RuleResult(IMPORT_CAPABLE_RULE, IMPORT_CAPABLE_TITLE, Status.PASS, "`mode` offers `import`; job(s) ${importJobs.joinToString()} run it in the plan environment and upload `$IMPORT_ARTIFACT`", offersImport = true)
+        else RuleResult(IMPORT_CAPABLE_RULE, IMPORT_CAPABLE_TITLE, Status.FAIL, problems.joinToString("; "), "the supported shape is a stub calling $REUSABLE_WORKFLOW@$IMPORT_MINIMUM_RELEASE; or drop `import` from `mode`'s options", offersImport = true)
     }
 
     // ── stub.* — the supported shape ────────────────────────────────────────────────────────────────────────────
@@ -504,13 +603,15 @@ object WorkflowCheck {
 
         val jobs = doc["jobs"]
         val jp = mutableListOf<String>()
-        if (jobs.keys() != listOf("plan", "apply")) jp += "jobs must be exactly plan, apply (was ${jobs.keys().joinToString(", ")})"
-        val plan = jobs["plan"]; val apply = jobs["apply"]
-        if (plan?.get("if").str()?.replace(" ", "") != "inputs.mode=='plan'") jp += "plan must be gated `if: inputs.mode == 'plan'`"
-        if (apply?.get("if").str()?.replace(" ", "") != "inputs.mode=='apply'") jp += "apply must be gated `if: inputs.mode == 'apply'`"
-        if (plan?.get("environment").str() != forwarded("plan-environment")) jp += "plan must run in `environment: ${forwarded("plan-environment")}`"
-        if (apply?.get("environment").str() != forwarded("apply-environment")) jp += "apply must run in `environment: ${forwarded("apply-environment")}`"
-        listOf("plan" to plan, "apply" to apply).forEach { (name, job) ->
+        // Contract v2 (SSO-3991): a third job, `import`, in the PLAN environment (never apply-environment).
+        if (jobs.keys() != listOf("plan", "apply", IMPORT_MODE)) jp += "jobs must be exactly plan, apply, $IMPORT_MODE (was ${jobs.keys().joinToString(", ")})"
+        val plan = jobs["plan"]; val apply = jobs["apply"]; val import = jobs[IMPORT_MODE]
+        val environments = mapOf("plan" to "plan-environment", "apply" to "apply-environment", IMPORT_MODE to "plan-environment")
+        environments.forEach { (name, env) ->
+            if (jobs[name]?.get("if").str()?.replace(" ", "") != "inputs.mode=='$name'") jp += "$name must be gated `if: inputs.mode == '$name'`"
+            if (jobs[name]?.get("environment").str() != forwarded(env)) jp += "$name must run in `environment: ${forwarded(env)}`"
+        }
+        listOf("plan" to plan, "apply" to apply, IMPORT_MODE to import).forEach { (name, job) ->
             if (job?.get("runs-on").str()?.contains("inputs.runs-on") != true) jp += "$name must take its runner from `inputs.runs-on`"
             if (job?.get("timeout-minutes").str()?.contains("inputs.timeout-minutes") != true) jp += "$name must take `timeout-minutes` from `inputs.timeout-minutes`"
             if (job.permissions() != JOB_PERMISSIONS) jp += "$name permissions must be exactly ${JOB_PERMISSIONS.entries.joinToString(", ") { "${it.key}: ${it.value}" }}"
@@ -524,14 +625,59 @@ object WorkflowCheck {
         val topPerms = doc["permissions"]
         if (topPerms != null && !(topPerms.isObject && topPerms.isEmpty)) jp += "top-level permissions must be absent or {}"
         if (!markerPresent(text)) jp += "the apply job must carry `$APPLY_JOB_MARKER`"
-        out += if (jp.isEmpty()) pass("reusable.jobs", "plan and apply jobs as the contract pins them", "gated on inputs.mode; environments, runner and timeout from inputs; permissions exact; checkout at head_sha; fix request uploaded; config read through the CLI; apply-job marker")
-        else fail("reusable.jobs", "plan and apply jobs as the contract pins them", jp.joinToString("; "), "shape the jobs as docs/provisioning-workflow-contract.md §reusable describes")
+        out += if (jp.isEmpty()) pass("reusable.jobs", "plan, apply and import jobs as the contract pins them", "gated on inputs.mode; environments (import in the plan one), runner and timeout from inputs; permissions exact; checkout at head_sha; fix request uploaded; config read through the CLI; apply-job marker")
+        else fail("reusable.jobs", "plan, apply and import jobs as the contract pins them", jp.joinToString("; "), "shape the jobs as docs/provisioning-workflow-contract.md §reusable describes")
+
+        out += importJobRule(import)
 
         val writes = jobs.keys().filter { (jobs[it].permissions() ?: emptyMap()).let { p -> p["contents"] == "write" || p.containsKey("pull-requests") } }
         val pushes = doc.runs().filter { it.contains("gh pr create") || it.contains("git push") || it.contains("git commit") }
         out += if (writes.isEmpty() && pushes.isEmpty()) pass("reusable.no-write-back", "nothing is written back to the repository", "no contents: write, no pull-requests, no git push / gh pr create — the platform is the ledger (ADR 2026-10-15)")
         else fail("reusable.no-write-back", "nothing is written back to the repository", (writes.map { "job `$it` may write to the repository" } + pushes.map { "a run block pushes or opens a pull request" }).joinToString("; "), "drop contents: write / pull-requests: write and the receipt step — ownership is the platform's `owner` relation, not a committed file (SSO-3708 / SSO-3717)")
         return out
+    }
+
+    /**
+     * SSO-3991 (contract v2 §3) — `reusable.import-job`: what the App relies on from the `import` job beyond the per-job
+     * shape `reusable.jobs` pins. It imports each configured file with `provision import --for-workflow` into a copy (never
+     * the checkout — `--write` without `--file` would edit the working tree), previews it with `provision plan`, writes the
+     * summary through `provision workflow import-summary` (the CLI's allow-listed field list, the size bound), never applies
+     * or destroys, and uploads [IMPORT_ARTIFACT] (pinned to a commit, hidden `.thoryn/` paths included, missing files an
+     * error, kept 7 days) — on success only, never on failure.
+     */
+    private fun importJobRule(job: JsonNode?): RuleResult {
+        val title = "the import job imports read-only and hands the files over as the $IMPORT_ARTIFACT artifact"
+        if (job == null) return fail(IMPORT_JOB_RULE, title, "no `$IMPORT_MODE` job", "add the `$IMPORT_MODE` job of docs/provisioning-workflow-contract.md §3 (contract v2)").copy(offersImport = true)
+        val runs = job.steps().mapNotNull { it["run"].str() }
+        // Commands, not comments: each non-comment line of every run block.
+        val lines = runs.flatMap { it.lines() }.map { it.trim() }.filter { it.isNotEmpty() && !it.startsWith("#") }
+        val problems = mutableListOf<String>()
+        val importRun = lines.firstOrNull { it.contains("thoryn.jar provision import ") }
+        if (importRun == null) problems += "no step runs `thoryn provision import`"
+        else {
+            if (!importRun.contains("--for-workflow")) problems += "`provision import` must run with `--for-workflow <file>` (the connection's scopes, plane routing, own trusts excluded)"
+            if (!importRun.contains("--file \"\$out/")) problems += "`provision import` must write a copy under the artifact directory (`--file \"\$out/<file>\"`), never the checkout"
+            if (!importRun.contains("--write")) problems += "`provision import` must `--write` the copy"
+        }
+        if (lines.none { it.contains("thoryn.jar provision plan ") && it.contains("--file \"\$out/") && it.contains("--output json") }) problems += "no `provision plan --file \"\$out/<file>\" --output json` preview of the imported copy"
+        if (lines.none { it.contains("thoryn.jar provision workflow import-summary ") && it.contains("--artifact") }) problems += "no step writes ${ProvisioningWorkflowContract.IMPORT_SUMMARY_FILE} through `thoryn provision workflow import-summary`"
+        if (lines.any { it.contains("provision apply") || it.contains("provision destroy") }) problems += "the import job must never apply or destroy"
+        val uploads = job.steps().filter { it["uses"].str()?.startsWith("actions/upload-artifact@") == true && it["with"]?.get("name").str() == IMPORT_ARTIFACT }
+        val upload = uploads.singleOrNull()
+        if (upload == null) problems += "the job must upload exactly one `$IMPORT_ARTIFACT` artifact"
+        else {
+            val with = upload["with"]
+            if (!Regex("@[0-9a-f]{40}").containsMatchIn(upload["uses"].asString())) problems += "`$IMPORT_ARTIFACT` must be uploaded with actions/upload-artifact pinned to a commit"
+            if (upload["if"].str()?.contains("failure()") == true || upload["if"].str()?.contains("always()") == true) problems += "`$IMPORT_ARTIFACT` must be uploaded only by a successful job"
+            if (with?.get("retention-days").str() != "7") problems += "`$IMPORT_ARTIFACT` must set `retention-days: 7`"
+            if (with?.get("include-hidden-files").str() != "true") problems += "`$IMPORT_ARTIFACT` must set `include-hidden-files: true` (the files live under `.thoryn/`, which upload-artifact v4.4+ leaves out by default)"
+            if (with?.get("if-no-files-found").str() != "error") problems += "`$IMPORT_ARTIFACT` must set `if-no-files-found: error`"
+        }
+        return if (problems.isEmpty()) {
+            RuleResult(IMPORT_JOB_RULE, title, Status.PASS, "imports each configured file with --for-workflow into a copy, previews it with plan, writes the summary through the CLI, applies nothing, uploads $IMPORT_ARTIFACT (pinned, hidden files included, 7 days)", offersImport = true)
+        } else {
+            RuleResult(IMPORT_JOB_RULE, title, Status.FAIL, problems.joinToString("; "), "shape the `$IMPORT_MODE` job as docs/provisioning-workflow-contract.md §3 describes (contract v2)", offersImport = true)
+        }
     }
 
     // ── common.* — every shape ──────────────────────────────────────────────────────────────────────────────────

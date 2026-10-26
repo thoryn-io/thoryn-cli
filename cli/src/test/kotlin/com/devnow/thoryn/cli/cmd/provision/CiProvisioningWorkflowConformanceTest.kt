@@ -91,7 +91,9 @@ class CiProvisioningWorkflowConformanceTest {
         assertThat(reusable.shape).isEqualTo(WorkflowCheck.Shape.REUSABLE)
         assertThat(reusable.rules.filter { it.failed }).withFailMessage("%s", reusable.rules.filter { it.failed }).isEmpty()
         val doc = YAMLMapper.builder().build().readTree(text)
-        assertThat(doc["jobs"].propertyNames().toList()).containsExactly("plan", "apply")
+        // Contract v2 (SSO-3991): the third job imports; this repository's own stub stays v1 (it does not offer `import`).
+        assertThat(doc["jobs"].propertyNames().toList()).containsExactly("plan", "apply", "import")
+        assertThat(report.importCapable).isFalse()
         // The App dispatches `apply` only when it sees this marker; the stub carries it, and so does the job it points at.
         assertThat(text).containsPattern("(?m)^\\s*# thoryn-provisioning: apply-job\\s*$")
         assertThat(stubText).containsPattern("(?m)^\\s*# thoryn-provisioning: apply-job\\s*$")

@@ -20,8 +20,11 @@ import com.devnow.thoryn.provision.FixRequest
  */
 object ProvisioningWorkflowContract {
 
-    /** Bump when a rule changes what a valid stub or reusable workflow looks like. */
-    const val CONTRACT_VERSION: Int = 1
+    /**
+     * Bump when a rule changes what a valid stub or reusable workflow looks like. v2 (SSO-3991, decided under SSO-3989):
+     * `mode` may also offer `import` ([IMPORT_MODE]), and the reusable workflow carries the `import` job.
+     */
+    const val CONTRACT_VERSION: Int = 2
 
     /** Where the App dispatches: the ONE path it looks for (`ThorynFiles.WORKFLOW_PATH`). */
     const val WORKFLOW_PATH: String = ".github/workflows/thoryn-provisioning.yml"
@@ -44,7 +47,35 @@ object ProvisioningWorkflowContract {
     /** `concurrency.group` must be per mode: a plan and an apply never wait on each other, two applies never race. */
     const val CONCURRENCY_MODE_FRAGMENT: String = "\${{ inputs.mode }}"
 
+    /** Contract v1's modes: what every stub offers. */
     val MODES: List<String> = listOf("plan", "apply")
+
+    /**
+     * SSO-3991 (contract v2 §1) — the mode the App dispatches after a config project's setup pull request is merged: the
+     * reusable workflow's `import` job imports the workspace's live configuration as the repository's own READ-ONLY plan
+     * identity and uploads it as [IMPORT_ARTIFACT]. Offered only by a stub whose `mode` options include it.
+     */
+    const val IMPORT_MODE: String = "import"
+
+    /** Contract v2's modes: a stub that may be dispatched [IMPORT_MODE]. */
+    val MODES_V2: List<String> = MODES + IMPORT_MODE
+
+    /** The `mode` options a stub may declare: v1's `[plan, apply]`, or v2's `[plan, apply, import]` — nothing else. */
+    val ALLOWED_MODE_OPTIONS: List<List<String>> = listOf(MODES, MODES_V2)
+
+    /**
+     * The first thoryn-cli release whose reusable workflow carries the `import` job (and whose CLI has `provision import
+     * --for-workflow` and `provision workflow import-summary`). A stub that offers [IMPORT_MODE] must call the reusable
+     * workflow at this release or newer: an older one has no job gated on `import`, so an import dispatch would run ZERO
+     * jobs and report green with nothing imported (`dispatch.import-capable`).
+     */
+    const val IMPORT_MINIMUM_RELEASE: String = "cli-v0.51.0"
+
+    /** SSO-3991 — the run artifact the `import` job uploads: each configured file at its repository path + [IMPORT_SUMMARY_FILE]. */
+    const val IMPORT_ARTIFACT: String = "thoryn-import"
+
+    /** The summary inside [IMPORT_ARTIFACT], at the artifact's root. */
+    const val IMPORT_SUMMARY_FILE: String = "import-summary.json"
 
     /** The run artifact the App reads a red job's fix request from (SSO-3710). */
     const val FIX_REQUEST_ARTIFACT: String = FixRequest.ARTIFACT_NAME
@@ -54,6 +85,7 @@ object ProvisioningWorkflowContract {
 
     /** The App dispatches with exactly these (`ThorynFiles.workflowYaml`). */
     val DISPATCH_INPUTS: Map<String, DispatchInput> = linkedMapOf(
+        // v1 stubs declare MODES, v2 stubs MODES_V2 (ALLOWED_MODE_OPTIONS); the App sends `import` only to the latter.
         "mode" to DispatchInput(required = true, type = "choice", options = MODES),
         "head_sha" to DispatchInput(required = true, type = "string"),
         "check_run_id" to DispatchInput(required = true, type = "string"),
@@ -94,7 +126,7 @@ object ProvisioningWorkflowContract {
      * is held to this map by the conformance test; `thoryn provision workflow check` refuses a `with:` key not in it.
      */
     val REUSABLE_INPUTS: Map<String, ReusableInput> = linkedMapOf(
-        "mode" to ReusableInput("plan or apply — forwarded from the App's dispatch input.", required = true, forwardedDispatchInput = true),
+        "mode" to ReusableInput("plan, apply or import — forwarded from the App's dispatch input.", required = true, forwardedDispatchInput = true),
         "head_sha" to ReusableInput("The commit to plan or apply — forwarded.", required = true, forwardedDispatchInput = true),
         "check_run_id" to ReusableInput("The App's check run — forwarded.", required = true, forwardedDispatchInput = true),
         "pr_number" to ReusableInput("The pull request (plan only) — forwarded.", default = "", forwardedDispatchInput = true),
@@ -140,9 +172,14 @@ object ProvisioningWorkflowContract {
         RELEASE_TAG_GRAMMAR.matchEntire(tag)?.let { tag.removePrefix("cli-v").split('.').map(String::toInt) }
 
     /** Is [tag] at least [MINIMUM_RELEASE]? */
-    fun isAtLeastMinimumRelease(tag: String): Boolean {
+    fun isAtLeastMinimumRelease(tag: String): Boolean = isAtLeast(tag, MINIMUM_RELEASE)
+
+    /** Is [tag] at least [IMPORT_MINIMUM_RELEASE] — does its reusable workflow carry the `import` job? */
+    fun shipsImportJob(tag: String): Boolean = isAtLeast(tag, IMPORT_MINIMUM_RELEASE)
+
+    private fun isAtLeast(tag: String, minimum: String): Boolean {
         val v = releaseVersion(tag) ?: return false
-        val min = releaseVersion(MINIMUM_RELEASE)!!
+        val min = releaseVersion(minimum)!!
         for (i in 0..2) {
             if (v[i] != min[i]) return v[i] > min[i]
         }

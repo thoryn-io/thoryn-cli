@@ -1,5 +1,5 @@
 # Thoryn provisioning — the REUSABLE workflow every repository's stub calls (SSO-3719, epic SSO-3304; oauthy converge
-# ADR 2026-10-13 Amendments 1, 5–7). Contract: docs/provisioning-workflow-contract.md (v1), pinned in code by
+# ADR 2026-10-13 Amendments 1, 5–7). Contract: docs/provisioning-workflow-contract.md (v2), pinned in code by
 # `ProvisioningWorkflowContract` and linted by `thoryn provision workflow check`.
 #
 # WHY A WORKFLOW FILE STAYS AT ALL. The job's own GitHub OIDC token IS the repository's identity, and the job's GitHub
@@ -32,6 +32,14 @@
 # CALLER's stub instead) — so a stub pinned `@cli-v0.36.0` runs cli-v0.36.0 with no second pin to keep in step. A
 # ref that is not a cli-v* tag (a stub pinned `@main` or a sha) falls back to the latest cli-v* release, with a notice.
 #
+# THE IMPORT JOB (contract v2, SSO-3991; thoryn-provisioning ADR 2026-09-30 amendment 2026-10-26 §13). After a config
+# project's setup pull request is merged, the App dispatches `mode: import` — only to a stub whose `mode` options offer it.
+# The job runs in the PLAN environment, so the hub mints the trust's read-only plan profile: no new right. For each
+# configured file it signs in as that file's connection, imports into a COPY under $RUNNER_TEMP (`provision import
+# --for-workflow`), previews the copy with `provision plan`, and uploads the copies at their repository paths plus
+# import-summary.json as the `thoryn-import` artifact. It writes nothing to the repository: the App commits the files to
+# its own branch and opens the import pull request, whose plan is the semantic check.
+#
 # Every `inputs.*` / `github.*` value reaches a shell only through `env:` (the template-injection rule, oauthy SSO-3635).
 name: Thoryn provisioning (reusable)
 
@@ -39,11 +47,11 @@ on:
   workflow_call:
     inputs:
       mode:
-        description: "plan (pull request, read-only) or apply (default branch, reviewed) — forwarded from the App's dispatch input"
+        description: "plan (pull request, read-only), apply (default branch, reviewed) or import (default branch, read-only; contract v2) — forwarded from the App's dispatch input"
         required: true
         type: string
       head_sha:
-        description: "The commit to plan or apply — forwarded"
+        description: "The commit to plan, apply or import at — forwarded"
         required: true
         type: string
       check_run_id:
@@ -56,7 +64,7 @@ on:
         type: string
         default: ""
       plan-environment:
-        description: "The UNPROTECTED GitHub environment the plan job runs in (the trust's plan profile is keyed on it)"
+        description: "The UNPROTECTED GitHub environment the plan and import jobs run in (the trust's plan profile is keyed on it)"
         required: true
         type: string
       apply-environment:
@@ -323,3 +331,123 @@ jobs:
             echo "Applied $(jq -r '.config.files | length' "$report") provisioning file(s) as this repository's own workload identity in the reviewed environment \`$APPLY_ENVIRONMENT\`."
             echo "Nothing is committed back: the platform is the ledger (what this repository owns is the \`owner\` relation Thoryn holds). Removals ran only as .thoryn/workflow.yaml configured them (prune=$(jq -r '.config.apply.prune' "$report"), destroy=$(jq -r '.config.apply.destroy' "$report"))."
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # SSO-3991 (contract v2 §3) — the configuration import. Read-only by construction: the PLAN environment (never
+  # apply-environment), so the hub mints the trust's plan profile; `contents: read`; nothing pushed, no pull request.
+  import:
+    if: inputs.mode == 'import'
+    runs-on: ${{ startsWith(inputs.runs-on, '[') && fromJSON(inputs.runs-on) || inputs.runs-on }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    environment: ${{ inputs.plan-environment }}
+    permissions:
+      id-token: write
+      checks: write
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ inputs.head_sha }}
+          # The job uploads an artifact; the checkout keeps no token in .git/config that anything could pick up.
+          persist-credentials: false
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4.9.1
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Download the released thoryn CLI
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CLI_VERSION: ${{ inputs.cli-version }}
+          # The whole (small, secret-free) job context: its `workflow_ref` names THIS file with the ref it was called at.
+          JOB_CONTEXT: ${{ toJSON(job) }}
+        run: |
+          set -euo pipefail
+          tag="$CLI_VERSION"
+          if [ -z "$tag" ]; then
+            # The release this reusable workflow was called at: job.workflow_ref = <owner>/<repo>/<path>@<ref>.
+            job_ref="$(jq -r '.workflow_ref // empty' <<<"$JOB_CONTEXT")"
+            case "${job_ref##*@}" in refs/tags/cli-v*) tag="${job_ref##*@refs/tags/}" ;; esac
+          fi
+          if [ -z "$tag" ]; then
+            tag="$(gh release list --repo thoryn-io/thoryn-cli --limit 40 --json tagName -q '.[].tagName' | grep '^cli-v' | head -1)"
+            echo "::notice::the reusable workflow was called at '${job_ref:-an unknown ref}', not a cli-v* release tag; running the latest release $tag — pin the stub's uses: to a cli-v* tag."
+          fi
+          echo "Using thoryn CLI release $tag"
+          gh release download "$tag" --repo thoryn-io/thoryn-cli --pattern thoryn.jar --dir .
+          # The import needs `provision import --for-workflow` and `provision workflow import-summary` (contract v2).
+          java -jar thoryn.jar provision workflow import-summary --help >/dev/null 2>&1 || {
+            echo "::error::release $tag predates the configuration import (contract v2) — set cli-version to cli-v0.51.0 or newer (or leave it empty)." >&2; exit 1; }
+      - name: Check the stub and read .thoryn/workflow.yaml
+        id: config
+        env:
+          MODE: ${{ inputs.mode }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          CONFIG: ${{ inputs.config }}
+        run: |
+          set -euo pipefail
+          [ "$MODE" = "import" ] || { echo "::error::the import job runs only for mode import (was '$MODE')" >&2; exit 1; }
+          # github.workflow_ref is the CALLER's workflow: <owner>/<repo>/<path>@<ref> — the stub the App dispatched.
+          stub="${WORKFLOW_REF#*/*/}"; stub="${stub%@*}"
+          report="$RUNNER_TEMP/thoryn-workflow.json"
+          if ! java -jar thoryn.jar provision workflow check --file "$stub" --config "$CONFIG" --output json > "$report"; then
+            java -jar thoryn.jar provision workflow check --file "$stub" --config "$CONFIG" | tee -a "$GITHUB_STEP_SUMMARY" || true
+            echo "::error::the provisioning workflow stub or $CONFIG does not satisfy the contract — the rules above name each fix." >&2
+            exit 1
+          fi
+          echo "fix-request=$(jq -r '.config.fixRequest' "$report")" >> "$GITHUB_OUTPUT"
+          echo "Configuration ($(jq -r '.config.source // "built-in defaults"' "$report")): $(jq -r '[.config.files[].file] | join(", ")' "$report")"
+      - name: Import every configured file as its own connection (the plan profile) into a copy
+        env:
+          # SSO-3710 — where `login --connection` / `provision plan` write the fix request (the CLI's `--fix-request`).
+          THORYN_FIX_REQUEST: ${{ runner.temp }}/thoryn-provision-request.json
+          # SSO-3723 — the consent base URL: the input, else the config's consentUrl (exported below), else none.
+          CONSENT_URL_INPUT: ${{ inputs.consent-url }}
+          CONFIG: ${{ inputs.config }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+        run: |
+          set -euo pipefail
+          report="$RUNNER_TEMP/thoryn-workflow.json"
+          consent="${CONSENT_URL_INPUT:-$(jq -r '.config.consentUrl // ""' "$report")}"
+          if [ -n "$consent" ]; then export THORYN_CONSENT_URL="$consent"; fi
+          while IFS=$'\t' read -r name value; do
+            [ -n "$name" ] || continue
+            [[ "$name" =~ ^THORYN_[A-Z0-9_]+$ ]] || { echo "::error::refusing environment variable '$name'" >&2; exit 1; }
+            export "$name=$value"
+          done < <(jq -r '.config.env | to_entries[] | [.key, (.value | tostring)] | @tsv' "$report")
+          # The artifact directory holds ONLY the configured files at their repository paths (+ the summary); the CLI's
+          # import and plan JSON go to a separate work directory. The checkout itself is never written.
+          out="$RUNNER_TEMP/thoryn-import"; work="$RUNNER_TEMP/thoryn-import-work"
+          rm -rf "$out" "$work"; mkdir -p "$out" "$work"
+          i=0
+          while read -r entry; do
+            file="$(jq -r '.file' <<<"$entry")"; connection="$(jq -r '.connection' <<<"$entry")"
+            java -jar thoryn.jar login --connection "$connection" < /dev/null
+            # The committed file is the starting point (config.valid proved it loads); the import appends what it lacks.
+            mkdir -p "$(dirname "$out/$file")"
+            cp "$file" "$out/$file"
+            java -jar thoryn.jar provision import --for-workflow "$file" --config "$CONFIG" --file "$out/$file" --write --output json > "$work/$i.import.json" < /dev/null
+            # The preview, by the same read-only identity. A plan that is not all noop is reported in the summary, not
+            # fatal: the import pull request's own plan shows it to the reviewer.
+            plan_exit=0
+            java -jar thoryn.jar provision plan --file "$out/$file" --output json > "$work/$i.plan.json" < /dev/null || plan_exit=$?
+            echo "$plan_exit" > "$work/$i.plan.exit"
+            i=$((i + 1))
+          done < <(jq -c '.config.files[]' "$report")
+          java -jar thoryn.jar provision workflow import-summary --artifact "$out" --work "$work" --head-sha "$HEAD_SHA" --config "$CONFIG" | tee -a "$GITHUB_STEP_SUMMARY"
+      # What the App reads: each configured file at its repository path + import-summary.json. `.thoryn/` is a hidden
+      # directory, which upload-artifact v4.4+ leaves out unless told otherwise.
+      - name: Upload the imported files
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: thoryn-import
+          path: ${{ runner.temp }}/thoryn-import
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
+      - name: Upload the fix request
+        if: failure() && steps.config.outputs.fix-request == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: thoryn-provision-request
+          path: ${{ runner.temp }}/thoryn-provision-request.json
+          if-no-files-found: ignore
+          retention-days: 7
