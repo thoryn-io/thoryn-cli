@@ -2,11 +2,13 @@ package com.devnow.thoryn.cli.cmd.provision
 
 import com.devnow.thoryn.provision.ChangeAction
 import com.devnow.thoryn.provision.FixRequest
+import com.devnow.thoryn.provision.ImportOptions
 import com.devnow.thoryn.provision.ImportedResource
 import com.devnow.thoryn.provision.MissingScopeException
 import com.devnow.thoryn.provision.ProvisionEngine
 import com.devnow.thoryn.provision.ProvisionException
 import com.devnow.thoryn.provision.ProvisionFile
+import com.devnow.thoryn.provision.ProvisionPart
 import com.devnow.thoryn.provision.ProvisionPlan
 import com.devnow.thoryn.cli.api.ProductApiException
 import com.devnow.thoryn.cli.auth.JwtClaims
@@ -65,7 +67,8 @@ import java.util.concurrent.Callable
  *    receipts as the marker) is REMOVED; nothing else consumed it.
  *    `import [--write]` renders what the identity may reach as `provision.yaml` entries (`manager` ⇒ an entry
  *    the file converges; `viewer` ⇒ `readOnly: true`, as is an object another repository owns); without
- *    `--write` it only prints them. SSO-3715 — `import` writes the file only.
+ *    `--write` it only prints them. SSO-3715 — `import` writes the file only. SSO-3990 — part- and scope-aware, and with
+ *    `--for-workflow <file>` bounded by that configured file's connection and routed by plane (see [ImportSubcommand]).
  *  - SSO-3668 (ADR 2026-10-13 production-clients-declared-in-the-config-project §2): an `application`'s
  *    `publishTo:` targets receive its clientId after `apply` converged it — through [GitHubActionsVariablePublisher]
  *    (`gh variable set … --env`, the customer's own `gh` login) on every apply. `plan` prints the pending publish
@@ -584,44 +587,113 @@ class ProvisionCommand : Callable<Int> {
     }
 
     /**
-     * `thoryn provision import [--file] [--write]` — SSO-3659 (ADR 2026-10-13 §2): the inverse of `plan`,
-     * bounded by the same relations. Lists what the signed-in identity may reach (`GET /api/v1/access/mine`,
-     * `manager` then `viewer`) and renders each live resource the file does not yet declare as a `provision.yaml`
-     * entry — `manager` objects as entries the file converges, `viewer` objects (and, SSO-3673, objects the platform
-     * says another repository OWNS) as `readOnly: true`. Nothing the identity has no relation to is listed, so
-     * nothing it has no relation to can be imported — the hub's rows stay the authority; SSO-3715 — `import` writes
-     * the FILE only. Without `--write` it prints the entries it would add (stdout; notes and skipped objects on
-     * stderr) and changes nothing.
+     * `thoryn provision import [--file] [--write] [--for-workflow <file> [--root] [--config]] [--part]` — SSO-3659 (ADR
+     * 2026-10-13 §2): the inverse of `plan`, bounded by the same relations. Lists what the signed-in identity may reach
+     * (`GET /api/v1/access/mine`, `manager` then `viewer`) and renders each live resource the file does not yet declare as a
+     * `provision.yaml` entry — `manager` objects as entries the file converges, `viewer` objects (and, SSO-3673, objects the
+     * platform says another repository OWNS) as `readOnly: true`. Nothing the identity has no relation to is listed, so
+     * nothing it has no relation to can be imported — the hub's rows stay the authority; SSO-3715 — `import` writes the FILE
+     * only. Without `--write` it prints the entries it would add (stdout; notes and skipped objects on stderr) and changes
+     * nothing.
+     *
+     * SSO-3990 (thoryn-provisioning ADR 2026-09-30, amendment 2026-10-26 §13) — what it writes plans as all `noop`:
+     *  - **part-aware** — a `thoryn.io/tenant/v1` file never receives `kind: application`, an application file never a tenant
+     *    kind; each object left out is listed with the reason. A file that does not exist yet takes `--part`.
+     *  - **scope-aware** — a kind the session cannot read is listed as not imported, naming the scope (no `403` aborts the
+     *    run); an entry whose write scope is missing is rendered `readOnly: true`. With `--for-workflow` the scopes are the
+     *    configured file's connection's (`auth.scopes`, narrowed by the token to plan), so the file passes `provision workflow
+     *    check`'s `config.trust-scopes` with that connection; without it, the token's.
+     *  - `emailProvider` / `federationMember` are always `readOnly` (write-only secrets); production-plane users are never
+     *    imported, sandbox test users are; the repository's own trusts are never imported; with `--for-workflow`, each object
+     *    goes to exactly one configured file by plane.
      */
     @Command(name = "import", description = ["Render the live resources this identity may reach as provisioning-file entries; --write appends them to the file."], mixinStandardHelpOptions = true)
     internal class ImportSubcommand : FileOptions(), Callable<Int> {
         @Option(names = ["--write"], description = ["Append the entries to the provisioning file (created when absent). Default: print only."])
         var write: Boolean = false
 
+        @Option(
+            names = ["--for-workflow"],
+            paramLabel = "<file>",
+            description = [
+                "SSO-3990 — import for this configured provisioning file of .thoryn/workflow.yaml (its path as listed there): its connection's auth.scopes " +
+                    "decide what is read (narrowed by the token) and what is written as readOnly, every object goes to one configured file by plane, and the " +
+                    "configured connections' own trusts are left out. --file defaults to <root>/<file>; pass --file to write a copy instead.",
+            ],
+        )
+        var forWorkflow: String? = null
+
+        @Option(names = ["--root"], description = ["With --for-workflow: the repository root the configured paths are resolved against (default: the current directory)."])
+        var root: File? = null
+
+        @Option(names = ["--config"], description = ["With --for-workflow: the run-time configuration (default: <root>/${com.devnow.thoryn.cli.cmd.provision.workflow.WorkflowConfig.DEFAULT_PATH}; absent ⇒ the built-in default)."])
+        var config: File? = null
+
+        @Option(names = ["--part"], description = ["SSO-3990 — the part of a file that does not exist yet: tenant (thoryn.io/tenant/v1) or application (thoryn.io/application/v1). An existing file's own apiVersion decides; default for a new file: whatever the imported kinds make it."])
+        var partRaw: String? = null
+
         override fun call(): Int {
             val format = CommandSupport.parseFormat(outputRaw) ?: return CommandSupport.EXIT_USAGE
-            val target = file ?: ProvisionFile.resolveDefault() ?: File(ProvisionFile.DEFAULT_DIR, ProvisionFile.DEFAULT_FILES.first())
+            val repoRoot = root ?: File(".")
+            if (forWorkflow == null && (root != null || config != null)) {
+                System.err.println("Error: --root and --config only apply with --for-workflow <file>.")
+                return CommandSupport.EXIT_USAGE
+            }
+            val workflowTarget = forWorkflow?.let { configured ->
+                val configFile = config ?: File(repoRoot, com.devnow.thoryn.cli.cmd.provision.workflow.WorkflowConfig.DEFAULT_PATH)
+                try {
+                    WorkflowImportTarget.resolve(repoRoot, configFile, config?.path ?: com.devnow.thoryn.cli.cmd.provision.workflow.WorkflowConfig.DEFAULT_PATH, configured)
+                } catch (ex: WorkflowImportException) {
+                    System.err.println("Error: ${ex.message}"); return CommandSupport.EXIT_USAGE
+                }
+            }
+            val target = file ?: workflowTarget?.let { File(repoRoot, it.file) } ?: ProvisionFile.resolveDefault() ?: File(ProvisionFile.DEFAULT_DIR, ProvisionFile.DEFAULT_FILES.first())
             val existing = try {
                 if (target.isFile) ProvisionFile.load(target).also { printWarnings(it) } else null
             } catch (ex: ProvisionException) {
                 System.err.println("Error: ${ex.message}"); return CommandSupport.EXIT_USAGE
             }
+            val requestedPart = when (partRaw?.trim()?.lowercase()) {
+                null -> null
+                ProvisionPart.TENANT.label -> ProvisionPart.TENANT
+                ProvisionPart.APPLICATION.label -> ProvisionPart.APPLICATION
+                else -> { System.err.println("Error: --part must be tenant or application (was $partRaw)."); return CommandSupport.EXIT_USAGE }
+            }
+            if (existing != null && requestedPart != null && existing.part != requestedPart) {
+                System.err.println("Error: --part $partRaw, but ${target.path} declares ${existing.part.apiVersion} — the file's own apiVersion decides; drop --part.")
+                return CommandSupport.EXIT_USAGE
+            }
+            val part = existing?.part ?: requestedPart ?: ProvisionPart.MIXED
             if (write && target.name.endsWith(".json", ignoreCase = true)) {
                 System.err.println("Error: --write appends YAML; ${target.path} is a JSON file — run without --write and add the entries by hand.")
                 return CommandSupport.EXIT_USAGE
             }
             val tokens = CommandSupport.readTokens() ?: return CommandSupport.EXIT_NOT_SIGNED_IN
             gateway = CommandSupport.resolveGateway(gateway, tokens)
+            val tokenScopes = callerScopesOf(tokens)
+            val options = workflowTarget?.options(part, tokenScopes) ?: ImportOptions(part = part, planScopes = tokenScopes, applyScopes = tokenScopes)
+            workflowTarget?.let { w ->
+                val session = subjectOf(tokens)
+                if (session != "client:${w.connection.clientId}") {
+                    System.err.println(
+                        "Warning: signed in as ${session ?: "an identity this CLI cannot name"}, not as ${w.connectionPath}'s client ${w.connection.clientId} — " +
+                            "the scopes are that connection's, but what is read-only because it is only viewed or owned elsewhere follows the signed-in identity.",
+                    )
+                }
+            }
             return try {
                 val engine = engine(gateway, tokens, format = format)
-                val result = engine.import(existing)
+                val result = engine.import(existing, options)
                 val yaml = renderEntries(result.resources)
                 if (format == OutputFormat.TABLE) {
                     if (result.resources.isEmpty()) println("Nothing to import — every resource this identity may reach is already declared in ${target.path}.") else print(yaml)
                 } else {
                     CommandSupport.emitValue(
                         format,
-                        mapOf("file" to target.path, "written" to (write && result.resources.isNotEmpty()), "resources" to result.resources.map { it.toStructured() }, "skipped" to result.skipped),
+                        mapOf(
+                            "file" to target.path, "part" to part.label, "written" to (write && result.resources.isNotEmpty()),
+                            "resources" to result.resources.map { it.toStructured() }, "skipped" to result.skipped,
+                        ),
                         "",
                     )
                 }
@@ -631,7 +703,7 @@ class ProvisionCommand : Callable<Int> {
                     if (!write && result.resources.isNotEmpty()) System.err.println("Printed ${result.resources.size} entry(ies) — nothing was written; re-run with --write to append them to ${target.path}.")
                     return CommandSupport.EXIT_OK
                 }
-                appendEntries(target, yaml, existing, result.resources.map { it.resource.kind })
+                appendEntries(target, yaml, existing, if (part == ProvisionPart.MIXED) ProvisionYamlEdit.apiVersionFor(result.resources.map { it.resource.kind }) else part.apiVersion)
                 val readOnly = result.resources.count { it.resource.readOnly }
                 if (format == OutputFormat.TABLE) {
                     println("Imported ${result.resources.size} entry(ies) into ${target.path}: ${result.resources.size - readOnly} to converge, $readOnly read-only. Nothing else was written — the platform is the ledger.")
@@ -655,11 +727,18 @@ class ProvisionCommand : Callable<Int> {
          * through [ProvisionFile] and the original bytes restored when it does not validate, so `--write` can never
          * leave an invalid file behind.
          */
-        private fun appendEntries(target: File, fragment: String, existing: ProvisionFile?, kinds: List<String>) {
+        private fun appendEntries(target: File, fragment: String, existing: ProvisionFile?, apiVersion: String) {
             if (existing == null) {
                 target.absoluteFile.parentFile?.mkdirs()
-                // SSO-3962 — a fresh file declares the part its entries belong to (both parts ⇒ the mixed format, which warns to split).
-                target.writeText(ProvisionYamlEdit.fresh(fragment, ProvisionYamlEdit.apiVersionFor(kinds)))
+                // SSO-3962 — a fresh file declares the part its entries belong to (both parts ⇒ the mixed format, which warns to
+                // split); SSO-3990 — or the part `--part` named, whose kinds alone the import rendered.
+                target.writeText(ProvisionYamlEdit.fresh(fragment, apiVersion))
+                try {
+                    ProvisionFile.load(target)
+                } catch (ex: ProvisionException) {
+                    target.delete()
+                    throw ProvisionException("the imported entries did not validate (${ex.message}); ${target.path} was not written")
+                }
             } else {
                 val original = target.readBytes()
                 // The shared edit rule (ProvisionYamlEdit): append under `resources:` only when it is the last top-level key.

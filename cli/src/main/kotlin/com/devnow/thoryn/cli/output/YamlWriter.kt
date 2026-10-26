@@ -120,6 +120,9 @@ internal object YamlWriter {
 
     private fun scalar(node: JsonNode): String = when {
         node.isNull -> "null"
+        // SSO-3990 — an EMPTY list / map is a flow collection, never the string "[]" (a role that grants no permission).
+        node.isArray && node.isEmpty -> "[]"
+        node.isObject && node.isEmpty -> "{}"
         node.isBoolean -> if (node.asBoolean()) "true" else "false"
         node.isNumber -> node.asString()
         node.isTextual -> yamlString(node.asString())

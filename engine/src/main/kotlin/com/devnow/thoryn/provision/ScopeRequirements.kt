@@ -154,13 +154,20 @@ object ScopeRequirements {
      * [prune] adds what `--prune` reads (the identity's owned objects). The plan needs are repeated in the apply set's
      * coverage by the callers (an apply plans first); this list states each need once, under the phase that introduces it.
      */
-    fun of(file: ProvisionFile, prune: Boolean = false): List<ScopeNeed> {
+    fun of(file: ProvisionFile, prune: Boolean = false): List<ScopeNeed> = ofResources(file.resources, prune)
+
+    /**
+     * SSO-3990 — [of] over [resources] that are not (yet) a file: `provision import` holds each entry it would render to
+     * exactly the needs `config.trust-scopes` will hold the written file to, so an imported file passes that rule by
+     * construction (a plan need it cannot meet ⇒ not imported; an apply need ⇒ `readOnly: true`).
+     */
+    fun ofResources(resources: List<ProvisionResource>, prune: Boolean = false): List<ScopeNeed> {
         val needs = mutableListOf<ScopeNeed>()
         fun add(scope: String?, phase: Phase, r: ProvisionResource?, why: String, conditional: Boolean = false) {
             scope ?: return
             needs += ScopeNeed(scope, phase, r?.key, why, conditional)
         }
-        file.resources.forEach { r ->
+        resources.forEach { r ->
             add(readScope(r.kind), Phase.PLAN, r, "read its live state")
             // SSO-3941 — a role is not a platform access object: no ownership check is asked for it.
             if (r.kind != ProvisionFile.KIND_ROLE) add(AccessRefs.SCOPE_READ, Phase.PLAN, r, "the ownership check, POST /api/v1/access/check")

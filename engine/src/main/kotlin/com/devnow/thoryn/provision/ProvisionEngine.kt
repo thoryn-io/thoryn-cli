@@ -276,6 +276,47 @@ data class ImportedResource(
 data class ImportResult(val resources: List<ImportedResource>, val skipped: List<String>)
 
 /**
+ * SSO-3990 (thoryn-provisioning ADR 2026-09-30, amendment 2026-10-26 §13.3 / §13.5) — what bounds one `import` to the file it
+ * writes and the identity that will plan and apply that file, so the written file plans as all `noop` and passes
+ * `config.trust-scopes`:
+ *
+ *  - [part] — the target file's part when it does not exist yet (an existing file's own part wins): only its kinds are rendered;
+ *  - [planScopes] — the scopes the identity PLANS with (the session's token, narrowed to the connection's `auth.scopes` when a
+ *    connection plans the file); a kind it cannot read is listed, never read. Null ⇒ unknown: every read is attempted, and a
+ *    scope `403` is listed the same way;
+ *  - [applyScopes] — the scopes the identity APPLIES with (the connection's `auth.scopes`, else the token's); an entry whose
+ *    write need lies outside them is rendered `readOnly: true`. Null ⇒ unknown: nothing is made read-only for want of a scope;
+ *  - [routing] — plane routing over the repository's configured files; null ⇒ every plane goes to this file;
+ *  - [ownTrustClients] — the workload clients of the repository's own trusts (every configured connection): never imported.
+ */
+data class ImportOptions(
+    val part: ProvisionPart = ProvisionPart.MIXED,
+    val planScopes: Set<String>? = null,
+    val applyScopes: Set<String>? = null,
+    val routing: PlaneRouting? = null,
+    val ownTrustClients: Set<String> = emptySet(),
+)
+
+/**
+ * SSO-3990 — which configured provisioning file an object's PLANE belongs to: a sandbox's objects to the file whose connection
+ * is that sandbox's (`connection.json` `auth.environment`), everything else — the environments themselves, workspace-level
+ * kinds, the production plane, a sandbox no connection covers — to the production connection's file. Every object lands in
+ * exactly one file. [target] is the file being imported.
+ */
+class PlaneRouting(
+    val target: String,
+    /** The file planned with a production-plane connection; null when the workflow configures none. */
+    val productionFile: String?,
+    /** Sandbox slug → the file planned with that sandbox's connection. */
+    val sandboxFiles: Map<String, String>,
+) {
+    /** The configured file an object of [plane] (null ⇒ the production plane) goes to, or null when none is configured. */
+    fun fileFor(plane: String?): String? = plane?.let { sandboxFiles[it] } ?: productionFile
+
+    fun owns(plane: String?): Boolean = fileFor(plane) == target
+}
+
+/**
  * SSO-3715 (ADR 2026-10-15 §5 "nothing stays local") — one declared resource as `apply` left it: its `kind` +
  * `name` (the file's key), the live id, the environment SLUG it lives in (`null` ⇒ the production plane; an
  * `environment` records its own slug under `attributes.slug`), non-secret attributes, the platform `owner` the
@@ -1082,7 +1123,9 @@ class ProvisionEngine(
             // SSO-3722 — a 404 is the platform's "you reach nothing here" (SSO-3118): an empty list, so every declared
             // resource becomes an `access_not_reachable` row with its fix instead of one opaque exception.
             if (ex.httpStatus == 404) emptyList<JsonNode>().also { environments = it }
-            else throw ProvisionException("could not list the workspace's environments to resolve a resource's parent (${ex.message})")
+            // SSO-3990 — a scope 403 names the scope (import lists it and goes on; a plan renders it with the profile to add it to).
+            else throw MissingScopeException.of(ex, ScopeRequirements.SCOPE_ENVIRONMENTS_READ, ScopeRequirements.Phase.PLAN, null, "list the workspace's environments")
+                ?: ProvisionException("could not list the workspace's environments to resolve a resource's parent (${ex.message})")
         }
 
         fun environmentId(slug: String): String? = environments().firstOrNull { it.str("slug") == slug }?.str("id")
@@ -1667,7 +1710,7 @@ class ProvisionEngine(
             "check this identity's access — ownership is decided by the relation it holds on each resource (`POST /api/v1/access/check`)",
         ) ?: ProvisionException("could not check this identity's access (${ex.message}); nothing was planned or written")
 
-    // ── import (SSO-3659; ADR 2026-10-13 §2) ─────────────────────────────────────────────────────
+    // ── import (SSO-3659; ADR 2026-10-13 §2; SSO-3990 — for a config project's workflow) ─────────
 
     /**
      * The inverse of [plan], bounded by the same relations: every live platform object the identity holds
@@ -1678,14 +1721,32 @@ class ProvisionEngine(
      * it has no relation to can be imported — the file cannot claim by being written. Resources [existing]
      * already declares are left out; what is reachable but cannot be rendered as a `provision.yaml` entry
      * lands on [ImportResult.skipped] with the reason. Reads only; SSO-3715 — `import` writes the file only.
+     *
+     * **SSO-3990 (thoryn-provisioning ADR 2026-09-30, amendment 2026-10-26 §13.5)** — what is written must plan as all
+     * `noop` in the target file, with the identity that will plan and apply it ([options]):
+     *
+     *  - **part-aware** — only the kinds of the target file's part are rendered ([existing]'s part, else
+     *    [ImportOptions.part]); every object of another part is listed on [ImportResult.skipped] with the reason;
+     *  - **scope-aware** — each entry is held to exactly the needs `config.trust-scopes` holds the file to
+     *    ([ScopeRequirements.ofResources]): a plan need outside [ImportOptions.planScopes] ⇒ not imported, naming the
+     *    scope (a kind whose read scope is missing is never even read — no `403` aborts the run, and one that happens
+     *    anyway is listed the same way); an apply need outside [ImportOptions.applyScopes] ⇒ `readOnly: true`;
+     *  - `emailProvider` and `federationMember` are always `readOnly: true` — their secrets are write-only and a CI apply
+     *    has no channel for them; production-plane users are never imported (counted), sandbox test users are; the
+     *    repository's own trusts ([ImportOptions.ownTrustClients] and the signed-in client) are never imported;
+     *  - **plane routing** ([ImportOptions.routing]) — an object goes to exactly one configured file: a sandbox object to
+     *    the file planned with that sandbox's connection, everything else to the production connection's file;
+     *  - `role` is rendered (name, description, the full permission set) — `readOnly` without `tenant:roles.write`.
      */
-    fun import(existing: ProvisionFile?): ImportResult {
+    fun import(existing: ProvisionFile?, options: ImportOptions = ImportOptions()): ImportResult {
         val reach = Reach()
         val out = mutableListOf<ImportedResource>()
         val skipped = mutableListOf<String>()
         fun skip(why: String) { skipped += why }
+        val part = existing?.part ?: options.part
         val declared = existing?.resources.orEmpty()
         val names = declared.map { it.key }.toMutableSet()
+        val routing = options.routing
         fun uniqueName(kind: String, base: String): String {
             val root = slugName(base).ifEmpty { kind.lowercase() }
             var candidate = root
@@ -1693,6 +1754,89 @@ class ProvisionEngine(
             while (!names.add("$kind/$candidate")) candidate = "$root-${n++}".take(63).trimEnd('-')
             return candidate
         }
+        fun canPlan(scope: String): Boolean = options.planScopes?.let { ScopeRequirements.holds(it, scope) } ?: true
+        fun canApply(scope: String): Boolean = options.applyScopes?.let { ScopeRequirements.holds(it, scope) } ?: true
+        val addScopeHint = "add it to the identity that plans this file (a workload identity trust's plan profile and scopes, and connection.json auth.scopes) to import it"
+
+        /** The kind's listing needs (its read scope; `tenant:access.read` for an access object) this identity is known to lack. */
+        fun listingMissing(kind: String): List<String> =
+            (listOfNotNull(ScopeRequirements.readScope(kind)) + if (kind == ProvisionFile.KIND_ROLE) emptyList() else listOf(AccessRefs.SCOPE_READ))
+                .filterNot { canPlan(it) }
+
+        /**
+         * Run one kind's import: refused up front (one line, naming the scope) when this identity cannot list it; a scope
+         * `403` that happens anyway is listed the same way and the next kind runs — never an aborted import.
+         */
+        fun importKind(kind: String, block: () -> Unit) {
+            val missing = listingMissing(kind)
+            if (missing.isNotEmpty()) {
+                return skip("$kind — not imported: this identity does not hold ${missing.joinToString(" and ")}, which reading it needs; $addScopeHint")
+            }
+            try {
+                block()
+            } catch (ex: MissingScopeException) {
+                skip("$kind — not imported: product-api refused a read (HTTP 403) because the token does not carry ${ex.scope}; $addScopeHint")
+            } catch (ex: ProductApiException) {
+                val scope = ScopeRequirements.readScope(kind)
+                MissingScopeException.of(ex, scope, ScopeRequirements.Phase.PLAN, null, "read") ?: throw ex
+                skip("$kind — not imported: product-api refused a read (HTTP 403) because the token does not carry $scope; $addScopeHint")
+            }
+        }
+
+        /** Plane routing: whether an object on [plane] belongs to another configured file (listed, with that file). */
+        fun routedAway(plane: String?, label: String): Boolean {
+            routing ?: return false
+            if (routing.owns(plane)) return false
+            val elsewhere = routing.fileFor(plane)
+            skip(
+                "$label — not imported into ${routing.target}: " + if (elsewhere != null) {
+                    "objects of ${planeLabel(plane)} belong to $elsewhere (the file planned with ${if (plane != null && plane in routing.sandboxFiles) "that sandbox's" else "the production"} connection)"
+                } else {
+                    "objects of ${planeLabel(plane)} belong to the production connection's file, and .thoryn/workflow.yaml configures none"
+                },
+            )
+            return true
+        }
+
+        /** Whether an object of [kind] goes to a file of the target's part; otherwise it is listed. */
+        fun ofPart(kind: String): Boolean = kind in part.kinds
+        fun partReason(kind: String): String = if (part == ProvisionPart.TENANT) {
+            "a tenant file (${part.apiVersion}) does not carry kind $kind — an application is declared in its own project's application file (${ProvisionFile.API_VERSION_APPLICATION})"
+        } else {
+            "an application file (${part.apiVersion}) carries only applications — kind $kind defines the tenant and is declared in the workspace's config project (${ProvisionFile.API_VERSION_TENANT})"
+        }
+
+        /**
+         * The last step for every rendered entry: the write-only-secret kinds and an apply need this identity lacks make it
+         * `readOnly: true`; a plan need it lacks means not imported. Answers whether it was imported.
+         */
+        fun accept(candidate: ImportedResource, label: String): Boolean {
+            var resource = candidate.resource
+            val notes = listOfNotNull(candidate.note).toMutableList()
+            WRITE_ONLY_SECRET_FIELDS[resource.kind]?.let { field ->
+                if (!resource.readOnly) {
+                    resource = resource.copy(readOnly = true)
+                    notes.clear()
+                    notes += "its $field is write-only and a provisioning workflow carries no secret, so this file cannot converge it — imported read-only; " +
+                        "to manage it from this file, drop `readOnly` and add `${field}Env: <VAR>` to an apply that holds the secret"
+                }
+            }
+            if (!resource.readOnly && options.applyScopes != null) {
+                val lacking = ScopeRequirements.ofResources(listOf(resource)).filter { it.phase == ScopeRequirements.Phase.APPLY }.map { it.scope }.distinct().filterNot { canApply(it) }
+                if (lacking.isNotEmpty()) {
+                    resource = resource.copy(readOnly = true)
+                    notes += "the identity that applies this file does not hold ${lacking.joinToString(" ")} — imported as a read-only reference"
+                }
+            }
+            val planLacking = ScopeRequirements.ofResources(listOf(resource)).filter { it.phase == ScopeRequirements.Phase.PLAN }.map { it.scope }.distinct().filterNot { canPlan(it) }
+            if (planLacking.isNotEmpty()) {
+                skip("$label — not imported: planning it needs ${planLacking.joinToString(" and ")}, which this identity does not hold; $addScopeHint")
+                return false
+            }
+            out += candidate.copy(resource = resource, note = notes.joinToString("; ").ifEmpty { null })
+            return true
+        }
+
         // Every object of a kind the identity holds any relation on, strongest first.
         fun reachable(type: String): List<Pair<String, Access>> {
             val managed = reach.ids(type, RELATION_MANAGER)
@@ -1706,113 +1850,171 @@ class ProvisionEngine(
             owner != null && !reach.owns(ref) -> true to "owned by another repository (the platform's `owner` relation) — imported as a read-only reference"
             else -> false to null
         }
-        fun add(kind: String, name: String, environment: String?, environmentSlug: String?, id: String, access: Access, spec: Map<String, Any?>, note: String? = null, owner: String? = null) {
+        fun add(kind: String, name: String, environment: String?, environmentSlug: String?, id: String, access: Access, spec: Map<String, Any?>, note: String? = null, owner: String? = null): Boolean {
             val ref = objectRef(kind, id, environmentSlug)
             val (readOnly, ownerNote) = readOnlyFor(ref, access, owner)
             val resource = ProvisionResource(kind = kind, name = name, environment = environment, spec = spec, readOnly = readOnly)
-            out += ImportedResource(resource, id, access, listOfNotNull(ownerNote, note).joinToString("; ").ifEmpty { null })
+            return accept(ImportedResource(resource, id, access, listOfNotNull(ownerNote, note).joinToString("; ").ifEmpty { null }), "$kind/$name (${planeLabel(environmentSlug)})")
+        }
+        /** SSO-3990 — an access-object kind of the other part: each listed object is skipped with the reason. */
+        fun listOtherPart(kind: String, type: String) {
+            val ids = if (!canPlan(AccessRefs.SCOPE_READ)) null else try { reachable(type).map { it.first } } catch (ex: MissingScopeException) { null }
+            if (ids == null) return skip("$kind — not imported: ${partReason(kind)}")
+            ids.filterNot { type == OBJECT_TYPE_ENVIRONMENT && it == PRODUCTION_ENV_SLUG }.forEach { id -> skip("$type:$id — not imported: ${partReason(kind)}") }
         }
 
-        // Environments first: a child rendered below names its sandbox by the resource NAME when the same import adds it.
+        // The workspace's sandboxes: listing them needs `tenant:environments.read`; without it only the production plane is imported.
+        val noSandboxes = if (ofPart(ProvisionFile.KIND_ENVIRONMENT)) "environment — not imported, nor any object in a sandbox" else "objects in a sandbox — not imported"
+        var environmentsListed = true
+        val sandboxSlugs: List<String> = when {
+            !canPlan(ScopeRequirements.SCOPE_ENVIRONMENTS_READ) -> emptyList<String>().also {
+                environmentsListed = false
+                skip("$noSandboxes: this identity does not hold ${ScopeRequirements.SCOPE_ENVIRONMENTS_READ}, which listing the workspace's environments needs; $addScopeHint")
+            }
+            else -> try {
+                reach.environments().filter { it.str("kind") != PRODUCTION_ENV_SLUG && it.str("slug") != PRODUCTION_ENV_SLUG }.mapNotNull { it.str("slug") }
+            } catch (ex: MissingScopeException) {
+                environmentsListed = false
+                emptyList<String>().also { skip("$noSandboxes: product-api refused the listing (HTTP 403) because the token does not carry ${ex.scope}; $addScopeHint") }
+            }
+        }
         val envName = declared.filter { it.kind == ProvisionFile.KIND_ENVIRONMENT }.associate { it.spec["slug"].toString() to it.name }.toMutableMap()
-        val sandboxSlugs = reach.environments().filter { it.str("kind") != PRODUCTION_ENV_SLUG && it.str("slug") != PRODUCTION_ENV_SLUG }.mapNotNull { it.str("slug") }
-        reachable(OBJECT_TYPE_ENVIRONMENT).forEach { (id, access) ->
-            val node = reach.environments().firstOrNull { it.str("id") == id } ?: return@forEach skip("environment:$id — listed as reachable but not in the workspace's environment list")
-            val slug = node.str("slug") ?: return@forEach
-            if (slug == PRODUCTION_ENV_SLUG || node.str("kind") == PRODUCTION_ENV_SLUG) return@forEach // the production plane is not a declarable resource
-            if (declared.any { it.kind == ProvisionFile.KIND_ENVIRONMENT && it.spec["slug"] == slug }) return@forEach
-            val name = uniqueName(ProvisionFile.KIND_ENVIRONMENT, slug)
-            envName[slug] = name
-            add(ProvisionFile.KIND_ENVIRONMENT, name, null, null, id, access, linkedMapOf("slug" to slug, "displayName" to (node.str("name") ?: slug)), owner = ProvisionApi.ownerOf(node))
+        fun declaredOnPlane(r: ProvisionResource, plane: String?): Boolean =
+            if (plane == null) ProvisionFile.isProductionPlane(r.environment) else r.environment == plane || r.environment == envName[plane]
+
+        // Environments first: a child rendered below names its sandbox by the resource NAME when the same import adds it.
+        // An environment is a production-plane (workspace-level) object: it goes to the production connection's file.
+        if (!ofPart(ProvisionFile.KIND_ENVIRONMENT)) listOtherPart(ProvisionFile.KIND_ENVIRONMENT, OBJECT_TYPE_ENVIRONMENT)
+        else if (environmentsListed) importKind(ProvisionFile.KIND_ENVIRONMENT) {
+            reachable(OBJECT_TYPE_ENVIRONMENT).forEach { (id, access) ->
+                val node = reach.environments().firstOrNull { it.str("id") == id } ?: return@forEach skip("environment:$id — listed as reachable but not in the workspace's environment list")
+                val slug = node.str("slug") ?: return@forEach
+                if (slug == PRODUCTION_ENV_SLUG || node.str("kind") == PRODUCTION_ENV_SLUG) return@forEach // the production plane is not a declarable resource
+                if (declared.any { it.kind == ProvisionFile.KIND_ENVIRONMENT && it.spec["slug"] == slug }) return@forEach
+                if (routedAway(null, "environment:$slug")) return@forEach
+                val name = uniqueName(ProvisionFile.KIND_ENVIRONMENT, slug)
+                if (add(ProvisionFile.KIND_ENVIRONMENT, name, null, null, id, access, linkedMapOf("slug" to slug, "displayName" to (node.str("name") ?: slug)), owner = ProvisionApi.ownerOf(node))) {
+                    envName[slug] = name
+                }
+            }
         }
         /** The environment a per-environment object lives in: the first plane that answers its GET (production first). */
         fun locate(read: (ProvisionApi) -> JsonNode): Pair<String?, JsonNode>? =
             (listOf<String?>(null) + sandboxSlugs).firstNotNullOfOrNull { plane -> fetchOrNull { read(clients(plane)) }?.let { plane to it } }
         fun environmentField(slug: String?): String? = slug?.let { envName[it] ?: it }
 
-        reachable(OBJECT_TYPE_APPLICATION).forEach { (id, access) ->
-            if (declared.any { it.kind == ProvisionFile.KIND_APPLICATION && it.spec["clientId"] == id }) return@forEach
-            val (plane, n) = locate { it.getApplication(id) } ?: return@forEach skip("application:$id — listed as reachable but not readable in any environment")
-            val spec = linkedMapOf<String, Any?>("clientId" to id, "displayName" to (n.str("displayName") ?: id))
-            n.str("clientType")?.let { spec["clientType"] = it }
-            listOf("grantTypes", "redirectUris", "postLogoutRedirectUris", "scopes").forEach { f ->
-                // SSO-3856 — an imported file never declares an operator-plane scope: it could not be applied.
-                val value = plain(n[f] ?: return@forEach).let { if (f == "scopes") withoutOperatorPlaneScopes(it) else it }
-                (value as? List<*>)?.takeIf { it.isNotEmpty() }?.let { spec[f] = it }
+        if (!ofPart(ProvisionFile.KIND_APPLICATION)) listOtherPart(ProvisionFile.KIND_APPLICATION, OBJECT_TYPE_APPLICATION)
+        else importKind(ProvisionFile.KIND_APPLICATION) {
+            reachable(OBJECT_TYPE_APPLICATION).forEach { (id, access) ->
+                if (declared.any { it.kind == ProvisionFile.KIND_APPLICATION && it.spec["clientId"] == id }) return@forEach
+                val (plane, n) = locate { it.getApplication(id) } ?: return@forEach skip("application:$id — listed as reachable but not readable in any environment")
+                if (routedAway(plane, "application:$id")) return@forEach
+                val spec = linkedMapOf<String, Any?>("clientId" to id, "displayName" to (n.str("displayName") ?: id))
+                n.str("clientType")?.let { spec["clientType"] = it }
+                listOf("grantTypes", "redirectUris", "postLogoutRedirectUris", "scopes").forEach { f ->
+                    // SSO-3856 — an imported file never declares an operator-plane scope: it could not be applied.
+                    val value = plain(n[f] ?: return@forEach).let { if (f == "scopes") withoutOperatorPlaneScopes(it) else it }
+                    (value as? List<*>)?.takeIf { it.isNotEmpty() }?.let { spec[f] = it }
+                }
+                val confidential = !n.str("clientType").equals("public", ignoreCase = true)
+                add(
+                    ProvisionFile.KIND_APPLICATION, uniqueName(ProvisionFile.KIND_APPLICATION, n.str("displayName") ?: id), environmentField(plane), plane, id, access, spec,
+                    if (confidential && access == Access.MANAGER) "its existing client secret is not recoverable; `thoryn clients rotate-secret $id --secret-file <path>` mints a new one" else null,
+                    owner = ProvisionApi.ownerOf(n),
+                )
             }
-            val confidential = !n.str("clientType").equals("public", ignoreCase = true)
-            add(
-                ProvisionFile.KIND_APPLICATION, uniqueName(ProvisionFile.KIND_APPLICATION, n.str("displayName") ?: id), environmentField(plane), plane, id, access, spec,
-                if (confidential && access == Access.MANAGER) "its existing client secret is not recoverable; `thoryn clients rotate-secret $id --secret-file <path>` mints a new one" else null,
-                owner = ProvisionApi.ownerOf(n),
-            )
         }
-        reachable(OBJECT_TYPE_USER).forEach { (id, access) ->
-            val (plane, n) = locate { it.getUser(id) } ?: return@forEach skip("user:$id — listed as reachable but not readable in any environment")
-            val email = n.str("email") ?: return@forEach skip("user:$id — no email on the live record")
-            if (declared.any { it.kind == ProvisionFile.KIND_USER && it.spec["email"].toString().equals(email, ignoreCase = true) }) return@forEach
-            val spec = linkedMapOf<String, Any?>("email" to email)
-            n["emailVerified"]?.takeIf { it.isBoolean }?.let { spec["emailVerified"] = it.asBoolean() }
-            add(ProvisionFile.KIND_USER, uniqueName(ProvisionFile.KIND_USER, email.substringBefore('@')), environmentField(plane), plane, id, access, spec)
+        if (!ofPart(ProvisionFile.KIND_USER)) listOtherPart(ProvisionFile.KIND_USER, OBJECT_TYPE_USER)
+        else importKind(ProvisionFile.KIND_USER) {
+            var productionUsers = 0
+            reachable(OBJECT_TYPE_USER).forEach { (id, access) ->
+                val (plane, n) = locate { it.getUser(id) } ?: return@forEach skip("user:$id — listed as reachable but not readable in any environment")
+                // SSO-3990 — people who sign up on the production plane are not configuration, and a git history cannot honour
+                // an erasure request: never imported (counted). A sandbox's test users are imported.
+                if (plane == null) { productionUsers++; return@forEach }
+                val email = n.str("email") ?: return@forEach skip("user:$id — no email on the live record")
+                if (declared.any { it.kind == ProvisionFile.KIND_USER && it.spec["email"].toString().equals(email, ignoreCase = true) }) return@forEach
+                if (routedAway(plane, "user:$id")) return@forEach
+                val spec = linkedMapOf<String, Any?>("email" to email)
+                n["emailVerified"]?.takeIf { it.isBoolean }?.let { spec["emailVerified"] = it.asBoolean() }
+                add(ProvisionFile.KIND_USER, uniqueName(ProvisionFile.KIND_USER, email.substringBefore('@')), environmentField(plane), plane, id, access, spec)
+            }
+            if (productionUsers > 0) {
+                skip("user — $productionUsers production-plane user(s) not imported: people who sign up are not configuration, and a git history cannot honour an erasure request (sandbox test users are imported)")
+            }
         }
-        reachable(OBJECT_TYPE_FEDERATION_MEMBER).forEach { (id, access) ->
-            val (plane, n) = locate { it.getFederationMember(id) } ?: return@forEach skip("federation_member:$id — listed as reachable but not readable in any environment")
-            if (declared.any { it.kind == ProvisionFile.KIND_FEDERATION_MEMBER && it.spec["displayName"] == n.str("displayName") }) return@forEach
-            val spec = linkedMapOf<String, Any?>("providerType" to (n.str("providerType") ?: "oidc"))
-            listOf("displayName", "discoveryUrl", "clientId").forEach { f -> n.str(f)?.let { spec[f] = it } }
-            add(
-                ProvisionFile.KIND_FEDERATION_MEMBER, uniqueName(ProvisionFile.KIND_FEDERATION_MEMBER, n.str("displayName") ?: id), environmentField(plane), plane, id, access, spec,
-                if (access == Access.MANAGER) "its upstream client secret is write-only: add `clientSecretEnv: <VAR>` before an update is converged" else null,
-            )
+        if (!ofPart(ProvisionFile.KIND_FEDERATION_MEMBER)) listOtherPart(ProvisionFile.KIND_FEDERATION_MEMBER, OBJECT_TYPE_FEDERATION_MEMBER)
+        else importKind(ProvisionFile.KIND_FEDERATION_MEMBER) {
+            reachable(OBJECT_TYPE_FEDERATION_MEMBER).forEach { (id, access) ->
+                val (plane, n) = locate { it.getFederationMember(id) } ?: return@forEach skip("federation_member:$id — listed as reachable but not readable in any environment")
+                if (declared.any { it.kind == ProvisionFile.KIND_FEDERATION_MEMBER && it.spec["displayName"] == n.str("displayName") }) return@forEach
+                if (routedAway(plane, "federation_member:$id")) return@forEach
+                val spec = linkedMapOf<String, Any?>("providerType" to (n.str("providerType") ?: "oidc"))
+                listOf("displayName", "discoveryUrl", "clientId").forEach { f -> n.str(f)?.let { spec[f] = it } }
+                add(ProvisionFile.KIND_FEDERATION_MEMBER, uniqueName(ProvisionFile.KIND_FEDERATION_MEMBER, n.str("displayName") ?: id), environmentField(plane), plane, id, access, spec)
+            }
         }
         // The per-environment singletons: the object id IS the environment slug (`production` for the plane without one).
         fun singletonPlane(id: String): String? = if (id == PRODUCTION_ENV_SLUG) null else id.takeIf { it in sandboxSlugs }
-        fun singletonDeclared(kind: String, plane: String?): Boolean =
-            declared.any { it.kind == kind && (it.environment == plane || (plane != null && it.environment == envName[plane])) }
-        reachable(OBJECT_TYPE_EMAIL_PROVIDER).forEach { (id, access) ->
-            if (id != PRODUCTION_ENV_SLUG && id !in sandboxSlugs) return@forEach skip("email_provider:$id — no environment with that slug")
-            val plane = singletonPlane(id)
-            if (singletonDeclared(ProvisionFile.KIND_EMAIL_PROVIDER, plane)) return@forEach
-            val n = fetchOrNull { clients(plane).getEmailProvider() } ?: return@forEach
-            if (n["configured"]?.asBoolean() == false) return@forEach
+        fun singletonDeclared(kind: String, plane: String?): Boolean = declared.any { it.kind == kind && declaredOnPlane(it, plane) }
+        // A singleton's `name` defaults to its kind, but `kind/name` is the file's key: the same kind on a second plane takes a
+        // distinct name (`loginmethods-<plane>`) — the singleton converges by its environment, never by its name.
+        fun singletonName(kind: String, plane: String?): String =
+            if (names.add("$kind/$kind")) kind else uniqueName(kind, "$kind-${plane ?: PRODUCTION_ENV_SLUG}")
+        fun singleton(kind: String, type: String, block: (id: String, plane: String?, access: Access) -> Unit) {
+            if (!ofPart(kind)) return listOtherPart(kind, type)
+            importKind(kind) {
+                reachable(type).forEach { (id, access) ->
+                    if (id != PRODUCTION_ENV_SLUG && id !in sandboxSlugs) return@forEach skip("$type:$id — no environment with that slug")
+                    val plane = singletonPlane(id)
+                    if (singletonDeclared(kind, plane)) return@forEach
+                    block(id, plane, access)
+                }
+            }
+        }
+        singleton(ProvisionFile.KIND_EMAIL_PROVIDER, OBJECT_TYPE_EMAIL_PROVIDER) { id, plane, access ->
+            val n = fetchOrNull { clients(plane).getEmailProvider() } ?: return@singleton
+            if (n["configured"]?.asBoolean() == false) return@singleton
             val spec = linkedMapOf<String, Any?>()
             listOf("smtpHost", "smtpUsername", "transportSecurity", "fromAddress", "fromName", "replyTo", "providerType").forEach { f -> n.str(f)?.let { spec[f] = it } }
             n["smtpPort"]?.takeIf { it.isNumber }?.let { spec["smtpPort"] = it.asInt() }
             n["enabled"]?.takeIf { it.isBoolean }?.let { spec["enabled"] = it.asBoolean() }
-            if (spec["smtpHost"] == null) return@forEach skip("email_provider:$id — configured without an SMTP host; not a declarable emailProvider")
-            add(
-                ProvisionFile.KIND_EMAIL_PROVIDER, ProvisionFile.KIND_EMAIL_PROVIDER, environmentField(plane), plane, n.str("providerType") ?: "email-provider", access, spec,
-                if (access == Access.MANAGER) "the SMTP password is write-only: add `smtpPasswordEnv: <VAR>` before an update is converged" else null,
-            )
+            if (spec["smtpHost"] == null) return@singleton skip("email_provider:$id — configured without an SMTP host; not a declarable emailProvider")
+            if (routedAway(plane, "email_provider:$id")) return@singleton
+            add(ProvisionFile.KIND_EMAIL_PROVIDER, singletonName(ProvisionFile.KIND_EMAIL_PROVIDER, plane), environmentField(plane), plane, n.str("providerType") ?: "email-provider", access, spec)
         }
-        reachable(OBJECT_TYPE_LOGIN_THEME).forEach { (id, access) ->
-            if (id != PRODUCTION_ENV_SLUG && id !in sandboxSlugs) return@forEach skip("login_theme:$id — no environment with that slug")
-            val plane = singletonPlane(id)
-            if (singletonDeclared(ProvisionFile.KIND_LOGIN_THEME, plane)) return@forEach
-            val stored = fetchOrNull { clients(plane).getLoginBranding() }?.get("stored") ?: return@forEach
+        singleton(ProvisionFile.KIND_LOGIN_THEME, OBJECT_TYPE_LOGIN_THEME) { _, plane, access ->
+            val stored = fetchOrNull { clients(plane).getLoginBranding() }?.get("stored") ?: return@singleton
             val fields = listOf("logoUrl", "primaryColor", "backgroundColor", "borderRadiusPx", "theme", "cssVariables")
             val spec = stored.toMap(fields).filterValues { it != null && !(it is Map<*, *> && it.isEmpty()) }
-            if (spec.isEmpty()) return@forEach // nothing stored ⇒ the platform default ⇒ nothing to declare
-            add(ProvisionFile.KIND_LOGIN_THEME, ProvisionFile.KIND_LOGIN_THEME, environmentField(plane), plane, "login-theme", access, spec)
+            if (spec.isEmpty()) return@singleton // nothing stored ⇒ the platform default ⇒ nothing to declare
+            if (routedAway(plane, "login_theme:${plane ?: PRODUCTION_ENV_SLUG}")) return@singleton
+            add(ProvisionFile.KIND_LOGIN_THEME, singletonName(ProvisionFile.KIND_LOGIN_THEME, plane), environmentField(plane), plane, "login-theme", access, spec)
         }
-        reachable(OBJECT_TYPE_LOGIN_METHODS).forEach { (id, access) ->
-            if (id != PRODUCTION_ENV_SLUG && id !in sandboxSlugs) return@forEach skip("login_methods:$id — no environment with that slug")
-            val plane = singletonPlane(id)
-            if (singletonDeclared(ProvisionFile.KIND_LOGIN_METHODS, plane)) return@forEach
-            val stored = fetchOrNull { clients(plane).getLoginMethods() }?.get("stored")?.takeIf { !it.isNull && it.isArray } ?: return@forEach
+        singleton(ProvisionFile.KIND_LOGIN_METHODS, OBJECT_TYPE_LOGIN_METHODS) { _, plane, access ->
+            val stored = fetchOrNull { clients(plane).getLoginMethods() }?.get("stored")?.takeIf { !it.isNull && it.isArray } ?: return@singleton
+            if (routedAway(plane, "login_methods:${plane ?: PRODUCTION_ENV_SLUG}")) return@singleton
             val methods = stored.toList().map { it.asString() }
-            add(ProvisionFile.KIND_LOGIN_METHODS, ProvisionFile.KIND_LOGIN_METHODS, environmentField(plane), plane, "login-methods", access, linkedMapOf("methods" to methods))
+            add(ProvisionFile.KIND_LOGIN_METHODS, singletonName(ProvisionFile.KIND_LOGIN_METHODS, plane), environmentField(plane), plane, "login-methods", access, linkedMapOf("methods" to methods))
         }
-        reachable(OBJECT_TYPE_LOGIN_FLOW).forEach { (id, _) ->
-            skipped += "login_flow:$id — a loginFlow is declared by its templateId, which the active flow does not record; declare it by hand"
+        if (!ofPart(ProvisionFile.KIND_LOGIN_FLOW)) listOtherPart(ProvisionFile.KIND_LOGIN_FLOW, OBJECT_TYPE_LOGIN_FLOW)
+        else importKind(ProvisionFile.KIND_LOGIN_FLOW) {
+            reachable(OBJECT_TYPE_LOGIN_FLOW).forEach { (id, _) ->
+                if (routing != null && !routing.owns(if (id == PRODUCTION_ENV_SLUG) null else id)) return@forEach
+                skip("login_flow:$id — a loginFlow is declared by its templateId, which the active flow does not record; declare it by hand")
+            }
         }
-        reachable(OBJECT_TYPE_CUSTOM_DOMAIN).forEach { (id, access) ->
-            if (declared.any { it.kind == ProvisionFile.KIND_CUSTOM_DOMAIN }) return@forEach
-            val body = fetchOrNull { clients(null).getCustomDomain() } ?: return@forEach
-            val view = CustomDomainView.of(body)
-            val host = view.domain?.takeIf { it.isNotBlank() } ?: return@forEach
-            if (view.state == CustomDomainView.NONE) return@forEach
-            add(ProvisionFile.KIND_CUSTOM_DOMAIN, ProvisionFile.KIND_CUSTOM_DOMAIN, null, null, id, access, linkedMapOf("host" to host))
+        if (!ofPart(ProvisionFile.KIND_CUSTOM_DOMAIN)) listOtherPart(ProvisionFile.KIND_CUSTOM_DOMAIN, OBJECT_TYPE_CUSTOM_DOMAIN)
+        else importKind(ProvisionFile.KIND_CUSTOM_DOMAIN) {
+            reachable(OBJECT_TYPE_CUSTOM_DOMAIN).forEach { (id, access) ->
+                if (declared.any { it.kind == ProvisionFile.KIND_CUSTOM_DOMAIN }) return@forEach
+                val body = fetchOrNull { clients(null).getCustomDomain() } ?: return@forEach
+                val view = CustomDomainView.of(body)
+                val host = view.domain?.takeIf { it.isNotBlank() } ?: return@forEach
+                if (view.state == CustomDomainView.NONE) return@forEach
+                if (routedAway(null, "custom_domain:$id")) return@forEach
+                add(ProvisionFile.KIND_CUSTOM_DOMAIN, ProvisionFile.KIND_CUSTOM_DOMAIN, null, null, id, access, linkedMapOf("host" to host))
+            }
         }
         // SSO-3689 / SSO-3774 — workload-identity trusts: the API lists a plane's trusts filtered to what this identity reaches
         // (S1: the trusts it holds a relation on, every trust of a plane it views); each is rendered with the relation held on
@@ -1823,35 +2025,72 @@ class ProvisionEngine(
             plane == null -> if (workspaceId != null && reach.holds("$OBJECT_TYPE_WORKSPACE:$workspaceId", RELATION_VIEWER)) Access.VIEWER else Access.NONE
             else -> reach.environmentId(plane)?.let { reach.on(objectRef(ProvisionFile.KIND_ENVIRONMENT, it, null)) } ?: Access.NONE
         }
-        val ownClientId = subject?.takeIf { it.startsWith("client:") }?.substringAfter(':')
-        (listOf<String?>(null) + sandboxSlugs).forEach { plane ->
-            val onPlane = planeAccess(plane)
-            // A plane this identity reaches nothing in answers 404 — nothing to import there.
-            val trusts = fetchOrNull { trustsOf(plane) } ?: return@forEach
-            trusts.forEach { n ->
-                val name = n.str("name") ?: return@forEach
-                val id = n.str("id") ?: return@forEach
-                val ref = objectRef(ProvisionFile.KIND_WORKLOAD_IDENTITY_TRUST, id, plane)
-                val access = stronger(reach.onTrust(ref) ?: Access.NONE, onPlane)
-                if (access == Access.NONE) return@forEach
-                val envField = environmentField(plane)
-                if (declared.any { it.kind == ProvisionFile.KIND_WORKLOAD_IDENTITY_TRUST && it.name == name && (it.environment == envField || it.environment == plane) }) return@forEach
-                // The structural limit: the identity applying a file cannot declare its OWN bootstrap trust.
-                if (ownClientId != null && n.str("clientId") == ownClientId) {
-                    skipped += "workloadIdentityTrust:$name — the trust this identity itself signs in with (its own bootstrap trust); it was created once by a person and is never declared by the file it applies"
-                    return@forEach
+        // SSO-3990 — the repository's own trusts: the signed-in client's, and every configured connection's.
+        val ownClients = options.ownTrustClients + listOfNotNull(subject?.takeIf { it.startsWith("client:") }?.substringAfter(':'))
+        if (!ofPart(ProvisionFile.KIND_WORKLOAD_IDENTITY_TRUST)) {
+            skip("${ProvisionFile.KIND_WORKLOAD_IDENTITY_TRUST} — not imported: ${partReason(ProvisionFile.KIND_WORKLOAD_IDENTITY_TRUST)}")
+        } else importKind(ProvisionFile.KIND_WORKLOAD_IDENTITY_TRUST) {
+            (listOf<String?>(null) + sandboxSlugs).forEach { plane ->
+                val onPlane = planeAccess(plane)
+                // A plane this identity reaches nothing in answers 404 — nothing to import there.
+                val trusts = fetchOrNull { trustsOf(plane) } ?: return@forEach
+                trusts.forEach { n ->
+                    val name = n.str("name") ?: return@forEach
+                    val id = n.str("id") ?: return@forEach
+                    val ref = objectRef(ProvisionFile.KIND_WORKLOAD_IDENTITY_TRUST, id, plane)
+                    val access = stronger(reach.onTrust(ref) ?: Access.NONE, onPlane)
+                    if (access == Access.NONE) return@forEach
+                    val envField = environmentField(plane)
+                    if (declared.any { it.kind == ProvisionFile.KIND_WORKLOAD_IDENTITY_TRUST && it.name == name && declaredOnPlane(it, plane) }) return@forEach
+                    // The structural limit: the identity applying a file cannot declare its OWN bootstrap trust (SSO-3990: nor
+                    // any trust the repository's configured connections sign in with).
+                    if (n.str("clientId") in ownClients) {
+                        skipped += "workloadIdentityTrust:$name — the trust this repository itself signs in with (its own bootstrap trust); it was created once by a person and is never declared by the file it applies"
+                        return@forEach
+                    }
+                    if (routedAway(plane, "workloadIdentityTrust:$name")) return@forEach
+                    // The trust's NAME is its converge key on the API, so it cannot be renamed to stay unique in the file.
+                    if (!names.add("${ProvisionFile.KIND_WORKLOAD_IDENTITY_TRUST}/$name")) {
+                        skipped += "workloadIdentityTrust:$name (${planeLabel(plane)}) — a trust of the same name is already in the file; a trust converges by its API name, so declare it by hand under a second file"
+                        return@forEach
+                    }
+                    val (spec, note) = trustSpecOf(n, production = plane == null)
+                    val owner = ProvisionApi.ownerOf(n)
+                    val ownedElsewhere = access == Access.MANAGER && owner != null && !reach.ownsTrust(ref)
+                    val resource = ProvisionResource(ProvisionFile.KIND_WORKLOAD_IDENTITY_TRUST, name, envField, spec, readOnly = access == Access.VIEWER || ownedElsewhere)
+                    val ownerNote = if (ownedElsewhere) "owned by another repository (the platform's `owner` relation) — imported as a read-only reference" else null
+                    accept(ImportedResource(resource, id, access, listOfNotNull(ownerNote, note).joinToString("; ").ifEmpty { null }), "workloadIdentityTrust/$name (${planeLabel(plane)})")
                 }
-                // The trust's NAME is its converge key on the API, so it cannot be renamed to stay unique in the file.
-                if (!names.add("${ProvisionFile.KIND_WORKLOAD_IDENTITY_TRUST}/$name")) {
-                    skipped += "workloadIdentityTrust:$name (${planeLabel(plane)}) — a trust of the same name is already in the file; a trust converges by its API name, so declare it by hand under a second file"
-                    return@forEach
+            }
+        }
+        // SSO-3990 — roles: not platform access objects (product-api gates them on `tenant:roles.*` alone), so what this identity
+        // may read is every role of a plane it reaches, and whether it may change one is the write scope.
+        if (!ofPart(ProvisionFile.KIND_ROLE)) {
+            skip("${ProvisionFile.KIND_ROLE} — not imported: ${partReason(ProvisionFile.KIND_ROLE)}")
+        } else importKind(ProvisionFile.KIND_ROLE) {
+            val access = if (canApply(ScopeRequirements.writeScope(ProvisionFile.KIND_ROLE)!!)) Access.MANAGER else Access.VIEWER
+            (listOf<String?>(null) + sandboxSlugs).forEach { plane ->
+                val client = clients(plane)
+                val roles = fetchOrNull { allPages { cursor -> client.listRoles(null, cursor) } } ?: return@forEach
+                roles.forEach { n ->
+                    val name = n.str("name") ?: return@forEach
+                    val id = n.str("id") ?: return@forEach
+                    if (declared.any { it.kind == ProvisionFile.KIND_ROLE && it.name == name && declaredOnPlane(it, plane) }) return@forEach
+                    if (routedAway(plane, "role:$name")) return@forEach
+                    // A role converges by its NAME, so the name is the resource name — it cannot be renamed to fit the grammar.
+                    if (!ProvisionFile.NAME_PATTERN.matches(name)) {
+                        return@forEach skip("role:$name (${planeLabel(plane)}) — a role converges by its name, and '$name' is not a resource name (${ProvisionFile.NAME_PATTERN.pattern}); it cannot be declared in a file")
+                    }
+                    if (!names.add("${ProvisionFile.KIND_ROLE}/$name")) {
+                        return@forEach skip("role:$name (${planeLabel(plane)}) — a role of the same name is already in the file; a role converges by its name, so declare it under a second file")
+                    }
+                    val permissions = allPages { cursor -> client.listRolePermissions(id, null, cursor) }.mapNotNull { it.str("name") }.sorted()
+                    val spec = linkedMapOf<String, Any?>()
+                    n.str("description")?.let { spec[ProvisionFile.ROLE_DESCRIPTION] = it }
+                    spec[ProvisionFile.ROLE_PERMISSIONS] = permissions
+                    val resource = ProvisionResource(ProvisionFile.KIND_ROLE, name, environmentField(plane), spec)
+                    accept(ImportedResource(resource, id, access), "role/$name (${planeLabel(plane)})")
                 }
-                val (spec, note) = trustSpecOf(n, production = plane == null)
-                val owner = ProvisionApi.ownerOf(n)
-                val ownedElsewhere = access == Access.MANAGER && owner != null && !reach.ownsTrust(ref)
-                val resource = ProvisionResource(ProvisionFile.KIND_WORKLOAD_IDENTITY_TRUST, name, envField, spec, readOnly = access == Access.VIEWER || ownedElsewhere)
-                val ownerNote = if (ownedElsewhere) "owned by another repository (the platform's `owner` relation) — imported as a read-only reference" else null
-                out += ImportedResource(resource, id, access, listOfNotNull(ownerNote, note).joinToString("; ").ifEmpty { null })
             }
         }
         return ImportResult(out, skipped)
@@ -3795,6 +4034,15 @@ class ProvisionEngine(
         const val RELATION_OWNER = AccessRefs.RELATION_OWNER
 
         /** The platform object types (`GET /api/v1/access/mine?type=…`); the per-kind mapping is [objectRef]. */
+        /**
+         * SSO-3990 — the kinds whose secret is write-only (never rendered back), by the secret's spec field: `import` always
+         * renders them `readOnly: true`, because a provisioning workflow carries no secret and so could never converge them.
+         */
+        val WRITE_ONLY_SECRET_FIELDS: Map<String, String> = mapOf(
+            ProvisionFile.KIND_EMAIL_PROVIDER to "smtpPassword",
+            ProvisionFile.KIND_FEDERATION_MEMBER to "clientSecret",
+        )
+
         const val OBJECT_TYPE_WORKSPACE = "workspace"
         const val OBJECT_TYPE_ENVIRONMENT = "environment"
         const val OBJECT_TYPE_APPLICATION = "application"
