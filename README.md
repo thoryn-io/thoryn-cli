@@ -375,7 +375,10 @@ thoryn provision workflow check [--file <stub>] [--config <.thoryn/workflow.yaml
                                              # SSO-3719 — lint the App-dispatched STUB (.github/workflows/thoryn-provisioning.yml) and .thoryn/workflow.yaml
                                              # against the provisioning workflow contract: every rule PASS/FAIL with its fix + the EFFECTIVE configuration;
                                              # exit 0 / 4. The reusable workflow runs it (--output json) and acts on its `config`. See "Configure the
-                                             # provisioning workflow" below.
+                                             # provisioning workflow" below. --output json carries `importCapable` (contract v2, SSO-3991).
+thoryn provision workflow import-summary --artifact <dir> --work <dir> --head-sha <sha> [--config] [--root]
+                                             # SSO-3991 — the reusable workflow's own step (not a customer command): checks the import job's artifact
+                                             # directory holds exactly the configured files and writes import-summary.json beside them; exit 0 / 4.
 
 # Least-privilege access grants (SSO-3113, epic SSO-3108) — who may manage / view which resource.
 # Thin wrappers over product-api /api/v1/access (the SSO-3112 contract). Subjects: member:<sub> | client:<clientId>;
@@ -2767,6 +2770,34 @@ A self-hosted pool with a longer timeout — in the stub's `with:`:
 `config.*` — the file), then the effective inputs and configuration. A hand-written workflow with its own jobs is
 reported as **not the supported shape**: the check still says what the App would need from it (`custom.jobs`), but
 Thoryn does not promote or support it; a `uses:` of any other reusable workflow cannot be verified at all.
+
+#### The configuration import — `mode: import` (contract v2, SSO-3991)
+
+After a config project's setup pull request is merged, the Thoryn GitHub App dispatches the stub with `mode: import`
+(thoryn-provisioning ADR 2026-09-30, amendment 2026-10-26 §13). It does so **only when the stub offers it**: `mode`'s
+options are `[plan, apply, import]` and `uses:` calls the reusable workflow at **cli-v0.51.0 or newer**. A stub with
+`[plan, apply]` stays valid and is never sent an import. The check's `dispatch.import-capable` rule fails a stub that
+offers `import` at an older release: that dispatch would run zero jobs and report green with nothing imported.
+
+```yaml
+      mode: { description: "plan, apply or import", required: true, type: choice, options: [plan, apply, import] }
+```
+
+The reusable workflow's **`import` job** runs in `plan-environment`, so the hub mints the trust's read-only plan
+profile; no new right. For each `files[]` entry it signs in as that entry's connection, copies the committed file under
+`$RUNNER_TEMP`, runs `thoryn provision import --for-workflow <file> --file <copy> --write` (part- and scope-aware,
+plane-routed, SSO-3990) and previews the copy with `thoryn provision plan`. It uploads the artifact **`thoryn-import`**
+(kept 7 days):
+
+| Path in the artifact | What it is |
+|---|---|
+| each configured file, at its repository path (`.thoryn/…`) | the committed file plus what the import added |
+| `import-summary.json` | `version: 1`, `contractVersion`, `headSha`; per file: `path`, `connection`, `apiVersion`, `bytes`, `sha256`, `imported[]` (`{kind, name, environment, readOnly, note}`), `notImported[]` (the CLI's lines, each with its reason), `plan` (`exit`, `counts`, `allNoop`, `notNoop[]` as `{kind, name, environment, action, fields}`) |
+
+The summary never carries a value of the configuration: no `spec`, no id, and for a plan row only the NAMES of the
+fields that differ. A file over 1 MiB, an artifact over 8 MiB, a stray or missing file in the artifact directory, or a
+plan preview that did not run fails the job before anything is uploaded. Nothing is written to the repository: the job
+holds `contents: read`. The App commits the files to its own branch and opens the import pull request.
 
 #### The scopes a provisioning file needs — `config.trust-scopes` (SSO-3926)
 

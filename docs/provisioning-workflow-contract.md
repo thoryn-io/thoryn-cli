@@ -1,4 +1,4 @@
-# The provisioning workflow contract — v1 (SSO-3719, epic SSO-3304)
+# The provisioning workflow contract — v2 (SSO-3719, epic SSO-3304; v2: SSO-3991)
 
 **Audience: Thoryn engineers.** This is the INTERNAL contract between the Thoryn GitHub App (oauthy
 `starter-orchestrator`, converge ADR 2026-10-13 Amendments 1, 5–7) and the reusable workflow
@@ -19,14 +19,14 @@ the reusable workflow. What a repository keeps is a **stub**.
 ## 1. What the App dispatches (`dispatch.*`)
 
 The App dispatches the file at **`.github/workflows/thoryn-provisioning.yml`** (`ThorynFiles.WORKFLOW_PATH`) on the
-default branch, in both modes, by `workflow_dispatch`:
+default branch, in every mode, by `workflow_dispatch`:
 
 | Input | Required | Type | Value |
 |---|---|---|---|
-| `mode` | yes | `choice` `[plan, apply]` | `plan` on a pull request touching `.thoryn/**`; `apply` on a push to the default branch |
-| `head_sha` | yes | `string` | the commit to plan or apply (the PR head, or the pushed sha) |
-| `check_run_id` | yes | `string` | the App's check run (*Thoryn provisioning plan* / *apply*) |
-| `pr_number` | no (`default: ""`) | `string` | the pull request, plan only |
+| `mode` | yes | `choice` `[plan, apply]` (v1) or `[plan, apply, import]` (v2) | `plan` on a pull request touching `.thoryn/**`; `apply` on a push to the default branch; `import` after a config project's setup pull request is merged (v2, §7) |
+| `head_sha` | yes | `string` | the commit to plan or apply (the PR head, or the pushed sha); for `import`, the setup pull request's merge commit |
+| `check_run_id` | yes | `string` | the App's check run (*Thoryn provisioning plan* / *apply* / *Thoryn configuration import*) |
+| `pr_number` | no (`default: ""`) | `string` | the pull request: plan; for `import`, the setup pull request |
 
 and requires of the dispatched workflow:
 
@@ -36,6 +36,13 @@ and requires of the dispatched workflow:
   the App dispatches `apply` only when it sees it. In a stub the marker sits above the `uses:` job; the reusable workflow
   carries it on its own apply job;
 - top-level **`permissions: {}`**; the job(s) declare their own;
+- **`dispatch.import-capable`** (v2) — the App dispatches `import` only to a file this rule passes **and** whose `mode`
+  options include `import` (`--output json`: `importCapable: true`). A stub that does not offer `import` passes (it is
+  never sent one). A stub that offers it must call the reusable workflow at **`cli-v0.51.0`**
+  (`ProvisioningWorkflowContract.IMPORT_MINIMUM_RELEASE`) or newer, and must not set `cli-version` older than that —
+  otherwise the rule FAILS: an older reusable workflow has no job gated on `import`, so the dispatch would run zero jobs
+  and report green with nothing imported. A commit-SHA or branch pin cannot be dated and is UNVERIFIABLE. A hand-written
+  workflow that offers `import` needs a job gated on it, in the plan job's environment, uploading `thoryn-import`;
 - **`concurrency.group`** contains `${{ inputs.mode }}` and `cancel-in-progress: false` — a plan never waits on an
   apply, two applies never race, a held apply is never cancelled. The stub's top-level concurrency covers the called jobs
   (they are part of the caller's run), so the reusable workflow declares none;
@@ -106,10 +113,10 @@ release tag it pins to have been cut.
 | `config` | no | `.thoryn/workflow.yaml` | relative path | the run-time configuration (§5) |
 | `consent-url` | no | `""` | `https://` base URL, no query/fragment | SSO-3723 — `THORYN_CONSENT_URL` for the CLI: a red job's `To fix — Option 2, in the browser:` link, `<url>/github/consent/run/<owner>/<repo>/<run_id>`, and (SSO-3738) Option 1 `thoryn access approve <owner>/<repo>/<run_id>` for the same consent; empty ⇒ §5 `consentUrl`, else the raw CLI commands alone, under a check-each-line warning |
 
-Jobs **`plan`** and **`apply`**, each: `if: inputs.mode == '<mode>'`; `runs-on` from `inputs.runs-on`
+Jobs **`plan`**, **`apply`** and (v2) **`import`** (§7), each: `if: inputs.mode == '<mode>'`; `runs-on` from `inputs.runs-on`
 (`startsWith(…, '[') && fromJSON(…) || …`); `timeout-minutes` from the input; **`environment: ${{ inputs.<mode>-environment }}`
 — a called job's environment resolves against the CALLER**, so the caller's reviewers gate it and the caller's trust
-pins it; permissions exactly §2's three; first step `actions/checkout` at `${{ inputs.head_sha }}`; then set up Java,
+pins it (the import job runs in `plan-environment`, §7); permissions exactly §2's three; first step `actions/checkout` at `${{ inputs.head_sha }}`; then set up Java,
 download the release's `thoryn.jar`, run **`thoryn provision workflow check --file <stub> --config <config> --output json`**
 (the stub from `github.workflow_ref` — the CALLER's workflow path — the config from the input; a red check fails the job
 with each fix named) and act on its `config` object: for every `files[]` entry `thoryn login --connection <connection>` then
@@ -133,7 +140,8 @@ falls back to the latest `cli-v*` release with a `::notice`. `cli-version` overr
 ## 4. Nothing is written back (`reusable.no-write-back`)
 
 Per oauthy ADR `2026-10-15-platform-is-the-ledger-no-committed-provisioning-receipt` (SSO-3708; the orchestrator's
-SSO-3717 shape): no `contents: write`, no `pull-requests`, no `git push` / `gh pr create`. Ownership is the platform's
+SSO-3717 shape): no `contents: write`, no `pull-requests`, no `git push` / `git commit` / `gh pr create` — in any job,
+the import job included. Ownership is the platform's
 `owner` relation, not a committed receipt. Removals are never automated unless the configuration says so (§5; both
 toggles default off).
 
@@ -191,7 +199,10 @@ contract can hold them. When configuration is not enough, file a product gap.
 
 ## Versioning
 
-`contractVersion: 1`. The rule ids above (`dispatch.*`, `stub.*`, `reusable.*`, `config.*`, `custom.*`, `common.*`) are
+`contractVersion: 2` (SSO-3991). v1 → v2 changed what a valid stub may look like: `mode` may also offer `import`
+(`dispatch.inputs` accepts `[plan, apply]` or `[plan, apply, import]`), with the new rule `dispatch.import-capable`;
+the reusable workflow gained the `import` job (`reusable.jobs` now pins three jobs; new rule `reusable.import-job`). A
+v1 stub is still valid and is never dispatched `import`. `--output json` gained `importCapable`. The rule ids above (`dispatch.*`, `stub.*`, `reusable.*`, `config.*`, `custom.*`, `common.*`) are
 the stable names the check prints and `--output json` carries.
 
 SSO-3738 did **not** bump it: what a valid stub or reusable workflow looks like is unchanged (same inputs, same
@@ -219,51 +230,64 @@ not load used to pass `config.valid` (it only checked the file was committed) an
 and `config.trust-scopes` from the report, so a project whose one file was broken printed "OK". Now it fails, as its
 plan job would have. A repository that was green with a broken configured file is red on the next run, naming the file.
 
-## Decided — contract v2: `mode: import` (SSO-3989, not yet implemented)
+## 7. Contract v2 — `mode: import` (`dispatch.import-capable`, `reusable.import-job`)
 
-**Status: decided** (product owner, 2026-10-26); built by **SSO-3990** (the `provision import` changes) and
-**SSO-3991** (this contract v2: the mode, the job, the artifact, a release). Until those land,
-`ProvisioningWorkflowContract` and `WorkflowCheck` enforce v1 above. The design and its reasons are in thoryn-provisioning `adrs/2026-09-30-starter-orchestrator-service.md`,
-*Amendment 2026-10-26* (§13). In short: after a config project's setup pull request is merged, the App dispatches an
-import on the default branch; the job imports the workspace's live configuration as the repository's own read-only
-identity and hands the files to the App as an artifact; the App opens a pull request with them, whose plan is all
-`noop`.
+**Status: implemented** in cli-v0.51.0 (SSO-3991; decided under SSO-3989 by the product owner on 2026-10-26; the
+`provision import` changes it builds on are SSO-3990). The design and its reasons are thoryn-provisioning
+`adrs/2026-09-30-starter-orchestrator-service.md`, *Amendment 2026-10-26* (§13). After a config project's setup pull
+request is merged, the App dispatches an import on the default branch; the job imports the workspace's live configuration
+as the repository's own read-only identity and hands the files to the App as an artifact; the App opens a pull request
+with them, whose plan is all `noop`.
 
-It bumps `contractVersion` to **2**, because it changes what a valid stub may look like.
+- **§1** — `mode` is `[plan, apply]` or `[plan, apply, import]`. `import` is dispatched only on the default branch, by the
+  App, with `head_sha` = the setup pull request's merge commit, `check_run_id` = the *Thoryn configuration import* check
+  run and `pr_number` = the setup pull request, and only to a file `dispatch.import-capable` passes with `import` offered
+  (`importCapable: true`). The `run-name` and concurrency rules are unchanged; `import` gets its own group through
+  `${{ inputs.mode }}`.
+- **§2** — nothing else in the stub changes: same single job, same three permissions, no secrets. Opting in is two
+  edits: `import` in the options, and the `uses:` pin at cli-v0.51.0 or newer.
+- **§3 — the `import` job** (`reusable.jobs` + `reusable.import-job`): `if: inputs.mode == 'import'`;
+  **`environment: ${{ inputs.plan-environment }}`**, so the hub mints the trust's read-only plan profile (never
+  `apply-environment`); the same three permissions; checkout at `head_sha` with `persist-credentials: false`; the same
+  CLI download (it also requires `provision workflow import-summary`, refusing an older `cli-version` by name) and the
+  same `workflow check`. Then, for the i-th `files[]` entry: `thoryn login --connection <connection>`; copy the committed
+  file to `$RUNNER_TEMP/thoryn-import/<file>`; `thoryn provision import --for-workflow <file> --config <config> --file
+  <copy> --write --output json` into `<work>/<i>.import.json`; `thoryn provision plan --file <copy> --output json` into
+  `<work>/<i>.plan.json` (its exit code into `<i>.plan.exit` — a preview that is not all `noop` is reported, not fatal).
+  Finally `thoryn provision workflow import-summary` checks the artifact directory and writes `import-summary.json`
+  (below). It never runs `provision apply` / `destroy`. It uploads **`thoryn-import`** (`actions/upload-artifact` pinned
+  to a commit, `include-hidden-files: true` — the files live under `.thoryn/` — `if-no-files-found: error`,
+  `retention-days: 7`, only on success), and on failure the same fix request as the plan job.
+- **The artifact** — exactly each configured file at its repository path, plus `import-summary.json` at the root:
 
-- **§1 `dispatch.*`** — `mode` becomes the choice `[plan, apply, import]`. `import` is dispatched only on the default
-  branch, by the App, with `head_sha` = the merge commit of the setup pull request, `check_run_id` = the App's
-  *Thoryn configuration import* check run and `pr_number` = the setup pull request. The `run-name` rule
-  (`check-run:`) and the concurrency rule are unchanged; `import` gets its own group through `${{ inputs.mode }}`.
-  The App dispatches `import` only to a stub whose `mode` options include it (`dispatch.import-capable`); a v1 stub
-  stays valid and is never sent an import.
-- **§2 `stub.*`** — the stub's `mode` options may be `[plan, apply]` (v1) or `[plan, apply, import]` (v2); nothing
-  else in the stub changes: same single job, same three permissions, no secrets.
-- **§3 `reusable.*`** — a third job **`import`**: `if: inputs.mode == 'import'`, **`environment: ${{ inputs.plan-environment }}`**
-  (so the hub mints the trust's read-only plan profile — never `apply-environment`), the same three permissions,
-  checkout at `head_sha`, the same CLI download and `workflow check`, then for every `files[]` entry:
-  `thoryn login --connection <connection>` and `thoryn provision import` for that file into a copy under
-  `$RUNNER_TEMP`, followed by `thoryn provision plan` of the copy as a preview. The job uploads the artifact
-  **`thoryn-import`** (`actions/upload-artifact` pinned to a commit, `retention-days: 7`): each imported file under its
-  repository path, plus `import-summary.json` (`version: 1`; `headSha`; per file its SHA-256, the entries
-  `{kind, name, environment, readOnly, note}`, the *not imported* list with reasons, and the plan preview counts with
-  any row that is not `noop`). The fix-request upload on failure is the same as the plan job's.
-- **§4 `reusable.no-write-back`** — unchanged. The import job holds `contents: read` and pushes nothing; the App commits
-  the files to its own branch.
-- **What `provision import` must do for this** (engine/CLI changes, SSO-3990, before the job is useful):
-  - render only the kinds of the target file's part (a tenant file never receives `kind: application`; each skipped
-    object is listed);
-  - be **scope-aware**: a kind whose read scope the session lacks is listed as not imported, naming the scope — no
-    `403` aborts the run; an object whose write scope the session lacks is rendered `readOnly: true`. Every imported
-    file then passes `config.trust-scopes`;
-  - route each object to one configured file by plane: a sandbox object to the file whose connection is that sandbox's,
-    everything else to the production connection's file;
-  - render `emailProvider` and `federationMember` `readOnly: true` (their secrets are write-only and this workflow has
-    no secret channel), never import the config project's own trusts, never import production-plane users, and DO
-    import sandbox test users onto their sandbox's file (product owner, 2026-10-26);
-  - render `role` (today's import has no role renderer);
-  - guarantee the round trip: for every kind it renders, `import` followed by `plan` of the result is all `noop`.
-- **Scopes.** The config template's connections declare every tenant kind's read and write scopes (product owner,
-  2026-10-26; thoryn-provisioning SSO-3992 widens the `starters` client first, thoryn-starters SSO-3993 follows), so the
-  plan profile the import job runs under can read every tenant kind. The scope-aware rendering above still holds for
-  a trust with fewer scopes.
+  ```json
+  {
+    "version": 1,
+    "contractVersion": 2,
+    "headSha": "<merge commit>",
+    "files": [{
+      "path": ".thoryn/environments/production/provision.yaml",
+      "connection": ".thoryn/environments/production/connection.json",
+      "apiVersion": "thoryn.io/tenant/v1",
+      "bytes": 812,
+      "sha256": "<hex of the file in the artifact>",
+      "imported": [{ "kind": "emailProvider", "name": "emailProvider", "environment": null, "readOnly": true, "note": "<why>" }],
+      "notImported": ["user — 1 production-plane user(s) not imported: …"],
+      "plan": { "exit": 0, "counts": { "create": 0, "update": 0, "remove": 0, "noop": 4, "…": 0 }, "allNoop": true, "notNoop": [] }
+    }]
+  }
+  ```
+
+  `notNoop` rows are `{kind, name, environment, action, fields}` — the NAMES of the fields that differ, never their values.
+  The summary is a fixed field list (`ImportSummary`): no `spec`, no id, no value of the configuration; the files are what
+  the CLI renders, a fixed field list per kind, and the API returns no secret. Bounds: 1 MiB per file, 1 MiB for the
+  summary, 8 MiB for the artifact. The step refuses (exit 4, nothing uploaded) a stray file or symbolic link in the
+  artifact directory, a configured file missing from it or not loading, a bound exceeded, a preview that did not run,
+  and a `head_sha` that is not a commit — the shape the App validates on download (§13.4), refused here first.
+- **§4** — unchanged. The import job holds `contents: read` and pushes nothing (`reusable.no-write-back` covers it); the
+  App commits the files to its own branch.
+- **What `provision import` does for this** (SSO-3990): renders only the target file's part, is scope-aware against the
+  file's connection, routes each object to one configured file by plane, renders `emailProvider` / `federationMember`
+  `readOnly`, never imports the repository's own trusts or production-plane users, imports sandbox test users, renders
+  `role`, and guarantees import → plan is all `noop` for every kind it renders. See the README, "What `import` writes
+  plans as all `noop`".
