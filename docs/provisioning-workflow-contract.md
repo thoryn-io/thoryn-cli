@@ -218,3 +218,52 @@ SSO-3970 did **not** bump it: the stub, the reusable workflow and the rule ids a
 not load used to pass `config.valid` (it only checked the file was committed) and silently drop `config.secret-delivery`
 and `config.trust-scopes` from the report, so a project whose one file was broken printed "OK". Now it fails, as its
 plan job would have. A repository that was green with a broken configured file is red on the next run, naming the file.
+
+## Decided — contract v2: `mode: import` (SSO-3989, not yet implemented)
+
+**Status: decided** (product owner, 2026-10-26); built by **SSO-3990** (the `provision import` changes) and
+**SSO-3991** (this contract v2: the mode, the job, the artifact, a release). Until those land,
+`ProvisioningWorkflowContract` and `WorkflowCheck` enforce v1 above. The design and its reasons are in thoryn-provisioning `adrs/2026-09-30-starter-orchestrator-service.md`,
+*Amendment 2026-10-26* (§13). In short: after a config project's setup pull request is merged, the App dispatches an
+import on the default branch; the job imports the workspace's live configuration as the repository's own read-only
+identity and hands the files to the App as an artifact; the App opens a pull request with them, whose plan is all
+`noop`.
+
+It bumps `contractVersion` to **2**, because it changes what a valid stub may look like.
+
+- **§1 `dispatch.*`** — `mode` becomes the choice `[plan, apply, import]`. `import` is dispatched only on the default
+  branch, by the App, with `head_sha` = the merge commit of the setup pull request, `check_run_id` = the App's
+  *Thoryn configuration import* check run and `pr_number` = the setup pull request. The `run-name` rule
+  (`check-run:`) and the concurrency rule are unchanged; `import` gets its own group through `${{ inputs.mode }}`.
+  The App dispatches `import` only to a stub whose `mode` options include it (`dispatch.import-capable`); a v1 stub
+  stays valid and is never sent an import.
+- **§2 `stub.*`** — the stub's `mode` options may be `[plan, apply]` (v1) or `[plan, apply, import]` (v2); nothing
+  else in the stub changes: same single job, same three permissions, no secrets.
+- **§3 `reusable.*`** — a third job **`import`**: `if: inputs.mode == 'import'`, **`environment: ${{ inputs.plan-environment }}`**
+  (so the hub mints the trust's read-only plan profile — never `apply-environment`), the same three permissions,
+  checkout at `head_sha`, the same CLI download and `workflow check`, then for every `files[]` entry:
+  `thoryn login --connection <connection>` and `thoryn provision import` for that file into a copy under
+  `$RUNNER_TEMP`, followed by `thoryn provision plan` of the copy as a preview. The job uploads the artifact
+  **`thoryn-import`** (`actions/upload-artifact` pinned to a commit, `retention-days: 7`): each imported file under its
+  repository path, plus `import-summary.json` (`version: 1`; `headSha`; per file its SHA-256, the entries
+  `{kind, name, environment, readOnly, note}`, the *not imported* list with reasons, and the plan preview counts with
+  any row that is not `noop`). The fix-request upload on failure is the same as the plan job's.
+- **§4 `reusable.no-write-back`** — unchanged. The import job holds `contents: read` and pushes nothing; the App commits
+  the files to its own branch.
+- **What `provision import` must do for this** (engine/CLI changes, SSO-3990, before the job is useful):
+  - render only the kinds of the target file's part (a tenant file never receives `kind: application`; each skipped
+    object is listed);
+  - be **scope-aware**: a kind whose read scope the session lacks is listed as not imported, naming the scope — no
+    `403` aborts the run; an object whose write scope the session lacks is rendered `readOnly: true`. Every imported
+    file then passes `config.trust-scopes`;
+  - route each object to one configured file by plane: a sandbox object to the file whose connection is that sandbox's,
+    everything else to the production connection's file;
+  - render `emailProvider` and `federationMember` `readOnly: true` (their secrets are write-only and this workflow has
+    no secret channel), never import the config project's own trusts, never import production-plane users, and DO
+    import sandbox test users onto their sandbox's file (product owner, 2026-10-26);
+  - render `role` (today's import has no role renderer);
+  - guarantee the round trip: for every kind it renders, `import` followed by `plan` of the result is all `noop`.
+- **Scopes.** The config template's connections declare every tenant kind's read and write scopes (product owner,
+  2026-10-26; thoryn-provisioning SSO-3992 widens the `starters` client first, thoryn-starters SSO-3993 follows), so the
+  plan profile the import job runs under can read every tenant kind. The scope-aware rendering above still holds for
+  a trust with fewer scopes.
