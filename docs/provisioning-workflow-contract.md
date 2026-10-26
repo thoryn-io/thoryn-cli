@@ -219,10 +219,11 @@ not load used to pass `config.valid` (it only checked the file was committed) an
 and `config.trust-scopes` from the report, so a project whose one file was broken printed "OK". Now it fails, as its
 plan job would have. A repository that was green with a broken configured file is red on the next run, naming the file.
 
-## Proposed — contract v2: `mode: import` (SSO-3989, not implemented)
+## Decided — contract v2: `mode: import` (SSO-3989, not yet implemented)
 
-**Status: proposed.** Nothing in this section is built; `ProvisioningWorkflowContract` and `WorkflowCheck` still
-enforce v1 above. The design and its reasons are in thoryn-provisioning `adrs/2026-09-30-starter-orchestrator-service.md`,
+**Status: decided** (product owner, 2026-10-26); built by **SSO-3990** (the `provision import` changes) and
+**SSO-3991** (this contract v2: the mode, the job, the artifact, a release). Until those land,
+`ProvisioningWorkflowContract` and `WorkflowCheck` enforce v1 above. The design and its reasons are in thoryn-provisioning `adrs/2026-09-30-starter-orchestrator-service.md`,
 *Amendment 2026-10-26* (§13). In short: after a config project's setup pull request is merged, the App dispatches an
 import on the default branch; the job imports the workspace's live configuration as the repository's own read-only
 identity and hands the files to the App as an artifact; the App opens a pull request with them, whose plan is all
@@ -249,7 +250,7 @@ It bumps `contractVersion` to **2**, because it changes what a valid stub may lo
   any row that is not `noop`). The fix-request upload on failure is the same as the plan job's.
 - **§4 `reusable.no-write-back`** — unchanged. The import job holds `contents: read` and pushes nothing; the App commits
   the files to its own branch.
-- **What `provision import` must do for this** (engine/CLI changes, before the job is useful):
+- **What `provision import` must do for this** (engine/CLI changes, SSO-3990, before the job is useful):
   - render only the kinds of the target file's part (a tenant file never receives `kind: application`; each skipped
     object is listed);
   - be **scope-aware**: a kind whose read scope the session lacks is listed as not imported, naming the scope — no
@@ -258,6 +259,11 @@ It bumps `contractVersion` to **2**, because it changes what a valid stub may lo
   - route each object to one configured file by plane: a sandbox object to the file whose connection is that sandbox's,
     everything else to the production connection's file;
   - render `emailProvider` and `federationMember` `readOnly: true` (their secrets are write-only and this workflow has
-    no secret channel), never import the config project's own trusts, and never import production-plane users;
+    no secret channel), never import the config project's own trusts, never import production-plane users, and DO
+    import sandbox test users onto their sandbox's file (product owner, 2026-10-26);
   - render `role` (today's import has no role renderer);
   - guarantee the round trip: for every kind it renders, `import` followed by `plan` of the result is all `noop`.
+- **Scopes.** The config template's connections declare every tenant kind's read and write scopes (product owner,
+  2026-10-26; thoryn-provisioning SSO-3992 widens the `starters` client first, thoryn-starters SSO-3993 follows), so the
+  plan profile the import job runs under can read every tenant kind. The scope-aware rendering above still holds for
+  a trust with fewer scopes.
