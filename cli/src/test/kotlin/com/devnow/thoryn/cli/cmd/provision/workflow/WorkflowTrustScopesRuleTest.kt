@@ -131,8 +131,11 @@ class WorkflowTrustScopesRuleTest {
     }
 
     @Test
-    fun `a connection that does not load gets no verdict from this rule`() {
-        assertThat(check(cicd, full, connection = "{}")).isNull()
+    fun `a connection that does not load fails this rule as not checked — it is never skipped (SSO-3970)`() {
+        val r = check(cicd, full, connection = "{}")!!
+        assertThat(r.status).isEqualTo(WorkflowCheck.Status.FAIL)
+        assertThat(r.detail).isEqualTo("not checked: .thoryn/connection.json could not be loaded (see config.valid)")
+        assertThat(r.fix).isEqualTo("make config.valid pass, then run the check again")
     }
 
     /** SSO-3941 — a file declaring a `role` needs `tenant:roles.read` to plan and `tenant:roles.write` to apply. */
