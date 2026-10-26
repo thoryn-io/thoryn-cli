@@ -21,12 +21,15 @@ import java.util.concurrent.Callable
  * A hand-written workflow (own jobs, own steps) is reported as NOT the supported shape: the rules still say what the App
  * would need from it, but it is unsupported, not promoted. A `uses:` of a workflow that is not thoryn-cli's cannot be
  * verified at all ("run the check on that file").
+ *
+ * `thoryn provision workflow import-summary` (SSO-3991, contract v2) is the reusable workflow's own step: it writes the
+ * `import-summary.json` of the `import` job's artifact ([ImportSummary]). It is not a customer command.
  */
 @Command(
     name = "workflow",
     description = ["The provisioning workflow stub and its .thoryn/workflow.yaml: check them against the contract."],
     mixinStandardHelpOptions = true,
-    subcommands = [ProvisionWorkflowCommand.CheckSubcommand::class],
+    subcommands = [ProvisionWorkflowCommand.CheckSubcommand::class, ProvisionWorkflowCommand.ImportSummarySubcommand::class],
 )
 class ProvisionWorkflowCommand : Callable<Int> {
 
@@ -97,6 +100,51 @@ class ProvisionWorkflowCommand : Callable<Int> {
             println()
             val failed = report.rules.filter { it.failed }
             println(if (report.ok) "OK — ${report.rules.size} rule(s) pass." else "FAILED — ${failed.size} of ${report.rules.size} rule(s): ${failed.joinToString(", ") { it.id }}.")
+        }
+    }
+
+    /**
+     * `thoryn provision workflow import-summary --artifact <dir> --work <dir> --head-sha <sha> [--config] [--root]` — SSO-3991.
+     * The reusable workflow's `import` job runs this after importing every configured file: it checks the artifact directory
+     * holds exactly the configured files, each loading and within the size bound, and writes `import-summary.json` beside
+     * them ([ImportSummary]: a fixed field list, never a value of the configuration). Exit 0 written,
+     * [CommandSupport.EXIT_CHECK_FAILED] when the artifact would be refused (nothing written).
+     */
+    @Command(
+        name = "import-summary",
+        description = ["Used by the reusable workflow's import job (contract v2): check the imported files and write ${ProvisioningWorkflowContract.IMPORT_SUMMARY_FILE} beside them. Exit 0 written, 4 refused."],
+        mixinStandardHelpOptions = true,
+    )
+    internal class ImportSummarySubcommand : Callable<Int> {
+        @Option(names = ["--artifact"], required = true, description = ["The artifact directory: each configured file imported at its repository path."])
+        lateinit var artifact: File
+
+        @Option(names = ["--work"], required = true, description = ["Where the job wrote <i>.import.json, <i>.plan.json and <i>.plan.exit for the i-th configured file."])
+        lateinit var work: File
+
+        @Option(names = ["--head-sha"], required = true, description = ["The commit the import ran at (the dispatch's head_sha)."])
+        lateinit var headSha: String
+
+        @Option(names = ["--config"], description = ["The run-time configuration (default: <root>/${WorkflowConfig.DEFAULT_PATH}; absent ⇒ built-in defaults)."])
+        var config: File? = null
+
+        @Option(names = ["--root"], description = ["Repository root (default: the current directory)."])
+        var root: File? = null
+
+        override fun call(): Int {
+            val repoRoot = root ?: File(".")
+            val configFile = config ?: File(repoRoot, WorkflowConfig.DEFAULT_PATH)
+            return try {
+                val workflow = WorkflowConfig.load(configFile, config?.path ?: WorkflowConfig.DEFAULT_PATH)
+                val summary = ImportSummary.build(headSha.trim(), workflow, artifact, work)
+                ImportSummary.write(summary, artifact)
+                print(ImportSummary.render(summary))
+                CommandSupport.EXIT_OK
+            } catch (ex: WorkflowConfigException) {
+                System.err.println("Error: ${ex.message}"); CommandSupport.EXIT_USAGE
+            } catch (ex: ImportSummary.ImportSummaryException) {
+                System.err.println("Error: ${ex.message} — nothing is handed to the Thoryn GitHub App."); CommandSupport.EXIT_CHECK_FAILED
+            }
         }
     }
 }

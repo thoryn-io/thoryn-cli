@@ -31,12 +31,12 @@ class ProvisionWorkflowCheckCommandTest : CommandTestBase() {
         val r = runCli("provision", "workflow", "check", "--root", root.path)
         assertThat(r.err).isEmpty()
         assertThat(r.exit).isEqualTo(CommandSupport.EXIT_OK)
-        assertThat(r.out).contains("contract v1").contains("shape  stub calling the reusable workflow").doesNotContain("UNSUPPORTED")
+        assertThat(r.out).contains("contract v2").contains("shape  stub calling the reusable workflow").doesNotContain("UNSUPPORTED")
         assertThat(r.out).doesNotContain("FAIL").contains("PASS  config.valid").contains("built-in defaults").contains("every configured file loads")
             .contains("PASS  config.secret-delivery").contains("PASS  config.trust-scopes")
         assertThat(r.out).contains("Effective inputs").contains("plan-environment   acme-production-plan").contains("runs-on            ubuntu-latest")
         assertThat(r.out).contains("Effective configuration").contains(".thoryn/provision.yaml  (connection .thoryn/connection.json)").contains("prune=false destroy=false")
-        assertThat(r.out).contains("OK — 15 rule(s) pass.")
+        assertThat(r.out).contains("OK — 16 rule(s) pass.")
     }
 
     @Test
@@ -77,7 +77,7 @@ class ProvisionWorkflowCheckCommandTest : CommandTestBase() {
         assertThat(r.exit).isEqualTo(CommandSupport.EXIT_CHECK_FAILED)
         assertThat(r.out).contains("FAIL  stub.with").contains("`with.plan-env` is not an input of the reusable workflow").contains("`with.plan-environment` is missing")
             .contains("fix: remove `with.plan-env`").contains("add `with.plan-environment: <a GitHub environment name>`")
-        assertThat(r.out).contains("FAILED — 1 of 15 rule(s): stub.with.")
+        assertThat(r.out).contains("FAILED — 1 of 16 rule(s): stub.with.")
     }
 
     @Test
@@ -113,10 +113,12 @@ class ProvisionWorkflowCheckCommandTest : CommandTestBase() {
         val r = runCli("provision", "workflow", "check", "--root", root.path, "--output", "json")
         assertThat(r.exit).isEqualTo(CommandSupport.EXIT_OK)
         val json = parseJson(r.out)
-        assertThat(json["contractVersion"]).isEqualTo(1)
+        assertThat(json["contractVersion"]).isEqualTo(2)
         assertThat(json["shape"]).isEqualTo("stub")
         assertThat(json["supported"]).isEqualTo(true)
         assertThat(json["ok"]).isEqualTo(true)
+        // SSO-3991 — a v1 stub (mode offers plan, apply) is never import-capable: the App relies on this field.
+        assertThat(json["importCapable"]).isEqualTo(false)
         @Suppress("UNCHECKED_CAST") val rules = json["rules"] as List<Map<String, Any?>>
         assertThat(rules.map { it["id"] }).contains("stub.uses", "config.valid")
         assertThat(rules).allMatch { it["status"] == "PASS" }

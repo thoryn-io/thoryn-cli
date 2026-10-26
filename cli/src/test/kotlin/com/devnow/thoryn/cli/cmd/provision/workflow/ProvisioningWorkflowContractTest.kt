@@ -27,7 +27,7 @@ class ProvisioningWorkflowContractTest {
         assertThat(report.supported).isTrue()
         assertThat(report.rules.filter { it.failed }).isEmpty()
         assertThat(report.rules.map { it.id }).containsExactly(
-            "dispatch.inputs", "dispatch.run-name", "dispatch.permissions", "dispatch.concurrency", "dispatch.apply-job-marker",
+            "dispatch.inputs", "dispatch.run-name", "dispatch.permissions", "dispatch.concurrency", "dispatch.apply-job-marker", "dispatch.import-capable",
             "stub.job", "stub.uses", "stub.with", "stub.permissions", "stub.secrets",
             "common.no-secrets", "common.no-expression-in-run", "config.valid",
         )
@@ -107,7 +107,7 @@ class ProvisioningWorkflowContractTest {
         assertThat(report.shape).isEqualTo(Shape.CUSTOM)
         assertThat(report.supported).isFalse()
         assertThat(report.rules.map { it.id }).containsExactly(
-            "dispatch.inputs", "dispatch.run-name", "dispatch.permissions", "dispatch.concurrency", "dispatch.apply-job-marker",
+            "dispatch.inputs", "dispatch.run-name", "dispatch.permissions", "dispatch.concurrency", "dispatch.apply-job-marker", "dispatch.import-capable",
             "custom.jobs", "common.no-secrets", "common.no-expression-in-run",
         )
         // Today's full workflow meets everything the App needs — so the dogfood kept working — yet it is not promoted.
@@ -137,7 +137,7 @@ class ProvisioningWorkflowContractTest {
         val report = WorkflowCheck.evaluate(file.readText(), file.path)
         assertThat(report.shape).isEqualTo(Shape.REUSABLE)
         assertThat(report.rules.filter { it.failed }).withFailMessage("%s", report.rules.filter { it.failed }).isEmpty()
-        assertThat(report.rules.map { it.id }).containsExactly("reusable.inputs", "reusable.jobs", "reusable.no-write-back", "common.no-secrets", "common.no-expression-in-run", "config.valid")
+        assertThat(report.rules.map { it.id }).containsExactly("reusable.inputs", "reusable.jobs", "reusable.import-job", "reusable.no-write-back", "common.no-secrets", "common.no-expression-in-run", "config.valid")
     }
 
     @Test
