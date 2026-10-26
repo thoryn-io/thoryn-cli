@@ -94,12 +94,36 @@ abstract class ProjectTestBase : CommandTestBase() {
             ".thoryn/provision.yaml" to ("apiVersion: thoryn.io/provision/v1\n" to false),
         )
 
+        /**
+         * SSO-3971 — the published config template's file set (thoryn-starters `starters/config/`): TENANT provisioning
+         * sections and no workflow of its own — the stub, `.thoryn/workflow.yaml`, each `connection.json` and CODEOWNERS
+         * are seeded by `thoryn project init config`, which also replaces both sections with literal ones.
+         */
         val CONFIG_FILES: Map<String, Pair<String, Boolean>> = linkedMapOf(
-            "README.md" to ("# Config project\n" to false),
-            ".github/workflows/thoryn.yml" to ("name: Thoryn\n" to false),
-            ".thoryn/environments/production/provision.yaml" to ("apiVersion: thoryn.io/provision/v1\n" to false),
-            ".thoryn/environments/sandbox/provision.yaml" to ("apiVersion: thoryn.io/provision/v1\n" to false),
+            "README.md" to ("# Thoryn workspace configuration\n" to false),
+            ".gitignore" to ("*.receipt.json\n*.secret\n.thoryn/local.env\n" to false),
+            ".thoryn/environments/production/provision.yaml" to (CONFIG_PRODUCTION_SECTION to false),
+            ".thoryn/environments/sandbox/provision.yaml" to (CONFIG_SANDBOX_SECTION to false),
         )
+
+        /**
+         * SSO-3971 — the config template as thoryn-starters published it BEFORE SSO-3971 (commit eb4a2f6): the
+         * variable-driven `.github/workflows/thoryn.yml`, the `.thoryn/ci/` scripts and `thoryn.io/provision/v1` sections.
+         */
+        val LEGACY_CONFIG_FILES: Map<String, Pair<String, Boolean>> = linkedMapOf(
+            "README.md" to ("# Config project\n" to false),
+            ".github/workflows/thoryn.yml" to ("name: Thoryn configuration\non: { push: { branches: [main] } }\njobs: {}\n" to false),
+            ".thoryn/ci/login.sh" to ("#!/usr/bin/env bash\necho login\n" to true),
+            ".thoryn/environments/production/provision.yaml" to (CONFIG_PRODUCTION_SECTION.replace("thoryn.io/tenant/v1", "thoryn.io/provision/v1") to false),
+            ".thoryn/environments/sandbox/provision.yaml" to (CONFIG_SANDBOX_SECTION.replace("thoryn.io/tenant/v1", "thoryn.io/provision/v1") to false),
+        )
+
+        const val CONFIG_PRODUCTION_SECTION: String =
+            "apiVersion: thoryn.io/tenant/v1\nresources:\n  - kind: environment\n    name: sandbox\n    spec:\n" +
+                "      slug: \"{{env.THORYN_SANDBOX_ENVIRONMENT}}\"\n  - kind: loginMethods\n    spec:\n      methods: [\"password\", \"passkey\"]\n"
+        const val CONFIG_SANDBOX_SECTION: String =
+            "apiVersion: thoryn.io/tenant/v1\nresources:\n  - kind: loginMethods\n    environment: \"{{env.THORYN_SANDBOX_ENVIRONMENT}}\"\n" +
+                "    spec:\n      methods: [\"password\", \"passkey\", \"magic_code\", \"magic_link\"]\n"
 
         fun jwt(claims: Map<String, Any?>): String {
             val enc = Base64.getUrlEncoder().withoutPadding()

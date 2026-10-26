@@ -88,6 +88,13 @@ internal class FakeProjectApi : Dispatcher() {
             route == "/api/v1/workload-identity/trusts" && method == "GET" ->
                 ok(mapOf("data" to trustsIn(env ?: "production"), "pagination" to mapOf("cursor" to null, "hasMore" to false)))
             route == "/api/v1/workload-identity/trusts" && method == "POST" -> createTrust(env ?: "production", body)
+            route.startsWith("/api/v1/workload-identity/trusts/") && route.endsWith("/plan-profile") && method == "POST" -> {
+                val id = route.removePrefix("/api/v1/workload-identity/trusts/").removeSuffix("/plan-profile")
+                val trust = trusts.firstOrNull { it["id"] == id } ?: return problem(404, "not_found")
+                if (trust["plan"] != null) return problem(409, "plan_profile_already_set")
+                trust["plan"] = planOf(trust, body)
+                ok(trust)
+            }
             else -> MockResponse().setResponseCode(599).setBody("FakeProjectApi: unexpected $method $fullPath")
         }
     }
@@ -113,9 +120,18 @@ internal class FakeProjectApi : Dispatcher() {
             "tokenEndpoint" to "https://acme.auth.stg.thoryn.org/$env/oauth2/token",
             "github" to body["github"], "scopes" to scopes, "enabled" to true, "createdAt" to "2026-09-30T10:00:00Z",
         )
+        @Suppress("UNCHECKED_CAST")
+        (body["plan"] as? Map<String, Any?>)?.let { trust["plan"] = planOf(trust, it) }
         trusts += trust
         return json(201, trust)
     }
+
+    /** The plan profile as product-api renders it: the environment, and the scopes — derived (every `.read` scope of the trust) when none are given. */
+    @Suppress("UNCHECKED_CAST")
+    private fun planOf(trust: Map<String, Any?>, plan: Map<String, Any?>): Map<String, Any?> = linkedMapOf(
+        "environment" to plan["environment"],
+        "scopes" to ((plan["scopes"] as? List<String>) ?: (trust["scopes"] as List<String>).filter { it.endsWith(".read") }),
+    )
 
     private fun ok(value: Any?) = json(200, value)
 

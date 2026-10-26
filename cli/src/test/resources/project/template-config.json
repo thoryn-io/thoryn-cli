@@ -1,7 +1,7 @@
 {
   "apiVersion": "thoryn.io/starter-template/v2",
   "kind": "config",
-  "description": "The workspace's CONFIG project: configuration only, no app code. It owns the workspace-wide configuration (environments, sign-in methods, branding, email, identity providers, custom domain), one section per connection under .thoryn/environments/<connection>/. Nothing in the repository is rendered: the pipeline reads its wiring from the GitHub Actions variables below at run time. This file stays in the repository as the declaration of what the creation flow must set up.",
+  "description": "The workspace's CONFIG project: TENANT provisioning only (apiVersion thoryn.io/tenant/v1), no app code. It defines what the tenant is (environments, sign-in methods and flows, branding, email, identity providers, users, roles, custom domain), one section per connection under .thoryn/environments/<connection>/. Its provisioning runs through the stub .github/workflows/thoryn-provisioning.yml, which the creation flow (thoryn project init config, or the Thoryn GitHub App) seeds with each connection's connection.json and .thoryn/workflow.yaml, and which calls thoryn-cli's reusable workflow. This file stays in the repository as the declaration of what the creation flow must set up: the trusts, their scopes and grants, and the GitHub Actions variables.",
   "github": {
     "productionEnvironment": "thoryn-production"
   },
@@ -38,7 +38,8 @@
         "tenant:environments.read",
         "tenant:environments.write",
         "tenant:idp.read",
-        "tenant:idp.write"
+        "tenant:idp.write",
+        "tenant:access.read"
       ],
       "grant": { "relation": "manager", "on": "workspace" }
     },
@@ -51,7 +52,8 @@
       "scopes": [
         "tenant:environments.read",
         "tenant:idp.read",
-        "tenant:idp.write"
+        "tenant:idp.write",
+        "tenant:access.read"
       ],
       "grant": { "relation": "manager", "on": "environment" }
     }
