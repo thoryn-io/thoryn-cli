@@ -78,7 +78,7 @@ class ProjectInitSeedTest : ProjectTestBase() {
         assertThat(exit).describedAs(err).isEqualTo(0)
         val production = connectionOf(dir.resolve(".thoryn/environments/production/connection.json"))
         assertThat(production.clientId).isEqualTo("wi_client2")
-        assertThat(production.scopes).isEqualTo(listOf("tenant:environments.read", "tenant:environments.write", "tenant:idp.read", "tenant:idp.write"))
+        assertThat(production.scopes).isEqualTo(listOf("tenant:environments.read", "tenant:environments.write", "tenant:idp.read", "tenant:idp.write", "tenant:access.read"))
         assertThat(production.github!!.environment).isEqualTo("thoryn-production")
         assertThat(production.github!!.ref).isEqualTo("refs/heads/main")
         val sandbox = connectionOf(dir.resolve(".thoryn/environments/sandbox/connection.json"))

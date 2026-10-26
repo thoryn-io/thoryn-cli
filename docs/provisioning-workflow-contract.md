@@ -69,6 +69,11 @@ jobs:
       issuer: https://auth.thoryn.io      # optional, and the other optional inputs of §3
 ```
 
+Two seeders write this stub: the Thoryn GitHub App (oauthy/thoryn-provisioning `ThorynFiles.kt`) and, for a config
+project, `thoryn project init config` (SSO-3971: `plan-environment: <production environment>-plan`,
+`apply-environment: <production environment>`, `issuer:` the signed-in platform, pinned to the CLI's own release —
+`ProjectSeeds.configStubYaml`, held to this contract by `ProjectInitConfigWorkflowTest`).
+
 - **one job**, carrying only `uses`, `with`, `permissions` (`name`/`if`/`needs` tolerated) — `runs-on`, `timeout-minutes`
   and the environments are inputs of the reusable workflow; steps and secrets have no place here;
 - `uses:` is **`thoryn-io/thoryn-cli/.github/workflows/provisioning.yml@<ref>`** with `<ref>` a `cli-v*` tag ≥

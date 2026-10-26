@@ -60,10 +60,16 @@ class ProjectInitConfigTest : ProjectTestBase() {
             "gh api --method PUT repos/acme/platform/contents/.thoryn/environments/production/connection.json --input -",
             "gh api repos/acme/platform/contents/.thoryn/environments/production/provision.yaml?ref=thoryn/provisioning",
             "gh api --method PUT repos/acme/platform/contents/.thoryn/environments/production/provision.yaml --input -",
+            // SSO-3971 — the provisioning stub and its run-time configuration, in the same reviewed pull request.
+            "gh api repos/acme/platform/contents/.github/workflows/thoryn-provisioning.yml?ref=thoryn/provisioning",
+            "gh api --method PUT repos/acme/platform/contents/.github/workflows/thoryn-provisioning.yml --input -",
+            "gh api repos/acme/platform/contents/.thoryn/workflow.yaml?ref=thoryn/provisioning",
+            "gh api --method PUT repos/acme/platform/contents/.thoryn/workflow.yaml --input -",
             "gh api repos/acme/platform/pulls?head=acme:thoryn/provisioning&state=open",
             "gh api --method POST repos/acme/platform/pulls -f title=${ProjectSeeds.PROVISIONING_MESSAGE} -f head=thoryn/provisioning -f base=main " +
-                "-f body=Proposed by `thoryn project init config`: each connection's `connection.json` (its workload identity, no secret) and a starter " +
-                "`provision.yaml`, so this repository converges its own configuration — `thoryn provision plan` on a pull request, `apply` on main.",
+                "-f body=Proposed by `thoryn project init config`: each connection's `connection.json` (its workload identity, no secret), a starter " +
+                "`provision.yaml` (tenant provisioning), and the provisioning stub `.github/workflows/thoryn-provisioning.yml` with `.thoryn/workflow.yaml`, " +
+                "so this repository converges its own configuration — `thoryn provision plan` on a pull request, `apply` on main, both dispatched by the Thoryn GitHub App.",
         )
         assertThat(parseJson(gh.calls.first { it.args.contains("PUT") && it.args.contains(env) }.stdin!!)).isEqualTo(
             mapOf(
@@ -81,7 +87,9 @@ class ProjectInitConfigTest : ProjectTestBase() {
         )
         val production = api.trustsIn("production").single()
         assertThat(production["name"]).isEqualTo("starter-production-$repoId")
-        assertThat(production["scopes"]).isEqualTo(listOf("tenant:environments.read", "tenant:environments.write", "tenant:idp.read", "tenant:idp.write"))
+        assertThat(production["scopes"]).isEqualTo(listOf("tenant:environments.read", "tenant:environments.write", "tenant:idp.read", "tenant:idp.write", "tenant:access.read"))
+        // SSO-3971 — the plan profile the stub's plan job is minted read-only scopes by (derived: the trust's .read scopes).
+        assertThat(production["plan"]).isEqualTo(mapOf("environment" to "thoryn-production-plan", "scopes" to listOf("tenant:environments.read", "tenant:idp.read", "tenant:access.read")))
         @Suppress("UNCHECKED_CAST")
         assertThat(production["github"] as Map<String, Any?>).containsEntry("environment", "thoryn-production").containsEntry("ref", "refs/heads/main")
         assertThat(api.writes.first { it.env == "production" }.body).containsEntry("confirmProduction", true)

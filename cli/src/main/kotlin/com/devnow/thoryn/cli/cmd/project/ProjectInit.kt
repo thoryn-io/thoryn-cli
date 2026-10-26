@@ -123,6 +123,12 @@ internal class ProjectInit(
         /** The trust this connection uses, once [ensureTrust] ran. */
         var trust: JsonNode? = null,
     ) {
+        /**
+         * SSO-3971 — the unprotected GitHub environment the production trust's PLAN profile is keyed on (the seeded stub's
+         * `plan-environment`); null for a sandbox connection, which pins no environment and so needs no second profile.
+         */
+        val planEnvironment: String? get() = githubEnvironment?.takeIf { spec.production }?.let { ProjectSeeds.planEnvironment(it) }
+
         /** Where this connection's `connection.json` is seeded: beside its `provisionFile`. */
         val connectionPath: String get() = ProjectSeeds.connectionPath(spec.provisionFile)
     }
@@ -360,11 +366,12 @@ internal class ProjectInit(
             t.trust = trust
             step(
                 STEP_TRUSTS, if (adopted) "adopted" else "created",
-                "${t.connection}: ${text(trust, "name")} → $clientId (in ${t.envSlug}${t.githubEnvironment?.let { ", GitHub environment $it" } ?: ""})",
+                "${t.connection}: ${text(trust, "name")} → $clientId (in ${t.envSlug}${t.githubEnvironment?.let { ", GitHub environment $it" } ?: ""}" +
+                    "${t.planEnvironment?.let { "; plan profile in $it" } ?: ""})",
             )
             connections += linkedMapOf(
                 "connection" to t.connection, "environment" to t.envSlug, "production" to t.spec.production,
-                "githubEnvironment" to t.githubEnvironment, "scopes" to t.spec.scopes,
+                "githubEnvironment" to t.githubEnvironment, "planEnvironment" to t.planEnvironment, "scopes" to t.spec.scopes,
                 "trustId" to text(trust, "id"), "trustName" to text(trust, "name"), "clientId" to clientId, "adopted" to adopted,
             )
         }
@@ -559,7 +566,8 @@ internal class ProjectInit(
         // A config project's CODEOWNERS (the reviewers own production, the workflows and CODEOWNERS) replaces the template's;
         // the seeded `.thoryn/` files (connection.json + the starter provision.yaml per connection) replace the template's
         // placeholders at those paths — they are rendered once the trusts exist (see seedFiles).
-        val seeded = manifest.connections.values.flatMap { listOf(it.provisionFile, ProjectSeeds.connectionPath(it.provisionFile)) }.toSet()
+        val seeded = manifest.connections.values.flatMap { listOf(it.provisionFile, ProjectSeeds.connectionPath(it.provisionFile)) }.toSet() +
+            (if (request.kind == Kind.CONFIG) setOf(ProjectSeeds.WORKFLOW_PATH, ProjectSeeds.WORKFLOW_CONFIG_PATH) else emptySet())
         val templateEntries = entries.filter { it.path !in seeded }
         val all = if (codeowners == null) templateEntries else templateEntries.filter { it.path != CODEOWNERS_PATH } + TemplateArchive.Entry(CODEOWNERS_PATH, codeowners.toByteArray(), false)
         // An existing connection.json that is not this repository's own (another repository's, or a client_credentials one)
@@ -711,7 +719,7 @@ internal class ProjectInit(
                 ProjectSeeds.Seed(t.connectionPath, ProjectSeeds.connectionJson(workspaceSlug, trust, t.envSlug, t.spec.production), ProjectSeeds.KIND_CONNECTION),
                 ProjectSeeds.Seed(t.spec.provisionFile, provision, ProjectSeeds.KIND_PROVISION),
             )
-        }
+        } + workflowSeeds(targets, repo)
         val files = mutableListOf<Map<String, Any?>>()
         var proposal: GitHubCli.Proposal? = null
         fun record(seed: ProjectSeeds.Seed, status: String) {
@@ -725,7 +733,7 @@ internal class ProjectInit(
                     val bytes = s.content.toByteArray()
                     val status = when {
                         !Files.exists(target) -> "written"
-                        s.kind == ProjectSeeds.KIND_PROVISION -> "kept" // the file is in control: never overwritten
+                        s.kind == ProjectSeeds.KIND_PROVISION || s.kind == ProjectSeeds.KIND_WORKFLOW -> "kept" // the file is in control: never overwritten
                         Files.isRegularFile(target) && Files.readAllBytes(target).contentEquals(bytes) -> "unchanged"
                         else -> "rewritten"
                     }
@@ -740,8 +748,10 @@ internal class ProjectInit(
                 // The default branch is protected now: the seeds go through a reviewed pull request, like CODEOWNERS would.
                 proposal = github.proposeFiles(
                     repo, seeds.map { it.path to it.content }, ProjectSeeds.PROVISIONING_BRANCH, ProjectSeeds.PROVISIONING_MESSAGE,
-                    "Proposed by `thoryn project init config`: each connection's `connection.json` (its workload identity, no secret) and a starter " +
-                        "`provision.yaml`, so this repository converges its own configuration — `thoryn provision plan` on a pull request, `apply` on ${repo.defaultBranch}.",
+                    "Proposed by `thoryn project init config`: each connection's `connection.json` (its workload identity, no secret), a starter " +
+                        "`provision.yaml` (tenant provisioning), and the provisioning stub `${ProjectSeeds.WORKFLOW_PATH}` with `${ProjectSeeds.WORKFLOW_CONFIG_PATH}`, " +
+                        "so this repository converges its own configuration — `thoryn provision plan` on a pull request, `apply` on ${repo.defaultBranch}, " +
+                        "both dispatched by the Thoryn GitHub App.",
                     STEP_PROVISIONING,
                 )
                 seeds.forEach { record(it, if (proposal!!.changed) "pending review" else "open") }
@@ -784,9 +794,44 @@ internal class ProjectInit(
         )
     }
 
+    /**
+     * SSO-3971 — a config project's provisioning WORKFLOW (thoryn-cli contract v1), the shape the Thoryn GitHub App
+     * dispatches and thoryn-io/thoryn-tenant runs: the stub `.github/workflows/thoryn-provisioning.yml` calling the reusable
+     * workflow at this CLI's release, plan in the production trust's plan environment and apply in the reviewed production
+     * environment; and `.thoryn/workflow.yaml` naming every section's tenant file with its connection, production first.
+     * Seeded like a provisioning file: written when absent, never overwritten. An app project gets none here (its starter
+     * ships its own CI).
+     */
+    private fun workflowSeeds(targets: List<Target>, repo: GhRepository): List<ProjectSeeds.Seed> {
+        if (request.kind != Kind.CONFIG) return emptyList()
+        val production = targets.first { it.spec.production }
+        val ordered = targets.sortedByDescending { it.spec.production }
+        return listOf(
+            ProjectSeeds.Seed(
+                ProjectSeeds.WORKFLOW_PATH,
+                ProjectSeeds.configStubYaml(repo, session.issuer, production.planEnvironment!!, production.githubEnvironment!!),
+                ProjectSeeds.KIND_WORKFLOW,
+            ),
+            ProjectSeeds.Seed(
+                ProjectSeeds.WORKFLOW_CONFIG_PATH,
+                ProjectSeeds.configWorkflowYaml(repo, ordered.map { it.spec.provisionFile to it.connectionPath }),
+                ProjectSeeds.KIND_WORKFLOW,
+            ),
+        )
+    }
+
     /** Adopt a matching trust (by name, or one the orchestrator made — by its pins), else create it. */
     private fun ensureTrust(t: Target, repo: GhRepository): Pair<JsonNode, Boolean> {
-        findTrust(t, repo)?.let { return it to true }
+        findTrust(t, repo)?.let { existing ->
+            // SSO-3971 — an adopted production trust without its plan profile gets one (findTrust refused a different one).
+            val plan = t.planEnvironment
+            if (plan != null && planEnvironmentOf(existing) == null) {
+                val id = text(existing, "id") ?: throw Stop(EXIT_HTTP, "invalid_response", "product-api returned a trust without an id.")
+                val updated = thoryn.inEnvironment(t.envSlug).setWorkloadIdentityTrustPlanProfile(id, linkedMapOf("environment" to plan))
+                return (updated.takeIf { it.isObject && text(it, "clientId") != null } ?: existing) to true
+            }
+            return existing to true
+        }
         val client = thoryn.inEnvironment(t.envSlug)
         val body = linkedMapOf(
             "name" to trustName(t.connection, repo.id),
@@ -802,6 +847,9 @@ internal class ProjectInit(
             ),
             "scopes" to t.spec.scopes,
             "confirmProduction" to t.spec.production.takeIf { it },
+            // SSO-3971 — the PLAN profile (oauthy ADR 2026-10-14): a job in the unprotected plan environment is minted the
+            // trust's read scopes (derived — no explicit list), so the stub's plan job runs on every pull request read-only.
+            "plan" to t.planEnvironment?.let { linkedMapOf("environment" to it) },
         )
         return try {
             client.createWorkloadIdentityTrust(body) to false
@@ -824,14 +872,33 @@ internal class ProjectInit(
         }
         val name = trustName(t.connection, repo.id)
         items.firstOrNull { text(it, "name") == name }?.let { existing ->
-            if (matches(existing, t, repo)) return existing
+            if (matches(existing, t, repo)) return checkPlanProfile(existing, t)
             throw Stop(
                 EXIT_CHECK, "workload_identity_trust_conflict",
                 "Trust '$name' in ${t.envSlug} exists but pins another repository, GitHub environment or ref, or carries other scopes than the template's.",
                 "Delete it (thoryn workload-identity trusts delete ${text(existing, "id")} --environment ${t.envSlug}) and re-run.",
             )
         }
-        return items.firstOrNull { matches(it, t, repo) }
+        return items.firstOrNull { matches(it, t, repo) }?.let { checkPlanProfile(it, t) }
+    }
+
+    /** The GitHub environment of [trust]'s plan profile, or null when it has none. */
+    private fun planEnvironmentOf(trust: JsonNode): String? = trust["plan"]?.takeIf { it.isObject }?.let { text(it, "environment") }
+
+    /**
+     * SSO-3971 — a production trust to adopt must have no plan profile (this run sets it) or the one the seeded stub plans
+     * in; a different one would leave the stub's plan job refused at the exchange, so it stops the run (at pre-flight for
+     * an existing repository) instead of being changed silently.
+     */
+    private fun checkPlanProfile(trust: JsonNode, t: Target): JsonNode {
+        val wanted = t.planEnvironment ?: return trust
+        val actual = planEnvironmentOf(trust) ?: return trust
+        if (actual == wanted) return trust
+        throw Stop(
+            EXIT_CHECK, "workload_identity_trust_conflict",
+            "Trust '${text(trust, "name")}' in ${t.envSlug} has its plan profile on GitHub environment '$actual'; the config project plans in '$wanted'.",
+            "Delete the trust (thoryn workload-identity trusts delete ${text(trust, "id")} --environment ${t.envSlug}) and re-run.",
+        )
     }
 
     private fun matches(trust: JsonNode, t: Target, repo: GhRepository): Boolean {
@@ -897,10 +964,10 @@ internal class ProjectInit(
                     )
                 } else if (touched.isNotEmpty()) {
                     add("Commit and push the added files: git add ${touched.joinToString(" ")} && git commit -m \"Add the Thoryn ${request.kind.label} project\" && git push")
-                } else {
+                } else if (!config) {
                     add("The template's files are already in this clone; push a commit (or re-run the workflow) to start a run.")
                 }
-                add("The first run after the push reads the variables that are now set; no secret is stored anywhere.")
+                if (!config) add("The first run after the push reads the variables that are now set; no secret is stored anywhere.")
             }
             createdRepo -> {
                 add("Clone it: gh repo clone ${repo.fullName}")
@@ -910,7 +977,7 @@ internal class ProjectInit(
                         "${committed.joinToString(" and ")} are committed on ${repo.defaultBranch}: the repository converges its own provisioning " +
                             "(`thoryn provision plan` on a pull request, `thoryn provision apply` on ${repo.defaultBranch}); that commit's run uses the variables.",
                     )
-                } else {
+                } else if (!config) {
                     add(
                         "GitHub's initial commit started a first workflow run before the variables existed, so its Thoryn jobs skipped. " +
                             "Re-run it (gh run list --repo ${repo.fullName}, then gh run rerun <id> --repo ${repo.fullName}) or push a commit; that run uses the variables.",
@@ -922,7 +989,8 @@ internal class ProjectInit(
                     (if (seededPaths("not added").isNotEmpty()) " or its .thoryn/ connection.json + provision.yaml" else "") +
                     " yet: clone it and run `thoryn project init ${request.kind.label} …` inside the clone (without --repo) to add them; the steps above are kept and re-used.",
             )
-            else -> add("Push a commit (or re-run the workflow) to start a run with the variables set.")
+            !config -> add("Push a commit (or re-run the workflow) to start a run with the variables set.")
+            else -> Unit
         }
         (report["codeownersPullRequest"] as? String)?.let {
             add("CODEOWNERS update pending review: $it — the ruleset already requires an approved pull request; merge this one to make the reviewers the code owners.")
@@ -930,7 +998,8 @@ internal class ProjectInit(
         @Suppress("UNCHECKED_CAST")
         ((report["provisioning"] as? Map<String, Any?>)?.get("pullRequest") as? String)?.let {
             add(
-                "Provisioning files pending review: $it — each connection's connection.json and starter provision.yaml. Merge it, and the repository " +
+                "Provisioning files pending review: $it — each connection's connection.json and starter provision.yaml" +
+                    (if (config) ", and the provisioning stub with .thoryn/workflow.yaml" else "") + ". Merge it, and the repository " +
                     "converges its own configuration from then on (`thoryn provision plan` on a pull request, `thoryn provision apply` on ${repo.defaultBranch}).",
             )
         }
@@ -964,6 +1033,14 @@ internal class ProjectInit(
             )
         }
         if (config) {
+            // SSO-3971 — the seeded stub runs only when the Thoryn GitHub App dispatches it (workflow_dispatch, contract v1).
+            val plan = productionGithubEnvironment?.let { ProjectSeeds.planEnvironment(it) }
+            add(
+                "${ProjectSeeds.WORKFLOW_PATH} runs only when the Thoryn GitHub App dispatches it: install the App on ${repo.fullName}, and it plans " +
+                    "every pull request that changes .thoryn/ (GitHub environment $plan, read-only) and applies on ${repo.defaultBranch} " +
+                    "(GitHub environment $productionGithubEnvironment, reviewed). Lint the files with `thoryn provision workflow check`; " +
+                    "plan from a laptop with `thoryn provision plan --file .thoryn/environments/sandbox/provision.yaml`.",
+            )
             val reviewers = request.reviewers.joinToString(", ")
             @Suppress("UNCHECKED_CAST")
             val envReviewers = ((report["productionApproval"] as? Map<String, Any?>)?.get("mechanisms") as? List<String>)?.contains("environment_reviewers") == true

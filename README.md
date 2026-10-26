@@ -1077,18 +1077,40 @@ Set up the config project acme/thoryn-config for workspace acme.
   protection      set      GitHub environment thoryn-production: deploys from main only; required reviewers not offered by this GitHub plan (the ruleset carries the approval)
   environments    created  sandbox sandbox
   workload-trust  created  sandbox: starter-sandbox-1044556677 → wi_… (in sandbox)
-  workload-trust  created  production: starter-production-1044556677 → wi_… (in production, GitHub environment thoryn-production)
+  workload-trust  created  production: starter-production-1044556677 → wi_… (in production, GitHub environment thoryn-production; plan profile in thoryn-production-plan)
   access          granted  client:wi_… manager environment:<id>
   access          granted  client:wi_… manager workspace:<id>
   variables       set      THORYN_ISSUER, THORYN_WORKSPACE, THORYN_SANDBOX_ENVIRONMENT, THORYN_SANDBOX_WIF_CLIENT_ID (repository); THORYN_PRODUCTION_WIF_CLIENT_ID (environment thoryn-production)
-  provisioning    pending review  pull request pending review: https://github.com/acme/thoryn-config/pull/1 — .thoryn/environments/sandbox/connection.json (pending review), …
+  provisioning    pending review  pull request pending review: https://github.com/acme/thoryn-config/pull/1 — .thoryn/environments/sandbox/connection.json (pending review), …, .github/workflows/thoryn-provisioning.yml (pending review), .thoryn/workflow.yaml (pending review)
 
 Next steps:
   1. Clone it: gh repo clone acme/thoryn-config
-  2. GitHub's initial commit started a first workflow run before the variables existed, so its Thoryn jobs skipped. Re-run it …
-  3. Provisioning files pending review: https://github.com/acme/thoryn-config/pull/1 — each connection's connection.json and starter provision.yaml. Merge it, and the repository converges its own configuration from then on …
+  2. Provisioning files pending review: https://github.com/acme/thoryn-config/pull/1 — each connection's connection.json and starter provision.yaml, and the provisioning stub with .thoryn/workflow.yaml. Merge it, and the repository converges its own configuration from then on …
+  3. .github/workflows/thoryn-provisioning.yml runs only when the Thoryn GitHub App dispatches it: install the App on acme/thoryn-config, and it plans every pull request that changes .thoryn/ (GitHub environment thoryn-production-plan, read-only) and applies on main (GitHub environment thoryn-production, reviewed). …
   4. Production changes need a pull request to main approved by a code owner (alice, bob); only main deploys to the GitHub environment thoryn-production. (Environment reviewers are not offered by this GitHub plan.)
 ```
+
+**The tenant + stub shape (SSO-3971).** A config project comes out in the shape of the ADR 2026-10-25
+(provisioning is tenant and applications) — the shape `thoryn-io/thoryn-tenant` runs:
+
+| File | Written by | What it is |
+|---|---|---|
+| `.thoryn/environments/<section>/provision.yaml` | seeded (replaces the template's) | `apiVersion: thoryn.io/tenant/v1`; production declares the sandbox, the sandbox section anchors on it `readOnly: true` |
+| `.thoryn/environments/<section>/connection.json` | seeded | the section's workload identity (no secret) |
+| `.github/workflows/thoryn-provisioning.yml` | seeded | the stub the Thoryn GitHub App dispatches: `uses: thoryn-io/thoryn-cli/.github/workflows/provisioning.yml@cli-v<this CLI's release>` (a non-release build pins `cli-v0.49.0`), `plan-environment: thoryn-production-plan`, `apply-environment: thoryn-production`, `issuer:` your platform |
+| `.thoryn/workflow.yaml` | seeded | `files:` production then sandbox, each with its `connection.json`; `fixRequest: true`; `prune` / `destroy` off; no `consentUrl` (add the App's consent base URL if you want the browser link) |
+| `.github/CODEOWNERS` | written | the `--reviewer` logins |
+| `README.md`, `.gitignore`, `.thoryn/template.json` | the template (`thoryn-io/starter-config`) | — |
+
+The production trust is created with a **plan profile** on `thoryn-production-plan` (an adopted trust without one
+gets it; one on another environment stops the run, exit 4): a pull request's plan job runs there, unreviewed, and is
+minted only the trust's `.read` scopes; the apply runs in `thoryn-production`, behind its reviewers. GitHub creates
+`thoryn-production-plan` the first time a job names it. The stub is `workflow_dispatch`-only: **nothing runs until the
+Thoryn GitHub App is installed on the repository.** Lint the result any time with `thoryn provision workflow check`.
+
+GitHub accepts a new or changed workflow file from an OAuth token only with the `workflow` scope: when the command
+opens the provisioning pull request for you (`--repo` on a new repository), and when you push the clone's files over
+HTTPS with `gh` as the credential helper. If `gh auth status` does not list it, run `gh auth refresh -s workflow`.
 
 The rules match the console's flow. There is one production connection. `--reviewer` (1–6 GitHub
 logins) and `--confirm-production` are required. You must be a manager of the workspace, and you must
@@ -1245,10 +1267,14 @@ connection's `provisionFile` from `.thoryn/template.json`: `.thoryn/` for an app
   `thoryn provision` already converges. An app project declares its OAuth client in its sandbox
   (`kind: application`, public with PKCE, a framework-default redirect URI to adjust). A config project's
   production section declares the workspace's sandbox environment (matched by its slug, named as it is);
-  its sandbox section anchors on that sandbox by slug only — that connection holds
-  `tenant:environments.read`, so nothing in the starter can need a write — and names the kinds to add
-  (`loginMethods`, `federationMember`, `emailProvider`, `loginTheme`, `loginFlow`). It is seeded only
+  its sandbox section anchors on that sandbox by slug only, `readOnly: true` — a dependency the production
+  section owns, so the sandbox connection (which holds no `tenant:environments.write`) passes
+  `config.trust-scopes` — and names the kinds to add (`loginMethods`, `federationMember`, `emailProvider`,
+  `loginTheme`, `loginFlow`, `user`, `workloadIdentityTrust`). Both are `thoryn.io/tenant/v1`. It is seeded only
   when **absent** and never overwritten afterwards: from then on the file is in control.
+- **Config only — `.github/workflows/thoryn-provisioning.yml` and `.thoryn/workflow.yaml`** (SSO-3971): the
+  provisioning stub and its run-time configuration (see "The tenant + stub shape" above). Seeded like
+  `provision.yaml`: only when absent, kept afterwards.
 
 Where they go depends on how the command ran:
 
@@ -1306,8 +1332,9 @@ gh api repos/<cfg>/git/ref/heads/thoryn/app-<name> ; gh api --method POST repos/
 
 On Thoryn it uses your own session and the public customer-plane API: `GET /api/v1/environments`,
 `GET /api/v1/access/mine`, `POST /api/v1/environments` (config, only when the sandbox is missing),
-`GET`/`POST /api/v1/workload-identity/trusts`, and `GET`/`POST /api/v1/access/grants` (a grant is read
-first and posted only when missing).
+`GET`/`POST /api/v1/workload-identity/trusts`, `POST /api/v1/workload-identity/trusts/<id>/plan-profile`
+(config, only for an adopted production trust without a plan profile), and `GET`/`POST /api/v1/access/grants`
+(a grant is read first and posted only when missing).
 
 #### Nothing half-done, and safe to re-run
 
@@ -1351,7 +1378,9 @@ step reads before it writes, and the report says `Checked the … project` inste
 | `required reviewers not offered by this GitHub plan` (config, success) | Not an error. GitHub offers environment reviewers for a private repository only on GitHub Enterprise. The reviewed pull request (ruleset + CODEOWNERS) carries the approval. |
 | `already has a different .github/CODEOWNERS` (config, exit 4) | Merge the three ownership lines into your CODEOWNERS and re-run, or re-run with `--force` to replace it. Once the approval ruleset exists, that replacement is a pull request. |
 | `CODEOWNERS update pending review: <url>` (config, success) | The default branch is already protected, so the CLI does not commit to it: it opened (or reused) a pull request from `thoryn/codeowners`. Have a reviewer approve and merge it. |
-| `Provisioning files pending review: <url>` (config, success) | The seeded `connection.json` + starter `provision.yaml` of each connection went through a pull request from `thoryn/provisioning`, because the approval ruleset protects the default branch. Merge it; the repository then converges its own configuration. A re-run converges and names the same pull request. |
+| `Provisioning files pending review: <url>` (config, success) | The seeded `connection.json` + starter `provision.yaml` of each connection, and the provisioning stub with `.thoryn/workflow.yaml`, went through a pull request from `thoryn/provisioning`, because the approval ruleset protects the default branch. Merge it; the repository then converges its own configuration once the Thoryn GitHub App is installed on it. A re-run converges and names the same pull request. |
+| `refusing to allow an OAuth App to create or update workflow .github/workflows/thoryn-provisioning.yml without workflow scope` (config, exit 3) | Your `gh` token lacks the `workflow` scope GitHub requires to write a workflow file. Run `gh auth refresh -s workflow` and re-run: every step before it is kept and re-used. |
+| `Trust 'starter-production-…' … has its plan profile on GitHub environment '…'` (config, exit 4) | The production trust carries a plan profile on another environment than the stub's `thoryn-production-plan`. Delete the trust and re-run (the printed command), so it is recreated with the right one. |
 | `These files already exist with different content: .thoryn/connection.json` (exit 4) | The clone has a connection.json that is not this repository's own (another repository's, or a `client_credentials` one). Move it aside, or re-run with `--force` to replace it with the trust's `workload_identity` contract. An existing `provision.yaml` is never a conflict: it is kept. |
 | `the protection step failed — gh: …` (exit 3) | GitHub refused the environment for another reason. Most often you lack admin rights on the repository. The message is GitHub's own. |
 | `cannot yet grant a machine client workspace-wide management` (exit 2, config) | The platform does not yet support `manager` on `workspace:<id>` for a client. Everything before it is kept and no variable is set. Re-run once it does. |

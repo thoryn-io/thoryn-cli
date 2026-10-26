@@ -1,7 +1,10 @@
 package com.devnow.thoryn.cli.cmd.project
 
+import com.devnow.thoryn.cli.VersionProvider
 import com.devnow.thoryn.cli.auth.WorkloadIdentityFlow
 import com.devnow.thoryn.cli.cmd.connection.Connection
+import com.devnow.thoryn.cli.cmd.provision.workflow.ProvisioningWorkflowContract
+import com.devnow.thoryn.cli.cmd.provision.workflow.WorkflowConfig
 import com.devnow.thoryn.provision.ProvisionFile
 import tools.jackson.databind.JsonNode
 import tools.jackson.databind.json.JsonMapper
@@ -23,6 +26,11 @@ import tools.jackson.databind.json.JsonMapper
  *    `tenant:environments.read`, so nothing it declares can need a write); for an app project it declares the
  *    app's OAuth client in its sandbox. Seeded only when ABSENT and never overwritten afterwards: from then on the
  *    file is in control (`plan` on a pull request, `apply` on the default branch).
+ *
+ * A config project also gets its provisioning WORKFLOW (SSO-3971, thoryn-cli contract v1): the App-dispatched stub
+ * [WORKFLOW_PATH] calling the reusable workflow at this CLI's release, and its run-time configuration
+ * [WORKFLOW_CONFIG_PATH] — the shape oauthy ADR 2026-10-25 (provisioning is tenant and applications) and
+ * thoryn-io/thoryn-tenant use. Seeded like `provision.yaml`: only when absent.
  *
  * Both live next to the connection's `provisionFile` from `.thoryn/template.json`: an app template's
  * `.thoryn/provision.yaml` gets `.thoryn/connection.json` beside it; a config template's
@@ -151,6 +159,147 @@ internal object ProjectSeeds {
         |
     """.trimMargin()
 
+    // ── SSO-3971 — the App-dispatched workflow stub and its run-time configuration (thoryn-cli contract v1) ──────────
+
+    /** The stub the Thoryn GitHub App dispatches — the ONE path it looks for. */
+    const val WORKFLOW_PATH: String = ProvisioningWorkflowContract.WORKFLOW_PATH
+
+    /** The reusable workflow's run-time configuration the stub's default `with.config` names. */
+    const val WORKFLOW_CONFIG_PATH: String = WorkflowConfig.DEFAULT_PATH
+
+    const val KIND_WORKFLOW: String = "workflow"
+
+    /**
+     * The release a stub pins when this CLI is not a release build (a local or SNAPSHOT build has no tag of its own): the
+     * first release whose engine reads `thoryn.io/tenant/v1` (SSO-3962). A release build pins ITSELF ([stubRelease]).
+     */
+    const val FALLBACK_STUB_RELEASE: String = "cli-v0.49.0"
+
+    private val RELEASE_VERSION = Regex("^\\d+\\.\\d+\\.\\d+$")
+    private val HTTPS_ORIGIN = Regex("^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?$")
+
+    /**
+     * The `cli-v*` tag the seeded stub calls the reusable workflow at — and so, through `job.workflow_ref`, the CLI its jobs
+     * run: this CLI's own release (`cli-v0.50.0` for a 0.50.0 build, whose tag exists because the release is cut from it),
+     * else [FALLBACK_STUB_RELEASE].
+     */
+    fun stubRelease(version: String = VersionProvider.readVersion()): String =
+        if (RELEASE_VERSION.matches(version)) "cli-v$version" else FALLBACK_STUB_RELEASE
+
+    /** The unprotected GitHub environment a config project's plan job runs in: the production trust's plan profile is keyed on it. */
+    fun planEnvironment(applyEnvironment: String): String = "$applyEnvironment-plan"
+
+    /**
+     * The config project's provisioning STUB (contract v1 §2): the App's four `workflow_dispatch` inputs, `check-run:` in
+     * the `run-name`, `permissions: {}`, per-mode concurrency, and ONE job — under the apply marker — that calls the
+     * reusable workflow at [release] with `id-token: write`, `checks: write`, `contents: read`: the plan job in
+     * [planEnvironment] (unprotected; the production trust's plan profile mints it read-only scopes), the apply job in
+     * [applyEnvironment] (the reviewed production environment the trust pins). [issuer] is passed only when it is an
+     * `https://` origin the contract accepts (the reusable workflow's default is production's).
+     */
+    fun configStubYaml(repository: GhRepository, issuer: String, planEnvironment: String, applyEnvironment: String, release: String = stubRelease()): String {
+        val issuerLine = issuer.trim().trimEnd('/').takeIf { HTTPS_ORIGIN.matches(it) }?.let { "\n|      issuer: $it" } ?: ""
+        return """
+            |# Thoryn provisioning — the STUB the Thoryn GitHub App dispatches (seeded by `thoryn project init config`, SSO-3971).
+            |# It only forwards the App's inputs to the reusable workflow ${ProvisioningWorkflowContract.REUSABLE_WORKFLOW}:
+            |# $WORKFLOW_CONFIG_PATH holds the run-time configuration (files, fixRequest, consentUrl, apply toggles), the `with:` block
+            |# the job shape. Configure, never edit the job; lint both with `thoryn provision workflow check`.
+            |#
+            |# This repository is the workspace's CONFIG PROJECT — TENANT provisioning (thoryn.io/tenant/v1; oauthy ADR
+            |# 2026-10-25-provisioning-is-tenant-and-applications). The App never holds a credential to your workspace: each called
+            |# job signs in as THIS repository's own workload identity (.thoryn/environments/<connection>/connection.json, no
+            |# secret) — in `$planEnvironment` (unprotected) for a read-only plan on every pull request, in `$applyEnvironment` (deploys
+            |# from ${repository.defaultBranch} only, reviewed) for the apply. One trust, two profiles: the hub mints write scopes only to a job in
+            |# `$applyEnvironment`. Removals are never automated, and nothing is written back: the platform is the ledger.
+            |name: Thoryn provisioning
+            |run-name: "Thoryn provisioning ${'$'}{{ inputs.mode }} ${'$'}{{ inputs.head_sha }} check-run:${'$'}{{ inputs.check_run_id }}"
+            |
+            |on:
+            |  workflow_dispatch:
+            |    inputs:
+            |      mode:
+            |        description: "plan (pull request, read-only) or apply (default branch, reviewed)"
+            |        required: true
+            |        type: choice
+            |        options: [plan, apply]
+            |      head_sha:
+            |        description: "The commit to plan or apply"
+            |        required: true
+            |        type: string
+            |      check_run_id:
+            |        description: "The Thoryn GitHub App check run this run reports to"
+            |        required: true
+            |        type: string
+            |      pr_number:
+            |        description: "The pull request (plan only)"
+            |        required: false
+            |        type: string
+            |        default: ""
+            |
+            |concurrency:
+            |  group: thoryn-provisioning-${'$'}{{ inputs.mode }}
+            |  cancel-in-progress: false
+            |
+            |permissions: {}
+            |
+            |jobs:
+            |  ${ProvisioningWorkflowContract.APPLY_JOB_MARKER}
+            |  provisioning:
+            |    uses: ${ProvisioningWorkflowContract.REUSABLE_WORKFLOW}@$release
+            |    permissions:
+            |      id-token: write
+            |      checks: write
+            |      contents: read
+            |    with:
+            |      mode: ${'$'}{{ inputs.mode }}
+            |      head_sha: ${'$'}{{ inputs.head_sha }}
+            |      check_run_id: ${'$'}{{ inputs.check_run_id }}
+            |      pr_number: ${'$'}{{ inputs.pr_number }}
+            |      plan-environment: $planEnvironment
+            |      apply-environment: $applyEnvironment$issuerLine
+            |
+        """.trimMargin()
+    }
+
+    /**
+     * The config project's `.thoryn/workflow.yaml` (contract v1 §5): every section's tenant file with the connection beside
+     * it, production first (it declares the sandboxes the other sections configure); `fixRequest: true`; removals off. No
+     * `env`: the seeded files are literal. No `consentUrl`: this command knows no App consent page (a red job then prints
+     * the CLI commands alone) — set it when the Thoryn GitHub App is installed.
+     */
+    fun configWorkflowYaml(repository: GhRepository, files: List<Pair<String, String>>): String = buildString {
+        append(
+            """
+            |# Thoryn provisioning — the run-time configuration of the reusable workflow the stub ($WORKFLOW_PATH) calls.
+            |# Seeded by `thoryn project init config` (SSO-3971) for ${repository.fullName}. Schema: thoryn-cli examples/workflow.schema.json;
+            |# lint: `thoryn provision workflow check`. Unknown keys are refused — a knob that is not here is a product gap to report,
+            |# not a script to write.
+            |apiVersion: thoryn.io/workflow/v1
+            |# One tenant file per section, planned on every pull request and applied on ${repository.defaultBranch}, in this order — each signed in
+            |# with its own connection (this repository's workload identity for that plane).
+            |files:
+            |""".trimMargin(),
+        )
+        append('\n')
+        files.forEach { (file, connection) ->
+            append("  - file: $file\n")
+            append("    connection: $connection\n")
+        }
+        append(
+            """
+            |# Upload the fix request when a job is red on a missing right, so the App names the fix on its check run.
+            |fixRequest: true
+            |# Set `consentUrl` to the Thoryn GitHub App's browser consent base URL (an https:// origin) and a red job also prints
+            |# a link to approve the missing right in the browser. Unset: the job prints the CLI commands alone.
+            |# Removals are never automated: retiring a tenant resource is a reviewed act by a person.
+            |apply:
+            |  prune: false
+            |  destroy: false
+            |""".trimMargin(),
+        )
+        append('\n')
+    }
+
     /** The config project's SANDBOX section: anchored on the sandbox it configures (slug only — this connection reads environments, it does not rename them). */
     fun configSandboxProvisionYaml(repository: GhRepository, sandboxSlug: String, clientId: String): String = """
         |# Seeded by `thoryn project init config` (SSO-3435) for ${repository.fullName} — the SANDBOX section: what the sandbox
@@ -163,8 +312,9 @@ internal object ProjectSeeds {
         |# sandbox declare their own OAuth clients in their own thoryn.io/application/v1 files, never here.
         |apiVersion: ${ProvisionFile.API_VERSION_TENANT}
         |resources:
-        |  # The sandbox itself, adopted by slug — the anchor its configuration hangs off. This connection holds
-        |  # tenant:environments.read, so only the slug is declared (nothing here can need a write). Add the sandbox's
+        |  # The sandbox itself — the anchor its configuration hangs off. `readOnly: true`: a dependency, not this section's
+        |  # (the production section declares it), so plan reads it and apply never writes it, and this connection needs no
+        |  # tenant:environments.write (SSO-3971; the Thoryn GitHub App's seed does the same). Add the sandbox's
         |  # configuration below, each with `environment: ${resourceName(sandboxSlug, "sandbox")}`: loginMethods, federationMember,
         |  # emailProvider, loginTheme, loginFlow, role; `kind: user` for the sandbox's TEST USERS (an app project references
         |  # one by email in its test configuration, it never creates one); and `kind: workloadIdentityTrust` for each app
@@ -172,6 +322,7 @@ internal object ProjectSeeds {
         |  # tenant:environments.read for a sandbox client — and nothing wider).
         |  - kind: environment
         |    name: ${resourceName(sandboxSlug, "sandbox")}
+        |    readOnly: true
         |    spec:
         |      slug: $sandboxSlug
         |
