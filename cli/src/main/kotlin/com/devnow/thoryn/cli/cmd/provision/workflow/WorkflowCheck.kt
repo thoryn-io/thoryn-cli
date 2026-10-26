@@ -126,14 +126,12 @@ object WorkflowCheck {
             val configDisplay = configFile?.let { f -> root?.let { r -> f.absoluteFile.normalize().relativeToOrNull(r.absoluteFile.normalize())?.path } ?: f.path } ?: configRelative
             try {
                 config = WorkflowConfig.load(configPath, configDisplay)
-                val missing = if (root != null) config.files.flatMap { listOf(it.file, it.connection) }.filterNot { File(root, it).isFile } else emptyList()
-                rules += if (missing.isEmpty()) {
-                    RuleResult("config.valid", "the run-time configuration is valid", Status.PASS, (config.source?.let { "$it" } ?: "no ${WorkflowConfig.DEFAULT_PATH} — built-in defaults") + ": ${config.files.size} file(s), ${config.env.size} env var(s), fixRequest=${config.fixRequest}, prune=${config.prune}, destroy=${config.destroy}")
-                } else {
-                    RuleResult("config.valid", "the run-time configuration is valid", Status.FAIL, "configured file(s) not found in the repository: ${missing.joinToString(", ")}", "commit them, or point `files[].file` / `files[].connection` in ${config.source ?: WorkflowConfig.DEFAULT_PATH} at the committed paths")
+                val configured = if (root != null) ConfiguredFiles.load(config, root) else null
+                rules += configValidRule(config, configured)
+                if (configured != null && config.files.isNotEmpty()) {
+                    rules += secretDeliveryRule(config, configured)
+                    rules += trustScopesRule(config, configured)
                 }
-                if (root != null) secretDeliveryRule(config, root)?.let { rules += it }
-                if (root != null) trustScopesRule(config, root)?.let { rules += it }
             } catch (ex: WorkflowConfigException) {
                 configError = ex.message
                 rules += RuleResult("config.valid", "the run-time configuration is valid", Status.FAIL, ex.message ?: "invalid", "fix $configDisplay — schema: examples/workflow.schema.json (unknown keys are refused: a knob that is not there is a product gap to report)")
@@ -141,6 +139,95 @@ object WorkflowCheck {
         }
         return Report(path, shape, rules, inputs, config, configError)
     }
+
+    /**
+     * SSO-3970 — every file `.thoryn/workflow.yaml` lists (each `files[].file` and its `files[].connection`), loaded ONCE
+     * with the same loaders `thoryn provision plan` and `thoryn login --connection` use. A file that is missing or does not
+     * load is recorded with the loader's reason; the rules below never skip it silently. [files] / [connections] hold what
+     * loaded, keyed by the configured path.
+     */
+    internal class ConfiguredFiles private constructor(
+        val files: Map<String, ProvisionFile>,
+        val connections: Map<String, Connection>,
+        /** Configured paths that are not in the repository. */
+        val missing: List<String>,
+        /** Configured paths that exist but do not load, each with the loader's reason. */
+        val unloadable: Map<String, String>,
+    ) {
+        /** Configured paths that could not be read, for any reason. */
+        val notLoaded: List<String> get() = missing + unloadable.keys
+
+        companion object {
+            fun load(config: WorkflowConfig, root: File): ConfiguredFiles {
+                val files = linkedMapOf<String, ProvisionFile>()
+                val connections = linkedMapOf<String, Connection>()
+                val missing = mutableListOf<String>()
+                val unloadable = linkedMapOf<String, String>()
+                config.files.map { it.file }.distinct().forEach { path ->
+                    val f = File(root, path)
+                    if (!f.isFile) { missing += path; return@forEach }
+                    try {
+                        files[path] = ProvisionFile.parse(f.readBytes(), path, yaml = !f.name.endsWith(".json", ignoreCase = true))
+                    } catch (ex: ProvisionException) {
+                        unloadable[path] = oneLine(ex.message ?: "does not load")
+                    }
+                }
+                config.files.map { it.connection }.distinct().forEach { path ->
+                    val c = File(root, path)
+                    if (!c.isFile) { if (path !in missing) missing += path; return@forEach }
+                    try {
+                        connections[path] = Connection.parse(c.readBytes(), path)
+                    } catch (ex: ConnectionException) {
+                        unloadable[path] = oneLine(ex.message ?: "does not load")
+                    }
+                }
+                return ConfiguredFiles(files, connections, missing, unloadable)
+            }
+
+            /** A loader's message (a header line, then `  - violation` lines) as one line: `header violation; violation`. */
+            private fun oneLine(message: String): String {
+                val lines = message.lines().map { it.trim() }.filter { it.isNotEmpty() }
+                val head = lines.firstOrNull() ?: return message
+                val rest = lines.drop(1).map { it.removePrefix("- ") }
+                return if (rest.isEmpty()) head else "$head ${rest.joinToString("; ")}"
+            }
+        }
+    }
+
+    private const val CONFIG_VALID_TITLE = "the run-time configuration is valid"
+
+    /**
+     * `config.valid` — the configuration parsed (a [WorkflowConfigException] is reported by the caller) AND every file it
+     * lists is in the repository and loads. SSO-3970: a configured file that does not load used to pass here and silently
+     * drop the rules that read it, so a broken project printed "OK". Now each one fails this rule, named with the loader's
+     * reason. A configuration listing no file says so in the detail. [configured] null ⇒ no repository root to resolve
+     * the files against (the rule engine's unit tests): only the configuration itself is judged.
+     */
+    private fun configValidRule(config: WorkflowConfig, configured: ConfiguredFiles?): RuleResult {
+        val summary = (config.source ?: "no ${WorkflowConfig.DEFAULT_PATH} — built-in defaults") +
+            ": ${config.files.size} file(s), ${config.env.size} env var(s), fixRequest=${config.fixRequest}, prune=${config.prune}, destroy=${config.destroy}"
+        if (config.files.isEmpty()) return RuleResult("config.valid", CONFIG_VALID_TITLE, Status.PASS, "$summary — no provisioning files configured, so there is nothing to plan or apply")
+        if (configured == null || configured.notLoaded.isEmpty()) {
+            return RuleResult("config.valid", CONFIG_VALID_TITLE, Status.PASS, summary + if (configured != null) " — every configured file loads" else "")
+        }
+        val source = config.source ?: WorkflowConfig.DEFAULT_PATH
+        val problems = mutableListOf<String>()
+        val fixes = mutableListOf<String>()
+        if (configured.missing.isNotEmpty()) {
+            problems += "configured file(s) not found in the repository: ${configured.missing.joinToString(", ")}"
+            fixes += "commit them, or point `files[].file` / `files[].connection` in $source at the committed paths"
+        }
+        configured.unloadable.forEach { (path, reason) -> problems += "$path does not load: $reason" }
+        if (configured.unloadable.isNotEmpty()) {
+            fixes += "correct ${configured.unloadable.keys.joinToString(", ")} — `thoryn provision plan --file <file>` and `thoryn login --connection <connection>` report the same problems"
+        }
+        val loadedCount = configured.files.size
+        val head = if (loadedCount == 0) "no configured provisioning file loads, so nothing can be planned or applied" else "$loadedCount of ${config.files.map { it.file }.distinct().size} configured provisioning file(s) load"
+        return RuleResult("config.valid", CONFIG_VALID_TITLE, Status.FAIL, "$head; " + problems.joinToString("; "), fixes.joinToString("; "))
+    }
+
+    /** The detail suffix a file-reading rule carries when some configured file could not be read. */
+    private fun notChecked(paths: List<String>): String = "not checked: ${paths.joinToString(", ")} could not be loaded (see config.valid)"
 
     /**
      * SSO-3921 / SSO-3954 — `config.secret-delivery`: the reusable workflow's apply job runs on a hosted runner with no
@@ -153,24 +240,18 @@ object WorkflowCheck {
      * a `kubernetesSecret` sink has no cluster to reach on that runner, and a `file` sink writes onto a runner that is gone
      * when the job ends — green, and the secret lost all the same. A `workloadPull` sink (SSO-3921, rung 3) passes but is
      * reported DEPRECATED (SSO-3951 / SSO-3953). A `readOnly` reference, a public client and a secret-less one
-     * (`private_key_jwt`, `federated_assertion`) mint nothing and pass. A file that does not load is not judged here
-     * (`thoryn provision plan` names every violation); null when no configured file could be read.
+     * (`private_key_jwt`, `federated_assertion`) mint nothing and pass.
+     *
+     * SSO-3970: a configured file that does not load cannot be checked, so this rule FAILS naming it (the reason is on
+     * `config.valid`) — it never passes on the files that did load, and never disappears.
      */
-    private fun secretDeliveryRule(config: WorkflowConfig, root: File): RuleResult? {
+    private fun secretDeliveryRule(config: WorkflowConfig, configured: ConfiguredFiles): RuleResult {
         val title = "a CI apply can create every declared application"
         val problems = mutableListOf<String>()
         val notices = mutableListOf<String>()
-        val unreadable = mutableListOf<String>()
-        var checked = 0
+        val blocked = mutableListOf<String>()
         config.files.map { it.file }.distinct().forEach { path ->
-            val f = File(root, path).takeIf { it.isFile } ?: return@forEach
-            val file = try {
-                ProvisionFile.parse(f.readBytes(), path, yaml = !f.name.endsWith(".json", ignoreCase = true))
-            } catch (ex: ProvisionException) {
-                unreadable += path
-                return@forEach
-            }
-            checked++
+            val file = configured.files[path] ?: run { blocked += path; return@forEach }
             file.resources.filter { it.kind == ProvisionFile.KIND_APPLICATION && !it.readOnly && mintsSecret(it.spec) }.forEach { r ->
                 val sink = r.effectiveSecretSink ?: return@forEach
                 when (sink.kind) {
@@ -183,16 +264,20 @@ object WorkflowCheck {
                 }
             }
         }
-        if (checked == 0) return null
-        val skipped = unreadable.takeIf { it.isNotEmpty() }?.let { " (not checked — does not load, see `thoryn provision plan`: ${it.joinToString(", ")})" } ?: ""
+        if (blocked.isNotEmpty()) {
+            return RuleResult(
+                "config.secret-delivery", title, Status.FAIL, (listOf(notChecked(blocked)) + problems + notices).joinToString("; "),
+                "make config.valid pass, then run the check again" + if (problems.isNotEmpty()) "; and drop the `secretSink:` of the applications named above" else "",
+            )
+        }
         return if (problems.isEmpty()) {
             RuleResult(
                 "config.secret-delivery", title, Status.PASS,
-                (if (notices.isEmpty()) "no application in the configured file(s) is minted a secret the job would have to deliver" else notices.joinToString("; ")) + skipped,
+                if (notices.isEmpty()) "no application in the configured file(s) is minted a secret the job would have to deliver" else notices.joinToString("; "),
             )
         } else {
             RuleResult(
-                "config.secret-delivery", title, Status.FAIL, (problems + notices).joinToString("; ") + skipped,
+                "config.secret-delivery", title, Status.FAIL, (problems + notices).joinToString("; "),
                 "drop the `secretSink:` — the default is `${ProvisionFile.SECRET_SINK_KIND_CUSTOMER_MANAGED}` (apply discards the create's value; ${ProvisionFile.CUSTOMER_MANAGED_RUNBOOK}) — " +
                     "or authenticate without a minted secret (clientAuthenticationMethods: [private_key_jwt]); a kubernetesSecret or file sink is for an operator's own apply with the cluster or disk at hand",
             )
@@ -206,39 +291,38 @@ object WorkflowCheck {
      * `workloadPull` sink's grant, `tenant:workload-identity.read` for a trust a binding or sink names, a declared trust's
      * scope ceiling) and held against `auth.scopes`, and — the plan scopes — against the trust's plan profile as the
      * connection implies it ([TrustScopes.evaluate]). A missing one fails here, naming the scope and the profile, instead
-     * of as a `403 access_denied` in the middle of the plan job (thoryn-cicd run 39917407017). A file or connection that does
-     * not load is not judged (`thoryn provision plan` / `thoryn login --connection` name those); null when nothing could be read.
+     * of as a `403 access_denied` in the middle of the plan job (thoryn-cicd run 39917407017).
+     *
+     * SSO-3970: a pair whose file or connection does not load cannot be checked, so this rule FAILS naming it (the reason
+     * is on `config.valid`) — it never passes on the pairs that did load, and never disappears.
      */
-    private fun trustScopesRule(config: WorkflowConfig, root: File): RuleResult? {
+    private fun trustScopesRule(config: WorkflowConfig, configured: ConfiguredFiles): RuleResult {
         val title = "the identity carries every scope the provisioning files need"
         val problems = mutableListOf<String>()
         val satisfied = mutableListOf<String>()
-        val unreadable = mutableListOf<String>()
+        val blocked = mutableListOf<String>()
         config.files.forEach { entry ->
-            val f = File(root, entry.file).takeIf { it.isFile } ?: return@forEach
-            val c = File(root, entry.connection).takeIf { it.isFile } ?: return@forEach
-            val file = try {
-                ProvisionFile.parse(f.readBytes(), entry.file, yaml = !f.name.endsWith(".json", ignoreCase = true))
-            } catch (ex: ProvisionException) {
-                unreadable += entry.file
-                return@forEach
-            }
-            val connection = try {
-                Connection.load(c)
-            } catch (ex: ConnectionException) {
-                unreadable += entry.connection
+            val file = configured.files[entry.file]
+            val connection = configured.connections[entry.connection]
+            if (file == null || connection == null) {
+                if (file == null && entry.file !in blocked) blocked += entry.file
+                if (connection == null && entry.connection !in blocked) blocked += entry.connection
                 return@forEach
             }
             val verdict = TrustScopes.evaluate(file, entry.file, connection, entry.connection, config.prune)
             problems += verdict.problems
             if (verdict.problems.isEmpty()) satisfied += verdict.satisfied
         }
-        if (problems.isEmpty() && satisfied.isEmpty()) return null
-        val skipped = unreadable.takeIf { it.isNotEmpty() }?.let { " (not checked — does not load, see `thoryn provision plan` / `thoryn login --connection`: ${it.joinToString(", ")})" } ?: ""
+        if (blocked.isNotEmpty()) {
+            return RuleResult(
+                TrustScopes.RULE_ID, title, Status.FAIL, (listOf(notChecked(blocked)) + problems + satisfied).joinToString("; "),
+                "make config.valid pass, then run the check again" + if (problems.isNotEmpty()) "; and ${TrustScopes.FIX}" else "",
+            )
+        }
         return if (problems.isEmpty()) {
-            RuleResult(TrustScopes.RULE_ID, title, Status.PASS, satisfied.joinToString("; ") + skipped)
+            RuleResult(TrustScopes.RULE_ID, title, Status.PASS, satisfied.joinToString("; "))
         } else {
-            RuleResult(TrustScopes.RULE_ID, title, Status.FAIL, problems.joinToString("; ") + skipped, TrustScopes.FIX)
+            RuleResult(TrustScopes.RULE_ID, title, Status.FAIL, problems.joinToString("; "), TrustScopes.FIX)
         }
     }
 

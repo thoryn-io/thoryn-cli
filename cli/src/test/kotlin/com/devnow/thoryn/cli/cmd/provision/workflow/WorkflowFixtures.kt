@@ -47,6 +47,24 @@ internal object WorkflowFixtures {
               issuer: https://auth.thoryn.io
     """.trimIndent() + "\n"
 
+    /** SSO-3970 — a tenant provisioning file that loads (the config project's part): one role. */
+    const val TENANT_FILE = "apiVersion: thoryn.io/tenant/v1\nresources:\n  - { kind: role, name: editor, spec: { permissions: [docs:write] } }\n"
+
+    /** SSO-3970 — a workload-identity connection that loads, carrying every scope a tenant file of [TENANT_FILE]'s shape needs. */
+    val CONNECTION = """
+        {
+          "apiVersion": "thoryn.io/connection/v1",
+          "workspace": { "slug": "acme" },
+          "auth": {
+            "method": "workload_identity",
+            "clientId": "wi_44fdc26790a3ae28113bd2b6",
+            "audience": "https://acme.auth.thoryn.io",
+            "scopes": ["tenant:roles.read", "tenant:roles.write", "tenant:access.read", "tenant:access.write"],
+            "github": { "repository": "acme-config", "environment": "acme-production" }
+          }
+        }
+    """.trimIndent() + "\n"
+
     /** The same stub with one line replaced — the mutation every rule test is built from. */
     fun stubWith(old: String, new: String): String {
         check(STUB.contains(old)) { "fixture has no '$old'" }

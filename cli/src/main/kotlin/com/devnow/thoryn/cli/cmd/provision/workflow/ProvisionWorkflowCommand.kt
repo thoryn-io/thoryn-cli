@@ -88,6 +88,7 @@ class ProvisionWorkflowCommand : Callable<Int> {
                 println()
                 println("Effective configuration (${c.source ?: "no ${WorkflowConfig.DEFAULT_PATH} — built-in defaults"})")
                 println("  ${"provider".padEnd(18)} ${c.provider}")
+                if (c.files.isEmpty()) println("  ${"files".padEnd(18)} (none — no provisioning files configured)")
                 c.files.forEachIndexed { i, f -> println("  ${(if (i == 0) "files" else "").padEnd(18)} ${f.file}  (connection ${f.connection})") }
                 println("  ${"env".padEnd(18)} ${if (c.env.isEmpty()) "(none)" else c.env.entries.joinToString(" ") { "${it.key}=${it.value}" }}")
                 println("  ${"fixRequest".padEnd(18)} ${c.fixRequest}")

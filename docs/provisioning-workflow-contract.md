@@ -141,7 +141,17 @@ connection defaults to the `connection.json` beside its file), `env` (`THORYN_*`
 credential-shaped; exported, never evaluated), `fixRequest` (default true), `consentUrl` (SSO-3723 — the browser
 consent base URL, `https://` without query or fragment; `THORYN_CONSENT_URL` for the CLI when the `consent-url` input is
 empty; default empty ⇒ the raw CLI commands alone, under a check-each-line warning; set ⇒ Option 1 is `thoryn access approve`, SSO-3738), `apply.prune` / `apply.destroy` (default false) / `apply.confirm`
-(workspace slug). The check also confirms every configured file is committed.
+(workspace slug).
+
+`config.valid` (SSO-3970) also LOADS every file the configuration lists — each `files[].file` with the loader
+`thoryn provision plan` uses, each `files[].connection` with the one `thoryn login --connection` uses. A file that is not
+committed, is not valid YAML/JSON, declares an unknown `apiVersion`, or breaks a rule of its file (a kind from the other
+part, SSO-3962, among them) fails `config.valid`, which names the file and the loader's reason. When none of the
+configured provisioning files loads the detail says so ("no configured provisioning file loads, so nothing can be planned
+or applied"). The rules that read the files (`config.secret-delivery`, `config.trust-scopes`) then fail as
+`not checked: <file> could not be loaded (see config.valid)` — they never pass on the files that did load and never drop
+out of the report. A configuration that lists no file at all says so on `config.valid` ("no provisioning files
+configured"); today's schema refuses an empty `files:`, and an absent one means the default `.thoryn/provision.yaml`.
 
 `config.secret-delivery` (SSO-3921, reshaped by SSO-3954) reads every configured provisioning file that is committed: the
 apply job runs on a hosted runner with no kubeconfig, no `--secret-file` and no TTY. An application that MINTS a client
@@ -163,7 +173,8 @@ plan profile as the connection implies it (a profile without explicit scopes is 
 explicit one is a subset of them). A missing scope fails the rule naming the scope, the resources that need it, and the
 profile to add it to. The repository identity cannot read its trust's profile (`tenant:workload-identity.read`), so the
 rule derives it; `provision plan` holds the plan scopes against the minted token before its first call, and maps a scope
-`403` (`access_denied` / `insufficient_scope`) to the same message. A file or connection that does not load gets no verdict.
+`403` (`access_denied` / `insufficient_scope`) to the same message. A file or connection that does not load fails the rule
+as not checked (SSO-3970; the reason is on `config.valid`).
 
 ## 6. A hand-written workflow (`custom.*`) — unsupported
 
@@ -197,3 +208,8 @@ sink is green on the next run with no edit; one that declared `workloadPull` to 
 SSO-3926 did **not** bump it: the stub and the reusable workflow are unchanged. It adds `config.trust-scopes`, which reads
 the configured files AND their connections — a repository whose connection lacks a scope its file needs now fails the
 check, which is what its plan job would have done mid-plan with `403 access_denied` (thoryn-cicd run 39917407017).
+
+SSO-3970 did **not** bump it: the stub, the reusable workflow and the rule ids are unchanged. A configured file that does
+not load used to pass `config.valid` (it only checked the file was committed) and silently drop `config.secret-delivery`
+and `config.trust-scopes` from the report, so a project whose one file was broken printed "OK". Now it fails, as its
+plan job would have. A repository that was green with a broken configured file is red on the next run, naming the file.

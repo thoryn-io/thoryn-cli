@@ -13,7 +13,7 @@ import java.nio.file.Path
  * customer manages the secret — the default) or with `secretSink: { kind: customerManaged }`, and the rule's detail is the
  * notice that explains it. A `kubernetesSecret` sink and a `file` sink each still fail naming the application and the fix
  * (which now says: drop the sink); a `workloadPull` sink passes but is reported deprecated; a public or secret-less client
- * and a read-only reference pass silently; a file that does not load is left to `provision plan` (no verdict).
+ * and a read-only reference pass silently; a file that does not load fails as not checked (SSO-3970) — never a silent skip.
  */
 class WorkflowSecretDeliveryRuleTest {
 
@@ -81,7 +81,10 @@ class WorkflowSecretDeliveryRuleTest {
     }
 
     @Test
-    fun `a file that does not load gets no verdict from this rule`() {
-        assertThat(check("- { kind: nonsense }")).isNull()
+    fun `a file that does not load fails this rule as not checked — it is never skipped (SSO-3970)`() {
+        val r = check("- { kind: nonsense }")!!
+        assertThat(r.status).isEqualTo(WorkflowCheck.Status.FAIL)
+        assertThat(r.detail).isEqualTo("not checked: .thoryn/provision.yaml could not be loaded (see config.valid)")
+        assertThat(r.fix).isEqualTo("make config.valid pass, then run the check again")
     }
 }
