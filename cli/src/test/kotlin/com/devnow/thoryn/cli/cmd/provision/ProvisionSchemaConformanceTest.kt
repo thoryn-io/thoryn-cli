@@ -185,6 +185,36 @@ class ProvisionSchemaConformanceTest {
     }
 
     @Test
+    fun `loginTheme's schema block is the loader's record — the closed keys, the theme enum, the css-variable allowlist, the colour pattern and the bounds`() {
+        // SSO-4041 — the spec IS the record the PUT replaces, so both contracts pin the same closed shape and the same value grammar.
+        val spec = schema["\$defs"]["resource"]["allOf"].toList()
+            .first { it["if"]["properties"]["kind"]["const"].asString() == "loginTheme" }["then"]["properties"]["spec"]
+        assertThat(spec["additionalProperties"].asBoolean()).isFalse()
+        assertThat(spec["properties"].propertyNames().toSet()).isEqualTo(ProvisionFile.LOGIN_THEME_SPEC_KEYS)
+        assertThat(spec["properties"]["theme"]["enum"].toList().map { it.asString() }).isEqualTo(ProvisionFile.LOGIN_THEME_THEMES)
+        assertThat(spec["properties"]["primaryColor"]["pattern"].asString()).isEqualTo(ProvisionFile.HEX_COLOR_PATTERN.pattern)
+        assertThat(spec["properties"]["backgroundColor"]["pattern"].asString()).isEqualTo(ProvisionFile.HEX_COLOR_PATTERN.pattern)
+        assertThat(spec["properties"]["logoUrl"]["maxLength"].asInt()).isEqualTo(ProvisionFile.LOGIN_THEME_MAX_LOGO_URL_CHARS)
+        assertThat(spec["properties"]["logoUrl"]["pattern"].asString()).isEqualTo("^https://")
+        assertThat(spec["properties"]["borderRadiusPx"]["minimum"].asInt()).isEqualTo(0)
+        assertThat(spec["properties"]["borderRadiusPx"]["maximum"].asInt()).isEqualTo(ProvisionFile.LOGIN_THEME_MAX_BORDER_RADIUS_PX)
+        val css = spec["properties"]["cssVariables"]
+        assertThat(css["additionalProperties"].asBoolean()).isFalse()
+        assertThat(css["properties"].propertyNames().toSet()).isEqualTo(ProvisionFile.LOGIN_THEME_CSS_VARIABLES.keys)
+        ProvisionFile.LOGIN_THEME_CSS_VARIABLES.forEach { (token, kind) ->
+            val expected = if (kind == ProvisionFile.CSS_VARIABLE_KIND_COLOR) ProvisionFile.HEX_COLOR_PATTERN.pattern else ProvisionFile.LOGIN_THEME_FONT_STACK_PATTERN.pattern
+            assertThat(css["properties"][token]["pattern"].asString()).describedAs(token).isEqualTo(expected)
+        }
+        // Every field is optional (an empty spec declares the platform defaults) — and the loader agrees.
+        assertThat(spec["required"]).isNull()
+        assertThat(ProvisionFile.REQUIRED_SPEC.getValue(ProvisionFile.KIND_LOGIN_THEME)).isEmpty()
+        assertThat(ProvisionFile.validate(yaml.readTree("apiVersion: thoryn.io/tenant/v1\nresources:\n  - { kind: loginTheme, spec: {} }"))).isEmpty()
+        // And the loader refuses what the schema's additionalProperties:false refuses.
+        assertThat(ProvisionFile.validate(yaml.readTree("apiVersion: thoryn.io/tenant/v1\nresources:\n  - { kind: loginTheme, spec: { primaryColour: \"#000\" } }")))
+            .anyMatch { it.contains("spec.primaryColour is not a branding field") }
+    }
+
+    @Test
     fun `grants are validated — subject grammar, the relation enum, duplicates and unknown keys`() {
         // SSO-3113 — the `grants:` block carries no object (it derives from the receipt id) and no secret.
         val bad = yaml.readTree(
