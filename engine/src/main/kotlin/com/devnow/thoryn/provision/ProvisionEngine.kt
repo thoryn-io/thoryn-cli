@@ -1619,7 +1619,8 @@ class ProvisionEngine(
             ProvisionFile.KIND_FEDERATION_MEMBER -> "thoryn federation delete $id$confirm$env"
             ProvisionFile.KIND_EMAIL_PROVIDER -> "DELETE /api/v1/email-provider (reset to the platform sender)$env"
             ProvisionFile.KIND_LOGIN_METHODS -> "thoryn login-methods reset$env"
-            ProvisionFile.KIND_LOGIN_THEME -> "thoryn branding set (no delete surface; set the platform defaults)$env"
+            // SSO-4041 — the API has no DELETE; the empty record restores the platform defaults (`thoryn branding set` with an empty value clears one field at a time).
+            ProvisionFile.KIND_LOGIN_THEME -> "PUT /api/v1/login-experience/branding {} (the API has no DELETE; the empty record restores the platform defaults — or `thoryn branding set --logo-url '' --primary-color '' --background-color '' --theme ''`)$env"
             ProvisionFile.KIND_LOGIN_FLOW -> "activate another login flow (no delete surface)$env"
             ProvisionFile.KIND_CUSTOM_DOMAIN -> "thoryn domain remove --yes"
             ProvisionFile.KIND_WORKLOAD_IDENTITY_TRUST -> "thoryn workload-identity trusts delete $id --yes${if (plane == null) " --confirm <workspace-slug>" else ""}$env"
@@ -2322,11 +2323,15 @@ class ProvisionEngine(
             }
         }
         ProvisionFile.KIND_LOGIN_THEME -> {
-            val stored = clients(slug).getLoginBranding()["stored"]
-            val fields = listOf("logoUrl", "primaryColor", "backgroundColor", "borderRadiusPx", "theme", "cssVariables")
-            val live = stored?.toMap(fields).orEmpty()
-            if (live.values.all { it == null }) null
-            else Live("login-theme", diffOf(desired.filterKeys { it in fields }, live))
+            // SSO-4041 — the PUT replaces the WHOLE record, so the plan diffs the whole record: every field of
+            // [ProvisionFile.LOGIN_THEME_SPEC_KEYS], a stored one the file does not declare included (it WILL be cleared).
+            val live = brandingRecord(clients(slug).getLoginBranding()["stored"]?.let { plain(it) } as? Map<*, *>)
+            val want = brandingRecord(desired)
+            when {
+                // Nothing stored: a spec declaring nothing is the platform default already (never re-PUT); anything else is a create.
+                live.values.all { it == null } -> if (want.values.all { it == null }) Live("login-theme", emptyMap()) else null
+                else -> Live("login-theme", brandingDiff(want, live))
+            }
         }
         ProvisionFile.KIND_LOGIN_FLOW -> {
             // SSO-3715 — the active flow does not record its template, so a loginFlow converges by EXISTENCE: an active
@@ -2566,25 +2571,58 @@ class ProvisionEngine(
         }, action = ChangeAction.CREATE)
     }
 
+    /**
+     * SSO-4041 — `PUT /api/v1/login-experience/branding` REPLACES the stored record (identity's `LoginBrandingAdminService.upsert`:
+     * an omitted or `null` field clears the stored value; `cssVariables` is one map, `null` clears every token). The body is
+     * therefore the FULL record ([brandingRecord]) with an explicit `null` for every field the spec does not declare — what the
+     * plan showed as `(cleared)` is exactly what this clears, and nothing is left to the API's defaults by omission.
+     */
     private fun putLoginTheme(r: ProvisionResource, slug: String?, spec: Map<String, Any?>, mark: String): AppliedResource {
-        val body = linkedMapOf<String, Any?>()
-        listOf("logoUrl", "primaryColor", "backgroundColor", "theme").forEach { k -> spec[k].nonBlank()?.let { body[k] = it } }
-        spec["borderRadiusPx"]?.let { coerceInt(it)?.let { px -> body["borderRadiusPx"] = px } }
-        (spec["cssVariables"] as? Map<*, *>)?.let { raw ->
-            val css = raw.entries.mapNotNull { (k, v) ->
-                val key = k?.toString()?.trim()?.takeIf { it.isNotEmpty() }
-                val value = v?.toString()?.trim()?.takeIf { it.isNotEmpty() }
-                if (key != null && value != null) key to value else null
-            }.toMap()
-            if (css.isNotEmpty()) body["cssVariables"] = css
-        }
+        val body = brandingRecord(spec)
         val resp = clients(slug).putLoginBranding(body)
         val effective = resp["effective"]
-        out.println("  $mark loginTheme: theme=${effective?.str("theme") ?: "(default)"}")
+        val cleared = body.filterValues { it == null }.keys
+        out.println("  $mark loginTheme: theme=${effective?.str("theme") ?: "(default)"}" + if (cleared.isEmpty()) "" else " (cleared: ${cleared.joinToString(", ")})")
         return AppliedResource(r.kind, r.name, "login-theme", slug, buildMap {
             effective?.str("theme")?.let { put("theme", it) }
             effective?.str("primaryColor")?.let { put("primaryColor", it) }
         }, action = ChangeAction.CREATE)
+    }
+
+    /**
+     * SSO-4041 — the branding record as the PUT writes it and the plan compares it: every field of
+     * [ProvisionFile.LOGIN_THEME_SPEC_KEYS], in order, `null` when [spec] does not declare it (or declares it blank / empty —
+     * a blank colour and an empty `cssVariables` are "unset", as identity stores them). Scalars are normalised the way identity
+     * stores them (trimmed; colours and the theme lower-cased; the radius an integer); `cssVariables` keeps only tokens with a
+     * non-blank value (an all-blank map is `null`: the PUT clears the column either way).
+     */
+    private fun brandingRecord(spec: Map<*, *>?): Map<String, Any?> = linkedMapOf<String, Any?>().apply {
+        this["logoUrl"] = spec?.get("logoUrl").nonBlank()
+        this["primaryColor"] = spec?.get("primaryColor").nonBlank()?.lowercase()
+        this["backgroundColor"] = spec?.get("backgroundColor").nonBlank()?.lowercase()
+        this["borderRadiusPx"] = spec?.get("borderRadiusPx")?.let { coerceInt(it) }
+        this["theme"] = spec?.get("theme").nonBlank()?.lowercase()
+        this["cssVariables"] = (spec?.get("cssVariables") as? Map<*, *>)?.entries?.mapNotNull { (k, v) ->
+            val key = k?.toString()?.trim()?.takeIf { it.isNotEmpty() }
+            val value = v.nonBlank()
+            if (key != null && value != null) key to value else null
+        }?.toMap()?.takeIf { it.isNotEmpty() }
+    }
+
+    /**
+     * SSO-4041 — [diffOf] over the whole branding record: unlike a PATCH-style diff it ALSO lists a field that is stored but that
+     * the file does not declare, as `<stored> → (cleared)` — the PUT will clear it, so the plan must say so. `cssVariables` is
+     * one entry: the PUT replaces the map, so a token the file omits is cleared with the rest (`{…} → {…}` shows both maps).
+     */
+    private fun brandingDiff(desired: Map<String, Any?>, live: Map<String, Any?>): Map<String, String> {
+        val diff = LinkedHashMap<String, String>()
+        ProvisionFile.LOGIN_THEME_SPEC_KEYS.forEach { field ->
+            val want = desired[field]
+            val have = live[field]
+            if (norm(want) == norm(have)) return@forEach
+            diff[field] = if (want == null) "${render(have)} → (cleared — the file does not declare it; the platform default applies)" else "${render(have)} → ${render(want)}"
+        }
+        return diff
     }
 
     private fun applyLoginFlow(r: ProvisionResource, slug: String?, spec: Map<String, Any?>, mark: String): AppliedResource {
@@ -2864,6 +2902,11 @@ class ProvisionEngine(
                 // SSO-3100 — the delete path IS a reset: back to the default (every method offered).
                 clients(c.environment).resetLoginMethods()
                 out.println("  - loginMethods: reset to the default (every method offered)")
+            }
+            ProvisionFile.KIND_LOGIN_THEME -> {
+                // SSO-4041 — the API has no DELETE: the PUT of the EMPTY record (every field null) IS the reset to the platform defaults.
+                clients(c.environment).putLoginBranding(brandingRecord(null))
+                out.println("  - loginTheme: reset to the platform defaults (the empty record was PUT; the API has no DELETE)")
             }
             ProvisionFile.KIND_CUSTOM_DOMAIN -> {
                 // SSO-3413 — reached only through `--prune` / `destroy`, both production-plane gated by `--confirm`.

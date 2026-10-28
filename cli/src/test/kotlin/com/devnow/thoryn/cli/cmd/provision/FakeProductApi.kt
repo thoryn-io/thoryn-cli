@@ -431,6 +431,38 @@ internal class FakeProductApi : Dispatcher() {
     private var seq = 0
     private val mapper = JsonMapper.builder().addModule(kotlinModule()).build()
 
+    // ── SSO-4041 — hosted-login branding, in identity's shape (`LoginBrandingAdminService` + `BrandingCssVariables`) ──
+
+    private val BRANDING_FIELDS = listOf("logoUrl", "primaryColor", "backgroundColor", "borderRadiusPx", "theme", "cssVariables")
+    private val BRANDING_DEFAULTS = mapOf("logoUrl" to null, "primaryColor" to "#2563eb", "backgroundColor" to "#ffffff", "borderRadiusPx" to 4, "theme" to "auto")
+    private val HEX_COLOR = Regex("^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$")
+    private val CSS_VARIABLES = mapOf("--thoryn-accent" to "color", "--thoryn-text" to "color", "--thoryn-muted" to "color", "--thoryn-font-family" to "font")
+    private val FONT_STACK = Regex("^[A-Za-z0-9 ,_'\"-]{1,120}$")
+
+    /** product-api's `BrandingResponse`: `stored` with EVERY field (null when unset, `cssVariables` `{}`) + `effective` (defaults filled). */
+    private fun brandingView(env: String?): Map<String, Any?> {
+        val record = branding[env].orEmpty()
+        val stored = BRANDING_FIELDS.associateWith { f -> record[f] ?: if (f == "cssVariables") emptyMap<String, String>() else null }
+        val effective = BRANDING_DEFAULTS + record.filterKeys { it != "cssVariables" } + ("cssVariables" to (record["cssVariables"] ?: emptyMap<String, String>()))
+        return mapOf("stored" to stored, "effective" to effective, "updatedAt" to if (record.isEmpty()) null else "2026-10-28T00:00:00Z")
+    }
+
+    /** identity's strict write validation (`400 invalid_branding_field`, extension `field`); the contrast floor is not modelled. */
+    private fun brandingProblem(b: Map<String, Any?>): MockResponse? {
+        fun bad(field: String) = problem(400, "invalid_branding_field", mapOf("field" to field))
+        listOf("primaryColor", "backgroundColor").forEach { f -> (b[f] as? String)?.trim()?.takeIf { it.isNotEmpty() }?.let { if (!HEX_COLOR.matches(it)) return bad(f) } }
+        (b["borderRadiusPx"] as? Number)?.toInt()?.let { if (it !in 0..64) return bad("borderRadiusPx") }
+        (b["theme"] as? String)?.trim()?.takeIf { it.isNotEmpty() }?.let { if (it.lowercase() !in setOf("light", "dark", "auto")) return bad("theme") }
+        (b["logoUrl"] as? String)?.trim()?.takeIf { it.isNotEmpty() }?.let { if (!it.startsWith("https://") || it.length > 2000) return bad("logoUrl") }
+        (b["cssVariables"] as? Map<*, *>)?.forEach { (k, v) ->
+            val kind = CSS_VARIABLES[k] ?: return bad("cssVariables")
+            val value = v?.toString()?.trim()?.takeIf { it.isNotEmpty() } ?: return@forEach
+            if (kind == "color" && !HEX_COLOR.matches(value)) return bad("cssVariables")
+            if (kind == "font" && !FONT_STACK.matches(value)) return bad("cssVariables")
+        }
+        return null
+    }
+
     fun writesTo(pathPrefix: String) = writes.filter { it.path.startsWith(pathPrefix) }
 
     /** SSO-3100 — the PROVISIONING writes only: the recipe interpreter's best-effort receipt attestation POST is not one. */
@@ -1014,13 +1046,16 @@ internal class FakeProductApi : Dispatcher() {
             }
             route == "/api/v1/email-provider" && method == "DELETE" -> { emailProviders.remove(env); MockResponse().setResponseCode(204) }
             // ── branding (singleton per env) ──
-            route == "/api/v1/login-experience/branding" && method == "GET" -> {
-                val stored = branding[env] ?: emptyMap()
-                json(200, mapOf("stored" to stored, "effective" to (mapOf("theme" to "light", "primaryColor" to "#000000") + stored)))
-            }
+            // SSO-4041 — as identity's `LoginBrandingAdminService.upsert` behaves behind product-api's facade: the PUT REPLACES
+            // the record (an omitted / null field clears the stored value, `cssVariables` as one map), an unknown key is DROPPED by
+            // the lenient JSON binding (never a 400 — the typo class this fake used to hide), a malformed value is
+            // `400 invalid_branding_field`, and `stored` renders EVERY field (null when unset; `cssVariables` `{}`).
+            route == "/api/v1/login-experience/branding" && method == "GET" -> json(200, brandingView(env))
             route == "/api/v1/login-experience/branding" && method == "PUT" -> {
-                val stored = branding.getOrPut(env) { mutableMapOf() }; stored.putAll(b)
-                json(200, mapOf("stored" to stored, "effective" to (mapOf("theme" to "light", "primaryColor" to "#000000") + stored)))
+                brandingProblem(b)?.let { return it }
+                val record = b.filterKeys { it in BRANDING_FIELDS }.filterValues { it != null && !(it is String && it.isBlank()) && !(it is Map<*, *> && it.isEmpty()) }
+                if (record.isEmpty()) branding.remove(env) else branding[env] = record.toMutableMap()
+                json(200, brandingView(env))
             }
             // ── login methods (singleton per env; SSO-3100 — product-api /api/v1/login-methods) ──
             route == "/api/v1/login-methods" && method == "GET" -> {

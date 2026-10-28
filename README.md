@@ -271,7 +271,9 @@ thoryn examples share    <name> [--output <file>]   # SSO-2876 — export the se
 # Provisioning-as-code (SSO-3088, epic SSO-3087) — converge the DESIRED STATE in .thoryn/provision.yaml
 # (resources with a stable `name`: environment, application, user, federationMember, and the
 # per-environment singletons emailProvider / loginTheme / loginFlow / loginMethods — the last, SSO-3100,
-# is the sign-in METHOD allow-list `login-methods set` writes; destroy resets it — and, SSO-3413, the
+# is the sign-in METHOD allow-list `login-methods set` writes; destroy resets it; loginTheme, SSO-4041, is
+# the WHOLE branding record: the PUT replaces it, so plan diffs every field and shows an undeclared stored
+# one as cleared, apply PUTs the full record, and the spec is checked in identity's grammar — and, SSO-3413, the
 # workspace-level singleton customDomain: plan shows the DNS records, apply claims + verifies, only
 # --prune/destroy with --confirm release it). SSO-3715 (ADR 2026-10-15 platform-is-the-ledger): THERE IS
 # NO RECEIPT — nothing is written beside the file, committed or cached; plan / apply / destroy / import read
@@ -2006,6 +2008,44 @@ application: a sender constraint widens nothing.
 **A refusal at apply names the resource, the code and the change** (`Error: application/portal:
 session_exceeds_tenant_policy — … cap of 86400 seconds …`), never the "Required scope" hint a bare `403` would
 otherwise print. Everything converged before it stays live; fix the cause and re-run.
+
+### Hosted-login branding as code — `kind: loginTheme` (SSO-4041)
+
+`kind: loginTheme` is the hosted sign-in / register look of its environment (`thoryn branding get | set`,
+`/api/v1/login-experience/branding`; `tenant:idp.read` to plan, `tenant:idp.write` to apply). **The spec IS the record.**
+The product API's `PUT` replaces the stored record whole — an omitted field clears the stored value, and `cssVariables`
+is replaced as one map — so the file is converged the same way (ADR 2026-09-15: the file is the source of truth):
+
+- **plan** diffs the **whole record**: every declared field against what is stored, and every stored field the file does
+  not declare as `<stored> → (cleared — the file does not declare it; the platform default applies)`. A file that sets
+  `primaryColor` on an environment with a stored `logoUrl` plans **two** changes, and says which logo goes.
+- **apply** PUTs the full record — the declared values plus an explicit `null` for every undeclared field — so the apply
+  does exactly what the plan showed. An **empty `spec: {}` declares the platform defaults** (everything stored is cleared;
+  with nothing stored it is a no-op, never re-PUT).
+- **`cssVariables`** is one map, as the PUT treats it: a `--thoryn-*` token the file omits is cleared with the rest. The
+  plan shows both maps (`{…} → {…}`).
+- **the spec is checked before any call**, in identity-service's own grammar: the record is exactly `logoUrl` (`https://`,
+  ≤ 2000 chars), `primaryColor` / `backgroundColor` (`#rgb` / `#rrggbb` / `#rrggbbaa`), `borderRadiusPx` (0–64),
+  `theme` (`light` | `dark` | `auto`) and `cssVariables` (`--thoryn-accent`, `--thoryn-text`, `--thoryn-muted` as hex
+  colours; `--thoryn-font-family` a plain font stack). **An unknown key is refused** (`spec.primaryColour is not a
+  branding field …`): the API's lenient binding would drop it, and the PUT would then clear the field the typo meant to
+  set. A value carrying `{{env.NAME}}` is left to the API. The WCAG-AA contrast floor stays the API's
+  (`400 insufficient_contrast` at apply).
+- **destroy / `--prune`**: the API has no `DELETE`, so a removal is the PUT of the empty record (the platform defaults).
+  The singleton rule is unchanged (ADR 2026-10-15 §1): on the production plane the theme is left in place and the destroy
+  plan names the reset a person runs; in a sandbox it goes with its sandbox.
+
+```yaml
+- kind: loginTheme
+  environment: dev
+  spec:
+    logoUrl: https://cdn.acme.example/logo.svg
+    primaryColor: "#0f62fe"
+    theme: auto
+    cssVariables: { --thoryn-accent: "#7c3aed", --thoryn-font-family: "Inter, sans-serif" }
+```
+
+`thoryn provision import` renders the stored record as it is, so an imported theme plans as a no-op.
 
 ### Roles and claims in the token — `kind: role`, `tokenClaims` (SSO-3941, SSO-3945)
 
