@@ -273,7 +273,8 @@ thoryn examples share    <name> [--output <file>]   # SSO-2876 — export the se
 # per-environment singletons emailProvider / loginTheme / loginFlow / loginMethods — the last, SSO-3100,
 # is the sign-in METHOD allow-list `login-methods set` writes; destroy resets it — and, SSO-3413, the
 # workspace-level singleton customDomain: plan shows the DNS records, apply claims + verifies, only
-# --prune/destroy with --confirm release it). SSO-3715 (ADR 2026-10-15 platform-is-the-ledger): THERE IS
+# --prune/destroy with --confirm release it — and, SSO-4042, emailTemplate: one transactional email template
+# override per (type, locale), workspace-level today, body inline or in a file next to the provisioning file). SSO-3715 (ADR 2026-10-15 platform-is-the-ledger): THERE IS
 # NO RECEIPT — nothing is written beside the file, committed or cached; plan / apply / destroy / import read
 # live state only, and `apply --output json` / `plan --output json` carry the resolved ids (`resources[]`:
 # {kind, name, id, environment, action}). SSO-3089: every resource is read LIVE by its converge key before
@@ -1409,7 +1410,7 @@ about them. Provisioning as code is therefore two parts, and a project belongs t
 |---|---|---|
 | `apiVersion` | `thoryn.io/tenant/v1` | `thoryn.io/application/v1` |
 | Owner | ONE config project per workspace | MANY app projects per workspace |
-| Kinds | `environment`, `federationMember`, `user` (sandbox test users included), `loginMethods`, `loginFlow`, `loginTheme`, `emailProvider`, `customDomain`, `role`, `workloadIdentityTrust` | `application` (with `tokenClaims` + `roleMapping`, and the applications-API settings) |
+| Kinds | `environment`, `federationMember`, `user` (sandbox test users included), `loginMethods`, `loginFlow`, `loginTheme`, `emailProvider`, `emailTemplate`, `customDomain`, `role`, `workloadIdentityTrust` | `application` (with `tokenClaims` + `roleMapping`, and the applications-API settings) |
 | Relation | **defines** the tenant | **uses** the tenant: names roles / environments, never defines them |
 | Identity | the config project's trust: broad `tenant:*` write; production through a reviewed PR | the app project's trust, confined to `tenant:applications.read`, `tenant:applications.write`, `tenant:access.read`; its production client created under a consent-approved **creation slot** (`thoryn access reserve` / `thoryn access approve`) |
 | Who declares its trust | a person, once; the config project then owns and converges it | **the config project** (one `kind: workloadIdentityTrust` per app repository) — an app project never declares a trust, not even its own |
@@ -2006,6 +2007,55 @@ application: a sender constraint widens nothing.
 **A refusal at apply names the resource, the code and the change** (`Error: application/portal:
 session_exceeds_tenant_policy — … cap of 86400 seconds …`), never the "Required scope" hint a bare `403` would
 otherwise print. Everything converged before it stays live; fix the cause and re-run.
+
+### Email templates as code — `kind: emailTemplate` (SSO-4042)
+
+`kind: emailTemplate` is ONE transactional email template override of the workspace, per (type, locale) — the
+`/api/v1/login-experience/email-templates/{type}?locale=` surface (`tenant:idp.read` to plan, `tenant:idp.write` to
+apply). The eight types are identity-service's: `magic_link`, `invitation`, `password_reset`, `security_alert`,
+`account_unlock`, `email_verification`, `organization_invitation`, `co_admin_invitation`. The body is **`body`** (inline
+HTML) **or `bodyFile`** (a path relative to the provisioning file, inside its directory, read when the file is loaded) —
+exactly one.
+
+```yaml
+- kind: emailTemplate
+  name: welcome                                   # one resource per (type, locale)
+  spec:
+    type: magic_link
+    subject: "Sign in to Acme, {{displayName}}"   # the type's {{variables}}; the API refuses any other name
+    bodyFile: emails/magic_link.html              # relative to this file; or `body: |` inline
+- kind: emailTemplate
+  name: welcome-nl
+  spec: { type: magic_link, locale: nl, subject: "Inloggen bij Acme", bodyFile: emails/magic_link.nl.html }
+```
+
+- **Workspace-level, for now.** identity-service stores templates tenant-wide — one set for every environment, no
+  environment column — so `environment:` is refused, like `customDomain`'s, with a message pointing at **SSO-4043** (the
+  re-key to the environment axis). Until then a template declared in the config project's production file is the one
+  every sandbox sends too.
+- **Converge key** `(spec.type, spec.locale)`. `locale` is the API's grammar: a 2–3 letter ISO 639 language code (`en`,
+  `nl`); omitted ⇒ the base, locale-independent template (`*`). A region subtag (`en-GB`) is refused before any call —
+  product-api stores none.
+- **plan**: `404 template_not_customized` ⇒ create; a stored cell is diffed on `subject` and the body with line endings
+  and trailing whitespace normalised; a differing body is reported as a line count (`body differs (2 → 3 lines, +1 −0)`),
+  never as HTML. **apply**: `PUT { subject, bodyHtml }`. The checks the loader makes first — the closed record, the type
+  enum, the locale grammar, a non-blank subject ≤ 998 characters, a non-blank body ≤ 64 KiB — are identity's own; the
+  `{{variable}}` allowlist stays the API's (it is per type), so an unknown name is the API's refusal, surfaced plainly:
+  `emailTemplate/welcome: unknown_template_variable — … Allowed variables are: displayName, expiryMinutes, magicLinkUrl.`
+  An oversize subject or body the loader could not see is `template_body_too_large (HTTP 413)`, the same way.
+- **No `grants:`** — an email template is not a platform access object: product-api gates every login-experience call
+  on the caller's relation to `login_theme:production`, so the ownership check is that object's (`manager` to converge,
+  `viewer` for a `readOnly: true` reference).
+- **destroy / `--prune`**: the removal is the `DELETE` of the cell (back to the built-in default). The singleton rule
+  holds (ADR 2026-10-15 §1): on the production plane — every template today — the row is left in place and names the
+  call a person makes (`DELETE /api/v1/login-experience/email-templates/<type>?locale=<l>`; the CLI has no
+  `email-templates` command).
+- **import** reads each type's **base** template by address (there is no list endpoint; a locale variant is found only
+  by naming it, which `import` says once) and renders it with its body in **`emails/<type>.html` next to the
+  provisioning file**, `spec.bodyFile` naming it. `import --write` writes those files beside the entries and never
+  overwrites a body file that exists with other content. The configuration import (`--for-workflow`, contract v2)
+  stages the committed file's body files beside the copy so the copy loads and plans, and the `thoryn-import` artifact
+  carries them (`import-summary.json` lists them per file as `bodyFiles`).
 
 ### Roles and claims in the token — `kind: role`, `tokenClaims` (SSO-3941, SSO-3945)
 
@@ -2810,7 +2860,7 @@ CLI derives it — every scope is the gate product-api puts on the endpoint the 
 |---|---|---|
 | any resource | its kind's `.read` scope, and `tenant:access.read` (the ownership check) | its kind's `.write` scope (not for a `readOnly: true` reference) |
 | `environment` / `application` / `user` / `federationMember` | `tenant:environments.read` / `tenant:applications.read` / `tenant:users.read` / `tenant:federation.read` | the matching `.write` |
-| `emailProvider` / `loginTheme`, `loginFlow`, `loginMethods` / `customDomain` | `tenant:email.read` / `tenant:idp.read` / `tenant:domains.read` | the matching `.write` |
+| `emailProvider` / `loginTheme`, `loginFlow`, `loginMethods`, `emailTemplate` / `customDomain` | `tenant:email.read` / `tenant:idp.read` / `tenant:domains.read` | the matching `.write` |
 | `workloadIdentityTrust` | `tenant:workload-identity.read` | `tenant:workload-identity.write`, and every scope the trust carries (`spec.scopes` — the hub's ceiling, `scope_not_grantable`) |
 | `role` (SSO-3941) | `tenant:roles.read` — and NOT `tenant:access.read`: a role is not a platform access object, so no ownership check is asked | `tenant:roles.write` |
 | an application's `tokenClaims` | `tenant:applications.read` (already needed by the application) | `tenant:applications.write` |

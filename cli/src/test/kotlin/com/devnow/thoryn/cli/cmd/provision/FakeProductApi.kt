@@ -31,6 +31,10 @@ internal class FakeProductApi : Dispatcher() {
     val federationMembers = mutableListOf<MutableMap<String, Any?>>()
     val emailProviders = mutableMapOf<String?, MutableMap<String, Any?>>()
     val branding = mutableMapOf<String?, MutableMap<String, Any?>>()
+    /** SSO-4042 — the workspace's email template overrides by `<type>:<locale>` (`*` = the base cell); TENANT-WIDE, whatever the env header. */
+    val emailTemplates = mutableMapOf<String, MutableMap<String, Any?>>()
+    /** SSO-4042 — identity's `maxBodyBytes` (64 KiB); a test lowers it to see the `413` surface through the engine. */
+    var emailTemplateMaxBodyBytes = 64 * 1024
     val activeFlow = mutableMapOf<String?, Int>()
     /** SSO-3100 — the stored sign-in method allow-list per environment (absent ⇒ the default policy). */
     val loginMethods = mutableMapOf<String?, List<String>>()
@@ -430,6 +434,56 @@ internal class FakeProductApi : Dispatcher() {
     private val supportedLoginMethods = listOf("password", "magic_link", "magic_code", "passkey", "totp", "sms")
     private var seq = 0
     private val mapper = JsonMapper.builder().addModule(kotlinModule()).build()
+
+    // ── SSO-4042 — email templates, in identity's shape (`EmailTemplateType` + `EmailTemplateService`, behind product-api's facade) ──
+
+    /** identity's `EmailTemplateType.allowedVariables`, written out from oauthy (read 2026-10-28). */
+    private val EMAIL_TEMPLATE_VARIABLES = mapOf(
+        "magic_link" to setOf("magicLinkUrl", "displayName", "expiryMinutes"),
+        "invitation" to setOf("acceptUrl", "inviterName", "orgName", "role", "expiryDays"),
+        "password_reset" to setOf("resetUrl", "displayName", "expiryMinutes"),
+        "security_alert" to setOf("displayName", "clientId", "ipAddress", "userAgent", "timestamp", "action", "secureAccountUrl"),
+        "account_unlock" to setOf("unlockUrl", "displayName", "expiryMinutes"),
+        "email_verification" to setOf("verificationUrl", "displayName", "expiryHours"),
+        "organization_invitation" to setOf("acceptUrl", "inviterName", "orgName", "expiryDays"),
+        "co_admin_invitation" to setOf("acceptUrl", "inviterName", "expiryDays"),
+    )
+    private val TEMPLATE_PLACEHOLDER = Regex("\\{\\{\\s*([A-Za-z][A-Za-z0-9]*)\\s*}}")
+    private val TEMPLATE_LOCALE = Regex("^[a-z]{2,3}$")
+
+    private fun emailTemplate(method: String, type: String, rawLocale: String?, b: Map<String, Any?>): MockResponse {
+        val allowed = EMAIL_TEMPLATE_VARIABLES[type] ?: return problem(400, "unknown_template_type", mapOf("allowedTypes" to EMAIL_TEMPLATE_VARIABLES.keys.toList()))
+        val trimmed = rawLocale?.trim()
+        val locale = if (trimmed.isNullOrEmpty() || trimmed == "*") "*" else trimmed.lowercase().also { if (!TEMPLATE_LOCALE.matches(it)) return problem(400, "invalid_template_locale") }
+        val key = "$type:$locale"
+        fun view(rec: Map<String, Any?>) = mapOf("templateType" to type, "locale" to locale, "subject" to rec["subject"], "bodyHtml" to rec["bodyHtml"], "allowedVariables" to allowed.sorted(), "updatedAt" to "2026-10-28T00:00:00")
+        return when (method) {
+            "GET" -> emailTemplates[key]?.let { json(200, view(it)) } ?: problem(404, "template_not_customized", mapOf("allowedVariables" to allowed.sorted()))
+            "PUT" -> {
+                val subject = b["subject"]?.toString() ?: ""
+                val body = b["bodyHtml"]?.toString() ?: ""
+                if (subject.isBlank()) return problem(400, "template_subject_blank")
+                if (body.isBlank()) return problem(400, "template_body_blank")
+                if (subject.length > 998) return problem(413, "template_subject_too_large")
+                if (body.toByteArray(Charsets.UTF_8).size > emailTemplateMaxBodyBytes) return problem(413, "template_body_too_large")
+                val referenced = (TEMPLATE_PLACEHOLDER.findAll(subject) + TEMPLATE_PLACEHOLDER.findAll(body)).map { it.groupValues[1] }.toSet()
+                val unknown = referenced - allowed
+                if (unknown.isNotEmpty()) {
+                    return json(400, mapOf("type" to "about:blank", "status" to 400, "title" to "unknown_template_variable", "errorCode" to "unknown_template_variable",
+                        "detail" to "The template references ${unknown.size} variable(s) that are not allowed for the '$type' template type. Allowed variables are: ${allowed.sorted().joinToString(", ")}.",
+                        "allowedVariables" to allowed.sorted(), "unknownVariables" to unknown.sorted()))
+                }
+                emailTemplates[key] = mutableMapOf("subject" to subject, "bodyHtml" to body)
+                json(200, view(emailTemplates.getValue(key)))
+            }
+            "DELETE" -> {
+                val reset = emailTemplates.remove(key)
+                val remaining = emailTemplates.keys.filter { it.startsWith("$type:") }.map { it.substringAfter(':') }.sorted()
+                json(200, mapOf("templateType" to type, "allLocales" to false, "resetLocales" to listOfNotNull(locale.takeIf { reset != null }), "remainingLocales" to remaining))
+            }
+            else -> problem(405, "method")
+        }
+    }
 
     fun writesTo(pathPrefix: String) = writes.filter { it.path.startsWith(pathPrefix) }
 
@@ -1013,6 +1067,8 @@ internal class FakeProductApi : Dispatcher() {
                 json(200, p)
             }
             route == "/api/v1/email-provider" && method == "DELETE" -> { emailProviders.remove(env); MockResponse().setResponseCode(204) }
+            // ── SSO-4042 — email templates (tenant-wide; the env header is irrelevant, as product-api forwards none) ──
+            seg[0] == "login-experience" && seg.getOrNull(1) == "email-templates" && seg.size == 3 -> emailTemplate(method, seg[2], query(path)["locale"], b)
             // ── branding (singleton per env) ──
             route == "/api/v1/login-experience/branding" && method == "GET" -> {
                 val stored = branding[env] ?: emptyMap()

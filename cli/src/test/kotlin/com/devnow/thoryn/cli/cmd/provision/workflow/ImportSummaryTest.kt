@@ -67,7 +67,7 @@ class ImportSummaryTest {
         @Suppress("UNCHECKED_CAST") val files = doc["files"] as List<Map<String, Any?>>
         assertThat(files.map { it["path"] }).containsExactly(prodFile, sbxFile)
         val f = files.first()
-        assertThat(f.keys).containsExactly("path", "connection", "apiVersion", "bytes", "sha256", "imported", "notImported", "plan")
+        assertThat(f.keys).containsExactly("path", "connection", "apiVersion", "bytes", "sha256", "bodyFiles", "imported", "notImported", "plan")
         assertThat(f["apiVersion"]).isEqualTo("thoryn.io/tenant/v1")
         val expectedSha = MessageDigest.getInstance("SHA-256").digest(tenantYaml.toByteArray()).joinToString("") { "%02x".format(it) }
         assertThat(f["sha256"]).isEqualTo(expectedSha)
@@ -112,6 +112,27 @@ class ImportSummaryTest {
 
         File(artifact(), sbxFile).delete()
         assertThatThrownBy { build() }.isInstanceOf(ImportSummaryException::class.java).hasMessageContaining("$sbxFile is configured but was not imported")
+    }
+
+    @Test
+    fun `a body file a configured copy references is accepted, listed under bodyFiles and resolved when the copy is loaded — an unreferenced one is still refused`() {
+        // SSO-4042 — an emailTemplate's `bodyFile` lives beside its provisioning file, so the artifact carries it (and the App commits it).
+        jobOutputs()
+        File(artifact(), prodFile).writeText(
+            tenantYaml + "  - { kind: emailTemplate, name: welcome, spec: { type: magic_link, subject: \"Sign in\", bodyFile: emails/magic_link.html } }\n",
+        )
+        File(artifact(), ".thoryn/environments/production/emails/magic_link.html").apply { parentFile.mkdirs() }.writeText("<p><a href=\"{{magicLinkUrl}}\">Sign in</a></p>\n")
+        @Suppress("UNCHECKED_CAST") val files = build()["files"] as List<Map<String, Any?>>
+        assertThat(files.first { it["path"] == prodFile }["bodyFiles"]).isEqualTo(listOf("emails/magic_link.html"))
+        assertThat(files.first { it["path"] == sbxFile }["bodyFiles"]).isEqualTo(emptyList<String>())
+
+        File(artifact(), ".thoryn/environments/production/emails/stray.html").writeText("<p/>")
+        assertThatThrownBy { build() }.isInstanceOf(ImportSummaryException::class.java).hasMessageContaining("emails/stray.html").hasMessageContaining("not a configured provisioning file nor a body file one references")
+        File(artifact(), ".thoryn/environments/production/emails/stray.html").delete()
+
+        // Without the body file the copy does not load, and the summary says so instead of summarising a file that cannot plan.
+        File(artifact(), ".thoryn/environments/production/emails/magic_link.html").delete()
+        assertThatThrownBy { build() }.isInstanceOf(ImportSummaryException::class.java).hasMessageContaining("$prodFile does not load after the import").hasMessageContaining("emails/magic_link.html")
     }
 
     @Test

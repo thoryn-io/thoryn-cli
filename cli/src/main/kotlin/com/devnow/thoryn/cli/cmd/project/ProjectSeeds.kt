@@ -143,7 +143,8 @@ internal object ProjectSeeds {
         |#
         |# TENANT provisioning (SSO-3962, oauthy ADR 2026-10-25): the config project is the ONE place that defines what the tenant
         |# IS — its environments, identity sources (federationMember), users, sign-in (loginMethods, loginFlow, loginTheme),
-        |# email provider, custom domain, roles, and the workload identity trusts of the workspace's APP projects (one
+        |# email provider, email templates (emailTemplate — one per type and locale, workspace-wide today), custom domain,
+        |# roles, and the workload identity trusts of the workspace's APP projects (one
         |# `kind: workloadIdentityTrust` per app repository: a repository never declares its own authority). Applications are
         |# USERS of the tenant: each app project declares its own OAuth client in its own thoryn.io/application/v1 file,
         |# production client included (created under a creation slot a workspace admin approves) — never here.
@@ -316,7 +317,8 @@ internal object ProjectSeeds {
         |  # (the production section declares it), so plan reads it and apply never writes it, and this connection needs no
         |  # tenant:environments.write (SSO-3971; the Thoryn GitHub App's seed does the same). Add the sandbox's
         |  # configuration below, each with `environment: ${resourceName(sandboxSlug, "sandbox")}`: loginMethods, federationMember,
-        |  # emailProvider, loginTheme, loginFlow, role; `kind: user` for the sandbox's TEST USERS (an app project references
+        |  # emailProvider, loginTheme, loginFlow, role (an emailTemplate is workspace-wide and takes no environment — SSO-4043);
+        |  # `kind: user` for the sandbox's TEST USERS (an app project references
         |  # one by email in its test configuration, it never creates one); and `kind: workloadIdentityTrust` for each app
         |  # project's CI identity (its scopes: tenant:applications.read tenant:applications.write tenant:access.read — plus
         |  # tenant:environments.read for a sandbox client — and nothing wider).

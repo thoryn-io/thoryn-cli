@@ -29,6 +29,7 @@ package com.devnow.thoryn.provision
  * | `loginTheme` | `tenant:idp.read` | `tenant:idp.write` | `LoginExperienceController` (`/branding`) |
  * | `loginFlow` | `tenant:idp.read` | `tenant:idp.write` | `LoginFlowController` |
  * | `loginMethods` | `tenant:idp.read` | `tenant:idp.write` | `LoginMethodPolicyController` |
+ * | `emailTemplate` (SSO-4042) | `tenant:idp.read` | `tenant:idp.write` (PUT, DELETE) | `LoginExperienceController` (`/email-templates/{type}`) |
  * | `customDomain` | `tenant:domains.read` | `tenant:domains.write` | `CustomDomainController` |
  * | `workloadIdentityTrust` | `tenant:workload-identity.read` | `tenant:workload-identity.write` (create, delete, plan profile) | `WorkloadIdentityTrustController` |
  * | `role` (SSO-3941) | `tenant:roles.read` (roles, their permissions, the workspace permissions) | `tenant:roles.write` (create, description, permission set, a missing permission, delete) | `RolesController`, `PermissionsController` |
@@ -114,6 +115,7 @@ object ScopeRequirements {
         ProvisionFile.KIND_LOGIN_THEME to "idp",
         ProvisionFile.KIND_LOGIN_FLOW to "idp",
         ProvisionFile.KIND_LOGIN_METHODS to "idp",
+        ProvisionFile.KIND_EMAIL_TEMPLATE to "idp",
         ProvisionFile.KIND_CUSTOM_DOMAIN to "domains",
         ProvisionFile.KIND_WORKLOAD_IDENTITY_TRUST to "workload-identity",
         ProvisionFile.KIND_ROLE to "roles",
