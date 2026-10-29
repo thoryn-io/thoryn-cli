@@ -258,7 +258,9 @@ with them, whose plan is all `noop`.
   (below). It never runs `provision apply` / `destroy`. It uploads **`thoryn-import`** (`actions/upload-artifact` pinned
   to a commit, `include-hidden-files: true` — the files live under `.thoryn/` — `if-no-files-found: error`,
   `retention-days: 7`, only on success), and on failure the same fix request as the plan job.
-- **The artifact** — exactly each configured file at its repository path, plus `import-summary.json` at the root:
+- **The artifact** — exactly each configured file at its repository path, **plus the body files a configured file
+  references** (SSO-4042: an `emailTemplate`'s `spec.bodyFile`, relative to its file — staged from the checkout for a
+  committed template, written by the import for a live one), plus `import-summary.json` at the root:
 
   ```json
   {
@@ -271,6 +273,7 @@ with them, whose plan is all `noop`.
       "apiVersion": "thoryn.io/tenant/v1",
       "bytes": 812,
       "sha256": "<hex of the file in the artifact>",
+      "bodyFiles": ["emails/magic_link.html"],
       "imported": [{ "kind": "emailProvider", "name": "emailProvider", "environment": null, "readOnly": true, "note": "<why>" }],
       "notImported": ["user — 1 production-plane user(s) not imported: …"],
       "plan": { "exit": 0, "counts": { "create": 0, "update": 0, "remove": 0, "noop": 4, "…": 0 }, "allNoop": true, "notNoop": [] }
@@ -282,8 +285,9 @@ with them, whose plan is all `noop`.
   The summary is a fixed field list (`ImportSummary`): no `spec`, no id, no value of the configuration; the files are what
   the CLI renders, a fixed field list per kind, and the API returns no secret. Bounds: 1 MiB per file, 1 MiB for the
   summary, 8 MiB for the artifact. The step refuses (exit 4, nothing uploaded) a stray file or symbolic link in the
-  artifact directory, a configured file missing from it or not loading, a bound exceeded, a preview that did not run,
-  and a `head_sha` that is not a commit — the shape the App validates on download (§13.4), refused here first.
+  artifact directory (a file is not stray when a configured file names it as `bodyFile`; `bodyFiles` lists them, paths
+  only), a configured file missing from it or not loading, a bound exceeded, a preview that did not run, and a
+  `head_sha` that is not a commit — the shape the App validates on download (§13.4), refused here first.
 - **§4** — unchanged. The import job holds `contents: read` and pushes nothing (`reusable.no-write-back` covers it); the
   App commits the files to its own branch.
 - **What `provision import` does for this** (SSO-3990): renders only the target file's part, is scope-aware against the

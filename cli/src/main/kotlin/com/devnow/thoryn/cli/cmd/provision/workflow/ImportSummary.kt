@@ -65,7 +65,8 @@ object ImportSummary {
         paths.groupBy { normalize(it) }.filterValues { it.size > 1 }.keys.firstOrNull()?.let {
             throw ImportSummaryException("$it is configured more than once in ${config.source ?: WorkflowConfig.DEFAULT_PATH}; the import gives each file one home")
         }
-        checkArtifactShape(artifact, paths.map { normalize(it) }.toSet())
+        val configured = paths.map { normalize(it) }.toSet()
+        checkArtifactShape(artifact, configured, referencedBodyFiles(artifact, configured))
         val files = config.files.mapIndexed { i, entry -> fileSummary(entry, i, artifact, work) }
         return linkedMapOf(
             "version" to VERSION,
@@ -109,15 +110,31 @@ object ImportSummary {
 
     private const val IMPORT = ProvisioningWorkflowContract.IMPORT_ARTIFACT
 
-    /** Exactly the configured files, as regular files — nothing else, no link, no leftover summary. */
-    private fun checkArtifactShape(artifact: File, configured: Set<String>) {
+    /**
+     * SSO-4042 — the body files (`emailTemplate` `spec.bodyFile`) each configured copy in [artifact] names, as artifact-relative
+     * paths: the one kind of file an artifact may hold besides the configured files. A copy that does not load contributes
+     * none (and [fileSummary] refuses it with the reason).
+     */
+    private fun referencedBodyFiles(artifact: File, configured: Set<String>): Set<String> = configured.flatMap { path ->
+        val copy = File(artifact, path)
+        val loaded = try { if (copy.isFile) ProvisionFile.load(copy) else null } catch (ex: ProvisionException) { null } ?: return@flatMap emptyList()
+        val dir = File(path).parentFile?.path ?: ""
+        loaded.resources.filter { it.kind == ProvisionFile.KIND_EMAIL_TEMPLATE }
+            .mapNotNull { it.spec["bodyFile"]?.toString()?.trim()?.takeIf { p -> p.isNotEmpty() } }
+            .map { normalize(if (dir.isEmpty()) it else "$dir/$it") }
+    }.toSet()
+
+    /** Exactly the configured files and the body files they reference, as regular files — nothing else, no link, no leftover summary. */
+    private fun checkArtifactShape(artifact: File, configured: Set<String>, referenced: Set<String>) {
         if (!artifact.isDirectory) throw ImportSummaryException("the artifact directory ${artifact.path} does not exist")
         val root = artifact.toPath()
         Files.walk(root).use { stream ->
             stream.filter { it != root }.forEach { p ->
                 val rel = root.relativize(p).toString().replace(File.separatorChar, '/')
                 if (Files.isSymbolicLink(p)) throw ImportSummaryException("$rel in the artifact directory is a symbolic link; the artifact holds only the imported files")
-                if (Files.isRegularFile(p) && rel !in configured) throw ImportSummaryException("$rel in the artifact directory is not a configured provisioning file; the artifact holds only those and ${ProvisioningWorkflowContract.IMPORT_SUMMARY_FILE}")
+                if (Files.isRegularFile(p) && rel !in configured && rel !in referenced) {
+                    throw ImportSummaryException("$rel in the artifact directory is not a configured provisioning file nor a body file one references; the artifact holds only those and ${ProvisioningWorkflowContract.IMPORT_SUMMARY_FILE}")
+                }
             }
         }
         configured.forEach { if (!File(artifact, it).isFile) throw ImportSummaryException("$it is configured but was not imported into the artifact directory") }
@@ -128,11 +145,15 @@ object ImportSummary {
         val copy = File(artifact, path)
         val bytes = copy.readBytes()
         if (bytes.size > MAX_FILE_BYTES) throw ImportSummaryException("$path is ${bytes.size} bytes after the import, over the $MAX_FILE_BYTES-byte bound")
+        // SSO-4042 — LOADED from the copy, not parsed from its bytes: a `bodyFile` resolves against the copy's directory.
         val loaded = try {
-            ProvisionFile.parse(bytes, path, yaml = !path.endsWith(".json", ignoreCase = true))
+            ProvisionFile.load(copy)
         } catch (ex: ProvisionException) {
-            throw ImportSummaryException("$path does not load after the import: ${ex.message?.lineSequence()?.first()}")
+            // Every line of the loader's message (the reasons follow the first line, one per line), as one line.
+            throw ImportSummaryException("$path does not load after the import: ${ex.message?.lineSequence()?.map { it.trim() }?.filter { it.isNotEmpty() }?.joinToString(" ")}")
         }
+        val bodyFiles = loaded.resources.filter { it.kind == ProvisionFile.KIND_EMAIL_TEMPLATE }
+            .mapNotNull { it.spec["bodyFile"]?.toString()?.trim()?.takeIf { p -> p.isNotEmpty() } }.distinct().sorted()
         val imported = readJson(importJson(work, index), "the import of $path")
         val plan = readJson(planJson(work, index), "the plan preview of $path")
         if (plan["summary"]?.isObject != true) throw ImportSummaryException("the plan preview of $path did not run (exit ${planExitOf(work, index) ?: "unknown"}); its output is not a plan — see the job log")
@@ -142,6 +163,8 @@ object ImportSummary {
             "apiVersion" to loaded.part.apiVersion,
             "bytes" to bytes.size,
             "sha256" to sha256(bytes),
+            // SSO-4042 — the body files this file references, relative to it: the App commits them beside the file. Paths only.
+            "bodyFiles" to bodyFiles,
             "imported" to (imported["resources"]?.takeIf { it.isArray }?.toList()?.map { r -> entryOf(r) } ?: emptyList<Map<String, Any?>>()),
             "notImported" to (imported["skipped"]?.takeIf { it.isArray }?.toList()?.mapNotNull { it.takeIf { n -> n.isString }?.asString() } ?: emptyList()),
             "plan" to planPreview(plan, planExitOf(work, index)),

@@ -153,6 +153,54 @@ class WorkflowImportJobDryRunTest : CommandTestBase() {
     }
 
     @Test
+    fun `a committed bodyFile is staged beside the copy, a stored template is imported as a file, and the artifact carries the configured file plus the bodies it references`() {
+        // SSO-4042 — the committed file already declares one template with its body as a file; the platform holds a second one.
+        seedWorkspace()
+        api.emailTemplates["magic_link:*"] = mutableMapOf("subject" to "Sign in", "bodyHtml" to "<p><a href=\"{{magicLinkUrl}}\">Sign in</a></p>\n")
+        api.emailTemplates["password_reset:*"] = mutableMapOf("subject" to "Reset", "bodyHtml" to "<p><a href=\"{{resetUrl}}\">Reset</a></p>\n")
+        val root = repository()
+        val emails = ".thoryn/environments/production/emails"
+        File(root, "$emails/magic_link.html").apply { parentFile.mkdirs() }.writeText("<p><a href=\"{{magicLinkUrl}}\">Sign in</a></p>\n")
+        val withTemplate = committed + "  - { kind: emailTemplate, name: welcome, spec: { type: magic_link, subject: \"Sign in\", bodyFile: emails/magic_link.html } }\n"
+        File(root, file).writeText(withTemplate)
+        val config = File(root, ".thoryn/workflow.yaml")
+        val out = File(tempHome.toFile(), "runner-temp/thoryn-import")
+        val work = File(tempHome.toFile(), "runner-temp/thoryn-import-work").also { it.mkdirs() }
+        planSession()
+
+        // cp "$file" "$out/$file" — the job copies the configured file alone; the CLI stages the body files it names.
+        val copy = File(out, file).also { it.parentFile.mkdirs(); File(root, file).copyTo(it) }
+        val imported = runCli("provision", "import", "--for-workflow", file, "--root", root.path, "--config", config.path, "--file", copy.path, "--write", "--output", "json", "--gateway", baseUrl())
+        assertThat(imported.exit).withFailMessage(imported.err).isEqualTo(0)
+        ImportSummary.importJson(work, 0).writeText(imported.out)
+        val plan = runCli("provision", "plan", "--file", copy.path, "--output", "json", "--gateway", baseUrl())
+        ImportSummary.planJson(work, 0).writeText(plan.out)
+        ImportSummary.planExit(work, 0).writeText("${plan.exit}\n")
+        val summary = runCli("provision", "workflow", "import-summary", "--artifact", out.path, "--work", work.path, "--head-sha", sha, "--config", config.path, "--root", root.path)
+        assertThat(summary.exit).withFailMessage(summary.err).isEqualTo(CommandSupport.EXIT_OK)
+
+        // The checkout is untouched; the artifact holds the configured file, the staged body, the imported body and the summary.
+        assertThat(File(root, file).readText()).isEqualTo(withTemplate)
+        assertThat(File(root, emails).listFiles()!!.map { it.name }).containsExactly("magic_link.html")
+        assertThat(out.walkTopDown().filter { it.isFile }.map { it.relativeTo(out).path }.toList())
+            .containsExactlyInAnyOrder(file, "$emails/magic_link.html", "$emails/password_reset.html", ProvisioningWorkflowContract.IMPORT_SUMMARY_FILE)
+        assertThat(File(out, "$emails/password_reset.html").readText()).isEqualTo("<p><a href=\"{{resetUrl}}\">Reset</a></p>\n")
+        assertThat(File(copy.path).readText()).contains("bodyFile: emails/password_reset.html").doesNotContain("<p>")
+
+        @Suppress("UNCHECKED_CAST")
+        val doc = YAMLMapper.builder().build().readValue(File(out, ProvisioningWorkflowContract.IMPORT_SUMMARY_FILE), Map::class.java) as Map<String, Any?>
+        @Suppress("UNCHECKED_CAST") val f = (doc["files"] as List<Map<String, Any?>>).single()
+        assertThat(f["bodyFiles"]).isEqualTo(listOf("emails/magic_link.html", "emails/password_reset.html"))
+        @Suppress("UNCHECKED_CAST") val entries = (f["imported"] as List<Map<String, Any?>>).associateBy { "${it["kind"]}/${it["name"]}" }
+        // The plan profile holds tenant:idp.read only: the template is imported as a read-only reference, naming the write scope.
+        assertThat(entries.getValue("emailTemplate/password-reset")["readOnly"]).isEqualTo(true)
+        assertThat(entries.getValue("emailTemplate/password-reset")["note"] as String).contains("tenant:idp.write")
+        @Suppress("UNCHECKED_CAST") val preview = f["plan"] as Map<String, Any?>
+        assertThat(preview["allNoop"]).withFailMessage("plan preview: %s\n%s", preview, plan.err).isEqualTo(true)
+        assertThat(api.provisioningWrites).isEmpty()
+    }
+
+    @Test
     fun `the job runs these same commands with these same flags`() {
         val text = CiIdentityFixture.locate(ProvisioningWorkflowContract.REUSABLE_WORKFLOW_PATH).readText()
         val job = text.substring(text.indexOf("\n  import:\n"))

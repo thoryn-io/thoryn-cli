@@ -293,6 +293,17 @@ class ProvisionFile private constructor(
          */
         const val KIND_CUSTOM_DOMAIN = "customDomain"
         /**
+         * SSO-4042 — ONE transactional email template override of the workspace, per (type, locale):
+         * `/api/v1/login-experience/email-templates/{type}?locale=` (product-api `LoginExperienceController`, identity-service
+         * `EmailTemplateService`). WORKSPACE-level: identity stores templates tenant-wide today — there is no environment column
+         * (SSO-4043 re-keys them per environment) — so `environment` is refused. Converged by (`spec.type`, `spec.locale`): a GET
+         * that answers `404 template_not_customized` is a create, a stored cell is diffed on `subject` and the body (line endings
+         * and trailing whitespace normalised), `apply` PUTs `{ subject, bodyHtml }`, a removal is the `DELETE` (back to the
+         * built-in default). The body is `spec.body` inline or `spec.bodyFile`, a path relative to the provisioning file read when
+         * the file is loaded ([parse] with its directory). See [ProvisionEngine].
+         */
+        const val KIND_EMAIL_TEMPLATE = "emailTemplate"
+        /**
          * SSO-3689 (ADR 2026-10-14 credential ladder, rungs 1–3) — a workload-identity TRUST of the resource's
          * environment (`/api/v1/workload-identity/trusts`): the platform identity a CI job or a pod presents
          * instead of a stored secret, by `provider` with that provider's immutable pins. Converged by `name`;
@@ -316,7 +327,7 @@ class ProvisionFile private constructor(
          */
         val TENANT_KINDS: Set<String> = setOf(
             KIND_ENVIRONMENT, KIND_FEDERATION_MEMBER, KIND_USER, KIND_LOGIN_METHODS, KIND_LOGIN_FLOW, KIND_LOGIN_THEME,
-            KIND_EMAIL_PROVIDER, KIND_CUSTOM_DOMAIN, KIND_ROLE, KIND_WORKLOAD_IDENTITY_TRUST,
+            KIND_EMAIL_PROVIDER, KIND_CUSTOM_DOMAIN, KIND_ROLE, KIND_WORKLOAD_IDENTITY_TRUST, KIND_EMAIL_TEMPLATE,
         )
 
         /**
@@ -335,8 +346,40 @@ class ProvisionFile private constructor(
          */
         val SINGLETON_KINDS: Set<String> = setOf(KIND_EMAIL_PROVIDER, KIND_LOGIN_THEME, KIND_LOGIN_FLOW, KIND_LOGIN_METHODS, KIND_CUSTOM_DOMAIN)
 
-        /** SSO-3413 — kinds that live on the WORKSPACE, not in an environment: `environment` is refused on them. */
-        val WORKSPACE_KINDS: Set<String> = setOf(KIND_CUSTOM_DOMAIN)
+        /**
+         * SSO-3413 — kinds that live on the WORKSPACE, not in an environment: `environment` is refused on them. SSO-4042 — an
+         * `emailTemplate` is one today because identity stores templates tenant-wide (SSO-4043 moves it to the environment axis).
+         */
+        val WORKSPACE_KINDS: Set<String> = setOf(KIND_CUSTOM_DOMAIN, KIND_EMAIL_TEMPLATE)
+
+        // ── SSO-4042 — `emailTemplate`: identity-service's `EmailTemplateType` / `EmailTemplateService` rules, mirrored ──
+
+        /** `spec.type`: identity's `EmailTemplateType.wireValue`s (oauthy, read 2026-10-28). Must equal the schema's `type` enum. */
+        val EMAIL_TEMPLATE_TYPES: List<String> = listOf(
+            "magic_link", "invitation", "password_reset", "security_alert", "account_unlock", "email_verification", "organization_invitation", "co_admin_invitation",
+        )
+
+        /** The `spec` members an `emailTemplate` accepts (the schema's `additionalProperties: false`). */
+        val EMAIL_TEMPLATE_SPEC_KEYS: Set<String> = setOf("type", "locale", "subject", "body", "bodyFile")
+
+        /**
+         * `spec.locale`: the API's storage grammar — a 2–3 letter ISO 639 language code (`en`, `nl`; case-insensitive, stored
+         * lower-case). Omitted ⇒ the BASE, locale-independent template (`*` on the wire). A region subtag (`en-GB`) is refused
+         * by product-api (`400 invalid_template_locale`), so it is refused here. Must equal the schema's `locale` pattern.
+         */
+        val EMAIL_TEMPLATE_LOCALE_PATTERN = Regex("^[A-Za-z]{2,3}$")
+
+        /** The base, locale-independent template as the API renders its locale. */
+        const val EMAIL_TEMPLATE_BASE_LOCALE = "*"
+
+        /** `spec.subject`: at most this many characters (identity's `EmailTemplateProperties.maxSubjectChars`; `413 template_subject_too_large`). */
+        const val EMAIL_TEMPLATE_MAX_SUBJECT_CHARS = 998
+
+        /** The body: at most this many UTF-8 bytes (identity's `maxBodyBytes`, 64 KiB; `413 template_body_too_large`). */
+        const val EMAIL_TEMPLATE_MAX_BODY_BYTES = 64 * 1024
+
+        const val ERR_EMAIL_TEMPLATE_BODY_REQUIRED = "email_template_body_required"
+        const val ERR_EMAIL_TEMPLATE_BODY_AMBIGUOUS = "email_template_body_ambiguous"
 
         /** SSO-3413 — the `spec` members a `customDomain` accepts (the schema's `additionalProperties: false`). */
         val CUSTOM_DOMAIN_SPEC_KEYS: Set<String> = setOf("host", "acceptReSignIn")
@@ -396,6 +439,8 @@ class ProvisionFile private constructor(
             KIND_LOGIN_THEME to emptySet(),
             KIND_LOGIN_METHODS to setOf("methods"),
             KIND_CUSTOM_DOMAIN to setOf("host"),
+            // SSO-4042 — and exactly one of `body` / `bodyFile`, checked by [validateEmailTemplate].
+            KIND_EMAIL_TEMPLATE to setOf("type", "subject"),
             KIND_WORKLOAD_IDENTITY_TRUST to setOf("provider", "scopes"),
             // `permissions` is required too, but `[]` (a role that grants nothing) is legal — checked by [validateRole].
             KIND_ROLE to emptySet(),
@@ -754,7 +799,7 @@ class ProvisionFile private constructor(
                 throw ProvisionException("could not read provisioning file '${file.path}': ${e.message}")
             }
             val yaml = !file.name.endsWith(".json", ignoreCase = true)
-            return parse(bytes, file.path, yaml, env)
+            return parse(bytes, file.path, yaml, env, baseDir = file.absoluteFile.parentFile)
         }
 
         /**
@@ -766,12 +811,17 @@ class ProvisionFile private constructor(
          * not a write-only secret, so an unset or empty variable fails closed for plan and apply alike —
          * never a silent fallback to the production plane. [env] `null` leaves `environment` as written (a
          * bundled recipe resolves its own params later); `thoryn provision` ([load]) reads the process env.
+         *
+         * SSO-4042 — an `emailTemplate`'s `spec.bodyFile` is resolved against [baseDir] (the provisioning file's own directory,
+         * as [load] passes it), read here and checked against the body caps; the resource then carries the HTML as `spec.body`
+         * (and keeps `bodyFile` so a plan can name the file). A file parsed from bytes with no [baseDir] cannot declare one.
          */
         fun parse(
             bytes: ByteArray,
             source: String = "<provision>",
             yaml: Boolean = true,
             env: ((String) -> String?)? = null,
+            baseDir: File? = null,
         ): ProvisionFile {
             val root = try {
                 if (yaml) yamlMapper.readTree(bytes) else jsonMapper.readTree(bytes)
@@ -786,7 +836,8 @@ class ProvisionFile private constructor(
             val resources = root["resources"].toList().mapIndexed { i, r ->
                 val kind = r["kind"].asString()
                 @Suppress("UNCHECKED_CAST")
-                val spec = jsonMapper.convertValue(r["spec"], Map::class.java) as Map<String, Any?>
+                val declaredSpec = jsonMapper.convertValue(r["spec"], Map::class.java) as Map<String, Any?>
+                val spec = if (kind == KIND_EMAIL_TEMPLATE) readEmailTemplateBody(declaredSpec, baseDir, "resources[$i]", unresolved) else declaredSpec
                 ProvisionResource(
                     kind = kind,
                     name = r["name"]?.takeIf { !it.isNull }?.asString()?.takeIf { it.isNotBlank() } ?: kind,
@@ -817,6 +868,42 @@ class ProvisionFile private constructor(
             }
             val part = ProvisionPart.of(root["apiVersion"].asString()) ?: ProvisionPart.MIXED
             return ProvisionFile(source = source, digest = sha256(bytes), resources = resources, part = part, warnings = warnings(part, resources))
+        }
+
+        /**
+         * SSO-4042 — resolve `spec.bodyFile` into `spec.body`: the path is relative to [baseDir] and must stay inside it (the
+         * grammar check in [validateEmailTemplate] refused `..` and absolute paths; this is the resolved-path check), the file
+         * must exist and read as UTF-8, and its content is held to the same caps as an inline body. Problems land on [problems]
+         * (the file fails to load — a template whose body cannot be read must never plan as "create with an empty body").
+         */
+        private fun readEmailTemplateBody(spec: Map<String, Any?>, baseDir: File?, where: String, problems: MutableList<String>): Map<String, Any?> {
+            val path = spec["bodyFile"]?.toString()?.trim()?.takeIf { it.isNotEmpty() } ?: return spec
+            if (baseDir == null) {
+                problems += "$where (emailTemplate) spec.bodyFile '$path' cannot be resolved: this provisioning document was not read from a file, so there is no directory to resolve it against — use spec.body"
+                return spec
+            }
+            val root = baseDir.absoluteFile.normalize()
+            val file = File(root, path).absoluteFile.normalize()
+            if (!file.path.startsWith(root.path + File.separator)) {
+                problems += "$where (emailTemplate) spec.bodyFile '$path' resolves outside the provisioning file's directory"
+                return spec
+            }
+            if (!file.isFile) {
+                problems += "$where (emailTemplate) spec.bodyFile '$path' not found (${file.path})"
+                return spec
+            }
+            val html = try {
+                file.readText(Charsets.UTF_8)
+            } catch (e: Exception) {
+                problems += "$where (emailTemplate) spec.bodyFile '$path' could not be read: ${e.message}"
+                return spec
+            }
+            val bytes = html.toByteArray(Charsets.UTF_8).size
+            when {
+                html.isBlank() -> problems += "$where (emailTemplate) spec.bodyFile '$path' is blank"
+                bytes > EMAIL_TEMPLATE_MAX_BODY_BYTES -> problems += "$where (emailTemplate) spec.bodyFile '$path' is $bytes bytes, over the $EMAIL_TEMPLATE_MAX_BODY_BYTES-byte limit"
+            }
+            return spec + ("body" to html)
         }
 
         // ── SSO-3962 — what is accepted today and refused in a later release ──
@@ -947,7 +1034,10 @@ class ProvisionFile private constructor(
                 r["environment"]?.takeIf { !it.isNull }?.let { env ->
                     if (env.asString().isBlank()) v += "$where environment must be non-empty when present"
                     if (kind == KIND_ENVIRONMENT) v += "$where an environment resource cannot itself carry 'environment'"
-                    if (kind in WORKSPACE_KINDS) v += "$where a $kind belongs to the workspace, not an environment — remove 'environment'"
+                    if (kind in WORKSPACE_KINDS) {
+                        v += "$where a $kind belongs to the workspace, not an environment — remove 'environment'" +
+                            if (kind == KIND_EMAIL_TEMPLATE) " (email templates are stored tenant-wide today, one set for every environment; per-environment templates are SSO-4043)" else ""
+                    }
                 }
                 val spec = r["spec"]
                 if (spec == null || !spec.isObject()) {
@@ -996,6 +1086,9 @@ class ProvisionFile private constructor(
                     spec["host"]?.takeIf { !it.isNull && !it.isTextual() }?.let { v += "$where (customDomain) spec.host must be a host name" }
                     spec["acceptReSignIn"]?.takeIf { !it.isNull && !it.isBoolean() }?.let { v += "$where (customDomain) spec.acceptReSignIn must be true or false" }
                 }
+                // SSO-4042 — `emailTemplate`: the closed record, the type enum, the locale grammar, exactly one body source, the caps.
+                if (kind == KIND_EMAIL_TEMPLATE) validateEmailTemplate(spec, r, where, v)
+
                 // SSO-4041 — `loginTheme`: the closed record and identity's value grammar, checked before any call.
                 if (kind == KIND_LOGIN_THEME) validateLoginTheme(spec, where, v)
                 // SSO-3100 — `loginMethods.methods` is the FULL allow-list: a non-empty array of method tokens.
@@ -1019,6 +1112,7 @@ class ProvisionFile private constructor(
             }
             keys.groupBy { it }.filterValues { it.size > 1 }.keys.forEach { v += "duplicate resource '$it' — kind + name must be unique" }
             validateWorkloadPullTrusts(resources.toList(), v)
+            validateEmailTemplateCells(resources.toList(), v)
             return v
         }
 
@@ -1463,6 +1557,64 @@ class ProvisionFile private constructor(
         }
 
         /**
+         * SSO-4042 — an `emailTemplate`: exactly `{ type, locale?, subject, body | bodyFile }` ([EMAIL_TEMPLATE_SPEC_KEYS]); `type` one
+         * of [EMAIL_TEMPLATE_TYPES]; `locale` in the API's grammar ([EMAIL_TEMPLATE_LOCALE_PATTERN]); `subject` non-blank and at most
+         * [EMAIL_TEMPLATE_MAX_SUBJECT_CHARS] characters; EXACTLY ONE of `body` (inline HTML, non-blank, at most
+         * [EMAIL_TEMPLATE_MAX_BODY_BYTES] UTF-8 bytes) and `bodyFile` (a relative path inside the provisioning file's directory —
+         * no absolute path, no `..`; read and checked against the same caps when the file is loaded, see [parse]). It carries no
+         * `grants:` — product-api gates every login-experience call on the production plane's `login_theme` object, so there is
+         * no access object of its own to grant on. The `{{variable}}` allowlist stays the API's (`400 unknown_template_variable`
+         * at apply): it is per type and may grow, and the refusal names the allowed set.
+         */
+        private fun validateEmailTemplate(spec: JsonNode, r: JsonNode, where: String, v: MutableList<String>) {
+            rejectUnknownKeys(spec, EMAIL_TEMPLATE_SPEC_KEYS, "$where spec", v)
+            if (r["grants"]?.takeIf { !it.isNull } != null) {
+                v += "$where an emailTemplate cannot carry 'grants' — it has no access object of its own (product-api gates email templates with the login experience, login_theme:production); grant on the loginTheme instead"
+            }
+            spec["type"]?.takeIf { !it.isNull }?.let { t ->
+                val type = t.takeIf { it.isTextual() }?.asString()?.trim()
+                if (type == null || type !in EMAIL_TEMPLATE_TYPES) v += "$where (emailTemplate) spec.type '${t.asString()}' must be one of ${EMAIL_TEMPLATE_TYPES.joinToString(", ")}"
+            }
+            spec["locale"]?.takeIf { !it.isNull }?.let { l ->
+                val locale = l.takeIf { it.isTextual() }?.asString()?.trim()
+                if (locale == null || !EMAIL_TEMPLATE_LOCALE_PATTERN.matches(locale)) {
+                    v += "$where (emailTemplate) spec.locale '${l.asString()}' must be a 2-3 letter ISO 639 language code (e.g. en, nl) — the API stores no region subtag; omit it for the base template"
+                }
+            }
+            spec["subject"]?.takeIf { !it.isNull }?.let { s ->
+                val subject = s.takeIf { it.isTextual() }?.asString()
+                when {
+                    subject == null -> v += "$where (emailTemplate) spec.subject must be a string"
+                    subject.isBlank() -> v += "$where (emailTemplate) spec.subject must not be blank"
+                    subject.length > EMAIL_TEMPLATE_MAX_SUBJECT_CHARS -> v += "$where (emailTemplate) spec.subject is ${subject.length} characters, over the $EMAIL_TEMPLATE_MAX_SUBJECT_CHARS-character limit"
+                }
+            }
+            val body = spec["body"]?.takeIf { !it.isNull }
+            val bodyFile = spec["bodyFile"]?.takeIf { !it.isNull }
+            when {
+                body == null && bodyFile == null -> v += "$where (emailTemplate) $ERR_EMAIL_TEMPLATE_BODY_REQUIRED — spec.body (inline HTML) or spec.bodyFile (a path relative to this file) is required"
+                body != null && bodyFile != null -> v += "$where (emailTemplate) $ERR_EMAIL_TEMPLATE_BODY_AMBIGUOUS — declare spec.body OR spec.bodyFile, not both"
+            }
+            body?.let { b ->
+                val html = b.takeIf { it.isTextual() }?.asString()
+                when {
+                    html == null -> v += "$where (emailTemplate) spec.body must be a string of HTML"
+                    html.isBlank() -> v += "$where (emailTemplate) spec.body must not be blank"
+                    html.toByteArray(Charsets.UTF_8).size > EMAIL_TEMPLATE_MAX_BODY_BYTES ->
+                        v += "$where (emailTemplate) spec.body is ${html.toByteArray(Charsets.UTF_8).size} bytes, over the $EMAIL_TEMPLATE_MAX_BODY_BYTES-byte limit"
+                }
+            }
+            bodyFile?.let { f ->
+                val path = f.takeIf { it.isTextual() }?.asString()?.trim()
+                when {
+                    path.isNullOrEmpty() -> v += "$where (emailTemplate) spec.bodyFile must be a path relative to the provisioning file"
+                    File(path).isAbsolute || path.startsWith("/") || path.startsWith("\\") -> v += "$where (emailTemplate) spec.bodyFile '$path' must be relative to the provisioning file, not absolute"
+                    path.split('/', '\\').any { it == ".." } -> v += "$where (emailTemplate) spec.bodyFile '$path' must stay inside the provisioning file's directory (no '..')"
+                }
+            }
+        }
+
+        /**
          * SSO-4041 — a `loginTheme`: exactly the record `PUT /api/v1/login-experience/branding` replaces ([LOGIN_THEME_SPEC_KEYS];
          * an unknown key names the record, because the API's lenient binding would DROP it and the PUT would then clear the
          * field the author meant to set), every declared value in identity's own grammar: `logoUrl` an `https://` URL of at most
@@ -1526,6 +1678,20 @@ class ProvisionFile private constructor(
                 }
             }
         }
+
+        /** SSO-4042 — one resource per (type, locale) cell: the API addresses one record by them, so two declarations would fight over it. */
+        private fun validateEmailTemplateCells(resources: List<JsonNode>, v: MutableList<String>) {
+            resources.filter { it.isObject() && it["kind"]?.asString() == KIND_EMAIL_TEMPLATE && it["spec"]?.isObject() == true }
+                .groupBy { r -> emailTemplateCell(r["spec"]["type"]?.takeIf { it.isTextual() }?.asString(), r["spec"]["locale"]?.takeIf { it.isTextual() }?.asString()) }
+                .filterValues { it.size > 1 }
+                .forEach { (cell, dups) -> v += "duplicate emailTemplate for $cell — declared ${dups.size} times (${dups.joinToString(", ") { "'" + (it["name"]?.asString() ?: KIND_EMAIL_TEMPLATE) + "'" }}); one resource per (type, locale)" }
+        }
+
+        /** The (type, locale) a template addresses, as `type <t> locale <l>` — the base locale rendered as [EMAIL_TEMPLATE_BASE_LOCALE]. */
+        fun emailTemplateCell(type: String?, locale: String?): String = "type ${type?.trim() ?: "?"} locale ${emailTemplateLocale(locale)}"
+
+        /** A declared `spec.locale` in its storage form: trimmed, lower-cased; absent / blank / `*` ⇒ [EMAIL_TEMPLATE_BASE_LOCALE]. */
+        fun emailTemplateLocale(locale: Any?): String = locale?.toString()?.trim()?.lowercase()?.takeIf { it.isNotEmpty() && it != EMAIL_TEMPLATE_BASE_LOCALE } ?: EMAIL_TEMPLATE_BASE_LOCALE
 
         /**
          * SSO-3941 — a `role`: exactly `{ permissions, description? }`. `permissions` is required (an empty list is a role that

@@ -585,6 +585,24 @@ class ProductApiClient(
     override fun putLoginBranding(body: Map<String, Any?>): JsonNode =
         put("/api/v1/login-experience/branding", body)
 
+    // ── Email templates (SSO-4042; product-api /api/v1/login-experience/email-templates/{type}) ──
+    // The workspace's transactional email template overrides, one per (type, locale); see [ProvisionApi] for
+    // the wire contract. Tenant-wide today (product-api forwards no environment for this surface; SSO-4043).
+    // `?locale=` is sent only when a locale is given (omitted = the base template `*`). GET → tenant:idp.read;
+    // PUT / DELETE → tenant:idp.write. The DELETE answers a 200 JSON body (the reset's outcome), not 204.
+
+    override fun getEmailTemplate(type: String, locale: String?): JsonNode =
+        get(emailTemplatePath(type, locale))
+
+    override fun putEmailTemplate(type: String, locale: String?, body: Map<String, Any?>): JsonNode =
+        put(emailTemplatePath(type, locale), body)
+
+    override fun deleteEmailTemplate(type: String, locale: String?): JsonNode =
+        delete(emailTemplatePath(type, locale))
+
+    private fun emailTemplatePath(type: String, locale: String?): String =
+        "/api/v1/login-experience/email-templates/${encode(type)}" + (locale?.takeIf { it.isNotBlank() }?.let { "?locale=${encode(it)}" } ?: "")
+
     // ── Login flows (SSO-3065; product-api /api/v1/login-flows, per environment) ──
     // Author + activate the multi-step login journey (which authenticator stages a sign-in walks) for
     // the selected environment. Enables e.g. a `password + REQUIRED passkey` second-factor flow — the

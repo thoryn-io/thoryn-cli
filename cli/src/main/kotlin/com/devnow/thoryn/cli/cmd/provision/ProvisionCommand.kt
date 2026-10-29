@@ -648,6 +648,16 @@ class ProvisionCommand : Callable<Int> {
                 }
             }
             val target = file ?: workflowTarget?.let { File(repoRoot, it.file) } ?: ProvisionFile.resolveDefault() ?: File(ProvisionFile.DEFAULT_DIR, ProvisionFile.DEFAULT_FILES.first())
+            // SSO-4042 — the import job imports into a COPY of the committed file (`--file <copy>`); a `bodyFile` the committed
+            // file names is relative to it, so the copy loads only when those files sit beside it too. Stage them (never
+            // overwriting a different file); the artifact then carries the files a configured file references.
+            workflowTarget?.let { w ->
+                try {
+                    stageBodyFiles(File(repoRoot, w.file), target)
+                } catch (ex: ProvisionException) {
+                    System.err.println("Error: ${ex.message}"); return CommandSupport.EXIT_USAGE
+                }
+            }
             val existing = try {
                 if (target.isFile) ProvisionFile.load(target).also { printWarnings(it) } else null
             } catch (ex: ProvisionException) {
@@ -699,14 +709,20 @@ class ProvisionCommand : Callable<Int> {
                 }
                 result.resources.filter { it.note != null }.forEach { System.err.println("  note ${it.resource.kind} ${it.resource.name}: ${it.note}") }
                 result.skipped.forEach { System.err.println("  skipped $it") }
+                // SSO-4042 — the files the entries refer to (an emailTemplate's body as `bodyFile`), written next to the file.
+                val files = result.resources.flatMap { it.files.entries }.associate { it.key to it.value }
                 if (!write || result.resources.isEmpty()) {
-                    if (!write && result.resources.isNotEmpty()) System.err.println("Printed ${result.resources.size} entry(ies) — nothing was written; re-run with --write to append them to ${target.path}.")
+                    if (!write && result.resources.isNotEmpty()) {
+                        if (files.isNotEmpty()) System.err.println("  ${files.size} file(s) would be written next to ${target.path}: ${files.keys.sorted().joinToString(", ")}")
+                        System.err.println("Printed ${result.resources.size} entry(ies) — nothing was written; re-run with --write to append them to ${target.path}.")
+                    }
                     return CommandSupport.EXIT_OK
                 }
-                appendEntries(target, yaml, existing, if (part == ProvisionPart.MIXED) ProvisionYamlEdit.apiVersionFor(result.resources.map { it.resource.kind }) else part.apiVersion)
+                appendEntries(target, yaml, existing, if (part == ProvisionPart.MIXED) ProvisionYamlEdit.apiVersionFor(result.resources.map { it.resource.kind }) else part.apiVersion, files)
                 val readOnly = result.resources.count { it.resource.readOnly }
                 if (format == OutputFormat.TABLE) {
-                    println("Imported ${result.resources.size} entry(ies) into ${target.path}: ${result.resources.size - readOnly} to converge, $readOnly read-only. Nothing else was written — the platform is the ledger.")
+                    val wrote = if (files.isEmpty()) "Nothing else was written" else "${files.size} file(s) written beside it (${files.keys.sorted().joinToString(", ")}); nothing else was written"
+                    println("Imported ${result.resources.size} entry(ies) into ${target.path}: ${result.resources.size - readOnly} to converge, $readOnly read-only. $wrote — the platform is the ledger.")
                 }
                 CommandSupport.EXIT_OK
             } catch (ex: Exception) {
@@ -727,16 +743,20 @@ class ProvisionCommand : Callable<Int> {
          * through [ProvisionFile] and the original bytes restored when it does not validate, so `--write` can never
          * leave an invalid file behind.
          */
-        private fun appendEntries(target: File, fragment: String, existing: ProvisionFile?, apiVersion: String) {
+        private fun appendEntries(target: File, fragment: String, existing: ProvisionFile?, apiVersion: String, files: Map<String, String> = emptyMap()) {
+            target.absoluteFile.parentFile?.mkdirs()
+            // SSO-4042 — the referenced files first (the re-load below resolves `bodyFile` against the target's directory); a file
+            // that already exists with OTHER content is refused before anything is written — an import never clobbers a body.
+            val written = writeReferencedFiles(target, files)
+            fun undoFiles() = written.forEach { it.delete() }
             if (existing == null) {
-                target.absoluteFile.parentFile?.mkdirs()
                 // SSO-3962 — a fresh file declares the part its entries belong to (both parts ⇒ the mixed format, which warns to
                 // split); SSO-3990 — or the part `--part` named, whose kinds alone the import rendered.
                 target.writeText(ProvisionYamlEdit.fresh(fragment, apiVersion))
                 try {
                     ProvisionFile.load(target)
                 } catch (ex: ProvisionException) {
-                    target.delete()
+                    target.delete(); undoFiles()
                     throw ProvisionException("the imported entries did not validate (${ex.message}); ${target.path} was not written")
                 }
             } else {
@@ -746,10 +766,40 @@ class ProvisionCommand : Callable<Int> {
                 try {
                     ProvisionFile.load(target)
                 } catch (ex: ProvisionException) {
-                    target.writeBytes(original)
+                    target.writeBytes(original); undoFiles()
                     throw ProvisionException("the appended entries did not validate (${ex.message}); ${target.path} was left unchanged")
                 }
             }
+        }
+
+        /**
+         * SSO-4042 — write each `path → content` of [files] relative to [target]'s directory. Returns the files this call CREATED
+         * (an identical existing file is left as it is and not returned; a different one is refused before any write).
+         */
+        private fun writeReferencedFiles(target: File, files: Map<String, String>): List<File> {
+            val dir = target.absoluteFile.parentFile ?: File(".")
+            val resolved = files.mapKeys { (path, _) -> File(dir, path) }
+            resolved.forEach { (f, content) ->
+                if (f.exists() && f.readText(Charsets.UTF_8) != content) {
+                    throw ProvisionException("${f.path} already exists with different content; the import does not overwrite a template body — move it aside or declare that template by hand")
+                }
+            }
+            return resolved.mapNotNull { (f, content) ->
+                if (f.exists()) null else { f.parentFile?.mkdirs(); f.writeText(content, Charsets.UTF_8); f }
+            }
+        }
+
+        /**
+         * SSO-4042 — `--for-workflow` with `--file <copy>`: the files the COMMITTED file names as `bodyFile` are copied beside the
+         * copy (same relative paths) so the copy loads, plans and re-loads; an existing different file at the destination is refused.
+         * A no-op when the copy is the committed file itself or the committed file names no `bodyFile`.
+         */
+        private fun stageBodyFiles(committed: File, target: File) {
+            if (!committed.isFile || committed.absoluteFile.normalize() == target.absoluteFile.normalize()) return
+            val paths = ProvisionFile.load(committed).resources.filter { it.kind == ProvisionFile.KIND_EMAIL_TEMPLATE }.mapNotNull { it.spec["bodyFile"]?.toString()?.trim()?.takeIf { p -> p.isNotEmpty() } }.distinct()
+            if (paths.isEmpty()) return
+            val from = committed.absoluteFile.parentFile
+            writeReferencedFiles(target, paths.associateWith { File(from, it).readText(Charsets.UTF_8) })
         }
     }
 

@@ -63,6 +63,9 @@ class ProvisionSchemaConformanceTest {
             grants:
               - { subject: "client:cli-ci", relation: manager }
               - { subject: "member:alice", relation: viewer }
+          - kind: emailTemplate
+            name: welcome
+            spec: { type: magic_link, subject: "Sign in to Acme, {{displayName}}", body: "<p><a href=\"{{magicLinkUrl}}\">Sign in</a></p>" }
     """.trimIndent()
 
     @Test
@@ -85,7 +88,7 @@ class ProvisionSchemaConformanceTest {
         val file = ProvisionFile.parse(representative.toByteArray(), "provision.yaml")
         assertThat(file.digest).startsWith("sha256:")
         assertThat(file.resources.map { it.key }).containsExactly(
-            "environment/ci", "application/loopback-rp", "user/tester", "emailProvider/emailProvider", "loginTheme/loginTheme", "loginMethods/loginMethods", "application/ci-worker",
+            "environment/ci", "application/loopback-rp", "user/tester", "emailProvider/emailProvider", "loginTheme/loginTheme", "loginMethods/loginMethods", "application/ci-worker", "emailTemplate/welcome",
         )
         // SSO-3113 — `grants` parses into (subject, relation) pairs; a resource without the block has null (unmanaged).
         assertThat(file.resources[6].grants).containsExactly(ProvisionGrant("client:cli-ci", "manager"), ProvisionGrant("member:alice", "viewer"))
@@ -99,7 +102,7 @@ class ProvisionSchemaConformanceTest {
     @Test
     fun `the same document parses as JSON`() {
         val asJson = json.writeValueAsBytes(yaml.readTree(representative))
-        assertThat(ProvisionFile.parse(asJson, "provision.json", yaml = false).resources).hasSize(7)
+        assertThat(ProvisionFile.parse(asJson, "provision.json", yaml = false).resources).hasSize(8)
     }
 
     @Test
@@ -182,6 +185,42 @@ class ProvisionSchemaConformanceTest {
         assertThat(methods["minItems"].asInt()).isEqualTo(1)
         assertThat(methods["items"]["type"].asString()).isEqualTo("string")
         assertThat(ProvisionFile.SINGLETON_KINDS).contains(ProvisionFile.KIND_LOGIN_METHODS)
+    }
+
+    @Test
+    fun `emailTemplate's schema block is the loader's — the type enum, the locale grammar, the caps, exactly one body source, no environment, no grants`() {
+        // SSO-4042 — one (type, locale) cell per resource, workspace-level, body inline or as a file; both contracts pin the same shape.
+        val rule = schema["\$defs"]["resource"]["allOf"].toList().first { it["if"]["properties"]["kind"]["const"].asString() == "emailTemplate" }["then"]
+        assertThat(rule["required"].toList().map { it.asString() }).containsExactly("name")
+        assertThat(rule["not"]["anyOf"].toList().map { it["required"].toList().single().asString() }).containsExactlyInAnyOrder("environment", "grants")
+        val spec = rule["properties"]["spec"]
+        assertThat(spec["additionalProperties"].asBoolean()).isFalse()
+        assertThat(spec["properties"].propertyNames().toSet()).isEqualTo(ProvisionFile.EMAIL_TEMPLATE_SPEC_KEYS)
+        assertThat(spec["required"].toList().map { it.asString() }.toSet()).isEqualTo(ProvisionFile.REQUIRED_SPEC.getValue(ProvisionFile.KIND_EMAIL_TEMPLATE))
+        assertThat(spec["oneOf"].toList().map { it["required"].toList().single().asString() }).containsExactly("body", "bodyFile")
+        assertThat(spec["properties"]["type"]["enum"].toList().map { it.asString() }).isEqualTo(ProvisionFile.EMAIL_TEMPLATE_TYPES)
+        assertThat(spec["properties"]["locale"]["pattern"].asString()).isEqualTo(ProvisionFile.EMAIL_TEMPLATE_LOCALE_PATTERN.pattern)
+        assertThat(spec["properties"]["subject"]["maxLength"].asInt()).isEqualTo(ProvisionFile.EMAIL_TEMPLATE_MAX_SUBJECT_CHARS)
+        assertThat(ProvisionFile.WORKSPACE_KINDS).contains(ProvisionFile.KIND_EMAIL_TEMPLATE)
+        assertThat(ProvisionFile.TENANT_KINDS).contains(ProvisionFile.KIND_EMAIL_TEMPLATE)
+        assertThat(ProvisionFile.SINGLETON_KINDS).doesNotContain(ProvisionFile.KIND_EMAIL_TEMPLATE)
+        // The loader refuses what the schema refuses: both bodies, neither, a region locale, an environment.
+        val v = ProvisionFile.validate(
+            yaml.readTree(
+                """
+                apiVersion: thoryn.io/tenant/v1
+                resources:
+                  - { kind: emailTemplate, name: both, spec: { type: magic_link, subject: s, body: "<p/>", bodyFile: emails/x.html } }
+                  - { kind: emailTemplate, name: neither, spec: { type: magic_link, locale: nl, subject: s } }
+                  - { kind: emailTemplate, name: region, spec: { type: invitation, locale: en-GB, subject: s, body: "<p/>" } }
+                  - { kind: emailTemplate, name: env, environment: dev, spec: { type: invitation, subject: s, body: "<p/>" } }
+                """.trimIndent(),
+            ),
+        )
+        assertThat(v).anyMatch { it.contains("resources[0]") && it.contains(ProvisionFile.ERR_EMAIL_TEMPLATE_BODY_AMBIGUOUS) }
+        assertThat(v).anyMatch { it.contains("resources[1]") && it.contains(ProvisionFile.ERR_EMAIL_TEMPLATE_BODY_REQUIRED) }
+        assertThat(v).anyMatch { it.contains("resources[2]") && it.contains("spec.locale 'en-GB'") }
+        assertThat(v).anyMatch { it.contains("resources[3]") && it.contains("SSO-4043") }
     }
 
     @Test

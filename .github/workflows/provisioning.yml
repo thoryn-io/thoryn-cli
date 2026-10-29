@@ -413,8 +413,10 @@ jobs:
             [[ "$name" =~ ^THORYN_[A-Z0-9_]+$ ]] || { echo "::error::refusing environment variable '$name'" >&2; exit 1; }
             export "$name=$value"
           done < <(jq -r '.config.env | to_entries[] | [.key, (.value | tostring)] | @tsv' "$report")
-          # The artifact directory holds ONLY the configured files at their repository paths (+ the summary); the CLI's
-          # import and plan JSON go to a separate work directory. The checkout itself is never written.
+          # The artifact directory holds ONLY the configured files at their repository paths (+ the summary, + SSO-4042: the
+          # email-template body files a configured file names as `bodyFile`, which `provision import --for-workflow` stages
+          # beside the copy from the checkout and writes for a live template); the CLI's import and plan JSON go to a
+          # separate work directory. The checkout itself is never written.
           out="$RUNNER_TEMP/thoryn-import"; work="$RUNNER_TEMP/thoryn-import-work"
           rm -rf "$out" "$work"; mkdir -p "$out" "$work"
           i=0

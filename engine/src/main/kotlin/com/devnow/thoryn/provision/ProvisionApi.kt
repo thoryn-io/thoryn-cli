@@ -174,6 +174,24 @@ interface ProvisionApi {
     fun putApplicationTokenClaims(clientId: String, sources: List<String>, roleMapping: Map<String, String>?): JsonNode = throw unsupported("token claims")
     fun deleteApplicationTokenClaims(clientId: String): Unit = throw unsupported("token claims")
 
+    // ── Email templates (`/api/v1/login-experience/email-templates/{type}?locale=`; SSO-4042, product-api SSO-1926 / SSO-2098) ──
+    // Scopes `tenant:idp.read` (GET) and `tenant:idp.write` (PUT / DELETE); product-api gates every login-experience call on the
+    // caller's relation to `login_theme:<plane>` (404, never 403). TENANT-WIDE today: product-api forwards no environment for
+    // email templates (SSO-4043 re-keys them), so the engine calls the production-plane client. [locale] `null` ⇒ the base,
+    // locale-independent template (`*`). GET answers the stored cell `{ templateType, locale, subject, bodyHtml,
+    // allowedVariables, updatedAt }` or `404 template_not_customized` (never the built-in default); PUT `{ subject, bodyHtml }`
+    // creates or replaces the cell (`400 unknown_template_type` / `invalid_template_locale` / `template_subject_blank` /
+    // `template_body_blank` / `unknown_template_variable`, `413 template_subject_too_large` / `template_body_too_large`); DELETE
+    // resets the cell to the built-in default and answers `200 { templateType, allLocales, resetLocales, remainingLocales }`
+    // (idempotent — never a 404). There is no list endpoint: a stored locale variant is found only by addressing it.
+    //
+    // Defaulted (like [listRoles]) so a host that predates email templates keeps compiling: the default answers `501`, which the
+    // engine surfaces as a failed read of the template (never as "absent").
+
+    fun getEmailTemplate(type: String, locale: String?): JsonNode = throw unsupported("email templates")
+    fun putEmailTemplate(type: String, locale: String?, body: Map<String, Any?>): JsonNode = throw unsupported("email templates")
+    fun deleteEmailTemplate(type: String, locale: String?): JsonNode = throw unsupported("email templates")
+
     private fun unsupported(what: String): ProductApiException =
         ProductApiException(501, "not_implemented", "this host does not manage $what", "")
 
