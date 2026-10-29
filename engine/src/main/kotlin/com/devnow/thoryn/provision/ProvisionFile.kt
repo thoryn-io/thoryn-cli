@@ -395,7 +395,11 @@ class ProvisionFile private constructor(
         // call instead of being dropped by the API's lenient JSON binding and silently clearing the field it was meant to set.
 
         /** The `spec` members a `loginTheme` accepts — the whole record the PUT replaces (the schema's `additionalProperties: false`). */
-        val LOGIN_THEME_SPEC_KEYS: Set<String> = setOf("logoUrl", "primaryColor", "backgroundColor", "borderRadiusPx", "theme", "cssVariables")
+        val LOGIN_THEME_SPEC_KEYS: Set<String> = setOf(
+            "logoUrl", "primaryColor", "backgroundColor", "borderRadiusPx", "theme", "cssVariables",
+            // SSO-4048 (oauthy SSO-4044) — the tenant's name, the browser title, the favicon and the footer links.
+            "displayName", "pageTitle", "faviconUrl", "supportUrl", "termsUrl", "privacyUrl",
+        )
 
         /** `spec.theme`: identity's `LoginBranding.Theme` values. Must equal the schema's `theme` enum. */
         val LOGIN_THEME_THEMES: List<String> = listOf("light", "dark", "auto")
@@ -426,6 +430,54 @@ class ProvisionFile private constructor(
 
         /** A font-family stack as identity accepts it (letters, digits, spaces, commas, quotes, `-` and `_`; 1–120 chars). */
         val LOGIN_THEME_FONT_STACK_PATTERN = Regex("^[A-Za-z0-9 ,_'\"-]{1,120}$")
+
+        // ── SSO-4048 — name, title, favicon, footer links (oauthy SSO-4044; identity's `LoginBrandingService.sanitisePlainText`,
+        // `sanitiseHttpsUrl`, `sanitiseSupportUrl`, `MAX_DISPLAY_NAME_CHARS`, `MAX_PAGE_TITLE_CHARS`, `MAX_URL_CHARS`). Every one is
+        // trimmed first, and a blank value is "unset" (the PUT clears it), exactly as identity treats it.
+
+        /** `spec.displayName`: plain text of at most this many characters (identity's `MAX_DISPLAY_NAME_CHARS`). */
+        const val LOGIN_THEME_MAX_DISPLAY_NAME_CHARS = 80
+
+        /** `spec.pageTitle`: plain text of at most this many characters (identity's `MAX_PAGE_TITLE_CHARS`). */
+        const val LOGIN_THEME_MAX_PAGE_TITLE_CHARS = 120
+
+        /** The plain-text fields → their character limit. Must equal the schema's `maxLength` for each. */
+        val LOGIN_THEME_TEXT_FIELDS: Map<String, Int> = linkedMapOf(
+            "displayName" to LOGIN_THEME_MAX_DISPLAY_NAME_CHARS,
+            "pageTitle" to LOGIN_THEME_MAX_PAGE_TITLE_CHARS,
+        )
+
+        /** `spec.faviconUrl` / `supportUrl` / `termsUrl` / `privacyUrl`: at most this many characters (identity's `MAX_URL_CHARS`). */
+        const val LOGIN_THEME_MAX_LINK_CHARS = 2000
+
+        /**
+         * The link fields → the schemes each accepts (matched case-insensitively, as identity does; a bare scheme is not a
+         * destination). Only the support link may be a `mailto:` address.
+         */
+        val LOGIN_THEME_LINK_FIELDS: Map<String, List<String>> = linkedMapOf(
+            "faviconUrl" to listOf("https://"),
+            "supportUrl" to listOf("https://", "mailto:"),
+            "termsUrl" to listOf("https://"),
+            "privacyUrl" to listOf("https://"),
+        )
+
+        /**
+         * Plain text as identity accepts it: no `<`, `>` and no ISO control character (`Char.isISOControl`: U+0000–U+001F,
+         * U+007F–U+009F). Empty matches (a blank value clears). Must equal the schema's `pattern` for each plain-text field.
+         */
+        val LOGIN_THEME_PLAIN_TEXT_PATTERN = Regex("^[^<>\\u0000-\\u001F\\u007F-\\u009F]*$")
+
+        /**
+         * One character that is neither whitespace nor an ISO control character in Kotlin's sense (`Char.isWhitespace` ||
+         * `Char.isISOControl`), spelled out so the JSON Schema (ECMA-262) and the JVM read it the same way — `\s` differs between them.
+         */
+        private const val LINK_CHAR = "[^\\u0000-\\u0020\\u007F-\\u00A0\\u1680\\u2000-\\u200A\\u2028\\u2029\\u202F\\u205F\\u3000]"
+
+        /** An `https://` link (any case) with a destination after the scheme and no whitespace / control character; or empty. */
+        val LOGIN_THEME_HTTPS_LINK_PATTERN = Regex("^(?:[Hh][Tt][Tt][Pp][Ss]://$LINK_CHAR+)?$")
+
+        /** As [LOGIN_THEME_HTTPS_LINK_PATTERN], or a `mailto:` address (any case) — the support link only. */
+        val LOGIN_THEME_SUPPORT_LINK_PATTERN = Regex("^(?:(?:[Hh][Tt][Tt][Pp][Ss]://|[Mm][Aa][Ii][Ll][Tt][Oo]:)$LINK_CHAR+)?$")
 
         /** Required `spec` members per kind — mirrors the schema's per-kind `then.required`. */
         val REQUIRED_SPEC: Map<String, Set<String>> = mapOf(
@@ -1621,7 +1673,10 @@ class ProvisionFile private constructor(
          * [LOGIN_THEME_MAX_LOGO_URL_CHARS] characters, `primaryColor` / `backgroundColor` a hex colour ([HEX_COLOR_PATTERN]),
          * `borderRadiusPx` an integer `0..`[LOGIN_THEME_MAX_BORDER_RADIUS_PX], `theme` one of [LOGIN_THEME_THEMES], and
          * `cssVariables` an object whose keys are the closed `--thoryn-*` allowlist ([LOGIN_THEME_CSS_VARIABLES]) with a hex colour
-         * or a plain font stack ([LOGIN_THEME_FONT_STACK_PATTERN]) as values. A value carrying a `{{env.NAME}}` placeholder is
+         * or a plain font stack ([LOGIN_THEME_FONT_STACK_PATTERN]) as values; SSO-4048 — `displayName` / `pageTitle` plain text
+         * ([LOGIN_THEME_TEXT_FIELDS]: at most 80 / 120 characters, no `<`, `>` or control character) and `faviconUrl` / `termsUrl` /
+         * `privacyUrl` `https://` links, `supportUrl` `https://` or `mailto:` ([LOGIN_THEME_LINK_FIELDS]: at most
+         * [LOGIN_THEME_MAX_LINK_CHARS] characters, no whitespace). A value carrying a `{{env.NAME}}` placeholder is
          * left to the API (it is resolved at plan / apply). An EMPTY spec is legal: it declares the platform defaults, and the plan
          * shows every stored field as cleared. The WCAG contrast floor stays identity's (`400 insufficient_contrast` at apply).
          */
@@ -1656,6 +1711,25 @@ class ProvisionFile private constructor(
                     placeholder(px) -> Unit
                     !px.isIntegralNumber() -> v += "$where (loginTheme) spec.borderRadiusPx must be an integer between 0 and $LOGIN_THEME_MAX_BORDER_RADIUS_PX"
                     px.asInt() !in 0..LOGIN_THEME_MAX_BORDER_RADIUS_PX -> v += "$where (loginTheme) spec.borderRadiusPx ${px.asInt()} must be between 0 and $LOGIN_THEME_MAX_BORDER_RADIUS_PX"
+                }
+            }
+            // SSO-4048 — the name / title (plain text) and the favicon / footer links, in identity's grammar (trimmed; blank clears).
+            LOGIN_THEME_TEXT_FIELDS.forEach { (field, max) ->
+                text(field)?.takeIf { it.isNotEmpty() }?.let { value ->
+                    when {
+                        value.length > max -> v += "$where (loginTheme) spec.$field exceeds the $max-character limit"
+                        value.any { it == '<' || it == '>' || it.isISOControl() } -> v += "$where (loginTheme) spec.$field must be plain text: no '<', '>' or control characters"
+                    }
+                }
+            }
+            LOGIN_THEME_LINK_FIELDS.forEach { (field, schemes) ->
+                text(field)?.takeIf { it.isNotEmpty() }?.let { url ->
+                    when {
+                        url.length > LOGIN_THEME_MAX_LINK_CHARS -> v += "$where (loginTheme) spec.$field exceeds the $LOGIN_THEME_MAX_LINK_CHARS-character limit"
+                        url.any { it.isWhitespace() || it.isISOControl() } ||
+                            schemes.none { url.startsWith(it, ignoreCase = true) && url.length > it.length } ->
+                            v += "$where (loginTheme) spec.$field must be ${schemes.joinToString(" or ") { if (it == "mailto:") "a mailto: address" else "an https:// URL" }} without whitespace (was '$url')"
+                    }
                 }
             }
             spec["cssVariables"]?.takeIf { !it.isNull }?.let { css ->

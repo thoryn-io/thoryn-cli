@@ -244,6 +244,16 @@ class ProvisionSchemaConformanceTest {
             val expected = if (kind == ProvisionFile.CSS_VARIABLE_KIND_COLOR) ProvisionFile.HEX_COLOR_PATTERN.pattern else ProvisionFile.LOGIN_THEME_FONT_STACK_PATTERN.pattern
             assertThat(css["properties"][token]["pattern"].asString()).describedAs(token).isEqualTo(expected)
         }
+        // SSO-4048 — the name / title (plain text) and the favicon / footer links: the same limits and the same character rules.
+        ProvisionFile.LOGIN_THEME_TEXT_FIELDS.forEach { (field, max) ->
+            assertThat(spec["properties"][field]["maxLength"].asInt()).describedAs(field).isEqualTo(max)
+            assertThat(spec["properties"][field]["pattern"].asString()).describedAs(field).isEqualTo(ProvisionFile.LOGIN_THEME_PLAIN_TEXT_PATTERN.pattern)
+        }
+        ProvisionFile.LOGIN_THEME_LINK_FIELDS.forEach { (field, schemes) ->
+            val expected = if ("mailto:" in schemes) ProvisionFile.LOGIN_THEME_SUPPORT_LINK_PATTERN else ProvisionFile.LOGIN_THEME_HTTPS_LINK_PATTERN
+            assertThat(spec["properties"][field]["maxLength"].asInt()).describedAs(field).isEqualTo(ProvisionFile.LOGIN_THEME_MAX_LINK_CHARS)
+            assertThat(spec["properties"][field]["pattern"].asString()).describedAs(field).isEqualTo(expected.pattern)
+        }
         // Every field is optional (an empty spec declares the platform defaults) — and the loader agrees.
         assertThat(spec["required"]).isNull()
         assertThat(ProvisionFile.REQUIRED_SPEC.getValue(ProvisionFile.KIND_LOGIN_THEME)).isEmpty()
@@ -251,6 +261,33 @@ class ProvisionSchemaConformanceTest {
         // And the loader refuses what the schema's additionalProperties:false refuses.
         assertThat(ProvisionFile.validate(yaml.readTree("apiVersion: thoryn.io/tenant/v1\nresources:\n  - { kind: loginTheme, spec: { primaryColour: \"#000\" } }")))
             .anyMatch { it.contains("spec.primaryColour is not a branding field") }
+    }
+
+    @Test
+    fun `the loader and the schema accept and refuse the same name, title and link values`() {
+        // SSO-4048 — the schema's maxLength + pattern (read FROM the schema, run as a JVM regex: the patterns avoid every
+        // construct ECMA-262 and java.util.regex read differently) against the loader's own verdict, value by value.
+        val spec = schema["\$defs"]["resource"]["allOf"].toList()
+            .first { it["if"]["properties"]["kind"]["const"].asString() == "loginTheme" }["then"]["properties"]["spec"]["properties"]
+        fun schemaAccepts(field: String, value: String) =
+            value.length <= spec[field]["maxLength"].asInt() && Regex(spec[field]["pattern"].asString()).matches(value)
+        fun loaderAccepts(field: String, value: String) =
+            ProvisionFile.validate(json.readTree(json.writeValueAsString(mapOf("apiVersion" to "thoryn.io/tenant/v1", "resources" to listOf(mapOf("kind" to "loginTheme", "spec" to mapOf(field to value))))))).isEmpty()
+        val samples = mapOf(
+            "displayName" to listOf("Acme", "", "a".repeat(80), "a".repeat(81), "<b>", "x>y", "tab\there", "c1\u009Fhere", "Söhne & Co"),
+            "pageTitle" to listOf("Sign in to Acme", "b".repeat(120), "b".repeat(121), "line\nbreak"),
+            "faviconUrl" to listOf("https://a.example/f.ico", "HTTPS://a.example/f.ico", "", "http://a.example", "https://", "https://a b", "https://a\u00A0b", "https://a\u3000b", "mailto:x@a.example", "https://a.example/" + "x".repeat(1982), "https://a.example/" + "x".repeat(1983)),
+            "supportUrl" to listOf("https://a.example/help", "mailto:help@a.example", "MailTo:help@a.example", "mailto:", "ftp://a.example", "javascript:alert(1)", "mailto:a b@x"),
+            "termsUrl" to listOf("https://a.example/terms", "mailto:x@a.example", "https://a\u2028b"),
+            "privacyUrl" to listOf("https://a.example/privacy", "https://a\u0085b"),
+        )
+        samples.forEach { (field, values) ->
+            values.forEach { value ->
+                assertThat(schemaAccepts(field, value)).describedAs("$field=[$value]").isEqualTo(loaderAccepts(field, value))
+            }
+        }
+        // And the samples exercise both verdicts for every field (a sample set that only accepts proves nothing).
+        samples.forEach { (field, values) -> assertThat(values.map { loaderAccepts(field, it) }.toSet()).describedAs(field).containsExactlyInAnyOrder(true, false) }
     }
 
     @Test
