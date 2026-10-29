@@ -709,7 +709,7 @@ class ProvisionCommand : Callable<Int> {
                 }
                 result.resources.filter { it.note != null }.forEach { System.err.println("  note ${it.resource.kind} ${it.resource.name}: ${it.note}") }
                 result.skipped.forEach { System.err.println("  skipped $it") }
-                // SSO-4042 — the files the entries refer to (an emailTemplate's body as `bodyFile`), written next to the file.
+                // SSO-4042 — the files the entries refer to (an emailTemplate's or, SSO-4057, a legalDocument's body as `bodyFile`), written next to the file.
                 val files = result.resources.flatMap { it.files.entries }.associate { it.key to it.value }
                 if (!write || result.resources.isEmpty()) {
                     if (!write && result.resources.isNotEmpty()) {
@@ -781,7 +781,7 @@ class ProvisionCommand : Callable<Int> {
             val resolved = files.mapKeys { (path, _) -> File(dir, path) }
             resolved.forEach { (f, content) ->
                 if (f.exists() && f.readText(Charsets.UTF_8) != content) {
-                    throw ProvisionException("${f.path} already exists with different content; the import does not overwrite a template body — move it aside or declare that template by hand")
+                    throw ProvisionException("${f.path} already exists with different content; the import does not overwrite a template body or a legal document's body — move it aside or declare that resource by hand")
                 }
             }
             return resolved.mapNotNull { (f, content) ->
@@ -796,7 +796,7 @@ class ProvisionCommand : Callable<Int> {
          */
         private fun stageBodyFiles(committed: File, target: File) {
             if (!committed.isFile || committed.absoluteFile.normalize() == target.absoluteFile.normalize()) return
-            val paths = ProvisionFile.load(committed).resources.filter { it.kind == ProvisionFile.KIND_EMAIL_TEMPLATE }.mapNotNull { it.spec["bodyFile"]?.toString()?.trim()?.takeIf { p -> p.isNotEmpty() } }.distinct()
+            val paths = ProvisionFile.load(committed).resources.filter { it.kind in ProvisionFile.BODY_FILE_KINDS }.mapNotNull { it.spec["bodyFile"]?.toString()?.trim()?.takeIf { p -> p.isNotEmpty() } }.distinct()
             if (paths.isEmpty()) return
             val from = committed.absoluteFile.parentFile
             writeReferencedFiles(target, paths.associateWith { File(from, it).readText(Charsets.UTF_8) })

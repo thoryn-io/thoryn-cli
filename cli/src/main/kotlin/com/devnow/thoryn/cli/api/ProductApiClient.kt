@@ -608,6 +608,26 @@ class ProductApiClient(
     private fun emailTemplatePath(type: String, locale: String?): String =
         "/api/v1/login-experience/email-templates/${encode(type)}" + (locale?.takeIf { it.isNotBlank() }?.let { "?locale=${encode(it)}" } ?: "")
 
+    // ── Tenant-level legal documents (SSO-4057; product-api /api/v1/login-experience/legal-documents/{type}, oauthy #4290) ──
+    // The workspace environment's Terms of Use / Privacy Policy, versioned; see [ProvisionApi] for the wire contract.
+    // Environment-scoped via the `X-Thoryn-Environment` header this client sends for the selected env (none ⇒ production).
+    // GET → tenant:compliance.read; POST / DELETE → tenant:compliance.write. Activate and delete answer 204.
+
+    override fun listLegalDocuments(type: String): JsonNode =
+        get(legalDocumentPath(type))
+
+    override fun publishLegalDocument(type: String, body: Map<String, Any?>): JsonNode =
+        post(legalDocumentPath(type), body)
+
+    override fun activateLegalDocument(type: String, id: String) =
+        postNoContent(legalDocumentPath(type) + "/${encode(id)}/activate")
+
+    override fun deleteLegalDocument(type: String, id: String) =
+        deleteNoContent(legalDocumentPath(type) + "/${encode(id)}")
+
+    private fun legalDocumentPath(type: String): String =
+        "/api/v1/login-experience/legal-documents/${encode(type)}"
+
     // ── Login flows (SSO-3065; product-api /api/v1/login-flows, per environment) ──
     // Author + activate the multi-step login journey (which authenticator stages a sign-in walks) for
     // the selected environment. Enables e.g. a `password + REQUIRED passkey` second-factor flow — the

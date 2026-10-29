@@ -380,7 +380,10 @@ object ThorynConfig {
      * "The grant order" step 2. Granted to `cli` / `thoryn-cli` by oathy hub V206 (SSO-3855), which must be deployed
      * before a release carrying this default — same rule), SSO-3941 (`roles.*` for `thoryn users roles …` and the
      * `kind: role` of a provisioning file; hub V82 granted them to `thoryn-cli` only — a hub migration granting them to
-     * `cli` must be deployed before a release carrying this default — same rule).
+     * `cli` must be deployed before a release carrying this default — same rule), SSO-4057 (`compliance.*` for the
+     * `kind: legalDocument` of a provisioning file — the tenant-level terms of use / privacy policy, oathy SSO-4047; hub V125
+     * granted them to `thoryn-cli` only — a hub migration granting them to `cli` must be deployed before a release
+     * carrying this default — same rule).
      */
     const val DEFAULT_SCOPE =
         "openid offline_access " +
@@ -397,7 +400,8 @@ object ThorynConfig {
             "tenant:keys.read tenant:keys.rotate tenant:keys.retire " +
             "tenant:workload-identity.read tenant:workload-identity.write " +
             "tenant:github-connections.read tenant:github-connections.write " +
-            "tenant:roles.read tenant:roles.write"
+            "tenant:roles.read tenant:roles.write " +
+            "tenant:compliance.read tenant:compliance.write"
 
     /**
      * The `--hub` / `--gateway` "not given" sentinel of the post-login commands (SSO-2827): they use the
