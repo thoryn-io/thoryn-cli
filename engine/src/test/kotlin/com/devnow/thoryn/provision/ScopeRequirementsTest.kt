@@ -115,12 +115,12 @@ class ScopeRequirementsTest {
     }
 
     @Test
-    fun `a declared legal document needs compliance read to plan and compliance write to apply, and no ownership check`() {
-        // SSO-4057 — product-api's TenantLegalDocumentsController gates on tenant:compliance.* alone (no platform access object).
+    fun `a declared legal document needs legal-documents read to plan and legal-documents write to apply, and no ownership check`() {
+        // SSO-4057 — product-api's TenantLegalDocumentsController gates on its own tenant:legal-documents.* pair alone (SSO-4069; no platform access object).
         val needs = ScopeRequirements.of(file("- { kind: legalDocument, name: terms, spec: { type: terms-of-use, version: v1, title: Terms, body: \"x\" } }"))
-        assertThat(scopes(needs, Phase.PLAN)).containsExactly("tenant:compliance.read")
-        assertThat(scopes(needs, Phase.APPLY)).containsExactly("tenant:compliance.write")
-        assertThat(needs.single { it.scope == "tenant:compliance.read" }.resource).isEqualTo("legalDocument/terms")
+        assertThat(scopes(needs, Phase.PLAN)).containsExactly("tenant:legal-documents.read")
+        assertThat(scopes(needs, Phase.APPLY)).containsExactly("tenant:legal-documents.write")
+        assertThat(needs.single { it.scope == "tenant:legal-documents.read" }.resource).isEqualTo("legalDocument/terms")
     }
 
     @Test

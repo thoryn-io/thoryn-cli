@@ -85,7 +85,7 @@ class ProvisionLegalDocumentTest : CommandTestBase() {
         assertThat(console.toString()).contains("+ legalDocument terms: terms-of-use version 2026-10 published and active")
 
         // CRLF line endings and trailing whitespace are presentation, not a new text: a no-op, no write. A legal document is not
-        // a platform access object (product-api gates it on tenant:compliance.* alone), so no forward check is asked for it.
+        // a platform access object (product-api gates it on tenant:legal-documents.* alone), so no forward check is asked for it.
         api.reset(); api.checks.clear()
         val again = engine().plan(file(terms("2026-10", body = termsBody.replace("\n", "  \r\n"))), false).changes.single()
         assertThat(again.action).isEqualTo(ChangeAction.NOOP)
@@ -235,7 +235,7 @@ class ProvisionLegalDocumentTest : CommandTestBase() {
     }
 
     @Test
-    fun `the API's refusals at apply are named for the document, and a missing compliance scope names the scope`() {
+    fun `the API's refusals at apply are named for the document, and a missing legal-documents scope names the scope`() {
         // A label published between plan and apply: the API's 409, said as such.
         val f = file(terms("2026-10"))
         val e = engine()
@@ -245,10 +245,10 @@ class ProvisionLegalDocumentTest : CommandTestBase() {
             .isInstanceOf(ProvisionException::class.java)
             .hasMessageContaining("legalDocument/terms: version_exists — the terms-of-use version '2026-10' in the production plane was published since the plan was made")
 
-        // product-api gates the surface on tenant:compliance.*, not the login experience's idp area.
+        // product-api gates the surface on tenant:legal-documents.* (SSO-4069), not the login experience's idp area.
         api.enforceScopeGates = true
         api.callerScopes = setOf("tenant:idp.read", "tenant:idp.write")
         val failure = runCatching { engine().plan(file(terms("2026-11")), false) }.exceptionOrNull()
-        assertThat(failure?.message).contains("tenant:compliance.read")
+        assertThat(failure?.message).contains("tenant:legal-documents.read")
     }
 }

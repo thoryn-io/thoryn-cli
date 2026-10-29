@@ -2085,7 +2085,7 @@ exactly one.
 
 `kind: legalDocument` is the **active version** of an environment's tenant-level Terms of Use or Privacy Policy, hosted by
 Thoryn — the `/api/v1/login-experience/legal-documents/{terms-of-use|privacy-policy}` surface (oauthy SSO-4047;
-`tenant:compliance.read` to plan, `tenant:compliance.write` to apply), addressed with `X-Thoryn-Environment`. Sign-ins
+`tenant:legal-documents.read` to plan, `tenant:legal-documents.write` to apply), addressed with `X-Thoryn-Environment`. Sign-ins
 of every application of the environment that has no document of its own are asked to accept it, and the hosted footer
 links to it when the branding sets no `termsUrl` / `privacyUrl`. The body is **`body`** (inline) **or `bodyFile`** (a
 path relative to the provisioning file, inside its directory, read when the file is loaded) — exactly one.
@@ -2123,7 +2123,7 @@ path relative to the provisioning file, inside its directory, read when the file
   a `<` followed by a letter, `/`, `!` or `?` is refused (`html_not_allowed`) rather than sanitised — `a < b` in prose
   is fine.
 - **No `grants:`, no ownership check** — like a `role`, a legal document is not a platform access object: product-api
-  gates it on `tenant:compliance.*` alone. `readOnly: true` declares a reference that must match what is active.
+  gates it on `tenant:legal-documents.*` alone. `readOnly: true` declares a reference that must match what is active.
 - **destroy / `--prune` never remove a production document** — the row is left in place and names the call a person
   makes (`DELETE /api/v1/login-experience/legal-documents/<type>/<id>`, which soft-deletes that version and is refused
   `409 document_accepted` once anyone accepted it; the CLI has no `legal-documents` command). In a sandbox the
@@ -2134,8 +2134,10 @@ path relative to the provisioning file, inside its directory, read when the file
   sandbox, named by `spec.bodyFile`. An environment with no active document gets no entry. `import --write` and the
   configuration import (`--for-workflow`) handle these files exactly like email-template bodies (`bodyFiles` in
   `import-summary.json`).
-- **Scopes:** `thoryn login` requests `tenant:compliance.read` / `.write` (a person holds them as a workspace admin);
-  a config project's connection and its CI identity need both to plan and apply a `legalDocument`.
+- **Scopes:** a legal document has its own narrow pair, `tenant:legal-documents.read` / `.write` (oauthy SSO-4069) —
+  not the broad `tenant:compliance.*`, which also gates retention, SCIM deprovisioning and SSF receivers. `thoryn login`
+  requests both (a person holds them as a workspace admin); a config project's connection and its CI identity need
+  both to plan and apply a `legalDocument`.
 
 ### Hosted-login branding as code — `kind: loginTheme` (SSO-4041, SSO-4048)
 
@@ -2286,7 +2288,7 @@ does not guess what you meant.
 | Declares | to plan | to apply |
 |---|---|---|
 | `kind: role` | `tenant:roles.read` (no `tenant:access.read` — there is no ownership check) | `tenant:roles.write` (create, description, permission set, a missing permission) |
-| `kind: legalDocument` (SSO-4057) | `tenant:compliance.read` (no `tenant:access.read` — there is no ownership check) | `tenant:compliance.write` (publish, activate) |
+| `kind: legalDocument` (SSO-4057) | `tenant:legal-documents.read` (no `tenant:access.read` — there is no ownership check) | `tenant:legal-documents.write` (publish, activate) |
 | `tokenClaims` | `tenant:applications.read` | `tenant:applications.write` |
 
 ### Declaring a workload-identity trust — `kind: workloadIdentityTrust` (SSO-3689)
@@ -2994,7 +2996,7 @@ CLI derives it — every scope is the gate product-api puts on the endpoint the 
 | `emailProvider` / `loginTheme`, `loginFlow`, `loginMethods`, `emailTemplate` / `customDomain` | `tenant:email.read` / `tenant:idp.read` / `tenant:domains.read` | the matching `.write` |
 | `workloadIdentityTrust` | `tenant:workload-identity.read` | `tenant:workload-identity.write`, and every scope the trust carries (`spec.scopes` — the hub's ceiling, `scope_not_grantable`) |
 | `role` (SSO-3941) | `tenant:roles.read` — and NOT `tenant:access.read`: a role is not a platform access object, so no ownership check is asked | `tenant:roles.write` |
-| `legalDocument` (SSO-4057) | `tenant:compliance.read` — and NOT `tenant:access.read`, as for a role | `tenant:compliance.write` |
+| `legalDocument` (SSO-4057) | `tenant:legal-documents.read` — and NOT `tenant:access.read`, as for a role | `tenant:legal-documents.write` |
 | an application's `tokenClaims` | `tenant:applications.read` (already needed by the application) | `tenant:applications.write` |
 | a `grants:` block | `tenant:access.read` | `tenant:access.write` |
 | no `secretSink`, or `secretSink: { kind: customerManaged }` (SSO-3954, the default) | — (nothing beyond the application's own) | — (nothing is granted) |

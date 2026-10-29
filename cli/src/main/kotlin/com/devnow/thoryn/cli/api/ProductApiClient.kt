@@ -611,7 +611,7 @@ class ProductApiClient(
     // ── Tenant-level legal documents (SSO-4057; product-api /api/v1/login-experience/legal-documents/{type}, oauthy #4290) ──
     // The workspace environment's Terms of Use / Privacy Policy, versioned; see [ProvisionApi] for the wire contract.
     // Environment-scoped via the `X-Thoryn-Environment` header this client sends for the selected env (none ⇒ production).
-    // GET → tenant:compliance.read; POST / DELETE → tenant:compliance.write. Activate and delete answer 204.
+    // GET → tenant:legal-documents.read; POST / DELETE → tenant:legal-documents.write (oauthy SSO-4069). Activate and delete answer 204.
 
     override fun listLegalDocuments(type: String): JsonNode =
         get(legalDocumentPath(type))

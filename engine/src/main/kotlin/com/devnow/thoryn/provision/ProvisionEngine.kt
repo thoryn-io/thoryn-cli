@@ -1190,7 +1190,7 @@ class ProvisionEngine(
         // per object like an application; its own gate keeps the plane rules a trust still has (create, the pre-S1 platform).
         if (r.kind == ProvisionFile.KIND_WORKLOAD_IDENTITY_TRUST) return gateTrust(r, change, file, envSlugs, slug, reach)
         // SSO-3941 — a role is not a platform access object: product-api gates it on `tenant:roles.*` alone. SSO-4057 — nor is a
-        // tenant-level legal document (`tenant:compliance.*` alone).
+        // tenant-level legal document (`tenant:legal-documents.*` alone).
         if (r.kind in ProvisionFile.SCOPE_ONLY_KINDS) return gateScopeOnly(r, change)
         val gated = gateObject(r, change, file, envSlugs, slug, reach)
         // SSO-3774 (ADR 2026-10-16 I4) — an application this identity may converge may still not BIND a trust it does not manage.
@@ -2103,7 +2103,7 @@ class ProvisionEngine(
         // provisioning file ([legalDocumentBodyPath]). A plane with no active document of a type renders nothing: there is no
         // fallback between environments, so a sandbox without its own document has none, and declaring none is not drift. The
         // historical (inactive) versions are not rendered — the file declares which version is active, not the history. Not a
-        // platform access object (`tenant:compliance.*` alone), so — like a role — what this identity may change is its write scope.
+        // platform access object (`tenant:legal-documents.*` alone), so — like a role — what this identity may change is its write scope.
         if (!ofPart(ProvisionFile.KIND_LEGAL_DOCUMENT)) {
             skip("${ProvisionFile.KIND_LEGAL_DOCUMENT} — not imported: ${partReason(ProvisionFile.KIND_LEGAL_DOCUMENT)}")
         } else importKind(ProvisionFile.KIND_LEGAL_DOCUMENT) {

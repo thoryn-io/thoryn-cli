@@ -32,7 +32,7 @@ package com.devnow.thoryn.provision
  * | `emailTemplate` (SSO-4042) | `tenant:idp.read` | `tenant:idp.write` (PUT, DELETE) | `LoginExperienceController` (`/email-templates/{type}`) |
  * | `customDomain` | `tenant:domains.read` | `tenant:domains.write` | `CustomDomainController` |
  * | `workloadIdentityTrust` | `tenant:workload-identity.read` | `tenant:workload-identity.write` (create, delete, plan profile) | `WorkloadIdentityTrustController` |
- * | `legalDocument` (SSO-4057) | `tenant:compliance.read` | `tenant:compliance.write` (publish, activate, delete) | `TenantLegalDocumentsController` (`/login-experience/legal-documents/{type}`, oauthy #4290) |
+ * | `legalDocument` (SSO-4057) | `tenant:legal-documents.read` | `tenant:legal-documents.write` (publish, activate, delete) | `TenantLegalDocumentsController` (`/login-experience/legal-documents/{type}`, oauthy #4290; its own scope pair since SSO-4069) |
  * | `role` (SSO-3941) | `tenant:roles.read` (roles, their permissions, the workspace permissions) | `tenant:roles.write` (create, description, permission set, a missing permission, delete) | `RolesController`, `PermissionsController` |
  * | an application's `tokenClaims` (SSO-3941) | `tenant:applications.read` | `tenant:applications.write` | `TokenClaimsController` |
  * | access (`/access/check`, `/mine`, `/grants` GET, `/application-slots` GET) | `tenant:access.read` | `tenant:access.write` (`/grants` POST / DELETE) | `AccessController`, `ApplicationSlotController` |
@@ -121,7 +121,7 @@ object ScopeRequirements {
         ProvisionFile.KIND_CUSTOM_DOMAIN to "domains",
         ProvisionFile.KIND_WORKLOAD_IDENTITY_TRUST to "workload-identity",
         ProvisionFile.KIND_ROLE to "roles",
-        ProvisionFile.KIND_LEGAL_DOCUMENT to "compliance",
+        ProvisionFile.KIND_LEGAL_DOCUMENT to "legal-documents",
     )
 
     /**

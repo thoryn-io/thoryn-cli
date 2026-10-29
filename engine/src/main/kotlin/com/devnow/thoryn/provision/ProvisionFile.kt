@@ -323,7 +323,7 @@ class ProvisionFile private constructor(
          * `spec.version`). The body is `spec.body` inline or `spec.bodyFile`, a path relative to the provisioning file read
          * when the file is loaded, exactly as for [KIND_EMAIL_TEMPLATE].
          *
-         * Not a platform access object: product-api gates the surface on `tenant:compliance.read` / `.write` alone (no
+         * Not a platform access object: product-api gates the surface on `tenant:legal-documents.read` / `.write` alone (no
          * `PlatformSingletonGate`), so — like [KIND_ROLE] — there is no ownership check and no `grants:` ([SCOPE_ONLY_KINDS]).
          */
         const val KIND_LEGAL_DOCUMENT = "legalDocument"
@@ -379,7 +379,7 @@ class ProvisionFile private constructor(
 
         /**
          * SSO-3941 / SSO-4057 — kinds that are NOT objects of the platform authorization graph: product-api gates them on their
-         * `tenant:` scope alone (a role on `tenant:roles.*`, a tenant-level legal document on `tenant:compliance.*`). The engine
+         * `tenant:` scope alone (a role on `tenant:roles.*`, a tenant-level legal document on `tenant:legal-documents.*`). The engine
          * asks no ownership check for them (so they need no `tenant:access.read`), and they cannot carry `grants:`.
          */
         val SCOPE_ONLY_KINDS: Set<String> = setOf(KIND_ROLE, KIND_LEGAL_DOCUMENT)
@@ -1754,7 +1754,7 @@ class ProvisionFile private constructor(
         private fun validateLegalDocument(spec: JsonNode, r: JsonNode, where: String, v: MutableList<String>) {
             rejectUnknownKeys(spec, LEGAL_DOCUMENT_SPEC_KEYS, "$where spec", v)
             if (r["grants"]?.takeIf { !it.isNull } != null) {
-                v += "$where a $KIND_LEGAL_DOCUMENT cannot carry 'grants' — it is not a platform access object (product-api gates legal documents on tenant:compliance.* alone)"
+                v += "$where a $KIND_LEGAL_DOCUMENT cannot carry 'grants' — it is not a platform access object (product-api gates legal documents on tenant:legal-documents.* alone)"
             }
             spec["type"]?.takeIf { !it.isNull }?.let { t ->
                 val type = t.takeIf { it.isTextual() }?.asString()?.trim()

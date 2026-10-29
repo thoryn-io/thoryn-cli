@@ -199,7 +199,7 @@ interface ProvisionApi {
     fun deleteEmailTemplate(type: String, locale: String?): JsonNode = throw unsupported("email templates")
 
     // ── Tenant-level legal documents (`/api/v1/login-experience/legal-documents/{type}`; SSO-4057, oauthy SSO-4047 / #4290) ──
-    // Scopes `tenant:compliance.read` (GET) and `tenant:compliance.write` (POST / DELETE); no platform access object (no
+    // Scopes `tenant:legal-documents.read` (GET) and `tenant:legal-documents.write` (POST / DELETE) (product owner 2026-10-29; oauthy SSO-4069 / #4290); no platform access object (no
     // `PlatformSingletonGate`). PER ENVIRONMENT: product-api routes every call by `X-Thoryn-Environment` (absent = production)
     // and identity keys the documents on (tenant, environment, type) — no fallback between environments. [type] is the path
     // segment, `terms-of-use` | `privacy-policy`. [listLegalDocuments] answers every version of the type in the plane, newest

@@ -144,7 +144,7 @@ internal object ProjectSeeds {
         |# TENANT provisioning (SSO-3962, oauthy ADR 2026-10-25): the config project is the ONE place that defines what the tenant
         |# IS — its environments, identity sources (federationMember), users, sign-in (loginMethods, loginFlow, loginTheme),
         |# email provider, email templates (emailTemplate — one per environment, type and locale), the terms of use and
-        |# privacy policy (legalDocument — the active version per environment and type; needs tenant:compliance.*), custom domain,
+        |# privacy policy (legalDocument — the active version per environment and type; needs tenant:legal-documents.*), custom domain,
         |# roles, and the workload identity trusts of the workspace's APP projects (one
         |# `kind: workloadIdentityTrust` per app repository: a repository never declares its own authority). Applications are
         |# USERS of the tenant: each app project declares its own OAuth client in its own thoryn.io/application/v1 file,

@@ -1084,8 +1084,9 @@ internal class FakeProductApi : Dispatcher() {
             "users" -> if (seg.getOrNull(2) == "roles") "roles" else "users"
             "federation-members" -> "federation"
             "email-provider" -> "email"
-            // SSO-4057 — TenantLegalDocumentsController: `tenant:compliance.*`, not the login experience's `idp` area.
-            "login-experience" -> if (seg.getOrNull(1) == "legal-documents") "compliance" else "idp"
+            // SSO-4057 — TenantLegalDocumentsController: its own `tenant:legal-documents.*` pair (oauthy SSO-4069), not the
+            // login experience's `idp` area.
+            "login-experience" -> if (seg.getOrNull(1) == "legal-documents") "legal-documents" else "idp"
             "login-flows", "login-methods" -> "idp"
             "custom-domain" -> "domains"
             "workload-identity" -> "workload-identity"
