@@ -236,12 +236,18 @@ thoryn env test-emails get <email-id> [--env <slug>]   # one email, incl. its ac
 thoryn branding get                                    # effective values + which fields are overridden
 thoryn branding set [--primary-color '#2563eb'] [--background-color '#fff'] \
                     [--logo-url https://…] [--border-radius-px 8] [--theme light|dark|auto]
+# SSO-4048 — the workspace name, the browser title, the favicon and the footer links the hosted screens show:
+thoryn branding set [--display-name 'Acme'] [--page-title 'Sign in to Acme'] [--favicon-url https://…/favicon.ico] \
+                    [--support-url https://…|mailto:help@acme.example] [--terms-url https://…] [--privacy-url https://…]
+#   display name plain text 1-80 chars, page title ≤ 120 (no < > or control characters); favicon / terms / privacy
+#   https:// only, support https:// or mailto: (≤ 2000 chars, no whitespace) — validated by the server (400 invalid_branding_field).
 # SSO-3038 — additionally set allowlisted --thoryn-* CSS variables (repeatable --var KEY=VALUE):
 thoryn branding set --var --thoryn-accent=#7c3aed --var --thoryn-font-family='Inter, sans-serif'
 #   allowed: --thoryn-accent, --thoryn-text, --thoryn-muted, --thoryn-font-family (colors hex +
 #   WCAG-AA contrast-guarded; font a safe stack). An empty value clears one: --var --thoryn-accent=
-# set MERGES (unspecified fields + CSS vars keep their stored value); pass an empty value to clear an
-# override, e.g. `thoryn branding set --logo-url ""` drops the custom logo back to the platform default.
+# set MERGES (unspecified fields + CSS vars keep their stored value — the name / title / favicon / footer links
+# too); pass an empty value to clear an override, e.g. `thoryn branding set --logo-url ""` drops the custom logo
+# back to the platform default, `--support-url ""` removes the footer's support link.
 
 # Tenant seeding (SSO-1553) — one-shot, zero-interaction provisioner for CI.
 thoryn tenant seed --non-interactive --secret-dir <dir> \
@@ -2073,7 +2079,7 @@ exactly one.
   stages the committed file's body files beside the copy so the copy loads and plans, and the `thoryn-import` artifact
   carries them (`import-summary.json` lists them per file as `bodyFiles`).
 
-### Hosted-login branding as code — `kind: loginTheme` (SSO-4041)
+### Hosted-login branding as code — `kind: loginTheme` (SSO-4041, SSO-4048)
 
 `kind: loginTheme` is the hosted sign-in / register look of its environment (`thoryn branding get | set`,
 `/api/v1/login-experience/branding`; `tenant:idp.read` to plan, `tenant:idp.write` to apply). **The spec IS the record.**
@@ -2090,8 +2096,13 @@ is replaced as one map — so the file is converged the same way (ADR 2026-09-15
   plan shows both maps (`{…} → {…}`).
 - **the spec is checked before any call**, in identity-service's own grammar: the record is exactly `logoUrl` (`https://`,
   ≤ 2000 chars), `primaryColor` / `backgroundColor` (`#rgb` / `#rrggbb` / `#rrggbbaa`), `borderRadiusPx` (0–64),
-  `theme` (`light` | `dark` | `auto`) and `cssVariables` (`--thoryn-accent`, `--thoryn-text`, `--thoryn-muted` as hex
-  colours; `--thoryn-font-family` a plain font stack). **An unknown key is refused** (`spec.primaryColour is not a
+  `theme` (`light` | `dark` | `auto`), `cssVariables` (`--thoryn-accent`, `--thoryn-text`, `--thoryn-muted` as hex
+  colours; `--thoryn-font-family` a plain font stack), and (SSO-4048) the workspace's `displayName` (plain text, 1–80
+  chars) and an explicit browser `pageTitle` (plain text, ≤ 120 chars) — neither may carry `<`, `>` or a control
+  character — the `faviconUrl` and the footer links `termsUrl` / `privacyUrl` (`https://`, ≤ 2000 chars, no whitespace)
+  and `supportUrl` (`https://` **or** `mailto:`, ≤ 2000 chars). Every value is trimmed first and a blank one clears the
+  field, as identity treats it; the URL schemes match in any case, and a bare `https://` / `mailto:` is refused (it is not
+  a destination). **An unknown key is refused** (`spec.primaryColour is not a
   branding field …`): the API's lenient binding would drop it, and the PUT would then clear the field the typo meant to
   set. A value carrying `{{env.NAME}}` is left to the API. The WCAG-AA contrast floor stays the API's
   (`400 insufficient_contrast` at apply).
@@ -2107,6 +2118,12 @@ is replaced as one map — so the file is converged the same way (ADR 2026-09-15
     primaryColor: "#0f62fe"
     theme: auto
     cssVariables: { --thoryn-accent: "#7c3aed", --thoryn-font-family: "Inter, sans-serif" }
+    displayName: Acme
+    pageTitle: Sign in to Acme
+    faviconUrl: https://cdn.acme.example/favicon.ico
+    supportUrl: mailto:help@acme.example
+    termsUrl: https://acme.example/terms
+    privacyUrl: https://acme.example/privacy
 ```
 
 `thoryn provision import` renders the stored record as it is, so an imported theme plans as a no-op.
@@ -2759,7 +2776,8 @@ thoryn provision workflow check --output json   # what the reusable workflow its
 The check loads every file `.thoryn/workflow.yaml` lists (SSO-3970). A provisioning file or connection that is missing,
 does not parse, declares an unknown `apiVersion` or breaks a file rule (a kind from the other part, for one) fails
 `config.valid` with the file and the reason, and the rules that read it (`config.secret-delivery`, `config.trust-scopes`)
-fail as "not checked" — the check is never green on a file it could not read.
+fail as "not checked" — the check is never green on a file it could not read. An `emailTemplate`'s `spec.bodyFile` is
+read next to its file, as `thoryn provision plan` reads it (SSO-4056).
 
 **Why there is no script hook.** A workflow file stays in your repository for exactly two reasons the App cannot take
 over: the job's own GitHub **OIDC token is your repository's identity** (Thoryn never holds a credential to your

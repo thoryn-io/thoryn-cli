@@ -571,7 +571,8 @@ class ProductApiClient(
     //
     // The per-(tenant, environment) branding of the hosted sign-in / register screens:
     // logoUrl + primaryColor + backgroundColor + borderRadiusPx + theme, rendered by
-    // identity-service as CSS custom properties (`--brand-*`) in the login templates. read →
+    // identity-service as CSS custom properties (`--brand-*`) in the login templates, plus (SSO-4048, oauthy
+    // SSO-4044) displayName + pageTitle + faviconUrl + supportUrl + termsUrl + privacyUrl. read →
     // tenant:idp.read; write → tenant:idp.write (both granted to thoryn-cli by hub V83). PUT
     // REPLACES the stored record (SSO-4041; identity's `LoginBrandingAdminService.upsert`: an omitted or
     // null field clears the stored value, `cssVariables` is one map) — `thoryn branding set` reads first to

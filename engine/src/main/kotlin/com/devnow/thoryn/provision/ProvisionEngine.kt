@@ -1627,7 +1627,7 @@ class ProvisionEngine(
             ProvisionFile.KIND_EMAIL_PROVIDER -> "DELETE /api/v1/email-provider (reset to the platform sender)$env"
             ProvisionFile.KIND_LOGIN_METHODS -> "thoryn login-methods reset$env"
             // SSO-4041 — the API has no DELETE; the empty record restores the platform defaults (`thoryn branding set` with an empty value clears one field at a time).
-            ProvisionFile.KIND_LOGIN_THEME -> "PUT /api/v1/login-experience/branding {} (the API has no DELETE; the empty record restores the platform defaults — or `thoryn branding set --logo-url '' --primary-color '' --background-color '' --theme ''`)$env"
+            ProvisionFile.KIND_LOGIN_THEME -> "PUT /api/v1/login-experience/branding {} (the API has no DELETE; the empty record restores the platform defaults — or `thoryn branding set --logo-url '' --primary-color '' --background-color '' --theme '' --display-name '' --page-title '' --favicon-url '' --support-url '' --terms-url '' --privacy-url ''`)$env"
             ProvisionFile.KIND_LOGIN_FLOW -> "activate another login flow (no delete surface)$env"
             ProvisionFile.KIND_CUSTOM_DOMAIN -> "thoryn domain remove --yes"
             // SSO-4042 — the CLI has no `email-templates` verb; the API call, which resets the cell to the built-in default.
@@ -1998,8 +1998,8 @@ class ProvisionEngine(
         }
         singleton(ProvisionFile.KIND_LOGIN_THEME, OBJECT_TYPE_LOGIN_THEME) { _, plane, access ->
             val stored = fetchOrNull { clients(plane).getLoginBranding() }?.get("stored") ?: return@singleton
-            val fields = listOf("logoUrl", "primaryColor", "backgroundColor", "borderRadiusPx", "theme", "cssVariables")
-            val spec = stored.toMap(fields).filterValues { it != null && !(it is Map<*, *> && it.isEmpty()) }
+            // SSO-4048 — the whole record (name, title, favicon and footer links included), so an imported theme plans as a no-op.
+            val spec = stored.toMap(ProvisionFile.LOGIN_THEME_SPEC_KEYS.toList()).filterValues { it != null && !(it is Map<*, *> && it.isEmpty()) }
             if (spec.isEmpty()) return@singleton // nothing stored ⇒ the platform default ⇒ nothing to declare
             if (routedAway(plane, "login_theme:${plane ?: PRODUCTION_ENV_SLUG}")) return@singleton
             add(ProvisionFile.KIND_LOGIN_THEME, singletonName(ProvisionFile.KIND_LOGIN_THEME, plane), environmentField(plane), plane, "login-theme", access, spec)
@@ -2768,8 +2768,9 @@ class ProvisionEngine(
      * SSO-4041 — the branding record as the PUT writes it and the plan compares it: every field of
      * [ProvisionFile.LOGIN_THEME_SPEC_KEYS], in order, `null` when [spec] does not declare it (or declares it blank / empty —
      * a blank colour and an empty `cssVariables` are "unset", as identity stores them). Scalars are normalised the way identity
-     * stores them (trimmed; colours and the theme lower-cased; the radius an integer); `cssVariables` keeps only tokens with a
-     * non-blank value (an all-blank map is `null`: the PUT clears the column either way).
+     * stores them (trimmed; colours and the theme lower-cased; the radius an integer; SSO-4048 — the name, title, favicon and
+     * footer links trimmed only); `cssVariables` keeps only tokens with a non-blank value (an all-blank map is `null`: the PUT
+     * clears the column either way).
      */
     private fun brandingRecord(spec: Map<*, *>?): Map<String, Any?> = linkedMapOf<String, Any?>().apply {
         this["logoUrl"] = spec?.get("logoUrl").nonBlank()
@@ -2782,6 +2783,8 @@ class ProvisionEngine(
             val value = v.nonBlank()
             if (key != null && value != null) key to value else null
         }?.toMap()?.takeIf { it.isNotEmpty() }
+        // SSO-4048 — name, title, favicon and footer links: stored trimmed and as written (identity lower-cases none of them).
+        listOf("displayName", "pageTitle", "faviconUrl", "supportUrl", "termsUrl", "privacyUrl").forEach { field -> this[field] = spec?.get(field).nonBlank() }
     }
 
     /**

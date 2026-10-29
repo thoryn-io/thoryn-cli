@@ -56,7 +56,7 @@ class ProvisionLoginThemeTest : CommandTestBase() {
 
     /** The record as the PUT writes it: every field present, `null` for what the file does not declare. */
     private fun fullRecord(vararg declared: Pair<String, Any?>): Map<String, Any?> =
-        linkedMapOf<String, Any?>("logoUrl" to null, "primaryColor" to null, "backgroundColor" to null, "borderRadiusPx" to null, "theme" to null, "cssVariables" to null) + declared
+        ProvisionFile.LOGIN_THEME_SPEC_KEYS.associateWith { null as Any? } + declared
 
     // ── the plan is honest about the PUT ─────────────────────────────────────
 
@@ -213,6 +213,12 @@ class ProvisionLoginThemeTest : CommandTestBase() {
                 borderRadiusPx: 0
                 theme: auto
                 cssVariables: { --thoryn-accent: "#7c3aed", --thoryn-text: "#111827", --thoryn-muted: "#666", --thoryn-font-family: "Inter, sans-serif" }
+                displayName: Acme
+                pageTitle: Sign in to Acme
+                faviconUrl: https://cdn.acme.example/favicon.ico
+                supportUrl: mailto:help@acme.example
+                termsUrl: https://acme.example/terms
+                privacyUrl: https://acme.example/privacy
         """)
         assertThat(f.resources.single().spec.keys).containsExactlyInAnyOrderElementsOf(ProvisionFile.LOGIN_THEME_SPEC_KEYS)
     }
