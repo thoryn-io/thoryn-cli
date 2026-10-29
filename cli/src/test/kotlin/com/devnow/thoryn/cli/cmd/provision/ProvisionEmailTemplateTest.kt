@@ -23,8 +23,9 @@ import java.io.PrintStream
  * through `/api/v1/login-experience/email-templates/{type}?locale=`: a `404 template_not_customized` is a create, a stored cell
  * is diffed on `subject` and the body (line endings and trailing whitespace normalised), `apply` PUTs `{ subject, bodyHtml }`,
  * a removal is the `DELETE`. The body is inline (`body`) or a file next to the provisioning file (`bodyFile`, read when the
- * file is loaded). Workspace-level: `environment` is refused, pointing at SSO-4043. The API's refusals (`unknown_template_variable`,
- * `413`) surface as plain refusals naming the cell. `import` writes each stored base template with its body as a file.
+ * file is loaded). The API's refusals (`unknown_template_variable`, `413`) surface as plain refusals naming the cell. `import` writes
+ * each stored cell with its body as a file. These cases are the production plane's; SSO-4054 moved the kind onto the environment
+ * axis — the sandbox cases are [ProvisionEmailTemplateEnvironmentTest].
  *
  * Every assertion was watched failing against a reverted implementation before it was trusted (the control table in the PR).
  */
@@ -198,7 +199,7 @@ class ProvisionEmailTemplateTest : CommandTestBase() {
     // ── validation ───────────────────────────────────────────────────────────
 
     @Test
-    fun `the spec is checked before any call — type, locale, subject, size, an unknown key, grants, a duplicate cell, and environment points at SSO-4043`() {
+    fun `the spec is checked before any call — type, locale, subject, size, an unknown key, grants, a duplicate cell per environment`() {
         assertThatThrownBy {
             file("""
                 - kind: emailTemplate
@@ -235,9 +236,15 @@ class ProvisionEmailTemplateTest : CommandTestBase() {
                   spec: { type: email_verification, locale: FR, subject: s, body: "<p>x</p>" }
                 - kind: emailTemplate
                   spec: { type: co_admin_invitation, subject: s, body: "<p>x</p>" }
+                - kind: emailTemplate
+                  name: dup-staging
+                  environment: staging
+                  spec: { type: email_verification, locale: fr, subject: s, body: "<p>x</p>" }
             """)
         }.isInstanceOf(ProvisionException::class.java)
-            .hasMessageContaining("resources[0] a emailTemplate belongs to the workspace, not an environment — remove 'environment' (email templates are stored tenant-wide today, one set for every environment; per-environment templates are SSO-4043)")
+            // SSO-4054 — `environment` is accepted (the kind is per environment), and the same cell in another environment is
+            // another record: dup-staging does not join the production pair below.
+            .hasMessageNotContaining("resources[0]").hasMessageNotContaining("SSO-4043").hasMessageNotContaining("dup-staging")
             .hasMessageContaining("resources[1] (emailTemplate) spec.type 'welcome_mail' must be one of magic_link, invitation, password_reset, security_alert, account_unlock, email_verification, organization_invitation, co_admin_invitation")
             .hasMessageContaining("resources[2] (emailTemplate) spec.locale 'en-GB' must be a 2-3 letter ISO 639 language code")
             .hasMessageContaining("resources[3] (emailTemplate) spec.subject must not be blank")
@@ -246,7 +253,7 @@ class ProvisionEmailTemplateTest : CommandTestBase() {
             .hasMessageContaining("resources[6] spec has unknown property 'bodyHtml'")
             .hasMessageContaining("resources[6] (emailTemplate) ${ProvisionFile.ERR_EMAIL_TEMPLATE_BODY_REQUIRED}")
             .hasMessageContaining("resources[7] an emailTemplate cannot carry 'grants'")
-            .hasMessageContaining("duplicate emailTemplate for type email_verification locale fr — declared 2 times ('dup-a', 'dup-b')")
+            .hasMessageContaining("duplicate emailTemplate for type email_verification locale fr — declared 2 times ('dup-a', 'dup-b'); one resource per (environment, type, locale)")
             .hasMessageContaining("resources[10] (emailTemplate) requires a name")
         assertThat(api.requests).isEmpty()
     }
@@ -310,22 +317,29 @@ class ProvisionEmailTemplateTest : CommandTestBase() {
     // ── import ───────────────────────────────────────────────────────────────
 
     @Test
-    fun `import renders each stored base template with its body as a file, says locale variants cannot be listed, and import --write round-trips to an all-noop plan`() {
+    fun `import renders each listed cell with its body as a file — locale variants included — and import --write round-trips to an all-noop plan`() {
         api.emailTemplates["magic_link:*"] = mutableMapOf("subject" to "Sign in to Acme, {{displayName}}", "bodyHtml" to "<p>Hi {{displayName}}</p>\n<p><a href=\"{{magicLinkUrl}}\">Sign in</a></p>\n")
         api.emailTemplates["password_reset:*"] = mutableMapOf("subject" to "Reset your Acme password", "bodyHtml" to "<p><a href=\"{{resetUrl}}\">Reset</a></p>\n")
         api.emailTemplates["magic_link:nl"] = mutableMapOf("subject" to "Inloggen", "bodyHtml" to welcomeBody)
 
         val result = engine().import(existing = null)
         val templates = result.resources.filter { it.resource.kind == "emailTemplate" }.associateBy { it.resource.name }
-        assertThat(templates.keys).containsExactlyInAnyOrder("magic-link", "password-reset")
+        assertThat(templates.keys).containsExactlyInAnyOrder("magic-link", "magic-link-nl", "password-reset")
         assertThat(templates.getValue("magic-link").resource.spec).isEqualTo(mapOf("type" to "magic_link", "subject" to "Sign in to Acme, {{displayName}}", "bodyFile" to "emails/magic_link.html"))
         assertThat(templates.getValue("magic-link").files).isEqualTo(mapOf("emails/magic_link.html" to "<p>Hi {{displayName}}</p>\n<p><a href=\"{{magicLinkUrl}}\">Sign in</a></p>\n"))
         assertThat(templates.getValue("magic-link").liveId).isEqualTo("magic_link:*")
         assertThat(templates.getValue("magic-link").resource.readOnly).isFalse()
         assertThat(templates.getValue("magic-link").toStructured()["files"]).isEqualTo(listOf("emails/magic_link.html"))
-        assertThat(result.skipped).anyMatch { it.startsWith("emailTemplate — locale variants (`?locale=`) cannot be listed by the API") }
-        // Every type was asked for exactly once, by address — there is no list endpoint.
-        assertThat(api.requests.filter { it.contains("/email-templates/") }).hasSize(ProvisionFile.EMAIL_TEMPLATE_TYPES.size)
+        // SSO-4054 — the listing names the locale variant, so it is imported with its locale and its own body file.
+        assertThat(templates.getValue("magic-link-nl").resource.spec).isEqualTo(mapOf("type" to "magic_link", "locale" to "nl", "subject" to "Inloggen", "bodyFile" to "emails/magic_link.nl.html"))
+        assertThat(templates.getValue("magic-link-nl").files).isEqualTo(mapOf("emails/magic_link.nl.html" to welcomeBody))
+        assertThat(templates.getValue("magic-link-nl").liveId).isEqualTo("magic_link:nl")
+        assertThat(result.skipped).noneMatch { it.contains("emailTemplate") }
+        // The listing once, then each listed cell once by address — no type that is not stored is asked for.
+        assertThat(api.requests.filter { it.contains("/email-templates") }).containsExactly(
+            "GET /api/v1/login-experience/email-templates",
+            "GET /api/v1/login-experience/email-templates/magic_link", "GET /api/v1/login-experience/email-templates/magic_link", "GET /api/v1/login-experience/email-templates/password_reset",
+        )
         assertThat(api.writes).isEmpty()
 
         // Through the CLI: the files land next to the provisioning file, the appended file plans as all no-ops, a second import adds nothing.
@@ -334,19 +348,20 @@ class ProvisionEmailTemplateTest : CommandTestBase() {
         val dry = runCli("provision", "import", "--file", target.path, "--gateway", baseUrl(), "--part", "tenant")
         assertThat(dry.exit).withFailMessage(dry.err).isEqualTo(0)
         assertThat(dry.out).contains("kind: emailTemplate").contains("bodyFile: emails/magic_link.html")
-        assertThat(dry.err).contains("2 file(s) would be written next to ${target.path}: emails/magic_link.html, emails/password_reset.html")
+        assertThat(dry.err).contains("3 file(s) would be written next to ${target.path}: emails/magic_link.html, emails/magic_link.nl.html, emails/password_reset.html")
         assertThat(File(dir, "emails")).doesNotExist()
 
         val written = runCli("provision", "import", "--file", target.path, "--gateway", baseUrl(), "--part", "tenant", "--write")
         assertThat(written.exit).withFailMessage(written.err).isEqualTo(0)
-        assertThat(written.out).contains("2 file(s) written beside it (emails/magic_link.html, emails/password_reset.html)")
+        assertThat(written.out).contains("3 file(s) written beside it (emails/magic_link.html, emails/magic_link.nl.html, emails/password_reset.html)")
+        assertThat(File(dir, "emails/magic_link.nl.html").readText()).isEqualTo(welcomeBody)
         assertThat(File(dir, "emails/magic_link.html").readText()).isEqualTo("<p>Hi {{displayName}}</p>\n<p><a href=\"{{magicLinkUrl}}\">Sign in</a></p>\n")
         assertThat(File(dir, "emails/password_reset.html").readText()).isEqualTo("<p><a href=\"{{resetUrl}}\">Reset</a></p>\n")
         assertThat(target.readText()).contains("bodyFile: emails/magic_link.html").doesNotContain("<p>")
 
         val plan = runCli("provision", "plan", "--file", target.path, "--gateway", baseUrl())
         assertThat(plan.exit).withFailMessage(plan.err).isEqualTo(0)
-        assertThat(plan.out).contains("0 to create, 0 to update, 0 to remove, 2 unchanged.")
+        assertThat(plan.out).contains("0 to create, 0 to update, 0 to remove, 3 unchanged.")
         val again = runCli("provision", "import", "--file", target.path, "--gateway", baseUrl(), "--write")
         assertThat(again.exit).isEqualTo(0)
         assertThat(again.out).contains("Nothing to import")

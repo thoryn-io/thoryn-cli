@@ -259,7 +259,7 @@ data class ImportedResource(
     val note: String? = null,
     /**
      * SSO-4042 — files the entry refers to, to be written NEXT TO the provisioning file by the host: path relative to the file →
-     * content. An `emailTemplate`'s body goes to `emails/<type>[.<locale>].html` and its spec names it as `bodyFile`; the engine
+     * content. An `emailTemplate`'s body goes to `emails/[<sandbox-slug>/]<type>[.<locale>].html` and its spec names it as `bodyFile`; the engine
      * (a library) writes nothing, the CLI's `import --write` does.
      */
     val files: Map<String, String> = emptyMap(),
@@ -1633,7 +1633,8 @@ class ProvisionEngine(
             // SSO-4042 — the CLI has no `email-templates` verb; the API call, which resets the cell to the built-in default.
             ProvisionFile.KIND_EMAIL_TEMPLATE -> "DELETE /api/v1/login-experience/email-templates/${id.substringBefore(':')}" +
                 id.substringAfter(':', ProvisionFile.EMAIL_TEMPLATE_BASE_LOCALE).takeIf { it != ProvisionFile.EMAIL_TEMPLATE_BASE_LOCALE }?.let { "?locale=$it" }.orEmpty() +
-                " (resets it to the built-in default; the CLI has no `email-templates` command)"
+                (plane?.let { " with header X-Thoryn-Environment: $it (resets that environment's copy — it then sends production's" } ?: " (resets it to the built-in default") +
+                "; the CLI has no `email-templates` command)"
             ProvisionFile.KIND_WORKLOAD_IDENTITY_TRUST -> "thoryn workload-identity trusts delete $id --yes${if (plane == null) " --confirm <workspace-slug>" else ""}$env"
             // SSO-3941 — the CLI has no `roles delete`; the API call, with the production confirmation it needs.
             ProvisionFile.KIND_ROLE -> "DELETE /api/v1/roles/$id (the CLI has no `roles delete`${if (plane == null) "; send X-Thoryn-Confirm: <workspace-slug>" else "; header X-Thoryn-Environment: $plane"})"
@@ -2028,34 +2029,62 @@ class ProvisionEngine(
                 add(ProvisionFile.KIND_CUSTOM_DOMAIN, ProvisionFile.KIND_CUSTOM_DOMAIN, null, null, id, access, linkedMapOf("host" to host))
             }
         }
-        // SSO-4042 — email templates: no list endpoint, so each type's BASE cell is read by address (`404 template_not_customized`
-        // ⇒ not stored); a locale variant cannot be discovered without naming it, which is said once. The relation is the login
-        // experience's (`login_theme:production`): manager ⇒ converge, viewer ⇒ readOnly. The body goes to a file next to the
-        // provisioning file (`emails/<type>.html`), the spec names it as `bodyFile`.
+        // SSO-4042 / SSO-4054 — email templates, PER ENVIRONMENT (oauthy SSO-4043): each plane's listing (`GET …/email-templates`
+        // with its `X-Thoryn-Environment`, oauthy SSO-4053) names exactly the (type, locale) cells THAT plane stores — never the
+        // rows a sandbox inherits from production — and each cell's body is read by address on the same plane. One resource per
+        // (environment, type, locale). The relation is the login experience's (`login_theme:<plane>`): manager ⇒ converge,
+        // viewer ⇒ readOnly. The body goes to a file next to the provisioning file — `emails/<type>[.<locale>].html` for
+        // production, `emails/<slug>/<type>[.<locale>].html` for a sandbox ([emailTemplateBodyPath]) — and the spec names it as
+        // `bodyFile`.
         if (!ofPart(ProvisionFile.KIND_EMAIL_TEMPLATE)) {
             skip("${ProvisionFile.KIND_EMAIL_TEMPLATE} — not imported: ${partReason(ProvisionFile.KIND_EMAIL_TEMPLATE)}")
         } else importKind(ProvisionFile.KIND_EMAIL_TEMPLATE) {
-            val ref = objectRef(ProvisionFile.KIND_EMAIL_TEMPLATE, "", null)
-            val access = reach.on(ref).let { direct -> if (direct == Access.NONE && reach.managesWorkspace()) Access.MANAGER else direct }
-            if (access != Access.NONE) {
-                var found = 0
-                ProvisionFile.EMAIL_TEMPLATE_TYPES.forEach { type ->
-                    if (declared.any { it.kind == ProvisionFile.KIND_EMAIL_TEMPLATE && ProvisionFile.emailTemplateCell(it.spec["type"]?.toString(), it.spec["locale"]?.toString()) == ProvisionFile.emailTemplateCell(type, null) }) return@forEach
-                    val n = try {
-                        clients(null).getEmailTemplate(type, null)
-                    } catch (ex: ProductApiException) {
-                        if (ex.httpStatus == 404) return@forEach else throw ex
-                    }
-                    found++
-                    val id = emailTemplateId(type, null)
-                    if (routedAway(null, "email_template:$id")) return@forEach
-                    val subject = n.str("subject") ?: return@forEach skip("email_template:$id — stored without a subject; not a declarable emailTemplate")
-                    val body = n.str("bodyHtml") ?: return@forEach skip("email_template:$id — stored without a body; not a declarable emailTemplate")
-                    val path = "emails/$type.html"
-                    val resource = ProvisionResource(ProvisionFile.KIND_EMAIL_TEMPLATE, uniqueName(ProvisionFile.KIND_EMAIL_TEMPLATE, type), null, linkedMapOf("type" to type, "subject" to subject, "bodyFile" to path), readOnly = access == Access.VIEWER)
-                    accept(ImportedResource(resource, id, access, files = mapOf(path to body)), "emailTemplate/${resource.name} (the workspace)")
+            fun templateAccess(plane: String?): Access {
+                val direct = reach.on(objectRef(ProvisionFile.KIND_EMAIL_TEMPLATE, "", plane))
+                if (direct != Access.NONE) return direct
+                // The login experience's object may be missing from the graph (never written); its parent's relation then decides.
+                return if (plane == null) {
+                    if (reach.managesWorkspace()) Access.MANAGER else Access.NONE
+                } else {
+                    reach.environmentId(plane)?.let { reach.on(objectRef(ProvisionFile.KIND_ENVIRONMENT, it, null)) } ?: Access.NONE
                 }
-                if (found > 0) skip("emailTemplate — locale variants (`?locale=`) cannot be listed by the API (there is no list endpoint); only each type's base template was read — declare a locale variant by hand with spec.locale")
+            }
+            (listOf<String?>(null) + sandboxSlugs).forEach plane@{ plane ->
+                val access = templateAccess(plane)
+                if (access == Access.NONE) return@plane
+                if (routedAway(plane, "emailTemplate (${planeLabel(plane)})")) return@plane
+                val rows = try {
+                    listItems(clients(plane).listEmailTemplates(), "data")
+                } catch (ex: ProductApiException) {
+                    if (ex.httpStatus != 404) throw ex
+                    return@plane skip(
+                        "emailTemplate (${planeLabel(plane)}) — not imported: the listing answered 404${ex.errorCode?.let { " $it" } ?: ""} — this identity has no reach into " +
+                            "that environment's login experience, or product-api predates the per-environment listing (oauthy SSO-4053)",
+                    )
+                }
+                rows.forEach row@{ row ->
+                    val type = row.str("templateType") ?: return@row
+                    val locale = row.str("locale")?.let { ProvisionFile.emailTemplateLocale(it) }?.takeIf { it != ProvisionFile.EMAIL_TEMPLATE_BASE_LOCALE }
+                    val id = emailTemplateId(type, locale)
+                    if (type !in ProvisionFile.EMAIL_TEMPLATE_TYPES) return@row skip("email_template:$id (${planeLabel(plane)}) — type '$type' is not one this CLI declares; update the CLI")
+                    val cell = ProvisionFile.emailTemplateCell(type, locale)
+                    if (declared.any { it.kind == ProvisionFile.KIND_EMAIL_TEMPLATE && declaredOnPlane(it, plane) && ProvisionFile.emailTemplateCell(it.spec["type"]?.toString(), it.spec["locale"]?.toString()) == cell }) return@row
+                    val n = try {
+                        clients(plane).getEmailTemplate(type, locale)
+                    } catch (ex: ProductApiException) {
+                        if (ex.httpStatus == 404 && ex.errorCode == ERROR_TEMPLATE_NOT_CUSTOMIZED) return@row else throw ex
+                    }
+                    val subject = n.str("subject") ?: return@row skip("email_template:$id (${planeLabel(plane)}) — stored without a subject; not a declarable emailTemplate")
+                    val body = n.str("bodyHtml") ?: return@row skip("email_template:$id (${planeLabel(plane)}) — stored without a body; not a declarable emailTemplate")
+                    val path = emailTemplateBodyPath(plane, type, locale)
+                    val spec = linkedMapOf<String, Any?>("type" to type)
+                    locale?.let { spec["locale"] = it }
+                    spec["subject"] = subject
+                    spec["bodyFile"] = path
+                    val name = uniqueName(ProvisionFile.KIND_EMAIL_TEMPLATE, listOfNotNull(type, locale, plane).joinToString("-"))
+                    val resource = ProvisionResource(ProvisionFile.KIND_EMAIL_TEMPLATE, name, environmentField(plane), spec, readOnly = access == Access.VIEWER)
+                    accept(ImportedResource(resource, id, access, files = mapOf(path to body)), "emailTemplate/$name (${planeLabel(plane)})")
+                }
             }
         }
         // SSO-3689 / SSO-3774 — workload-identity trusts: the API lists a plane's trusts filtered to what this identity reaches
@@ -2375,16 +2404,19 @@ class ProvisionEngine(
             }
         }
         ProvisionFile.KIND_EMAIL_TEMPLATE -> {
-            // SSO-4042 — the (type, locale) cell, read on the production plane (tenant-wide today). `404 template_not_customized`
-            // is the API's "no override" ⇒ a create; any OTHER 404 is the facade's gate (`not_found` — no relation on
-            // `login_theme:production`) and stays a 404 for [unreachable] to turn into the missing right.
+            // SSO-4042 / SSO-4054 — the (type, locale) cell of the resource's OWN environment (the plane's client sends
+            // `X-Thoryn-Environment`). `404 template_not_customized` is the API's "this environment stores no override" ⇒ a
+            // create; any OTHER 404 is the facade's gate (`not_found` — no relation on `login_theme:<plane>`, or
+            // `unknown_environment`) and stays a 404 for [unreachable] to turn into the missing right. The comparison is with the
+            // environment's own row, never the copy a sandbox inherits from production: the admin read is exact by contract, and a
+            // response naming another environment is treated as "not stored" all the same.
             val (type, locale) = emailTemplateAddress(desired)
             val stored = try {
-                clients(null).getEmailTemplate(type, locale)
+                clients(slug).getEmailTemplate(type, locale)
             } catch (ex: ProductApiException) {
                 if (ex.httpStatus == 404 && ex.errorCode == ERROR_TEMPLATE_NOT_CUSTOMIZED) null else throw ex
             }
-            stored?.let { n ->
+            stored?.takeIf { n -> n.str("environmentSlug")?.let { it == (slug ?: PRODUCTION_ENV_SLUG) } ?: true }?.let { n ->
                 val want = mapOf("subject" to desired["subject"].nonBlank(), "body" to desired["body"]?.toString())
                 val have = mapOf("subject" to n.str("subject"), "body" to n.str("bodyHtml"))
                 Live(emailTemplateId(type, locale), emailTemplateDiff(want, have), mapOf("type" to type, "locale" to (locale ?: ProvisionFile.EMAIL_TEMPLATE_BASE_LOCALE)))
@@ -2449,7 +2481,7 @@ class ProvisionEngine(
             ProvisionFile.KIND_LOGIN_FLOW -> applyLoginFlow(r, targetSlug(r, file, applied), spec, "+")
             ProvisionFile.KIND_LOGIN_METHODS -> putLoginMethods(r, targetSlug(r, file, applied), spec, "+")
             ProvisionFile.KIND_CUSTOM_DOMAIN -> claimCustomDomain(r, spec)
-            ProvisionFile.KIND_EMAIL_TEMPLATE -> putEmailTemplate(r, spec, "+")
+            ProvisionFile.KIND_EMAIL_TEMPLATE -> putEmailTemplate(r, targetSlug(r, file, applied), spec, "+")
             ProvisionFile.KIND_WORKLOAD_IDENTITY_TRUST -> createTrust(r, file, applied, spec)
             ProvisionFile.KIND_ROLE -> createRole(r, targetSlug(r, file, applied), spec)
             else -> throw ProvisionException("${r.key}: unsupported kind '${r.kind}'")
@@ -2601,7 +2633,7 @@ class ProvisionEngine(
             ProvisionFile.KIND_LOGIN_FLOW -> applyLoginFlow(r, slug, spec, "~").copy(action = ChangeAction.UPDATE)
             ProvisionFile.KIND_LOGIN_METHODS -> putLoginMethods(r, slug, spec, "~").copy(action = ChangeAction.UPDATE)
             ProvisionFile.KIND_CUSTOM_DOMAIN -> verifyDomain(r, spec).copy(action = ChangeAction.UPDATE)
-            ProvisionFile.KIND_EMAIL_TEMPLATE -> putEmailTemplate(r, spec, "~").copy(action = ChangeAction.UPDATE)
+            ProvisionFile.KIND_EMAIL_TEMPLATE -> putEmailTemplate(r, slug, spec, "~").copy(action = ChangeAction.UPDATE)
             else -> throw ProvisionException("${r.key}: unsupported kind '${r.kind}'")
         }
     }
@@ -2619,25 +2651,33 @@ class ProvisionEngine(
     private fun emailTemplateId(type: String, locale: String?): String = "$type:${locale ?: ProvisionFile.EMAIL_TEMPLATE_BASE_LOCALE}"
 
     /**
+     * SSO-4054 — where `import` puts a cell's body, relative to the provisioning file: `emails/<type>[.<locale>].html` for the
+     * production plane (the SSO-4042 layout, unchanged), `emails/<slug>/<type>[.<locale>].html` for a sandbox — so one file
+     * holding several environments never has two cells claim one body file.
+     */
+    private fun emailTemplateBodyPath(plane: String?, type: String, locale: String?): String =
+        "emails/" + (plane?.let { "$it/" } ?: "") + type + (locale?.let { ".$it" } ?: "") + ".html"
+
+    /**
      * `PUT /api/v1/login-experience/email-templates/{type}?locale=` with `{ subject, bodyHtml }` — the body as the file declared it
      * (inline, or read from `bodyFile` when the file was loaded). The API's refusals are surfaced as plain refusals naming the
      * cell and the cause ([emailTemplateFailure]): `unknown_template_variable` with the allowed set, `413` for an oversize subject or
      * body, the blank / locale / type checks the loader also makes.
      */
-    private fun putEmailTemplate(r: ProvisionResource, spec: Map<String, Any?>, mark: String): AppliedResource {
+    private fun putEmailTemplate(r: ProvisionResource, slug: String?, spec: Map<String, Any?>, mark: String): AppliedResource {
         val (type, locale) = emailTemplateAddress(spec)
         val subject = spec["subject"].nonBlank() ?: throw ProvisionException("${r.key}: spec.subject is required")
         val body = spec["body"]?.toString()?.takeIf { it.isNotBlank() }
             ?: throw ProvisionException("${r.key}: ${ProvisionFile.ERR_EMAIL_TEMPLATE_BODY_REQUIRED} — spec.body or spec.bodyFile is required")
         val resp = try {
-            clients(null).putEmailTemplate(type, locale, linkedMapOf("subject" to subject, "bodyHtml" to body))
+            clients(slug).putEmailTemplate(type, locale, linkedMapOf("subject" to subject, "bodyHtml" to body))
         } catch (ex: ProductApiException) {
             throw emailTemplateFailure(r, ex, type, locale)
         }
         val cell = emailTemplateId(type, locale)
         val source = spec["bodyFile"]?.toString()?.let { " body=$it" } ?: ""
-        out.println("  $mark emailTemplate ${r.name}: $cell subject=\"${subject.take(60)}${if (subject.length > 60) "…" else ""}\"$source")
-        return AppliedResource(r.kind, r.name, cell, null, buildMap {
+        out.println("  $mark emailTemplate ${r.name}: $cell${slug?.let { " (environment $it)" } ?: ""} subject=\"${subject.take(60)}${if (subject.length > 60) "…" else ""}\"$source")
+        return AppliedResource(r.kind, r.name, cell, slug, buildMap {
             put("type", resp.str("templateType") ?: type)
             put("locale", resp.str("locale") ?: locale ?: ProvisionFile.EMAIL_TEMPLATE_BASE_LOCALE)
         }, action = ChangeAction.CREATE)
@@ -3052,8 +3092,9 @@ class ProvisionEngine(
                 // SSO-4042 — the DELETE of the (type, locale) cell IS the reset to the built-in default (idempotent on the API).
                 val type = c.attributes["type"] ?: id.substringBefore(':')
                 val locale = (c.attributes["locale"] ?: id.substringAfter(':', ProvisionFile.EMAIL_TEMPLATE_BASE_LOCALE)).takeIf { it != ProvisionFile.EMAIL_TEMPLATE_BASE_LOCALE }
-                clients(null).deleteEmailTemplate(type, locale)
-                out.println("  - emailTemplate ${c.name}: ${emailTemplateId(type, locale)} reset to the built-in default")
+                // SSO-4054 — in the row's OWN environment only (`X-Thoryn-Environment`); a sandbox then sends production's copy.
+                clients(c.environment).deleteEmailTemplate(type, locale)
+                out.println("  - emailTemplate ${c.name}: ${emailTemplateId(type, locale)}${c.environment?.let { " (environment $it)" } ?: ""} reset to the built-in default")
             }
             ProvisionFile.KIND_WORKLOAD_IDENTITY_TRUST -> {
                 // SSO-3689 — only through `--prune` / `destroy`; the trust's workload client stops authenticating at once.
@@ -4298,9 +4339,9 @@ class ProvisionEngine(
                 // SSO-3413 — the workspace-level singleton; its id IS the workspace id (`tnt`).
                 ProvisionFile.KIND_CUSTOM_DOMAIN -> "custom_domain:$id"
                 // SSO-4042 — an email template has no access object of its own: product-api's LoginExperienceController gates EVERY
-                // login-experience call (SSO-3111 `PlatformSingletonGate`) on the caller's relation to `login_theme:<plane>`, and
-                // email templates are tenant-wide, so the plane is production.
-                ProvisionFile.KIND_EMAIL_TEMPLATE -> "$OBJECT_TYPE_LOGIN_THEME:$PRODUCTION_ENV_SLUG"
+                // login-experience call (SSO-3111 `PlatformSingletonGate`) on the caller's relation to `login_theme:<plane>`;
+                // SSO-4054 — the templates are per environment (oauthy SSO-4043), so the plane is the template's own.
+                ProvisionFile.KIND_EMAIL_TEMPLATE -> "$OBJECT_TYPE_LOGIN_THEME:$envSlug"
                 // SSO-3774 — the hub's trust UUID (stable, unique, needs no escaping).
                 ProvisionFile.KIND_WORKLOAD_IDENTITY_TRUST -> "$OBJECT_TYPE_TRUST:$id"
                 else -> throw ProvisionException("$kind: no access object type for this kind")

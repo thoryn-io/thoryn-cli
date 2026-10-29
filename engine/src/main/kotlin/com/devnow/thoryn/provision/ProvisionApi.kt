@@ -176,18 +176,24 @@ interface ProvisionApi {
 
     // ── Email templates (`/api/v1/login-experience/email-templates/{type}?locale=`; SSO-4042, product-api SSO-1926 / SSO-2098) ──
     // Scopes `tenant:idp.read` (GET) and `tenant:idp.write` (PUT / DELETE); product-api gates every login-experience call on the
-    // caller's relation to `login_theme:<plane>` (404, never 403). TENANT-WIDE today: product-api forwards no environment for
-    // email templates (SSO-4043 re-keys them), so the engine calls the production-plane client. [locale] `null` ⇒ the base,
-    // locale-independent template (`*`). GET answers the stored cell `{ templateType, locale, subject, bodyHtml,
-    // allowedVariables, updatedAt }` or `404 template_not_customized` (never the built-in default); PUT `{ subject, bodyHtml }`
-    // creates or replaces the cell (`400 unknown_template_type` / `invalid_template_locale` / `template_subject_blank` /
-    // `template_body_blank` / `unknown_template_variable`, `413 template_subject_too_large` / `template_body_too_large`); DELETE
-    // resets the cell to the built-in default and answers `200 { templateType, allLocales, resetLocales, remainingLocales }`
-    // (idempotent — never a 404). There is no list endpoint: a stored locale variant is found only by addressing it.
+    // caller's relation to `login_theme:<plane>` (404, never 403). SSO-4054 (oauthy SSO-4043) — PER ENVIRONMENT: identity keys
+    // the templates on (tenant, environment, type, locale) and product-api routes every call by the `X-Thoryn-Environment`
+    // header, so the engine calls the plane's client exactly as for `loginTheme`. [locale] `null` ⇒ the base,
+    // locale-independent template (`*`). GET answers the plane's OWN stored cell `{ templateType, locale, environmentSlug,
+    // subject, bodyHtml, allowedVariables, updatedAt }` or `404 template_not_customized` — EXACT per environment: a sandbox
+    // that stores no copy answers 404 even when production carries one (the production fallback is the SEND path's, never the
+    // admin read's), and never the built-in default; PUT `{ subject, bodyHtml }` creates or replaces the plane's cell
+    // (`400 unknown_template_type` / `invalid_template_locale` / `template_subject_blank` / `template_body_blank` /
+    // `unknown_template_variable`, `413 template_subject_too_large` / `template_body_too_large`); DELETE resets the plane's cell
+    // to the built-in default (a sandbox then sends production's copy) and answers `200 { templateType, allLocales,
+    // resetLocales, remainingLocales }` (idempotent — never a 404). [listEmailTemplates] (`GET …/email-templates`, oauthy
+    // SSO-4053) answers every (type, locale) cell the PLANE stores — `{ data: [{ templateType, locale, environmentSlug,
+    // subject, updatedAt }], pagination }`, no body, no inherited rows: a sandbox that stores nothing lists nothing.
     //
     // Defaulted (like [listRoles]) so a host that predates email templates keeps compiling: the default answers `501`, which the
     // engine surfaces as a failed read of the template (never as "absent").
 
+    fun listEmailTemplates(): JsonNode = throw unsupported("email templates")
     fun getEmailTemplate(type: String, locale: String?): JsonNode = throw unsupported("email templates")
     fun putEmailTemplate(type: String, locale: String?, body: Map<String, Any?>): JsonNode = throw unsupported("email templates")
     fun deleteEmailTemplate(type: String, locale: String?): JsonNode = throw unsupported("email templates")

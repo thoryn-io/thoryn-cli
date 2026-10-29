@@ -276,7 +276,8 @@ thoryn examples share    <name> [--output <file>]   # SSO-2876 — export the se
 # one as cleared, apply PUTs the full record, and the spec is checked in identity's grammar — and, SSO-3413, the
 # workspace-level singleton customDomain: plan shows the DNS records, apply claims + verifies, only
 # --prune/destroy with --confirm release it — and, SSO-4042, emailTemplate: one transactional email template
-# override per (type, locale), workspace-level today, body inline or in a file next to the provisioning file). SSO-3715 (ADR 2026-10-15 platform-is-the-ledger): THERE IS
+# override per (environment, type, locale) — SSO-4054: per environment, a sandbox without its own copy sends
+# production's — body inline or in a file next to the provisioning file). SSO-3715 (ADR 2026-10-15 platform-is-the-ledger): THERE IS
 # NO RECEIPT — nothing is written beside the file, committed or cached; plan / apply / destroy / import read
 # live state only, and `apply --output json` / `plan --output json` carry the resolved ids (`resources[]`:
 # {kind, name, id, environment, action}). SSO-3089: every resource is read LIVE by its converge key before
@@ -2010,11 +2011,11 @@ application: a sender constraint widens nothing.
 session_exceeds_tenant_policy — … cap of 86400 seconds …`), never the "Required scope" hint a bare `403` would
 otherwise print. Everything converged before it stays live; fix the cause and re-run.
 
-### Email templates as code — `kind: emailTemplate` (SSO-4042)
+### Email templates as code — `kind: emailTemplate` (SSO-4042, per environment since SSO-4054)
 
-`kind: emailTemplate` is ONE transactional email template override of the workspace, per (type, locale) — the
+`kind: emailTemplate` is ONE transactional email template override, per (environment, type, locale) — the
 `/api/v1/login-experience/email-templates/{type}?locale=` surface (`tenant:idp.read` to plan, `tenant:idp.write` to
-apply). The eight types are identity-service's: `magic_link`, `invitation`, `password_reset`, `security_alert`,
+apply), addressed with `X-Thoryn-Environment` exactly like `loginTheme`. The eight types are identity-service's: `magic_link`, `invitation`, `password_reset`, `security_alert`,
 `account_unlock`, `email_verification`, `organization_invitation`, `co_admin_invitation`. The body is **`body`** (inline
 HTML) **or `bodyFile`** (a path relative to the provisioning file, inside its directory, read when the file is loaded) —
 exactly one.
@@ -2029,13 +2030,22 @@ exactly one.
 - kind: emailTemplate
   name: welcome-nl
   spec: { type: magic_link, locale: nl, subject: "Inloggen bij Acme", bodyFile: emails/magic_link.nl.html }
+- kind: emailTemplate
+  name: welcome-staging
+  environment: staging                            # the sandbox's own copy; omitted ⇒ production
+  spec: { type: magic_link, subject: "[staging] Sign in", bodyFile: emails/staging/magic_link.html }
 ```
 
-- **Workspace-level, for now.** identity-service stores templates tenant-wide — one set for every environment, no
-  environment column — so `environment:` is refused, like `customDomain`'s, with a message pointing at **SSO-4043** (the
-  re-key to the environment axis). Until then a template declared in the config project's production file is the one
-  every sandbox sends too.
-- **Converge key** `(spec.type, spec.locale)`. `locale` is the API's grammar: a 2–3 letter ISO 639 language code (`en`,
+- **Per environment** (oauthy SSO-4043: identity keys templates on (tenant, environment, type, locale) and product-api
+  routes every call by the `X-Thoryn-Environment` header). `environment:` names the plane — omitted ⇒ production — and
+  the CLI sends it as the header, exactly as for `loginTheme`. **A sandbox inherits production's copy until it
+  declares its own:** a sandbox email for a cell the sandbox stores nothing for is sent with production's override (then
+  the built-in default). That inheritance is not drift — nothing is planned for a cell a sandbox does not declare, and
+  `plan` always compares a declared sandbox cell with the sandbox's **own** stored row (the API's read is exact per
+  environment), never with the copy it inherits. The sandbox-first workflow: declare the new template in the sandbox's
+  file, apply, check it there, then declare it in production's file.
+- **Converge key** `(environment, spec.type, spec.locale)`; two resources for the same cell in one environment are
+  refused, the same cell in production and a sandbox are two records. `locale` is the API's grammar: a 2–3 letter ISO 639 language code (`en`,
   `nl`); omitted ⇒ the base, locale-independent template (`*`). A region subtag (`en-GB`) is refused before any call —
   product-api stores none.
 - **plan**: `404 template_not_customized` ⇒ create; a stored cell is diffed on `subject` and the body with line endings
@@ -2046,16 +2056,20 @@ exactly one.
   `emailTemplate/welcome: unknown_template_variable — … Allowed variables are: displayName, expiryMinutes, magicLinkUrl.`
   An oversize subject or body the loader could not see is `template_body_too_large (HTTP 413)`, the same way.
 - **No `grants:`** — an email template is not a platform access object: product-api gates every login-experience call
-  on the caller's relation to `login_theme:production`, so the ownership check is that object's (`manager` to converge,
-  `viewer` for a `readOnly: true` reference).
-- **destroy / `--prune`**: the removal is the `DELETE` of the cell (back to the built-in default). The singleton rule
-  holds (ADR 2026-10-15 §1): on the production plane — every template today — the row is left in place and names the
-  call a person makes (`DELETE /api/v1/login-experience/email-templates/<type>?locale=<l>`; the CLI has no
-  `email-templates` command).
-- **import** reads each type's **base** template by address (there is no list endpoint; a locale variant is found only
-  by naming it, which `import` says once) and renders it with its body in **`emails/<type>.html` next to the
-  provisioning file**, `spec.bodyFile` naming it. `import --write` writes those files beside the entries and never
-  overwrites a body file that exists with other content. The configuration import (`--for-workflow`, contract v2)
+  on the caller's relation to `login_theme:<environment>`, so the ownership check is that object's (`manager` to
+  converge, `viewer` for a `readOnly: true` reference).
+- **destroy / `--prune`**: the removal is the `DELETE` of the cell in its own environment (`X-Thoryn-Environment`; a
+  production cell goes back to the built-in default, a sandbox cell back to inheriting production's). The singleton
+  rule holds (ADR 2026-10-15 §1): on the production plane the row is left in place and names the call a person makes
+  (`DELETE /api/v1/login-experience/email-templates/<type>?locale=<l>`; the CLI has no `email-templates` command); in a
+  sandbox the template goes with its sandbox when the file declares it, and otherwise the row names the same call with
+  the header.
+- **import** reads each environment's listing (`GET /api/v1/login-experience/email-templates` with that environment's
+  header — exactly the cells it stores, no inherited rows, locale variants included), then each cell by address, and
+  renders one entry per (environment, type, locale) with its body in a file **next to the provisioning file**:
+  `emails/<type>[.<locale>].html` for production, `emails/<sandbox-slug>/<type>[.<locale>].html` for a sandbox, named by
+  `spec.bodyFile`. A sandbox that stores nothing gets no entry (it inherits). `import --write` writes those files beside
+  the entries and never overwrites a body file that exists with other content. The configuration import (`--for-workflow`, contract v2)
   stages the committed file's body files beside the copy so the copy loads and plans, and the `thoryn-import` artifact
   carries them (`import-summary.json` lists them per file as `bodyFiles`).
 

@@ -188,11 +188,13 @@ class ProvisionSchemaConformanceTest {
     }
 
     @Test
-    fun `emailTemplate's schema block is the loader's — the type enum, the locale grammar, the caps, exactly one body source, no environment, no grants`() {
-        // SSO-4042 — one (type, locale) cell per resource, workspace-level, body inline or as a file; both contracts pin the same shape.
+    fun `emailTemplate's schema block is the loader's — the type enum, the locale grammar, the caps, exactly one body source, an environment allowed, no grants`() {
+        // SSO-4042 — one (type, locale) cell per resource, body inline or as a file; SSO-4054 — per environment (oauthy SSO-4043),
+        // so `environment` is no longer refused. Both contracts pin the same shape.
         val rule = schema["\$defs"]["resource"]["allOf"].toList().first { it["if"]["properties"]["kind"]["const"].asString() == "emailTemplate" }["then"]
         assertThat(rule["required"].toList().map { it.asString() }).containsExactly("name")
-        assertThat(rule["not"]["anyOf"].toList().map { it["required"].toList().single().asString() }).containsExactlyInAnyOrder("environment", "grants")
+        assertThat(rule["not"]["required"].toList().map { it.asString() }).containsExactly("grants")
+        assertThat(rule["not"]["anyOf"]).isNull()
         val spec = rule["properties"]["spec"]
         assertThat(spec["additionalProperties"].asBoolean()).isFalse()
         assertThat(spec["properties"].propertyNames().toSet()).isEqualTo(ProvisionFile.EMAIL_TEMPLATE_SPEC_KEYS)
@@ -201,10 +203,10 @@ class ProvisionSchemaConformanceTest {
         assertThat(spec["properties"]["type"]["enum"].toList().map { it.asString() }).isEqualTo(ProvisionFile.EMAIL_TEMPLATE_TYPES)
         assertThat(spec["properties"]["locale"]["pattern"].asString()).isEqualTo(ProvisionFile.EMAIL_TEMPLATE_LOCALE_PATTERN.pattern)
         assertThat(spec["properties"]["subject"]["maxLength"].asInt()).isEqualTo(ProvisionFile.EMAIL_TEMPLATE_MAX_SUBJECT_CHARS)
-        assertThat(ProvisionFile.WORKSPACE_KINDS).contains(ProvisionFile.KIND_EMAIL_TEMPLATE)
+        assertThat(ProvisionFile.WORKSPACE_KINDS).doesNotContain(ProvisionFile.KIND_EMAIL_TEMPLATE)
         assertThat(ProvisionFile.TENANT_KINDS).contains(ProvisionFile.KIND_EMAIL_TEMPLATE)
         assertThat(ProvisionFile.SINGLETON_KINDS).doesNotContain(ProvisionFile.KIND_EMAIL_TEMPLATE)
-        // The loader refuses what the schema refuses: both bodies, neither, a region locale, an environment.
+        // The loader refuses what the schema refuses: both bodies, neither, a region locale; and accepts what it accepts: an environment.
         val v = ProvisionFile.validate(
             yaml.readTree(
                 """
@@ -220,7 +222,7 @@ class ProvisionSchemaConformanceTest {
         assertThat(v).anyMatch { it.contains("resources[0]") && it.contains(ProvisionFile.ERR_EMAIL_TEMPLATE_BODY_AMBIGUOUS) }
         assertThat(v).anyMatch { it.contains("resources[1]") && it.contains(ProvisionFile.ERR_EMAIL_TEMPLATE_BODY_REQUIRED) }
         assertThat(v).anyMatch { it.contains("resources[2]") && it.contains("spec.locale 'en-GB'") }
-        assertThat(v).anyMatch { it.contains("resources[3]") && it.contains("SSO-4043") }
+        assertThat(v).noneMatch { it.contains("resources[3]") }
     }
 
     @Test
