@@ -159,7 +159,9 @@ empty; default empty ⇒ the raw CLI commands alone, under a check-each-line war
 `config.valid` (SSO-3970) also LOADS every file the configuration lists — each `files[].file` with the loader
 `thoryn provision plan` uses, each `files[].connection` with the one `thoryn login --connection` uses. A file that is not
 committed, is not valid YAML/JSON, declares an unknown `apiVersion`, or breaks a rule of its file (a kind from the other
-part, SSO-3962, among them) fails `config.valid`, which names the file and the loader's reason. When none of the
+part, SSO-3962, among them) fails `config.valid`, which names the file and the loader's reason. An `emailTemplate`'s
+`spec.bodyFile` resolves next to its file, exactly as `thoryn provision plan` resolves it (SSO-4056: cli-v0.52.0 and
+earlier read it with no directory and refused every body file). When none of the
 configured provisioning files loads the detail says so ("no configured provisioning file loads, so nothing can be planned
 or applied"). The rules that read the files (`config.secret-delivery`, `config.trust-scopes`) then fail as
 `not checked: <file> could not be loaded (see config.valid)` — they never pass on the files that did load and never drop

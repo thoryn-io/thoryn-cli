@@ -205,7 +205,9 @@ object WorkflowCheck {
                     val f = File(root, path)
                     if (!f.isFile) { missing += path; return@forEach }
                     try {
-                        files[path] = ProvisionFile.parse(f.readBytes(), path, yaml = !f.name.endsWith(".json", ignoreCase = true))
+                        // SSO-4056 — `baseDir` as `ProvisionFile.load` passes it: an emailTemplate's `spec.bodyFile` resolves against the
+                        // file's own directory. Without it every file naming a body file failed here with "not read from a file".
+                        files[path] = ProvisionFile.parse(f.readBytes(), path, yaml = !f.name.endsWith(".json", ignoreCase = true), baseDir = f.absoluteFile.parentFile)
                     } catch (ex: ProvisionException) {
                         unloadable[path] = oneLine(ex.message ?: "does not load")
                     }
