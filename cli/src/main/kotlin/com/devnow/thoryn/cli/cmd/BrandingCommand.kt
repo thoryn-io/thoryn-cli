@@ -17,7 +17,8 @@ import java.util.concurrent.Callable
  * sandbox and production can carry different looks. identity-service renders the fields as CSS custom
  * properties (`--brand-primary`, `--brand-bg`, `--brand-radius`, derived `--brand-fg-on-primary`) in
  * the login templates, with strict server-side validation (hex colors, radius range, theme enum,
- * https logo URL) plus a WCAG-AA contrast guard on the color pair.
+ * https logo URL) plus a WCAG-AA contrast guard on the color pair. SSO-4048 (oauthy SSO-4044) adds the workspace's
+ * display name, an explicit browser page title, the favicon and the footer's support / terms / privacy links.
  *
  * Subcommands:
  *  - `get` — GET /api/v1/login-experience/branding (shows the EFFECTIVE values the page uses, plus
@@ -79,8 +80,8 @@ class BrandingCommand : Callable<Int> {
      * `thoryn branding set [--primary-color '#2563eb'] [--logo-url https://…] ...`
      *
      * Merge-upsert: only the fields you pass change; omitted fields keep their stored value. Pass an
-     * empty value to a string flag (`--logo-url ""`, `--primary-color ""`, `--theme ""`) to CLEAR that
-     * override so resolution falls back to the platform default.
+     * empty value to a string flag (`--logo-url ""`, `--primary-color ""`, `--theme ""`, `--display-name ""`,
+     * `--support-url ""`, …) to CLEAR that override so resolution falls back to the platform default.
      */
     @Command(name = "set", description = ["Configure (merge) the hosted-login branding for the selected environment."], mixinStandardHelpOptions = true)
     class SetSubcommand : Callable<Int> {
@@ -100,6 +101,40 @@ class BrandingCommand : Callable<Int> {
         @Option(names = ["--theme"], description = ["Color theme: light | dark | auto. Empty clears."])
         var theme: String? = null
 
+        // ── SSO-4048 (oauthy SSO-4044) — name, title, favicon and footer links; identity validates them (400 invalid_branding_field) ──
+
+        @Option(names = ["--display-name"], description = ["Workspace name the hosted screens show: plain text, 1-80 chars, no < > or control characters. Empty clears."])
+        var displayName: String? = null
+
+        @Option(names = ["--page-title"], description = ["Explicit browser page title: plain text, at most 120 chars. Empty clears (the title falls back to the display name)."])
+        var pageTitle: String? = null
+
+        @Option(names = ["--favicon-url"], description = ["Favicon URL (https, at most 2000 chars). Empty clears."])
+        var faviconUrl: String? = null
+
+        @Option(names = ["--support-url"], description = ["Footer support link: an https URL or a mailto: address (at most 2000 chars). Empty clears."])
+        var supportUrl: String? = null
+
+        @Option(names = ["--terms-url"], description = ["Footer terms-of-service link (https, at most 2000 chars). Empty clears."])
+        var termsUrl: String? = null
+
+        @Option(names = ["--privacy-url"], description = ["Footer privacy-policy link (https, at most 2000 chars). Empty clears."])
+        var privacyUrl: String? = null
+
+        /** SSO-4048 — the plain string fields, by their API name: stored value seeded, flag overlaid (empty clears). */
+        private fun textFlags(): Map<String, String?> = linkedMapOf(
+            "logoUrl" to logoUrl,
+            "primaryColor" to primaryColor,
+            "backgroundColor" to backgroundColor,
+            "theme" to theme,
+            "displayName" to displayName,
+            "pageTitle" to pageTitle,
+            "faviconUrl" to faviconUrl,
+            "supportUrl" to supportUrl,
+            "termsUrl" to termsUrl,
+            "privacyUrl" to privacyUrl,
+        )
+
         @Option(
             names = ["--var"],
             description = [
@@ -117,10 +152,11 @@ class BrandingCommand : Callable<Int> {
 
         override fun call(): Int {
             val format = CommandSupport.parseFormat(outputRaw) ?: return CommandSupport.EXIT_USAGE
-            if (logoUrl == null && primaryColor == null && backgroundColor == null &&
-                borderRadiusPx == null && theme == null && cssVars.isEmpty()
-            ) {
-                System.err.println("Error: pass at least one of --logo-url, --primary-color, --background-color, --border-radius-px, --theme, --var.")
+            if (textFlags().values.all { it == null } && borderRadiusPx == null && cssVars.isEmpty()) {
+                System.err.println(
+                    "Error: pass at least one of --logo-url, --primary-color, --background-color, --border-radius-px, --theme, --var, " +
+                        "--display-name, --page-title, --favicon-url, --support-url, --terms-url, --privacy-url.",
+                )
                 return CommandSupport.EXIT_USAGE
             }
             val tokens = CommandSupport.readTokens() ?: return CommandSupport.EXIT_NOT_SIGNED_IN
@@ -135,11 +171,10 @@ class BrandingCommand : Callable<Int> {
             val cssMap = linkedMapOf<String, String>()
             try {
                 val stored = client.getLoginBranding()["stored"]
-                stored?.get("logoUrl")?.takeUnless { it.isNull }?.let { body["logoUrl"] = it.asString() }
-                stored?.get("primaryColor")?.takeUnless { it.isNull }?.let { body["primaryColor"] = it.asString() }
-                stored?.get("backgroundColor")?.takeUnless { it.isNull }?.let { body["backgroundColor"] = it.asString() }
+                // Every string field is seeded — SSO-4048: the name / title / favicon / footer links too, or a `set` of one
+                // colour would clear them (the PUT replaces the record).
+                textFlags().keys.forEach { field -> stored?.get(field)?.takeUnless { it.isNull }?.let { body[field] = it.asString() } }
                 stored?.get("borderRadiusPx")?.takeUnless { it.isNull }?.let { body["borderRadiusPx"] = it.asInt() }
-                stored?.get("theme")?.takeUnless { it.isNull }?.let { body["theme"] = it.asString() }
                 stored?.get("cssVariables")?.takeUnless { it.isNull }?.properties()?.forEach { (k, v) ->
                     if (!v.isNull) cssMap[k] = v.asString()
                 }
@@ -151,11 +186,8 @@ class BrandingCommand : Callable<Int> {
 
             // Overlay supplied flags. An empty string clears (sends null ⇒ server drops the override);
             // borderRadiusPx has no "empty" form, so it only ever sets.
-            logoUrl?.let { body["logoUrl"] = it.ifBlank { null } }
-            primaryColor?.let { body["primaryColor"] = it.ifBlank { null } }
-            backgroundColor?.let { body["backgroundColor"] = it.ifBlank { null } }
+            textFlags().forEach { (field, flag) -> flag?.let { body[field] = it.ifBlank { null } } }
             borderRadiusPx?.let { body["borderRadiusPx"] = it }
-            theme?.let { body["theme"] = it.ifBlank { null } }
             // Overlay --var entries: a blank value clears that token, else set/replace it.
             cssVars.forEach { (key, value) -> if (value.isBlank()) cssMap.remove(key) else cssMap[key] = value }
             // Always send the merged map — the server PUT replaces, so omitting it would clear overrides.
@@ -174,6 +206,9 @@ class BrandingCommand : Callable<Int> {
     }
 
     companion object {
+        /** SSO-4048 (oauthy SSO-4044) — the name, title, favicon and footer-link fields, in the API's order. */
+        internal val TEXT_FIELDS_4048 = listOf("displayName", "pageTitle", "faviconUrl", "supportUrl", "termsUrl", "privacyUrl")
+
         /**
          * Record fields for the `BrandingResponse`. Shows the EFFECTIVE values (what the hosted page
          * actually renders, after fallback to platform defaults) plus, for each field, the raw STORED
@@ -196,12 +231,15 @@ class BrandingCommand : Callable<Int> {
                 "cssVariables" to (effective?.get("cssVariables")?.takeUnless { it.isNull }
                     ?.properties()?.joinToString(", ") { (k, v) -> "$k=${v.asString()}" }
                     ?.ifEmpty { "(none)" } ?: "(none)"),
+                // SSO-4048 — the workspace name, page title, favicon and footer links ("(none)" when unset: the page omits them).
+                *TEXT_FIELDS_4048.map { field -> field to (effStr(field) ?: "(none)") }.toTypedArray(),
                 "overrides" to listOfNotNull(
                     storedStr("logoUrl")?.let { "logoUrl" },
                     storedStr("primaryColor")?.let { "primaryColor" },
                     storedStr("backgroundColor")?.let { "backgroundColor" },
                     stored?.get("borderRadiusPx")?.takeUnless { it.isNull }?.let { "borderRadiusPx" },
                     storedStr("theme")?.let { "theme" },
+                    *TEXT_FIELDS_4048.mapNotNull { field -> storedStr(field)?.let { field } }.toTypedArray(),
                 ).joinToString(", ").ifEmpty { "(all default)" },
                 "updatedAt" to node["updatedAt"]?.takeUnless { it.isNull }?.asString(),
             )

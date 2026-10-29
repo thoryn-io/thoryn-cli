@@ -487,8 +487,12 @@ internal class FakeProductApi : Dispatcher() {
 
     // ── SSO-4041 — hosted-login branding, in identity's shape (`LoginBrandingAdminService` + `BrandingCssVariables`) ──
 
-    private val BRANDING_FIELDS = listOf("logoUrl", "primaryColor", "backgroundColor", "borderRadiusPx", "theme", "cssVariables")
-    private val BRANDING_DEFAULTS = mapOf("logoUrl" to null, "primaryColor" to "#2563eb", "backgroundColor" to "#ffffff", "borderRadiusPx" to 4, "theme" to "auto")
+    // SSO-4048 — the record grew six fields with oauthy SSO-4044: name, page title, favicon, footer links (no defaults: absent = not rendered).
+    private val BRANDING_LINK_FIELDS = mapOf("faviconUrl" to listOf("https://"), "supportUrl" to listOf("https://", "mailto:"), "termsUrl" to listOf("https://"), "privacyUrl" to listOf("https://"))
+    private val BRANDING_TEXT_FIELDS = mapOf("displayName" to 80, "pageTitle" to 120)
+    private val BRANDING_FIELDS = listOf("logoUrl", "primaryColor", "backgroundColor", "borderRadiusPx", "theme", "cssVariables") + BRANDING_TEXT_FIELDS.keys + BRANDING_LINK_FIELDS.keys
+    private val BRANDING_DEFAULTS = mapOf("logoUrl" to null, "primaryColor" to "#2563eb", "backgroundColor" to "#ffffff", "borderRadiusPx" to 4, "theme" to "auto") +
+        (BRANDING_TEXT_FIELDS.keys + BRANDING_LINK_FIELDS.keys).associateWith { null }
     private val HEX_COLOR = Regex("^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$")
     private val CSS_VARIABLES = mapOf("--thoryn-accent" to "color", "--thoryn-text" to "color", "--thoryn-muted" to "color", "--thoryn-font-family" to "font")
     private val FONT_STACK = Regex("^[A-Za-z0-9 ,_'\"-]{1,120}$")
@@ -513,6 +517,16 @@ internal class FakeProductApi : Dispatcher() {
             val value = v?.toString()?.trim()?.takeIf { it.isNotEmpty() } ?: return@forEach
             if (kind == "color" && !HEX_COLOR.matches(value)) return bad("cssVariables")
             if (kind == "font" && !FONT_STACK.matches(value)) return bad("cssVariables")
+        }
+        // SSO-4048 — identity's `sanitisePlainText` / `sanitiseHttpsUrl` / `sanitiseSupportUrl` (trimmed; blank clears).
+        BRANDING_TEXT_FIELDS.forEach { (f, max) ->
+            (b[f] as? String)?.trim()?.takeIf { it.isNotEmpty() }?.let { t -> if (t.length > max || t.any { it == '<' || it == '>' || it.isISOControl() }) return bad(f) }
+        }
+        BRANDING_LINK_FIELDS.forEach { (f, schemes) ->
+            (b[f] as? String)?.trim()?.takeIf { it.isNotEmpty() }?.let { u ->
+                val ok = u.length <= 2000 && u.none { it.isWhitespace() || it.isISOControl() } && schemes.any { u.startsWith(it, ignoreCase = true) && u.length > it.length }
+                if (!ok) return bad(f)
+            }
         }
         return null
     }
