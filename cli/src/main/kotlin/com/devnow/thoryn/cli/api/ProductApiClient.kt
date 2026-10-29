@@ -573,9 +573,11 @@ class ProductApiClient(
     // logoUrl + primaryColor + backgroundColor + borderRadiusPx + theme, rendered by
     // identity-service as CSS custom properties (`--brand-*`) in the login templates. read →
     // tenant:idp.read; write → tenant:idp.write (both granted to thoryn-cli by hub V83). PUT
-    // is a merge-upsert of the supplied fields; the response carries `stored` (raw, null = unset)
-    // + `effective` (post-fallback values the page uses) + `updatedAt`. Environment-scoped via
-    // the `X-Thoryn-Environment` header this client already sends for the selected env.
+    // REPLACES the stored record (SSO-4041; identity's `LoginBrandingAdminService.upsert`: an omitted or
+    // null field clears the stored value, `cssVariables` is one map) — `thoryn branding set` reads first to
+    // give its flags merge semantics, `kind: loginTheme` sends the whole record; the response carries
+    // `stored` (raw, null = unset) + `effective` (post-fallback values the page uses) + `updatedAt`.
+    // Environment-scoped via the `X-Thoryn-Environment` header this client already sends for the selected env.
 
     override fun getLoginBranding(): JsonNode =
         get("/api/v1/login-experience/branding")

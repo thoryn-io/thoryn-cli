@@ -200,6 +200,20 @@
           "then": { "properties": { "spec": { "type": "object", "required": ["smtpHost"] } } } },
         { "if": { "properties": { "kind": { "const": "loginFlow" } } },
           "then": { "properties": { "spec": { "type": "object", "required": ["templateId"] } } } },
+        { "if": { "properties": { "kind": { "const": "loginTheme" } } },
+          "then": { "properties": { "spec": {
+                      "description": "SSO-4041 — the hosted-login branding of the resource's environment, as the WHOLE record `PUT /api/v1/login-experience/branding` replaces: what the spec declares is set, every stored field it does not declare is CLEARED (the plan shows each as `… → (cleared)`), and `cssVariables` is replaced as one map — a token the spec omits is cleared with the rest. An empty spec declares the platform defaults. Every field optional; an unknown key is refused (the API's lenient binding would drop it and the PUT would then clear the field it was meant to set). The value grammar is identity-service's; the WCAG-AA contrast floor is checked at apply (`400 insufficient_contrast`). `destroy` / `--prune` never remove a production-plane singleton (ADR 2026-10-15 §1); a removal is the PUT of the empty record (the API has no DELETE).",
+                      "type": "object", "additionalProperties": false, "properties": {
+                      "logoUrl": { "description": "The logo image URL — `https://` only, at most 2000 characters. Omit to clear the custom logo.", "type": "string", "pattern": "^https://", "maxLength": 2000 },
+                      "primaryColor": { "description": "The brand / primary-button colour as a CSS hex colour (`#rgb`, `#rrggbb`, `#rrggbbaa`).", "type": "string", "pattern": "^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$" },
+                      "backgroundColor": { "description": "The page background as a CSS hex colour.", "type": "string", "pattern": "^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$" },
+                      "borderRadiusPx": { "description": "The corner radius of inputs and buttons, in pixels (0–64).", "type": "integer", "minimum": 0, "maximum": 64 },
+                      "theme": { "description": "`light`, `dark`, or `auto` (follow the user agent's `prefers-color-scheme`).", "enum": ["light", "dark", "auto"] },
+                      "cssVariables": { "description": "SSO-3038 — the closed `--thoryn-*` allowlist of CSS custom properties the hosted screens render: colours as CSS hex, the font family as a plain font stack (letters, digits, spaces, commas, quotes; at most 120 characters). Replaced as ONE map by the PUT.", "type": "object", "additionalProperties": false, "properties": {
+                        "--thoryn-accent": { "type": "string", "pattern": "^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$" },
+                        "--thoryn-text": { "type": "string", "pattern": "^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$" },
+                        "--thoryn-muted": { "type": "string", "pattern": "^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$" },
+                        "--thoryn-font-family": { "type": "string", "pattern": "^[A-Za-z0-9 ,_'\"-]{1,120}$" } } } } } } } },
         { "if": { "properties": { "kind": { "const": "loginMethods" } } },
           "then": { "properties": { "spec": { "type": "object", "required": ["methods"], "properties": {
                       "methods": { "description": "The FULL sign-in method allow-list, in display order (e.g. password, magic_link, magic_code, passkey, totp, sms); the server rejects an unknown token. Converged as a SET (order-insensitive).",

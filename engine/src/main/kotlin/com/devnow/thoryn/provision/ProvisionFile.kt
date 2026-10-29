@@ -276,6 +276,11 @@ class ProvisionFile private constructor(
         const val KIND_ENVIRONMENT = "environment"
         const val KIND_APPLICATION = "application"
         const val KIND_EMAIL_PROVIDER = "emailProvider"
+        /**
+         * The per-environment hosted-login branding (`/api/v1/login-experience/branding`). SSO-4041 — the spec IS the record:
+         * the PUT replaces it whole, so the plan diffs every field ([LOGIN_THEME_SPEC_KEYS]) and a stored field the file does
+         * not declare is shown as cleared; the value grammar is identity's, mirrored in [validateLoginTheme].
+         */
         const val KIND_LOGIN_THEME = "loginTheme"
         const val KIND_LOGIN_FLOW = "loginFlow"
         /** SSO-3100 — the per-environment sign-in METHOD allow-list (`/api/v1/login-methods`). */
@@ -379,6 +384,49 @@ class ProvisionFile private constructor(
         /** SSO-3413 — the `spec` members a `customDomain` accepts (the schema's `additionalProperties: false`). */
         val CUSTOM_DOMAIN_SPEC_KEYS: Set<String> = setOf("host", "acceptReSignIn")
 
+        // ── SSO-4041 — `loginTheme`: the WHOLE branding record, with identity-service's write rules mirrored client-side ──
+        //
+        // `PUT /api/v1/login-experience/branding` REPLACES the stored record (identity's `LoginBrandingAdminService.upsert`:
+        // every field is written from the request, an omitted or `null` field CLEARS the stored value, and `cssVariables` is
+        // replaced as ONE map — `null` clears every token). So the file is the record: what it declares is set, what it
+        // does not declare is cleared, and the plan says so field by field. The grammar below is identity's
+        // (`LoginBrandingService.HEX_COLOR`, `MAX_BORDER_RADIUS_PX`, `LoginBranding.Theme`, `MAX_LOGO_URL_CHARS`,
+        // `BrandingCssVariables.ALLOWED` + `FONT_STACK`), so a typo (`primaryColour`) or a bad value is refused before any
+        // call instead of being dropped by the API's lenient JSON binding and silently clearing the field it was meant to set.
+
+        /** The `spec` members a `loginTheme` accepts — the whole record the PUT replaces (the schema's `additionalProperties: false`). */
+        val LOGIN_THEME_SPEC_KEYS: Set<String> = setOf("logoUrl", "primaryColor", "backgroundColor", "borderRadiusPx", "theme", "cssVariables")
+
+        /** `spec.theme`: identity's `LoginBranding.Theme` values. Must equal the schema's `theme` enum. */
+        val LOGIN_THEME_THEMES: List<String> = listOf("light", "dark", "auto")
+
+        /** A CSS hex colour as identity accepts it: `#rgb`, `#rrggbb` or `#rrggbbaa`. Must equal the schema's colour `pattern`. */
+        val HEX_COLOR_PATTERN = Regex("^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$")
+
+        /** `spec.logoUrl`: an `https://` URL of at most this many characters (identity's `MAX_LOGO_URL_CHARS`). */
+        const val LOGIN_THEME_MAX_LOGO_URL_CHARS = 2000
+
+        /** `spec.borderRadiusPx`: `0..64` (identity's `MAX_BORDER_RADIUS_PX`). */
+        const val LOGIN_THEME_MAX_BORDER_RADIUS_PX = 64
+
+        const val CSS_VARIABLE_KIND_COLOR = "color"
+        const val CSS_VARIABLE_KIND_FONT = "font"
+
+        /**
+         * The CLOSED allowlist of `spec.cssVariables` tokens (identity's `BrandingCssVariables.ALLOWED`): token → value kind
+         * ([CSS_VARIABLE_KIND_COLOR] is a hex colour, [CSS_VARIABLE_KIND_FONT] a plain font-family stack). Must equal the
+         * schema's `cssVariables.properties`.
+         */
+        val LOGIN_THEME_CSS_VARIABLES: Map<String, String> = linkedMapOf(
+            "--thoryn-accent" to CSS_VARIABLE_KIND_COLOR,
+            "--thoryn-text" to CSS_VARIABLE_KIND_COLOR,
+            "--thoryn-muted" to CSS_VARIABLE_KIND_COLOR,
+            "--thoryn-font-family" to CSS_VARIABLE_KIND_FONT,
+        )
+
+        /** A font-family stack as identity accepts it (letters, digits, spaces, commas, quotes, `-` and `_`; 1–120 chars). */
+        val LOGIN_THEME_FONT_STACK_PATTERN = Regex("^[A-Za-z0-9 ,_'\"-]{1,120}$")
+
         /** Required `spec` members per kind — mirrors the schema's per-kind `then.required`. */
         val REQUIRED_SPEC: Map<String, Set<String>> = mapOf(
             KIND_ENVIRONMENT to setOf("slug"),
@@ -387,6 +435,7 @@ class ProvisionFile private constructor(
             KIND_FEDERATION_MEMBER to setOf("providerType"),
             KIND_EMAIL_PROVIDER to setOf("smtpHost"),
             KIND_LOGIN_FLOW to setOf("templateId"),
+            // SSO-4041 — every field optional: the spec IS the record (an empty one declares the platform defaults); see [validateLoginTheme].
             KIND_LOGIN_THEME to emptySet(),
             KIND_LOGIN_METHODS to setOf("methods"),
             KIND_CUSTOM_DOMAIN to setOf("host"),
@@ -1039,6 +1088,9 @@ class ProvisionFile private constructor(
                 }
                 // SSO-4042 — `emailTemplate`: the closed record, the type enum, the locale grammar, exactly one body source, the caps.
                 if (kind == KIND_EMAIL_TEMPLATE) validateEmailTemplate(spec, r, where, v)
+
+                // SSO-4041 — `loginTheme`: the closed record and identity's value grammar, checked before any call.
+                if (kind == KIND_LOGIN_THEME) validateLoginTheme(spec, where, v)
                 // SSO-3100 — `loginMethods.methods` is the FULL allow-list: a non-empty array of method tokens.
                 if (kind == KIND_LOGIN_METHODS) spec["methods"]?.takeIf { it.isArray() }?.let { methods ->
                     if (methods.toList().any { !it.isTextual() || it.asString().isBlank() }) v += "$where (loginMethods) spec.methods must be a list of non-empty method names"
@@ -1558,6 +1610,71 @@ class ProvisionFile private constructor(
                     path.isNullOrEmpty() -> v += "$where (emailTemplate) spec.bodyFile must be a path relative to the provisioning file"
                     File(path).isAbsolute || path.startsWith("/") || path.startsWith("\\") -> v += "$where (emailTemplate) spec.bodyFile '$path' must be relative to the provisioning file, not absolute"
                     path.split('/', '\\').any { it == ".." } -> v += "$where (emailTemplate) spec.bodyFile '$path' must stay inside the provisioning file's directory (no '..')"
+                }
+            }
+        }
+
+        /**
+         * SSO-4041 — a `loginTheme`: exactly the record `PUT /api/v1/login-experience/branding` replaces ([LOGIN_THEME_SPEC_KEYS];
+         * an unknown key names the record, because the API's lenient binding would DROP it and the PUT would then clear the
+         * field the author meant to set), every declared value in identity's own grammar: `logoUrl` an `https://` URL of at most
+         * [LOGIN_THEME_MAX_LOGO_URL_CHARS] characters, `primaryColor` / `backgroundColor` a hex colour ([HEX_COLOR_PATTERN]),
+         * `borderRadiusPx` an integer `0..`[LOGIN_THEME_MAX_BORDER_RADIUS_PX], `theme` one of [LOGIN_THEME_THEMES], and
+         * `cssVariables` an object whose keys are the closed `--thoryn-*` allowlist ([LOGIN_THEME_CSS_VARIABLES]) with a hex colour
+         * or a plain font stack ([LOGIN_THEME_FONT_STACK_PATTERN]) as values. A value carrying a `{{env.NAME}}` placeholder is
+         * left to the API (it is resolved at plan / apply). An EMPTY spec is legal: it declares the platform defaults, and the plan
+         * shows every stored field as cleared. The WCAG contrast floor stays identity's (`400 insufficient_contrast` at apply).
+         */
+        private fun validateLoginTheme(spec: JsonNode, where: String, v: MutableList<String>) {
+            spec.properties().forEach { entry ->
+                if (entry.key !in LOGIN_THEME_SPEC_KEYS) {
+                    v += "$where (loginTheme) spec.${entry.key} is not a branding field — the record is exactly ${LOGIN_THEME_SPEC_KEYS.joinToString(", ")}; " +
+                        "the API would drop an unknown key, and the PUT replaces the whole record, so a typo here clears the field it was meant to set"
+                }
+            }
+            fun placeholder(n: JsonNode): Boolean = n.isTextual() && ProvisionEngine.ENV_PLACEHOLDER.containsMatchIn(n.asString())
+            fun text(field: String): String? {
+                val n = spec[field]?.takeIf { !it.isNull } ?: return null
+                if (!n.isTextual()) { v += "$where (loginTheme) spec.$field must be a string"; return null }
+                if (placeholder(n)) return null
+                return n.asString().trim()
+            }
+            text("logoUrl")?.takeIf { it.isNotEmpty() }?.let { url ->
+                if (!url.startsWith("https://")) v += "$where (loginTheme) spec.logoUrl must be an https:// URL (was '$url')"
+                if (url.length > LOGIN_THEME_MAX_LOGO_URL_CHARS) v += "$where (loginTheme) spec.logoUrl exceeds the $LOGIN_THEME_MAX_LOGO_URL_CHARS-character limit"
+            }
+            listOf("primaryColor", "backgroundColor").forEach { field ->
+                text(field)?.takeIf { it.isNotEmpty() }?.let { colour ->
+                    if (!HEX_COLOR_PATTERN.matches(colour)) v += "$where (loginTheme) spec.$field '$colour' is not a CSS hex colour — use #rgb, #rrggbb or #rrggbbaa"
+                }
+            }
+            text("theme")?.takeIf { it.isNotEmpty() }?.let { theme ->
+                if (theme !in LOGIN_THEME_THEMES) v += "$where (loginTheme) spec.theme '$theme' must be one of ${LOGIN_THEME_THEMES.joinToString(", ")}"
+            }
+            spec["borderRadiusPx"]?.takeIf { !it.isNull }?.let { px ->
+                when {
+                    placeholder(px) -> Unit
+                    !px.isIntegralNumber() -> v += "$where (loginTheme) spec.borderRadiusPx must be an integer between 0 and $LOGIN_THEME_MAX_BORDER_RADIUS_PX"
+                    px.asInt() !in 0..LOGIN_THEME_MAX_BORDER_RADIUS_PX -> v += "$where (loginTheme) spec.borderRadiusPx ${px.asInt()} must be between 0 and $LOGIN_THEME_MAX_BORDER_RADIUS_PX"
+                }
+            }
+            spec["cssVariables"]?.takeIf { !it.isNull }?.let { css ->
+                if (!css.isObject()) { v += "$where (loginTheme) spec.cssVariables must be an object of --thoryn-* token → value"; return }
+                css.properties().forEach { (token, value) ->
+                    val kind = LOGIN_THEME_CSS_VARIABLES[token]
+                    if (kind == null) {
+                        v += "$where (loginTheme) spec.cssVariables.$token is not a supported CSS variable — allowed: ${LOGIN_THEME_CSS_VARIABLES.keys.joinToString(", ")}"
+                        return@forEach
+                    }
+                    if (value.isNull) return@forEach
+                    if (!value.isTextual()) { v += "$where (loginTheme) spec.cssVariables.$token must be a string"; return@forEach }
+                    if (placeholder(value)) return@forEach
+                    val text = value.asString().trim()
+                    if (text.isEmpty()) return@forEach
+                    when (kind) {
+                        CSS_VARIABLE_KIND_COLOR -> if (!HEX_COLOR_PATTERN.matches(text)) v += "$where (loginTheme) spec.cssVariables.$token '$text' is not a CSS hex colour — use #rgb, #rrggbb or #rrggbbaa"
+                        CSS_VARIABLE_KIND_FONT -> if (!LOGIN_THEME_FONT_STACK_PATTERN.matches(text)) v += "$where (loginTheme) spec.cssVariables.$token '$text' is not a plain font-family stack (letters, digits, spaces, commas, quotes; at most 120 characters)"
+                    }
                 }
             }
         }
