@@ -31,8 +31,22 @@ internal class FakeProductApi : Dispatcher() {
     val federationMembers = mutableListOf<MutableMap<String, Any?>>()
     val emailProviders = mutableMapOf<String?, MutableMap<String, Any?>>()
     val branding = mutableMapOf<String?, MutableMap<String, Any?>>()
-    /** SSO-4042 — the workspace's email template overrides by `<type>:<locale>` (`*` = the base cell); TENANT-WIDE, whatever the env header. */
+    /**
+     * SSO-4042 — the PRODUCTION plane's email template overrides by `<type>:<locale>` (`*` = the base cell). SSO-4054 (oauthy
+     * SSO-4043) — templates are per environment: no `X-Thoryn-Environment` header (or `production`) addresses this map, a sandbox
+     * slug addresses its own in [sandboxEmailTemplates] ([emailTemplatesOf]).
+     */
     val emailTemplates = mutableMapOf<String, MutableMap<String, Any?>>()
+    /** SSO-4054 — each sandbox's OWN email template overrides (sandbox slug → `<type>:<locale>` → record); empty ⇒ it inherits production's on the send path. */
+    val sandboxEmailTemplates = mutableMapOf<String, MutableMap<String, MutableMap<String, Any?>>>()
+
+    /** SSO-4054 — the store an `X-Thoryn-Environment` value addresses, as identity's `envOf`: absent, blank or `production` ⇒ production. */
+    fun emailTemplatesOf(env: String?): MutableMap<String, MutableMap<String, Any?>> {
+        val slug = env?.trim()?.takeIf { it.isNotEmpty() && it != "production" } ?: return emailTemplates
+        return sandboxEmailTemplates.getOrPut(slug) { mutableMapOf() }
+    }
+    /** SSO-4054 — off (the #4289 contract): a sandbox GET is exact. On: a sandbox GET without its own row answers production's (labelled `environmentSlug: production`). */
+    var emailTemplateGetResolves = false
     /** SSO-4042 — identity's `maxBodyBytes` (64 KiB); a test lowers it to see the `413` surface through the engine. */
     var emailTemplateMaxBodyBytes = 64 * 1024
     val activeFlow = mutableMapOf<String?, Int>()
@@ -451,14 +465,38 @@ internal class FakeProductApi : Dispatcher() {
     private val TEMPLATE_PLACEHOLDER = Regex("\\{\\{\\s*([A-Za-z][A-Za-z0-9]*)\\s*}}")
     private val TEMPLATE_LOCALE = Regex("^[a-z]{2,3}$")
 
-    private fun emailTemplate(method: String, type: String, rawLocale: String?, b: Map<String, Any?>): MockResponse {
+    /**
+     * SSO-4054 — `GET /api/v1/login-experience/email-templates` (oauthy SSO-4053): every (type, locale) cell the HEADER's
+     * environment stores, no body, sorted by (type, locale), in the `{data, pagination}` envelope (always one page). Exact per
+     * environment, as identity's `EmailTemplateService.list`: a sandbox that stores nothing lists nothing.
+     */
+    private fun emailTemplateList(env: String?): MockResponse {
+        val envSlug = env?.trim()?.takeIf { it.isNotEmpty() } ?: "production"
+        val rows = emailTemplatesOf(env).entries.sortedWith(compareBy({ it.key.substringBefore(':') }, { it.key.substringAfter(':') })).map { (key, rec) ->
+            mapOf("templateType" to key.substringBefore(':'), "locale" to key.substringAfter(':'), "environmentSlug" to envSlug, "subject" to rec["subject"], "updatedAt" to "2026-10-29T00:00:00")
+        }
+        return json(200, mapOf("data" to rows, "pagination" to mapOf("cursor" to null, "hasMore" to false)))
+    }
+
+    /**
+     * SSO-4042 — one cell; SSO-4054 — of the HEADER's environment ([emailTemplatesOf]). The GET is EXACT, as oauthy #4289 pins it
+     * (identity's `InternalTenantEmailTemplateEnvironmentE2ETest`: "a sandbox GET is exact — 404 template_not_customized even when
+     * production has an override"): the production fallback is the send path's, never the admin read's. [emailTemplateGetResolves]
+     * makes the GET answer production's row for a sandbox that has none, so a test can show the engine never mistakes an
+     * inherited copy for the sandbox's own.
+     */
+    private fun emailTemplate(method: String, type: String, rawLocale: String?, b: Map<String, Any?>, env: String?): MockResponse {
+        val emailTemplates = emailTemplatesOf(env)
+        val envSlug = env?.trim()?.takeIf { it.isNotEmpty() } ?: "production"
         val allowed = EMAIL_TEMPLATE_VARIABLES[type] ?: return problem(400, "unknown_template_type", mapOf("allowedTypes" to EMAIL_TEMPLATE_VARIABLES.keys.toList()))
         val trimmed = rawLocale?.trim()
         val locale = if (trimmed.isNullOrEmpty() || trimmed == "*") "*" else trimmed.lowercase().also { if (!TEMPLATE_LOCALE.matches(it)) return problem(400, "invalid_template_locale") }
         val key = "$type:$locale"
-        fun view(rec: Map<String, Any?>) = mapOf("templateType" to type, "locale" to locale, "subject" to rec["subject"], "bodyHtml" to rec["bodyHtml"], "allowedVariables" to allowed.sorted(), "updatedAt" to "2026-10-28T00:00:00")
+        fun view(rec: Map<String, Any?>, from: String = envSlug) = mapOf("templateType" to type, "locale" to locale, "environmentSlug" to from, "subject" to rec["subject"], "bodyHtml" to rec["bodyHtml"], "allowedVariables" to allowed.sorted(), "updatedAt" to "2026-10-28T00:00:00")
         return when (method) {
-            "GET" -> emailTemplates[key]?.let { json(200, view(it)) } ?: problem(404, "template_not_customized", mapOf("allowedVariables" to allowed.sorted()))
+            "GET" -> emailTemplates[key]?.let { json(200, view(it)) }
+                ?: this.emailTemplates[key]?.takeIf { emailTemplateGetResolves && envSlug != "production" }?.let { json(200, view(it, from = "production")) }
+                ?: problem(404, "template_not_customized", mapOf("allowedVariables" to allowed.sorted()))
             "PUT" -> {
                 val subject = b["subject"]?.toString() ?: ""
                 val body = b["bodyHtml"]?.toString() ?: ""
@@ -1113,8 +1151,9 @@ internal class FakeProductApi : Dispatcher() {
                 json(200, p)
             }
             route == "/api/v1/email-provider" && method == "DELETE" -> { emailProviders.remove(env); MockResponse().setResponseCode(204) }
-            // ── SSO-4042 — email templates (tenant-wide; the env header is irrelevant, as product-api forwards none) ──
-            seg[0] == "login-experience" && seg.getOrNull(1) == "email-templates" && seg.size == 3 -> emailTemplate(method, seg[2], query(path)["locale"], b)
+            // ── SSO-4042 / SSO-4054 — email templates, per environment (the header picks the plane, as product-api forwards it) ──
+            seg[0] == "login-experience" && seg.getOrNull(1) == "email-templates" && seg.size == 2 && method == "GET" -> emailTemplateList(env)
+            seg[0] == "login-experience" && seg.getOrNull(1) == "email-templates" && seg.size == 3 -> emailTemplate(method, seg[2], query(path)["locale"], b, env)
             // ── branding (singleton per env) ──
             // SSO-4041 — as identity's `LoginBrandingAdminService.upsert` behaves behind product-api's facade: the PUT REPLACES
             // the record (an omitted / null field clears the stored value, `cssVariables` as one map), an unknown key is DROPPED by

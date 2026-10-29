@@ -293,11 +293,13 @@ class ProvisionFile private constructor(
          */
         const val KIND_CUSTOM_DOMAIN = "customDomain"
         /**
-         * SSO-4042 — ONE transactional email template override of the workspace, per (type, locale):
+         * SSO-4042 — ONE transactional email template override, per (type, locale) of the resource's environment:
          * `/api/v1/login-experience/email-templates/{type}?locale=` (product-api `LoginExperienceController`, identity-service
-         * `EmailTemplateService`). WORKSPACE-level: identity stores templates tenant-wide today — there is no environment column
-         * (SSO-4043 re-keys them per environment) — so `environment` is refused. Converged by (`spec.type`, `spec.locale`): a GET
-         * that answers `404 template_not_customized` is a create, a stored cell is diffed on `subject` and the body (line endings
+         * `EmailTemplateService`). SSO-4054 (oauthy SSO-4043, identity V131) — PER ENVIRONMENT, like `loginTheme`: `environment`
+         * names the plane (omitted ⇒ production) and every call carries it as `X-Thoryn-Environment`. A sandbox that declares no
+         * copy of a cell sends production's (identity's send-path fallback) — that is not drift, and nothing is planned for it.
+         * Converged by (environment, `spec.type`, `spec.locale`): a GET that answers `404 template_not_customized` (exact per
+         * environment — the plane's own row, never the inherited one) is a create, a stored cell is diffed on `subject` and the body (line endings
          * and trailing whitespace normalised), `apply` PUTs `{ subject, bodyHtml }`, a removal is the `DELETE` (back to the
          * built-in default). The body is `spec.body` inline or `spec.bodyFile`, a path relative to the provisioning file read when
          * the file is loaded ([parse] with its directory). See [ProvisionEngine].
@@ -347,10 +349,10 @@ class ProvisionFile private constructor(
         val SINGLETON_KINDS: Set<String> = setOf(KIND_EMAIL_PROVIDER, KIND_LOGIN_THEME, KIND_LOGIN_FLOW, KIND_LOGIN_METHODS, KIND_CUSTOM_DOMAIN)
 
         /**
-         * SSO-3413 — kinds that live on the WORKSPACE, not in an environment: `environment` is refused on them. SSO-4042 — an
-         * `emailTemplate` is one today because identity stores templates tenant-wide (SSO-4043 moves it to the environment axis).
+         * SSO-3413 — kinds that live on the WORKSPACE, not in an environment: `environment` is refused on them. (SSO-4054 — an
+         * `emailTemplate` left this set when identity re-keyed templates per environment, oauthy SSO-4043.)
          */
-        val WORKSPACE_KINDS: Set<String> = setOf(KIND_CUSTOM_DOMAIN, KIND_EMAIL_TEMPLATE)
+        val WORKSPACE_KINDS: Set<String> = setOf(KIND_CUSTOM_DOMAIN)
 
         // ── SSO-4042 — `emailTemplate`: identity-service's `EmailTemplateType` / `EmailTemplateService` rules, mirrored ──
 
@@ -1086,10 +1088,7 @@ class ProvisionFile private constructor(
                 r["environment"]?.takeIf { !it.isNull }?.let { env ->
                     if (env.asString().isBlank()) v += "$where environment must be non-empty when present"
                     if (kind == KIND_ENVIRONMENT) v += "$where an environment resource cannot itself carry 'environment'"
-                    if (kind in WORKSPACE_KINDS) {
-                        v += "$where a $kind belongs to the workspace, not an environment — remove 'environment'" +
-                            if (kind == KIND_EMAIL_TEMPLATE) " (email templates are stored tenant-wide today, one set for every environment; per-environment templates are SSO-4043)" else ""
-                    }
+                    if (kind in WORKSPACE_KINDS) v += "$where a $kind belongs to the workspace, not an environment — remove 'environment'"
                 }
                 val spec = r["spec"]
                 if (spec == null || !spec.isObject()) {
@@ -1614,14 +1613,14 @@ class ProvisionFile private constructor(
          * [EMAIL_TEMPLATE_MAX_SUBJECT_CHARS] characters; EXACTLY ONE of `body` (inline HTML, non-blank, at most
          * [EMAIL_TEMPLATE_MAX_BODY_BYTES] UTF-8 bytes) and `bodyFile` (a relative path inside the provisioning file's directory —
          * no absolute path, no `..`; read and checked against the same caps when the file is loaded, see [parse]). It carries no
-         * `grants:` — product-api gates every login-experience call on the production plane's `login_theme` object, so there is
+         * `grants:` — product-api gates every login-experience call on its environment's `login_theme` object, so there is
          * no access object of its own to grant on. The `{{variable}}` allowlist stays the API's (`400 unknown_template_variable`
          * at apply): it is per type and may grow, and the refusal names the allowed set.
          */
         private fun validateEmailTemplate(spec: JsonNode, r: JsonNode, where: String, v: MutableList<String>) {
             rejectUnknownKeys(spec, EMAIL_TEMPLATE_SPEC_KEYS, "$where spec", v)
             if (r["grants"]?.takeIf { !it.isNull } != null) {
-                v += "$where an emailTemplate cannot carry 'grants' — it has no access object of its own (product-api gates email templates with the login experience, login_theme:production); grant on the loginTheme instead"
+                v += "$where an emailTemplate cannot carry 'grants' — it has no access object of its own (product-api gates email templates with the login experience of their environment, login_theme:<environment>); grant on the loginTheme instead"
             }
             spec["type"]?.takeIf { !it.isNull }?.let { t ->
                 val type = t.takeIf { it.isTextual() }?.asString()?.trim()
@@ -1753,12 +1752,20 @@ class ProvisionFile private constructor(
             }
         }
 
-        /** SSO-4042 — one resource per (type, locale) cell: the API addresses one record by them, so two declarations would fight over it. */
+        /**
+         * SSO-4042 — one resource per (type, locale) cell: the API addresses one record by them, so two declarations would fight over
+         * it. SSO-4054 — per ENVIRONMENT: the same cell in production and in a sandbox are two records (an omitted `environment`
+         * and `environment: production` are the same plane).
+         */
         private fun validateEmailTemplateCells(resources: List<JsonNode>, v: MutableList<String>) {
             resources.filter { it.isObject() && it["kind"]?.asString() == KIND_EMAIL_TEMPLATE && it["spec"]?.isObject() == true }
-                .groupBy { r -> emailTemplateCell(r["spec"]["type"]?.takeIf { it.isTextual() }?.asString(), r["spec"]["locale"]?.takeIf { it.isTextual() }?.asString()) }
+                .groupBy { r ->
+                    val env = r["environment"]?.takeIf { it.isTextual() }?.asString()?.trim()?.takeIf { it.isNotEmpty() && !isProductionPlane(it) }
+                    val cell = emailTemplateCell(r["spec"]["type"]?.takeIf { it.isTextual() }?.asString(), r["spec"]["locale"]?.takeIf { it.isTextual() }?.asString())
+                    if (env == null) cell else "$cell in environment $env"
+                }
                 .filterValues { it.size > 1 }
-                .forEach { (cell, dups) -> v += "duplicate emailTemplate for $cell — declared ${dups.size} times (${dups.joinToString(", ") { "'" + (it["name"]?.asString() ?: KIND_EMAIL_TEMPLATE) + "'" }}); one resource per (type, locale)" }
+                .forEach { (cell, dups) -> v += "duplicate emailTemplate for $cell — declared ${dups.size} times (${dups.joinToString(", ") { "'" + (it["name"]?.asString() ?: KIND_EMAIL_TEMPLATE) + "'" }}); one resource per (environment, type, locale)" }
         }
 
         /** The (type, locale) a template addresses, as `type <t> locale <l>` — the base locale rendered as [EMAIL_TEMPLATE_BASE_LOCALE]. */

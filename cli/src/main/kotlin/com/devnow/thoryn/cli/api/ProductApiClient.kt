@@ -587,10 +587,14 @@ class ProductApiClient(
         put("/api/v1/login-experience/branding", body)
 
     // ── Email templates (SSO-4042; product-api /api/v1/login-experience/email-templates/{type}) ──
-    // The workspace's transactional email template overrides, one per (type, locale); see [ProvisionApi] for
-    // the wire contract. Tenant-wide today (product-api forwards no environment for this surface; SSO-4043).
-    // `?locale=` is sent only when a locale is given (omitted = the base template `*`). GET → tenant:idp.read;
-    // PUT / DELETE → tenant:idp.write. The DELETE answers a 200 JSON body (the reset's outcome), not 204.
+    // The workspace's transactional email template overrides, one per (environment, type, locale); see [ProvisionApi]
+    // for the wire contract. SSO-4054 (oauthy SSO-4043) — environment-scoped via the `X-Thoryn-Environment` header this
+    // client already sends for the selected env (none ⇒ production), exactly like branding. `?locale=` is sent only when a
+    // locale is given (omitted = the base template `*`). GET / the listing → tenant:idp.read; PUT / DELETE →
+    // tenant:idp.write. The DELETE answers a 200 JSON body (the reset's outcome), not 204.
+
+    override fun listEmailTemplates(): JsonNode =
+        get("/api/v1/login-experience/email-templates")
 
     override fun getEmailTemplate(type: String, locale: String?): JsonNode =
         get(emailTemplatePath(type, locale))
