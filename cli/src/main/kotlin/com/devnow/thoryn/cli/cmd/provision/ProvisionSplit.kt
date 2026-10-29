@@ -41,7 +41,8 @@ internal object ProvisionSplit {
     fun split(source: File, tenantOut: File, applicationOut: File, overwrite: Boolean): List<Output> {
         if (!source.isFile) throw ProvisionException("provisioning file not found: ${source.path}")
         // `env = null`: `{{env.NAME}}` placeholders are copied as written, never resolved — a split is a move, not a run.
-        val file = ProvisionFile.parse(source.readBytes(), source.path, yaml = !source.name.endsWith(".json", ignoreCase = true), env = null)
+        // SSO-4056 — `baseDir`: an emailTemplate's `spec.bodyFile` resolves against the source file's directory, as `load` does.
+        val file = ProvisionFile.parse(source.readBytes(), source.path, yaml = !source.name.endsWith(".json", ignoreCase = true), env = null, baseDir = source.absoluteFile.parentFile)
         if (file.part != ProvisionPart.MIXED) {
             val article = if (file.part == ProvisionPart.APPLICATION) "an" else "a"
             throw ProvisionException(
@@ -62,8 +63,9 @@ internal object ProvisionSplit {
         rendered.forEach { (out, content) ->
             if (out.file.canonicalPath == source.canonicalPath) throw ProvisionException("${out.file.path} is the source file — the split never modifies it; pass another path")
             if (out.file.exists() && !overwrite) throw ProvisionException("${out.file.path} already exists — move it aside, or re-run with --force to overwrite it")
-            // The loader is the gate: an output it refuses is never written (and nothing else is either).
-            ProvisionFile.parse(content.toByteArray(), out.file.path)
+            // The loader is the gate: an output it refuses is never written (and nothing else is either). SSO-4056 — judged
+            // from the output's own directory, where `load` will resolve its `spec.bodyFile` paths once it is written.
+            ProvisionFile.parse(content.toByteArray(), out.file.path, baseDir = out.file.absoluteFile.parentFile)
         }
         rendered.forEach { (out, content) ->
             out.file.absoluteFile.parentFile?.mkdirs()

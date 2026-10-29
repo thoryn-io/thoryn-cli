@@ -2762,7 +2762,8 @@ thoryn provision workflow check --output json   # what the reusable workflow its
 The check loads every file `.thoryn/workflow.yaml` lists (SSO-3970). A provisioning file or connection that is missing,
 does not parse, declares an unknown `apiVersion` or breaks a file rule (a kind from the other part, for one) fails
 `config.valid` with the file and the reason, and the rules that read it (`config.secret-delivery`, `config.trust-scopes`)
-fail as "not checked" — the check is never green on a file it could not read.
+fail as "not checked" — the check is never green on a file it could not read. An `emailTemplate`'s `spec.bodyFile` is
+read next to its file, as `thoryn provision plan` reads it (SSO-4056).
 
 **Why there is no script hook.** A workflow file stays in your repository for exactly two reasons the App cannot take
 over: the job's own GitHub **OIDC token is your repository's identity** (Thoryn never holds a credential to your
