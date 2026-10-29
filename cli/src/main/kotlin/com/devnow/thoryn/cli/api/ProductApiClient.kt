@@ -616,6 +616,12 @@ class ProductApiClient(
     override fun listLegalDocuments(type: String): JsonNode =
         get(legalDocumentPath(type))
 
+    override fun getActiveLegalDocument(type: String): JsonNode =
+        get(legalDocumentPath(type) + "/active")
+
+    override fun getLegalDocument(type: String, id: String): JsonNode =
+        get(legalDocumentPath(type) + "/${encode(id)}")
+
     override fun publishLegalDocument(type: String, body: Map<String, Any?>): JsonNode =
         post(legalDocumentPath(type), body)
 

@@ -2084,7 +2084,8 @@ exactly one.
 ### Terms of use and privacy policy as code — `kind: legalDocument` (SSO-4057)
 
 `kind: legalDocument` is the **active version** of an environment's tenant-level Terms of Use or Privacy Policy, hosted by
-Thoryn — the `/api/v1/login-experience/legal-documents/{terms-of-use|privacy-policy}` surface (oauthy SSO-4047;
+Thoryn — the `/api/v1/login-experience/legal-documents/{terms-of-use|privacy-policy}` surface (oauthy SSO-4047, with the
+declarative-client shapes of SSO-4072 — the `…/active` read, body-less listing summaries, the `deleted` flag;
 `tenant:legal-documents.read` to plan, `tenant:legal-documents.write` to apply), addressed with `X-Thoryn-Environment`. Sign-ins
 of every application of the environment that has no document of its own are asked to accept it, and the hosted footer
 links to it when the branding sets no `termsUrl` / `privacyUrl`. The body is **`body`** (inline) **or `bodyFile`** (a
@@ -2106,12 +2107,18 @@ path relative to the provisioning file, inside its directory, read when the file
 
 - **Versioned, and a published version never changes** (users accepted that text; a version with acceptances cannot
   even be deleted — GDPR Art. 7). So the file declares which version is **active**, and `plan` decides by the
-  `version` label: the active version with that label, `title`, `format` and body (line endings and trailing
-  whitespace normalised) ⇒ no change; no version with that label ⇒ **publish** it — a create when nothing is active,
+  `version` label, reading the active version with its body (`GET …/{type}/active`; `404 no_active_document` means none)
+  and, only when the label is not the active one, the listing (summaries without bodies) and that version by id: the
+  active version with that label, `title`, `format` and body (line endings and trailing whitespace normalised) ⇒ no
+  change; no version with that label ⇒ **publish** it — a create when nothing is active,
   an update that shows `version: 2026-01 → 2026-10 (publishes a new version; users accept it at their next sign-in)`
   otherwise; the API activates the new version and deactivates the previous one; a stored, **inactive** version with
   that label and that content ⇒ **re-activate** it (`POST …/{id}/activate`, nothing published); a version with that
-  label and **other** content ⇒ the red row `legal_document_version_immutable` — give the new text a new `version`.
+  label and **other** content ⇒ the red row `legal_document_version_immutable` — give the new text a new `version`; a
+  **deleted** version with that label (the API's `deleted` flag, never inferred from `active: false`) ⇒ the red row
+  `legal_document_version_deleted`: a deleted version cannot be activated (`409 document_deleted`) and its label stays
+  taken (`409 version_exists`), so the document needs a new `version`. A version deleted between plan and apply is the
+  API's `document_deleted`, said as such.
 - **Per environment, no fallback.** identity resolves a sign-in's document as the application's own, else the
   tenant's for **that** environment, else none. A sandbox without a document of its own has none — so a sandbox
   declaration is a create there even when production holds the same text. Two resources for one (environment, type)
@@ -2121,7 +2128,10 @@ path relative to the provisioning file, inside its directory, read when the file
   (default; a block-level subset — headings, paragraphs, lists, `**bold**`, `https:` / `mailto:` links) or `text`;
   the body is at most 128 KiB of UTF-8, has no control character but newline / carriage return / tab, and **no HTML**:
   a `<` followed by a letter, `/`, `!` or `?` is refused (`html_not_allowed`) rather than sanitised — `a < b` in prose
-  is fine.
+  is fine, and so is a **CommonMark autolink** (`<https://acme.example/help>`, `<mailto:privacy@acme.example>`,
+  `<legal@acme.example>`; oauthy SSO-4072). The check is the server's, in its two steps: each autolink is replaced with a
+  space, then what remains is tested for markup — so `<https://acme.example><script>` is still refused. The JSON
+  Schema states the same rule as one regex with a negative lookahead (a schema pattern cannot replace first).
 - **No `grants:`, no ownership check** — like a `role`, a legal document is not a platform access object: product-api
   gates it on `tenant:legal-documents.*` alone. `readOnly: true` declares a reference that must match what is active.
 - **destroy / `--prune` never remove a production document** — the row is left in place and names the call a person
@@ -2129,8 +2139,8 @@ path relative to the provisioning file, inside its directory, read when the file
   `409 document_accepted` once anyone accepted it; the CLI has no `legal-documents` command). In a sandbox the
   document goes with its sandbox when the file declares it. Removing a declaration therefore changes nothing live: to
   replace a document, publish a new version.
-- **import** renders each environment's **active** version (never the history) with its body in a file next to the
-  provisioning file: `legal/<type>.md` (`.txt` for `format: text`) for production, `legal/<sandbox-slug>/<type>.md` for a
+- **import** renders each environment's **active** version (`GET …/{type}/active`; never the history) with its body in a
+  file next to the provisioning file: `legal/<type>.md` (`.txt` for `format: text`) for production, `legal/<sandbox-slug>/<type>.md` for a
   sandbox, named by `spec.bodyFile`. An environment with no active document gets no entry. `import --write` and the
   configuration import (`--for-workflow`) handle these files exactly like email-template bodies (`bodyFiles` in
   `import-summary.json`).

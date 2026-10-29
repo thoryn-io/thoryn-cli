@@ -242,7 +242,9 @@ class ProvisionSchemaConformanceTest {
         assertThat(spec["properties"]["title"]["maxLength"].asInt()).isEqualTo(ProvisionFile.LEGAL_DOCUMENT_MAX_TITLE_CHARS)
         assertThat(spec["properties"]["version"]["pattern"].asString()).isEqualTo(ProvisionFile.LOGIN_THEME_PLAIN_TEXT_PATTERN.pattern)
         assertThat(spec["properties"]["title"]["pattern"].asString()).isEqualTo(ProvisionFile.LOGIN_THEME_PLAIN_TEXT_PATTERN.pattern)
-        assertThat(spec["properties"]["body"]["not"]["pattern"].asString()).isEqualTo(ProvisionFile.LEGAL_DOCUMENT_HTML_MARKUP.pattern)
+        // SSO-4072 — the server's two-step rule (autolinks out, then `<[A-Za-z/!?]`) as one lookahead regex; equivalence is
+        // pinned on the server's vectors by `legalDocument's schema not-HTML pattern says what the two-step rule says`.
+        assertThat(spec["properties"]["body"]["not"]["pattern"].asString()).isEqualTo(ProvisionFile.LEGAL_DOCUMENT_SCHEMA_HTML_PATTERN)
         assertThat(ProvisionFile.TENANT_KINDS).contains(ProvisionFile.KIND_LEGAL_DOCUMENT)
         assertThat(ProvisionFile.WORKSPACE_KINDS).doesNotContain(ProvisionFile.KIND_LEGAL_DOCUMENT)
         assertThat(ProvisionFile.SINGLETON_KINDS).doesNotContain(ProvisionFile.KIND_LEGAL_DOCUMENT)
@@ -264,6 +266,19 @@ class ProvisionSchemaConformanceTest {
         assertThat(v).noneMatch { it.contains("resources[2]") }
         val app = ProvisionFile.validate(yaml.readTree("apiVersion: thoryn.io/application/v1\nresources:\n  - { kind: legalDocument, name: t, spec: { type: terms-of-use, version: v1, title: T, body: x } }"))
         assertThat(app).anyMatch { it.contains("resources[0]") && it.contains("legalDocument") }
+    }
+
+    @Test
+    fun `legalDocument's schema not-HTML pattern says what the two-step rule says, on the server's vectors`() {
+        // SSO-4072 — a JSON Schema pattern cannot replace before it tests, so the schema carries the rule as one regex with a
+        // negative lookahead. It must refuse exactly what the loader's two steps refuse (the server's vectors, LegalDocumentRulesVectors).
+        val rule = schema["\$defs"]["resource"]["allOf"].toList().first { it["if"]["properties"]["kind"]["const"].asString() == "legalDocument" }["then"]
+        val schemaHtml = Regex(rule["properties"]["spec"]["properties"]["body"]["not"]["pattern"].asString())
+        (LegalDocumentRulesVectors.ACCEPTED + LegalDocumentRulesVectors.REFUSED + LegalDocumentRulesVectors.ACCEPTED_SPACING).forEach { body ->
+            assertThat(schemaHtml.containsMatchIn(body)).withFailMessage("schema and loader disagree on: %s", body).isEqualTo(ProvisionFile.legalDocumentContainsHtml(body))
+        }
+        assertThat(LegalDocumentRulesVectors.REFUSED).allMatch { schemaHtml.containsMatchIn(it) }
+        assertThat(LegalDocumentRulesVectors.ACCEPTED).noneMatch { schemaHtml.containsMatchIn(it) }
     }
 
     @Test

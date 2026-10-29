@@ -441,9 +441,44 @@ class ProvisionFile private constructor(
         /**
          * HTML in a body, as identity detects it (`TenantLegalDocumentRules.HTML_MARKUP`): `<` followed by a letter, `/`, `!` or
          * `?` — a start or end tag, a comment, a doctype, a processing instruction. Refused (`400 html_not_allowed`), never
-         * sanitised; a `<` in prose (`a < b`) is fine. Must equal the schema's body `not.pattern`.
+         * sanitised; a `<` in prose (`a < b`) is fine. SSO-4072 — tested only AFTER every CommonMark autolink was replaced with
+         * a space ([legalDocumentContainsHtml]).
          */
         val LEGAL_DOCUMENT_HTML_MARKUP = Regex("<[A-Za-z/!?]")
+
+        /**
+         * SSO-4072 (oauthy #4294) — what is inside the angle brackets of a CommonMark URI autolink or email autolink (spec 0.31
+         * §6.5): `scheme:…` or `local@domain`. [LEGAL_DOCUMENT_AUTOLINK] is identity's and product-api's
+         * `TenantLegalDocumentRules.AUTOLINK`, character for character.
+         */
+        private const val LEGAL_DOCUMENT_AUTOLINK_INNER =
+            "[A-Za-z][A-Za-z0-9+.\\-]{1,31}:[^\\x00-\\x20\\x7F<>]*" +
+                "|[A-Za-z0-9.!#\$%&'*+/=?^_`{|}~\\-]+@[A-Za-z0-9](?:[A-Za-z0-9\\-]{0,61}[A-Za-z0-9])?" +
+                "(?:\\.[A-Za-z0-9](?:[A-Za-z0-9\\-]{0,61}[A-Za-z0-9])?)*"
+
+        /** SSO-4072 — a CommonMark autolink, angle brackets included (the server's `AUTOLINK`). Markdown, not HTML: accepted. */
+        val LEGAL_DOCUMENT_AUTOLINK = Regex("<(?:$LEGAL_DOCUMENT_AUTOLINK_INNER)>")
+
+        /**
+         * SSO-4072 — the server's two-step rule as ONE regex, for the schema's body `not.pattern` (a JSON Schema pattern cannot
+         * replace first): a `<` that starts HTML markup and does NOT start an autolink. Equivalent to [legalDocumentContainsHtml]
+         * because an autolink contains no `<`, so no `<` of the body can lie inside another autolink's match — every `<` the
+         * server's left-to-right replacement keeps is exactly a `<` at which no autolink starts. Must equal the schema's pattern.
+         */
+        val LEGAL_DOCUMENT_SCHEMA_HTML_PATTERN: String = "<(?!(?:$LEGAL_DOCUMENT_AUTOLINK_INNER)>)[A-Za-z/!?]"
+
+        /** SSO-4072 — the server's rule, in its two steps: replace every autolink with a space, then look for HTML markup. */
+        fun legalDocumentContainsHtml(body: String): Boolean = legalDocumentHtml(body) != null
+
+        /**
+         * SSO-4072 — the first HTML markup outside the autolinks, as (line, the matched `<x`), or null. Each autolink becomes one
+         * space (the server's `AUTOLINK.replace(body, " ")`); an autolink holds no newline, so the line is the body's.
+         */
+        private fun legalDocumentHtml(body: String): Pair<Int, String>? {
+            val stripped = LEGAL_DOCUMENT_AUTOLINK.replace(body, " ")
+            val m = LEGAL_DOCUMENT_HTML_MARKUP.find(stripped) ?: return null
+            return (stripped.substring(0, m.range.first).count { it == '\n' } + 1) to m.value
+        }
 
         const val ERR_LEGAL_DOCUMENT_BODY_REQUIRED = "legal_document_body_required"
         const val ERR_LEGAL_DOCUMENT_BODY_AMBIGUOUS = "legal_document_body_ambiguous"
@@ -1799,7 +1834,8 @@ class ProvisionFile private constructor(
         /**
          * SSO-4057 — what is wrong with a legal document's body, in identity's order (`TenantLegalDocumentRules.validate`): blank
          * (`invalid_body`), over [LEGAL_DOCUMENT_MAX_BODY_BYTES] UTF-8 bytes (`body_too_large`), a control character other than
-         * newline, carriage return or tab (`invalid_body`), HTML ([LEGAL_DOCUMENT_HTML_MARKUP], `html_not_allowed`). Null when it
+         * newline, carriage return or tab (`invalid_body`), HTML outside the CommonMark autolinks ([legalDocumentContainsHtml],
+         * `html_not_allowed`). Null when it
          * is acceptable. The phrase completes "spec.body …" / "spec.bodyFile '<path>' …".
          */
         fun legalDocumentBodyProblem(body: String): String? {
@@ -1807,9 +1843,8 @@ class ProvisionFile private constructor(
             val bytes = body.toByteArray(Charsets.UTF_8).size
             if (bytes > LEGAL_DOCUMENT_MAX_BODY_BYTES) return "is $bytes bytes, over the $LEGAL_DOCUMENT_MAX_BODY_BYTES-byte limit"
             if (body.any { it.isISOControl() && it != '\n' && it != '\r' && it != '\t' }) return "contains a control character (only newline, carriage return and tab are allowed)"
-            LEGAL_DOCUMENT_HTML_MARKUP.find(body)?.let { m ->
-                val line = body.substring(0, m.range.first).count { it == '\n' } + 1
-                return "$ERR_HTML_NOT_ALLOWED — it contains HTML ('${m.value}…' on line $line): write Markdown or plain text; the platform refuses HTML rather than sanitising it"
+            legalDocumentHtml(body)?.let { (line, markup) ->
+                return "$ERR_HTML_NOT_ALLOWED — it contains HTML ('$markup…' on line $line): write Markdown or plain text; the platform refuses HTML rather than sanitising it"
             }
             return null
         }

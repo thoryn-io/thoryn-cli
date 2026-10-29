@@ -50,7 +50,8 @@ internal class FakeProductApi : Dispatcher() {
     /**
      * SSO-4057 — tenant-level legal documents per environment (`null` ⇒ production, as [envKey] normalises the header): every
      * version of every type, oldest first, in identity's shape (`id`, `type` — the path segment —, `version`, `title`, `format`,
-     * `body`, `active`, `acceptanceCount`). A test seeds acceptances on a version to see `409 document_accepted`.
+     * `body`, `active`, `deletedAt`, `acceptanceCount`). A test seeds acceptances on a version to see `409 document_accepted`, and
+     * a deleted version (SSO-4072) to see `409 document_deleted`.
      */
     val legalDocuments = mutableMapOf<String?, MutableList<MutableMap<String, Any?>>>()
 
@@ -58,13 +59,17 @@ internal class FakeProductApi : Dispatcher() {
     fun legalDocumentsOf(env: String?, type: String): List<MutableMap<String, Any?>> = legalDocuments[envKey(env)].orEmpty().filter { it["type"] == type }
 
     /** SSO-4057 — seed one version (inactive unless [active]; an active one deactivates the other active version of its type). */
-    fun seedLegalDocument(env: String?, type: String, version: String, body: String, title: String = "Terms", format: String = "markdown", active: Boolean = true, acceptances: Long = 0): String {
+    fun seedLegalDocument(env: String?, type: String, version: String, body: String, title: String = "Terms", format: String = "markdown", active: Boolean = true, acceptances: Long = 0, deleted: Boolean = false): String {
         val id = "ld-${++seq}"
         val docs = legalDocuments.getOrPut(envKey(env)) { mutableListOf() }
-        if (active) docs.filter { it["type"] == type }.forEach { it["active"] = false }
-        docs += mutableMapOf("id" to id, "type" to type, "version" to version, "title" to title, "format" to format, "body" to body, "active" to active, "acceptanceCount" to acceptances)
+        if (active && !deleted) docs.filter { it["type"] == type }.forEach { it["active"] = false }
+        docs += mutableMapOf("id" to id, "type" to type, "version" to version, "title" to title, "format" to format, "body" to body,
+            "active" to (active && !deleted), "deletedAt" to (if (deleted) "2026-10-29T12:00:00Z" else null), "acceptanceCount" to acceptances)
         return id
     }
+
+    /** SSO-4072 — a product-api with #4290 but not #4294: no `…/active` route, so `active` is read as a version id (`404 not_found`). */
+    var legalDocumentsPredateActive = false
 
     private fun envKey(env: String?): String? = env?.trim()?.takeIf { it.isNotEmpty() && it != "production" }
 
@@ -549,6 +554,13 @@ internal class FakeProductApi : Dispatcher() {
 
     private val LEGAL_HTML = Regex("<[A-Za-z/!?]")
 
+    /** SSO-4072 — identity's `TenantLegalDocumentRules.AUTOLINK`, written out from oauthy #4294 (not taken from the engine). */
+    private val LEGAL_AUTOLINK = Regex(
+        "<(?:[A-Za-z][A-Za-z0-9+.\\-]{1,31}:[^\\x00-\\x20\\x7F<>]*" +
+            "|[A-Za-z0-9.!#\$%&'*+/=?^_`{|}~\\-]+@[A-Za-z0-9](?:[A-Za-z0-9\\-]{0,61}[A-Za-z0-9])?" +
+            "(?:\\.[A-Za-z0-9](?:[A-Za-z0-9\\-]{0,61}[A-Za-z0-9])?)*)>",
+    )
+
     /** identity's `TenantLegalDocumentRules.validate`, the first broken rule as a `400`; null when valid. */
     private fun legalDocumentRuleProblem(b: Map<String, Any?>): MockResponse? {
         fun plain(v: Any?, max: Int) = v?.toString()?.trim()?.takeIf { it.isNotEmpty() && it.length <= max && it.none { c -> c == '<' || c == '>' || c.isISOControl() } }
@@ -559,14 +571,19 @@ internal class FakeProductApi : Dispatcher() {
         val body = b["body"]?.toString()?.takeIf { it.isNotBlank() } ?: return problem(400, "invalid_body", mapOf("field" to "body"))
         if (body.toByteArray(Charsets.UTF_8).size > 131_072) return problem(400, "body_too_large", mapOf("field" to "body"))
         if (body.any { it.isISOControl() && it != '\n' && it != '\r' && it != '\t' }) return problem(400, "invalid_body", mapOf("field" to "body"))
-        if (LEGAL_HTML.containsMatchIn(body)) return problem(400, "html_not_allowed", mapOf("field" to "body"))
+        if (LEGAL_HTML.containsMatchIn(LEGAL_AUTOLINK.replace(body, " "))) return problem(400, "html_not_allowed", mapOf("field" to "body"))
         return null
     }
 
-    private fun legalDocumentView(d: Map<String, Any?>, env: String?): Map<String, Any?> = mapOf(
-        "id" to d["id"], "docType" to (if (d["type"] == "privacy-policy") "privacy" else "terms"), "environment" to (envKey(env) ?: "production"),
-        "version" to d["version"], "title" to d["title"], "format" to d["format"], "body" to d["body"], "active" to d["active"],
-        "createdAt" to "2026-10-29T00:00:00", "acceptanceCount" to d["acceptanceCount"],
+    /** SSO-4072 — the full shape (`…/active`, `…/{id}`, the publish answer): `type` in the path vocabulary, `deleted` + `deletedAt`, ISO `…Z` instants. */
+    private fun legalDocumentView(d: Map<String, Any?>, env: String?): Map<String, Any?> = legalDocumentSummary(d, env) + mapOf("body" to d["body"])
+
+    /** SSO-4072 — the listing's summary: the full shape without the `body`. */
+    private fun legalDocumentSummary(d: Map<String, Any?>, env: String?): Map<String, Any?> = mapOf(
+        "id" to d["id"], "type" to d["type"], "docType" to (if (d["type"] == "privacy-policy") "privacy" else "terms"), "environment" to (envKey(env) ?: "production"),
+        "version" to d["version"], "title" to d["title"], "format" to d["format"], "active" to d["active"],
+        "deleted" to (d["deletedAt"] != null), "deletedAt" to d["deletedAt"],
+        "createdAt" to "2026-10-29T00:00:00Z", "acceptanceCount" to d["acceptanceCount"],
     )
 
     /** `/api/v1/login-experience/legal-documents/{type}[/{id}[/activate]]` — [seg] from `login-experience`. */
@@ -576,8 +593,8 @@ internal class FakeProductApi : Dispatcher() {
         val docs = legalDocuments.getOrPut(envKey(env)) { mutableListOf() }
         val ofType = docs.filter { it["type"] == type }
         if (seg.size == 3) return when (method) {
-            // Newest first, every version (a soft-deleted one is just inactive), in product-api's ListEnvelope.
-            "GET" -> json(200, mapOf("data" to ofType.reversed().map { legalDocumentView(it, env) }))
+            // Newest first, every version (deleted ones flagged), as summaries without the body, in product-api's ListEnvelope.
+            "GET" -> json(200, mapOf("data" to ofType.reversed().map { legalDocumentSummary(it, env) }))
             "POST" -> {
                 legalDocumentRuleProblem(b)?.let { return it }
                 val version = b["version"].toString().trim()
@@ -585,20 +602,28 @@ internal class FakeProductApi : Dispatcher() {
                 ofType.forEach { it["active"] = false }
                 val id = "ld-${++seq}"
                 docs += mutableMapOf("id" to id, "type" to type, "version" to version, "title" to b["title"].toString().trim(),
-                    "format" to (b["format"]?.toString()?.trim()?.lowercase()?.takeIf { it.isNotEmpty() } ?: "markdown"), "body" to b["body"].toString(), "active" to true, "acceptanceCount" to 0L)
+                    "format" to (b["format"]?.toString()?.trim()?.lowercase()?.takeIf { it.isNotEmpty() } ?: "markdown"), "body" to b["body"].toString(), "active" to true,
+                    "deletedAt" to null, "acceptanceCount" to 0L)
                 json(201, legalDocumentView(docs.last(), env))
             }
             else -> problem(405, "method")
+        }
+        // SSO-4072 — the active version with its body; `404 no_active_document` when none (a pre-#4294 API reads `active` as an id).
+        if (seg.size == 4 && seg[3] == "active" && method == "GET" && !legalDocumentsPredateActive) {
+            return ofType.firstOrNull { it["active"] == true }?.let { json(200, legalDocumentView(it, env)) } ?: problem(404, "no_active_document")
         }
         val doc = ofType.firstOrNull { it["id"] == seg[3] } ?: return problem(404, "not_found")
         return when {
             seg.size == 4 && method == "GET" -> json(200, legalDocumentView(doc, env))
             seg.size == 4 && method == "DELETE" -> {
+                if (doc["deletedAt"] != null) return MockResponse().setResponseCode(204)
                 if ((doc["acceptanceCount"] as Number).toLong() > 0) return problem(409, "document_accepted")
                 doc["active"] = false
+                doc["deletedAt"] = "2026-10-29T12:00:00Z"
                 MockResponse().setResponseCode(204)
             }
             seg.size == 5 && seg[4] == "activate" && method == "POST" -> {
+                if (doc["deletedAt"] != null) return problem(409, "document_deleted")
                 ofType.forEach { it["active"] = false }
                 doc["active"] = true
                 MockResponse().setResponseCode(204)

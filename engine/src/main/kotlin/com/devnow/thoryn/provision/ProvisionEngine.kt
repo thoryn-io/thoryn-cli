@@ -776,9 +776,10 @@ class ProvisionEngine(
         } catch (ex: ConvergeKeyAmbiguousException) {
             // SSO-3715 (ADR 2026-10-15 §5) — two live matches: red, never a third copy.
             return PlannedChange(r.kind, r.name, ChangeAction.ERROR, "$ERROR_CONVERGE_KEY_AMBIGUOUS — ${ex.message}", resource = r, environment = slug, error = ERROR_CONVERGE_KEY_AMBIGUOUS, fixNote = FILE_FIX_NOTE_AMBIGUOUS)
-        } catch (ex: LegalDocumentVersionImmutableException) {
-            // SSO-4057 — the declared version label is published with OTHER content: a published version never changes.
-            return PlannedChange(r.kind, r.name, ChangeAction.ERROR, "$ERROR_LEGAL_DOCUMENT_VERSION_IMMUTABLE — ${ex.message}", resource = r, liveId = ex.liveId, environment = slug, diff = ex.diff, error = ERROR_LEGAL_DOCUMENT_VERSION_IMMUTABLE, fixNote = FILE_FIX_NOTE_LEGAL_DOCUMENT_VERSION)
+        } catch (ex: LegalDocumentLabelRefusedException) {
+            // SSO-4057 — the declared version label is published with OTHER content (a published version never changes), or
+            // (SSO-4072) belongs to a DELETED version (it cannot be activated, and its label stays taken).
+            return PlannedChange(r.kind, r.name, ChangeAction.ERROR, "${ex.code} — ${ex.message}", resource = r, liveId = ex.liveId, environment = slug, diff = ex.diff, error = ex.code, fixNote = FILE_FIX_NOTE_LEGAL_DOCUMENT_VERSION)
         } catch (ex: ProductApiException) {
             // SSO-3722 — product-api answers 404 `unknown_environment` not only for a plane that does not exist but for
             // one this identity has NO reach into (SSO-3118, the 404-not-403 rule): a brand-new repository identity gets it
@@ -2111,9 +2112,16 @@ class ProvisionEngine(
             (listOf<String?>(null) + sandboxSlugs).forEach plane@{ plane ->
                 ProvisionFile.LEGAL_DOCUMENT_TYPES.forEach type@{ type ->
                     if (declared.any { it.kind == ProvisionFile.KIND_LEGAL_DOCUMENT && declaredOnPlane(it, plane) && it.spec["type"]?.toString()?.trim() == type }) return@type
-                    // A plane this identity reaches nothing in answers 404 — nothing to import there.
-                    val rows = fetchOrNull { listItems(clients(plane).listLegalDocuments(type), "data") } ?: return@plane
-                    val active = rows.firstOrNull { it.isActive() } ?: return@type
+                    // SSO-4072 — the ACTIVE version with its body (`…/{type}/active`; `404 no_active_document` ⇒ none of this type). Any
+                    // other 404 is a plane this identity reaches nothing in — nothing to import there; a product-api that predates the
+                    // active read is said once per plane, never read as "none".
+                    val active = try {
+                        activeLegalDocument(clients(plane), type)
+                    } catch (ex: ProductApiException) {
+                        if (ex.httpStatus == 404) return@plane else throw ex
+                    } catch (ex: ProvisionException) {
+                        return@plane skip("${ProvisionFile.KIND_LEGAL_DOCUMENT} (${planeLabel(plane)}) — not imported: ${ex.message?.substringAfter("legalDocument: ")}")
+                    } ?: return@type
                     val id = legalDocumentId(type, active.str("id") ?: return@type)
                     val label = "legal_document:$id (${planeLabel(plane)})"
                     if (routedAway(plane, label)) return@type
@@ -2356,8 +2364,12 @@ class ProvisionEngine(
     /** SSO-3715 — two live resources match one converge key; the plan is red (`converge_key_ambiguous`), never a third copy. */
     private class ConvergeKeyAmbiguousException(message: String) : RuntimeException(message)
 
-    /** SSO-4057 — the declared legal-document version label is published with other content ([lookup] → an `ERROR` row in [probe]). */
-    private class LegalDocumentVersionImmutableException(message: String, val liveId: String, val diff: Map<String, String>) : RuntimeException(message)
+    /**
+     * SSO-4057 / SSO-4072 — the declared legal-document version label cannot be the active version ([lookup] → an `ERROR` row in
+     * [probe]): [code] is [ERROR_LEGAL_DOCUMENT_VERSION_IMMUTABLE] (published with other content) or
+     * [ERROR_LEGAL_DOCUMENT_VERSION_DELETED] (the version was deleted).
+     */
+    private class LegalDocumentLabelRefusedException(val code: String, message: String, val liveId: String, val diff: Map<String, String> = emptyMap()) : RuntimeException(message)
 
     /** The one live match of a converge key, or none; two or more is [ConvergeKeyAmbiguousException]. */
     private fun <T> List<T>.singleMatchOrNull(what: String, fix: String): T? = when (size) {
@@ -2476,31 +2488,46 @@ class ProvisionEngine(
             }
         }
         ProvisionFile.KIND_LEGAL_DOCUMENT -> {
-            // SSO-4057 — every version of the type in the resource's OWN environment (the plane's client sends
-            // `X-Thoryn-Environment`; identity keys on (tenant, environment, type), no fallback). The declaration is "the ACTIVE
-            // version is spec.version with this content"; a published version never changes. So, by the declared label:
-            //  - the active version, same content ⇒ no change;
-            //  - an inactive version, same content ⇒ re-activate it (no new version; [update] → activate);
-            //  - any version, OTHER content ⇒ refused (`legal_document_version_immutable`): new text needs a new label;
-            //  - no version: none active ⇒ a create (publish); another active ⇒ an update that publishes the new version.
+            // SSO-4057 / SSO-4072 — the resource's OWN environment (the plane's client sends `X-Thoryn-Environment`; identity keys
+            // on (tenant, environment, type), no fallback). The declaration is "the ACTIVE version is spec.version with this
+            // content"; a published version never changes. Read first the ACTIVE version with its body (`GET …/{type}/active`,
+            // `404 no_active_document` ⇒ none). Then, by the declared label:
+            //  - the active version, same content ⇒ no change (the only read);
+            //  - the active version, OTHER content ⇒ refused (`legal_document_version_immutable`): new text needs a new label;
+            //  - otherwise the listing (summaries, no body) names the label's version, if any:
+            //    - a DELETED version ⇒ refused (`legal_document_version_deleted`): it cannot be activated and its label stays taken;
+            //    - an inactive version: its body is read (`GET …/{type}/{id}`); same content ⇒ re-activate it ([update] → activate,
+            //      nothing published), OTHER content ⇒ `legal_document_version_immutable`;
+            //    - no version: none active ⇒ a create (publish); another active ⇒ an update that publishes the new version.
             val want = legalDocumentWant(desired)
-            val rows = listItems(clients(slug).listLegalDocuments(want.type), "data")
-            val active = rows.firstOrNull { it.isActive() }
-            val labelled = rows.firstOrNull { it.str("version")?.trim() == want.version }
+            val client = clients(slug)
+            val active = activeLegalDocument(client, want.type)
             fun liveIdOf(n: JsonNode) = legalDocumentId(want.type, n.str("id") ?: "")
             fun attributesOf(n: JsonNode) = mapOf("type" to want.type, "version" to (n.str("version")?.trim() ?: ""))
+            fun immutable(n: JsonNode, differs: Map<String, String>): Nothing = throw LegalDocumentLabelRefusedException(
+                ERROR_LEGAL_DOCUMENT_VERSION_IMMUTABLE,
+                "version '${want.version}' of the ${want.type} in ${planeLabel(slug)} is already published with a different ${differs.keys.joinToString(" and ")} " +
+                    "(${differs.values.joinToString("; ")}); a published version never changes — users accepted that text — so give the new text a new spec.version",
+                liveIdOf(n), differs,
+            )
+            if (active != null && active.str("version")?.trim() == want.version) {
+                val differs = legalDocumentContentDiff(want, active)
+                if (differs.isNotEmpty()) immutable(active, differs)
+                return Live(liveIdOf(active), emptyMap(), attributesOf(active))
+            }
+            val labelled = listItems(client.listLegalDocuments(want.type), "data").firstOrNull { it.str("version")?.trim() == want.version }
             when {
+                labelled != null && labelled.isDeleted() -> throw LegalDocumentLabelRefusedException(
+                    ERROR_LEGAL_DOCUMENT_VERSION_DELETED,
+                    "version '${want.version}' of the ${want.type} in ${planeLabel(slug)} was deleted${labelled.str("deletedAt")?.let { " at $it" } ?: ""}: a deleted version " +
+                        "cannot be activated again (409 document_deleted) and its label stays taken (409 version_exists) — give the document a new spec.version",
+                    liveIdOf(labelled),
+                )
                 labelled != null -> {
-                    val differs = legalDocumentContentDiff(want, labelled)
-                    if (differs.isNotEmpty()) {
-                        throw LegalDocumentVersionImmutableException(
-                            "version '${want.version}' of the ${want.type} in ${planeLabel(slug)} is already published with a different ${differs.keys.joinToString(" and ")} " +
-                                "(${differs.values.joinToString("; ")}); a published version never changes — users accepted that text — so give the new text a new spec.version",
-                            liveIdOf(labelled), differs,
-                        )
-                    }
-                    if (labelled.isActive()) Live(liveIdOf(labelled), emptyMap(), attributesOf(labelled))
-                    else Live(
+                    val stored = client.getLegalDocument(want.type, labelled.str("id") ?: "")
+                    val differs = legalDocumentContentDiff(want, stored)
+                    if (differs.isNotEmpty()) immutable(labelled, differs)
+                    Live(
                         liveIdOf(labelled),
                         mapOf("active" to "${active?.str("version")?.trim()?.let { "version $it" } ?: "no active version"} → version ${want.version} (re-activates the stored version; nothing is published)"),
                         attributesOf(labelled) + (ATTR_REACTIVATE to "true"),
@@ -2842,6 +2869,29 @@ class ProvisionEngine(
     /** Whether a listed legal-document version is the ACTIVE one. */
     private fun JsonNode.isActive(): Boolean = this["active"]?.takeIf { it.isBoolean }?.asBoolean() == true
 
+    /** SSO-4072 — whether a legal-document version was DELETED: the API's `deleted` flag, never inferred from `active: false`. */
+    private fun JsonNode.isDeleted(): Boolean = this["deleted"]?.takeIf { it.isBoolean }?.asBoolean() == true
+
+    /**
+     * SSO-4072 — the ACTIVE version of [type] with its body (`GET …/{type}/active`), or null when the API answers `404
+     * no_active_document`. Any other 404 is NOT "none active": `unknown_environment` (no reach into the plane) is rethrown for
+     * [probe] to turn into the missing right, and a `not_found` is the answer of a product-api that predates the active read
+     * (oauthy #4294 — it routes `active` as a version id), refused rather than planned as a create that would publish over
+     * the live document.
+     */
+    private fun activeLegalDocument(client: ProvisionApi, type: String): JsonNode? = try {
+        client.getActiveLegalDocument(type)
+    } catch (ex: ProductApiException) {
+        when {
+            ex.httpStatus == 404 && ex.errorCode == ERROR_NO_ACTIVE_DOCUMENT -> null
+            ex.httpStatus == 404 && ex.errorCode == "not_found" -> throw ProvisionException(
+                "legalDocument: GET /api/v1/login-experience/legal-documents/$type/active answered 404 not_found — this product-api predates the " +
+                    "active-version read (oauthy #4294), so the active $type cannot be read safely; deploy it first",
+            )
+            else -> throw ex
+        }
+    }
+
     /** The content fields of [want] that differ from the stored version [n] — title (trimmed), format, body ([bodyDiff]); empty when it is the same text. */
     private fun legalDocumentContentDiff(want: LegalDocumentWant, n: JsonNode): Map<String, String> {
         val diff = LinkedHashMap<String, String>()
@@ -2898,7 +2948,9 @@ class ProvisionEngine(
         val detail = ex.errorDescription?.takeIf { it.isNotBlank() } ?: ex.message ?: "the legal-document API refused the request"
         return ProvisionException(
             "${r.key}: " + when (ex.errorCode) {
-                "version_exists" -> "version_exists — $where was published since the plan was made (a label is unique per type and environment, inactive versions included); re-run plan"
+                "version_exists" -> "version_exists — $where was published since the plan was made (a label is unique per type and environment, inactive and deleted versions included); re-run plan"
+                // SSO-4072 — activating a version deleted since the plan: it can never be active again, and its label stays taken.
+                ERROR_DOCUMENT_DELETED -> "$ERROR_DOCUMENT_DELETED — $where was deleted since the plan was made; a deleted version cannot be activated and its label stays taken — give the document a new spec.version"
                 ProvisionFile.ERR_HTML_NOT_ALLOWED -> "${ProvisionFile.ERR_HTML_NOT_ALLOWED} — $detail ($where)"
                 null -> "HTTP ${ex.httpStatus} — $detail ($where)"
                 else -> "${ex.errorCode} — $detail ($where)"
@@ -4279,8 +4331,14 @@ class ProvisionEngine(
         const val ERROR_TEMPLATE_NOT_CUSTOMIZED = "template_not_customized"
         /** SSO-4057 — the declared `spec.version` of a legal document is published with other content: a published version never changes. */
         const val ERROR_LEGAL_DOCUMENT_VERSION_IMMUTABLE = "legal_document_version_immutable"
+        /** SSO-4072 — the declared `spec.version` of a legal document belongs to a DELETED version: it cannot be activated, its label stays taken. */
+        const val ERROR_LEGAL_DOCUMENT_VERSION_DELETED = "legal_document_version_deleted"
+        /** SSO-4072 — product-api's answer on `GET …/{type}/active` when no version of the type is active: the API's "absent". */
+        const val ERROR_NO_ACTIVE_DOCUMENT = "no_active_document"
+        /** SSO-4072 — product-api's `409` when a deleted version is activated. */
+        const val ERROR_DOCUMENT_DELETED = "document_deleted"
         /** SSO-4057 — the fix request's note for that row: the FILE must change. */
-        const val FILE_FIX_NOTE_LEGAL_DOCUMENT_VERSION = "a change to the file, not a missing right: give the changed legal document a new spec.version (or declare the stored text again)"
+        const val FILE_FIX_NOTE_LEGAL_DOCUMENT_VERSION = "a change to the file, not a missing right: give the legal document a new spec.version (or, for a changed text, declare the stored text again)"
         /** SSO-4057 — the plan attribute that tells [update] to re-activate the stored version instead of publishing one. */
         const val ATTR_REACTIVATE = "reactivate"
         const val ERROR_READ_ONLY = "access_read_only"
