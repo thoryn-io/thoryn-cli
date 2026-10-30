@@ -185,7 +185,8 @@ class ProvisionTrustScopesInPlaceTest : CommandTestBase() {
             .plan(doc(listOf("tenant:applications.read", "tenant:access.read")), false).changes.single()
         assertThat(narrow.action).isEqualTo(ChangeAction.ERROR)
         assertThat(narrow.error).isEqualTo(ProvisionEngine.ERROR_SCOPE_NOT_GRANTABLE)
-        assertThat(narrow.reason).contains("does not hold tenant:applications.read")
+        // SSO-4089 — the scope is named as one the trust already carries (product-api re-grants the whole set), not as an addition.
+        assertThat(narrow.reason).contains("does not hold tenant:applications.read, which the trust already carries").doesNotContain("which this file adds")
     }
 
     @Test

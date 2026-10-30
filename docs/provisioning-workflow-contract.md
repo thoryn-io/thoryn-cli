@@ -191,6 +191,11 @@ rule derives it; `provision plan` holds the plan scopes against the minted token
 `403` (`access_denied` / `insufficient_scope`) to the same message. A file or connection that does not load fails the rule
 as not checked (SSO-3970; the reason is on `config.valid`).
 
+The plan profile's scopes are **not** the applying identity's, and the engine knows it (SSO-4089): a `workloadIdentityTrust`
+whose declared scopes the plan job does not hold is not `scope_not_grantable` at plan time — the plan job holds no `.write`
+scope by design — so a trust **narrowing** plans as a plain `update` and a create is planned with the ceiling noted on the
+row; product-api checks the ceiling at apply, against the apply profile's token (thoryn-tenant PR 5, run 41036416524).
+
 ## 6. A hand-written workflow (`custom.*`) — unsupported
 
 `thoryn provision workflow check` evaluates §1's rules plus one (`custom.jobs`: a job gated on each mode, in two different

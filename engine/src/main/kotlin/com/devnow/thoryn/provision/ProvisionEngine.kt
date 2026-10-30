@@ -533,6 +533,15 @@ class ProvisionEngine(
      * the hub's own code. Null ⇒ unknown here — the plan states the ceiling and the hub enforces it at apply.
      */
     private val callerScopes: Set<String>? = null,
+    /**
+     * SSO-4089 — the session is a `github_actions` trust's PLAN PROFILE: the read-only token the hub mints a job that runs
+     * in the trust's plan environment (a pull request's plan). By design it holds no `.write` scope, and the identity that
+     * will APPLY is the trust's apply profile, whose scopes this session cannot see — so [callerScopes] says nothing about
+     * the applying identity and the scope ceiling is left to apply: a trust narrowing plans as a plain `update`; a create
+     * or a widening is planned with the ceiling noted on the row (product-api checks it against the apply identity, as
+     * it does when the scopes are unknown). False (the default) ⇒ [callerScopes] ARE the applying identity's scopes.
+     */
+    private val planProfile: Boolean = false,
 ) {
 
     /**
@@ -3420,7 +3429,8 @@ class ProvisionEngine(
             // SSO-3774 — a production-plane create from CI is refused by the gate (a person's act, or a trust it cannot see):
             // the scope ceiling of a create that will not happen would only hide that verdict.
             val ciOnProduction = (r.environment == null || slug == PRODUCTION_ENV_SLUG) && subject?.startsWith("client:") == true
-            val notHeld = if (ciOnProduction) emptyList() else scopesNotHeld(desired)
+            // SSO-4089 — under the plan profile the session's scopes are not the applying identity's: the ceiling is apply's.
+            val notHeld = if (ciOnProduction || planProfile) emptyList() else scopesNotHeld(desired)
             if (notHeld.isNotEmpty()) {
                 return PlannedChange(
                     r.kind, r.name, ChangeAction.ERROR,
@@ -3429,7 +3439,8 @@ class ProvisionEngine(
                     resource = r, environment = slug, error = ERROR_SCOPE_NOT_GRANTABLE,
                 )
             }
-            return PlannedChange(r.kind, r.name, ChangeAction.CREATE, "not found by its name in ${planeLabel(slug)} — mints its wi_ workload client$SCOPE_CEILING_NOTE", resource = r, environment = slug, retain = r.retain)
+            val ceiling = if (planProfile) deferredCeilingNote((desired[ProvisionFile.TRUST_SCOPES] as? List<*>).orEmpty().map { it.toString().trim() }) else SCOPE_CEILING_NOTE
+            return PlannedChange(r.kind, r.name, ChangeAction.CREATE, "not found by its name in ${planeLabel(slug)} — mints its wi_ workload client$ceiling", resource = r, environment = slug, retain = r.retain)
         }
         val id = node.str("id") ?: ""
         val view = trustView(node)
@@ -3560,13 +3571,30 @@ class ProvisionEngine(
             resource = r, liveId = id, environment = slug, attributes = attributes, diff = diff, error = code, trust = view, fixNote = fixNote,
         )
         change.problem?.let { return red(ProvisionFile.ERR_PLAN_SCOPE_NOT_SUBSET, it) }
+        // SSO-4089 — the ceiling is checked here only when the session's scopes ARE the applying identity's. A plan-profile
+        // session is read-only by design and never holds a write scope the trust keeps; what it says about the apply
+        // identity is nothing, so the ceiling is left to apply (noted on the row when this file adds a scope).
         val requested = ((change.body[ProvisionFile.TRUST_SCOPES] as? List<*>).orEmpty() + (change.body[API_PLAN_SCOPES] as? List<*>).orEmpty())
             .map { it.toString() }.distinct()
-        val notHeld = callerScopes?.let { held -> requested.filter { it !in held } }.orEmpty()
+        val notHeld = if (planProfile) emptyList() else callerScopes?.let { held -> requested.filter { it !in held } }.orEmpty()
         if (notHeld.isNotEmpty()) {
+            // Name what is ADDED apart from what the trust already carries: product-api re-grants the whole new set on a
+            // scope change (`PUT …/{id}/scopes` checks every requested scope, as at create), so a kept scope the identity
+            // lacks is refused there too — but the fix for each differs.
+            val addedBare = change.added.map { it.removePrefix("plan:") }.toSet()
+            val (addedNotHeld, keptNotHeld) = notHeld.partition { it in addedBare }
+            val parts = buildList {
+                if (addedNotHeld.isNotEmpty()) add("does not hold ${addedNotHeld.joinToString(", ")}, which this file adds")
+                if (keptNotHeld.isNotEmpty()) {
+                    add(
+                        "does not hold ${keptNotHeld.joinToString(", ")}, which the trust already carries and which product-api re-checks on every " +
+                            "scope change (the whole new set is granted again)",
+                    )
+                }
+            }
             return red(
                 ERROR_SCOPE_NOT_GRANTABLE,
-                "a trust can carry only tenant: scopes the applying identity itself holds, and this one does not hold ${notHeld.joinToString(", ")}: " +
+                "a trust can carry only tenant: scopes the applying identity itself holds, and this one ${parts.joinToString("; ")}: " +
                     "drop the scope from spec.scopes, or sign in with it first",
             )
         }
@@ -3589,9 +3617,11 @@ class ProvisionEngine(
         } else {
             ""
         }
+        // SSO-4089 — a widening planned under the plan profile: the ceiling of what is added is apply's to check.
+        val ceiling = if (planProfile && change.added.isNotEmpty()) deferredCeilingNote(change.added.map { it.removePrefix("plan:") }.distinct()) else ""
         return PlannedChange(
             r.kind, r.name, ChangeAction.UPDATE,
-            "exists — changes its scopes in place ($what); the wi_ workload client ${clientId ?: ""} stays$elevation".replace("  ", " "),
+            "exists — changes its scopes in place ($what); the wi_ workload client ${clientId ?: ""} stays$elevation$ceiling".replace("  ", " "),
             resource = r, liveId = id, environment = slug, attributes = attributes, diff = diff, trust = view, retain = r.retain, owner = owner,
         )
     }
@@ -3638,6 +3668,14 @@ class ProvisionEngine(
         )
         return AppliedResource(r.kind, r.name, id, slug, trustAttributes(view.ifEmpty { change.trust.orEmpty() }), owner = change.owner, action = ChangeAction.UPDATE)
     }
+
+    /**
+     * SSO-4089 — the ceiling note a plan-profile session puts on a trust row that ADDS [scopes] (a create: all of them):
+     * this session cannot vouch for the applying identity, so product-api's check at apply is the verdict.
+     */
+    private fun deferredCeilingNote(scopes: List<String>): String =
+        " (scope ceiling: grantability of ${scopes.joinToString(" ")} is checked at apply against the apply identity — " +
+            "this plan ran under the read-only plan profile, which holds no write scope by design)"
 
     /** The declared scopes the caller's token does not carry (empty when the host did not say what it carries). */
     private fun scopesNotHeld(spec: Map<String, Any?>): List<String> {
