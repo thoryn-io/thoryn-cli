@@ -111,7 +111,7 @@ object ImportSummary {
     private const val IMPORT = ProvisioningWorkflowContract.IMPORT_ARTIFACT
 
     /**
-     * SSO-4042 — the body files (`emailTemplate` `spec.bodyFile`) each configured copy in [artifact] names, as artifact-relative
+     * SSO-4042 — the body files (`emailTemplate` — SSO-4057: and `legalDocument` — `spec.bodyFile`) each configured copy in [artifact] names, as artifact-relative
      * paths: the one kind of file an artifact may hold besides the configured files. A copy that does not load contributes
      * none (and [fileSummary] refuses it with the reason).
      */
@@ -119,7 +119,7 @@ object ImportSummary {
         val copy = File(artifact, path)
         val loaded = try { if (copy.isFile) ProvisionFile.load(copy) else null } catch (ex: ProvisionException) { null } ?: return@flatMap emptyList()
         val dir = File(path).parentFile?.path ?: ""
-        loaded.resources.filter { it.kind == ProvisionFile.KIND_EMAIL_TEMPLATE }
+        loaded.resources.filter { it.kind in ProvisionFile.BODY_FILE_KINDS }
             .mapNotNull { it.spec["bodyFile"]?.toString()?.trim()?.takeIf { p -> p.isNotEmpty() } }
             .map { normalize(if (dir.isEmpty()) it else "$dir/$it") }
     }.toSet()
@@ -152,7 +152,7 @@ object ImportSummary {
             // Every line of the loader's message (the reasons follow the first line, one per line), as one line.
             throw ImportSummaryException("$path does not load after the import: ${ex.message?.lineSequence()?.map { it.trim() }?.filter { it.isNotEmpty() }?.joinToString(" ")}")
         }
-        val bodyFiles = loaded.resources.filter { it.kind == ProvisionFile.KIND_EMAIL_TEMPLATE }
+        val bodyFiles = loaded.resources.filter { it.kind in ProvisionFile.BODY_FILE_KINDS }
             .mapNotNull { it.spec["bodyFile"]?.toString()?.trim()?.takeIf { p -> p.isNotEmpty() } }.distinct().sorted()
         val imported = readJson(importJson(work, index), "the import of $path")
         val plan = readJson(planJson(work, index), "the plan preview of $path")

@@ -306,6 +306,28 @@ class ProvisionFile private constructor(
          */
         const val KIND_EMAIL_TEMPLATE = "emailTemplate"
         /**
+         * SSO-4057 (oauthy SSO-4047, identity V132) — the TENANT-LEVEL Terms of Use or Privacy Policy of the resource's
+         * environment, hosted by identity-service: `/api/v1/login-experience/legal-documents/{terms-of-use|privacy-policy}`
+         * (product-api `TenantLegalDocumentsController`, identity `TenantLegalDocumentService`). One per (environment,
+         * `spec.type`); `environment` names the plane (omitted ⇒ production) and every call carries it as
+         * `X-Thoryn-Environment`. There is NO fallback between environments: identity resolves a sign-in's document as the
+         * application's own active one, else the tenant's active one for THAT environment, else none
+         * (`TouCheckService.resolveActiveDocument`), so a sandbox without a document of its own has none.
+         *
+         * Documents are VERSIONED and a published version never changes (users accepted that text; a version with
+         * acceptances cannot even be deleted, GDPR Art. 7). So the declaration is "the ACTIVE version is `spec.version`, with
+         * this title, format and body": the active version with that label and that content ⇒ no change; no version with that
+         * label ⇒ publish it (a POST that activates the new version and deactivates the previous one — users accept it at
+         * their next sign-in); a stored, inactive version with that label and that content ⇒ re-activate it; a stored
+         * version with that label and OTHER content ⇒ refused at plan time ([ProvisionEngine]: give the new text a new
+         * `spec.version`). The body is `spec.body` inline or `spec.bodyFile`, a path relative to the provisioning file read
+         * when the file is loaded, exactly as for [KIND_EMAIL_TEMPLATE].
+         *
+         * Not a platform access object: product-api gates the surface on `tenant:legal-documents.read` / `.write` alone (no
+         * `PlatformSingletonGate`), so — like [KIND_ROLE] — there is no ownership check and no `grants:` ([SCOPE_ONLY_KINDS]).
+         */
+        const val KIND_LEGAL_DOCUMENT = "legalDocument"
+        /**
          * SSO-3689 (ADR 2026-10-14 credential ladder, rungs 1–3) — a workload-identity TRUST of the resource's
          * environment (`/api/v1/workload-identity/trusts`): the platform identity a CI job or a pod presents
          * instead of a stored secret, by `provider` with that provider's immutable pins. Converged by `name`;
@@ -330,6 +352,7 @@ class ProvisionFile private constructor(
         val TENANT_KINDS: Set<String> = setOf(
             KIND_ENVIRONMENT, KIND_FEDERATION_MEMBER, KIND_USER, KIND_LOGIN_METHODS, KIND_LOGIN_FLOW, KIND_LOGIN_THEME,
             KIND_EMAIL_PROVIDER, KIND_CUSTOM_DOMAIN, KIND_ROLE, KIND_WORKLOAD_IDENTITY_TRUST, KIND_EMAIL_TEMPLATE,
+            KIND_LEGAL_DOCUMENT,
         )
 
         /**
@@ -353,6 +376,16 @@ class ProvisionFile private constructor(
          * `emailTemplate` left this set when identity re-keyed templates per environment, oauthy SSO-4043.)
          */
         val WORKSPACE_KINDS: Set<String> = setOf(KIND_CUSTOM_DOMAIN)
+
+        /**
+         * SSO-3941 / SSO-4057 — kinds that are NOT objects of the platform authorization graph: product-api gates them on their
+         * `tenant:` scope alone (a role on `tenant:roles.*`, a tenant-level legal document on `tenant:legal-documents.*`). The engine
+         * asks no ownership check for them (so they need no `tenant:access.read`), and they cannot carry `grants:`.
+         */
+        val SCOPE_ONLY_KINDS: Set<String> = setOf(KIND_ROLE, KIND_LEGAL_DOCUMENT)
+
+        /** SSO-4057 — the kinds whose body may live in a file next to the provisioning file (`spec.bodyFile`, read when the file is loaded). */
+        val BODY_FILE_KINDS: Set<String> = setOf(KIND_EMAIL_TEMPLATE, KIND_LEGAL_DOCUMENT)
 
         // ── SSO-4042 — `emailTemplate`: identity-service's `EmailTemplateType` / `EmailTemplateService` rules, mirrored ──
 
@@ -382,6 +415,75 @@ class ProvisionFile private constructor(
 
         const val ERR_EMAIL_TEMPLATE_BODY_REQUIRED = "email_template_body_required"
         const val ERR_EMAIL_TEMPLATE_BODY_AMBIGUOUS = "email_template_body_ambiguous"
+
+        // ── SSO-4057 — `legalDocument`: identity-service's `TenantLegalDocumentRules` (oauthy #4290, read 2026-10-29), mirrored ──
+        // product-api applies the same rules before forwarding (its own `TenantLegalDocumentRules`); identity is authoritative.
+
+        /** `spec.type`: the API's path segment (`{docType:terms-of-use|privacy-policy}`). Must equal the schema's `type` enum. */
+        val LEGAL_DOCUMENT_TYPES: List<String> = listOf("terms-of-use", "privacy-policy")
+
+        /** The `spec` members a `legalDocument` accepts (the schema's `additionalProperties: false`). */
+        val LEGAL_DOCUMENT_SPEC_KEYS: Set<String> = setOf("type", "version", "title", "format", "body", "bodyFile")
+
+        /** `spec.format`: identity's `TermsOfUseEntity.BODY_FORMAT_*`; omitted ⇒ [LEGAL_DOCUMENT_DEFAULT_FORMAT]. Must equal the schema's `format` enum. */
+        val LEGAL_DOCUMENT_FORMATS: List<String> = listOf("markdown", "text")
+        const val LEGAL_DOCUMENT_DEFAULT_FORMAT = "markdown"
+
+        /** `spec.version`: plain text of at most this many characters after trimming (identity's `MAX_VERSION_CHARS`; `400 invalid_version`). */
+        const val LEGAL_DOCUMENT_MAX_VERSION_CHARS = 64
+
+        /** `spec.title`: plain text of at most this many characters after trimming (identity's `MAX_TITLE_CHARS`; `400 invalid_title`). */
+        const val LEGAL_DOCUMENT_MAX_TITLE_CHARS = 200
+
+        /** The body: at most this many UTF-8 bytes (identity's `MAX_BODY_BYTES`, 128 KiB; `400 body_too_large`). */
+        const val LEGAL_DOCUMENT_MAX_BODY_BYTES = 131_072
+
+        /**
+         * HTML in a body, as identity detects it (`TenantLegalDocumentRules.HTML_MARKUP`): `<` followed by a letter, `/`, `!` or
+         * `?` — a start or end tag, a comment, a doctype, a processing instruction. Refused (`400 html_not_allowed`), never
+         * sanitised; a `<` in prose (`a < b`) is fine. SSO-4072 — tested only AFTER every CommonMark autolink was replaced with
+         * a space ([legalDocumentContainsHtml]).
+         */
+        val LEGAL_DOCUMENT_HTML_MARKUP = Regex("<[A-Za-z/!?]")
+
+        /**
+         * SSO-4072 (oauthy #4294) — what is inside the angle brackets of a CommonMark URI autolink or email autolink (spec 0.31
+         * §6.5): `scheme:…` or `local@domain`. [LEGAL_DOCUMENT_AUTOLINK] is identity's and product-api's
+         * `TenantLegalDocumentRules.AUTOLINK`, character for character.
+         */
+        private const val LEGAL_DOCUMENT_AUTOLINK_INNER =
+            "[A-Za-z][A-Za-z0-9+.\\-]{1,31}:[^\\x00-\\x20\\x7F<>]*" +
+                "|[A-Za-z0-9.!#\$%&'*+/=?^_`{|}~\\-]+@[A-Za-z0-9](?:[A-Za-z0-9\\-]{0,61}[A-Za-z0-9])?" +
+                "(?:\\.[A-Za-z0-9](?:[A-Za-z0-9\\-]{0,61}[A-Za-z0-9])?)*"
+
+        /** SSO-4072 — a CommonMark autolink, angle brackets included (the server's `AUTOLINK`). Markdown, not HTML: accepted. */
+        val LEGAL_DOCUMENT_AUTOLINK = Regex("<(?:$LEGAL_DOCUMENT_AUTOLINK_INNER)>")
+
+        /**
+         * SSO-4072 — the server's two-step rule as ONE regex, for the schema's body `not.pattern` (a JSON Schema pattern cannot
+         * replace first): a `<` that starts HTML markup and does NOT start an autolink. Equivalent to [legalDocumentContainsHtml]
+         * because an autolink contains no `<`, so no `<` of the body can lie inside another autolink's match — every `<` the
+         * server's left-to-right replacement keeps is exactly a `<` at which no autolink starts. Must equal the schema's pattern.
+         */
+        val LEGAL_DOCUMENT_SCHEMA_HTML_PATTERN: String = "<(?!(?:$LEGAL_DOCUMENT_AUTOLINK_INNER)>)[A-Za-z/!?]"
+
+        /** SSO-4072 — the server's rule, in its two steps: replace every autolink with a space, then look for HTML markup. */
+        fun legalDocumentContainsHtml(body: String): Boolean = legalDocumentHtml(body) != null
+
+        /**
+         * SSO-4072 — the first HTML markup outside the autolinks, as (line, the matched `<x`), or null. Each autolink becomes one
+         * space (the server's `AUTOLINK.replace(body, " ")`); an autolink holds no newline, so the line is the body's.
+         */
+        private fun legalDocumentHtml(body: String): Pair<Int, String>? {
+            val stripped = LEGAL_DOCUMENT_AUTOLINK.replace(body, " ")
+            val m = LEGAL_DOCUMENT_HTML_MARKUP.find(stripped) ?: return null
+            return (stripped.substring(0, m.range.first).count { it == '\n' } + 1) to m.value
+        }
+
+        const val ERR_LEGAL_DOCUMENT_BODY_REQUIRED = "legal_document_body_required"
+        const val ERR_LEGAL_DOCUMENT_BODY_AMBIGUOUS = "legal_document_body_ambiguous"
+        /** identity's (and product-api's) error code for a body that carries HTML, used verbatim so a reader can search for it. */
+        const val ERR_HTML_NOT_ALLOWED = "html_not_allowed"
 
         /** SSO-3413 — the `spec` members a `customDomain` accepts (the schema's `additionalProperties: false`). */
         val CUSTOM_DOMAIN_SPEC_KEYS: Set<String> = setOf("host", "acceptReSignIn")
@@ -495,6 +597,8 @@ class ProvisionFile private constructor(
             KIND_CUSTOM_DOMAIN to setOf("host"),
             // SSO-4042 — and exactly one of `body` / `bodyFile`, checked by [validateEmailTemplate].
             KIND_EMAIL_TEMPLATE to setOf("type", "subject"),
+            // SSO-4057 — and exactly one of `body` / `bodyFile`, checked by [validateLegalDocument].
+            KIND_LEGAL_DOCUMENT to setOf("type", "version", "title"),
             KIND_WORKLOAD_IDENTITY_TRUST to setOf("provider", "scopes"),
             // `permissions` is required too, but `[]` (a role that grants nothing) is legal — checked by [validateRole].
             KIND_ROLE to emptySet(),
@@ -869,6 +973,7 @@ class ProvisionFile private constructor(
          * SSO-4042 — an `emailTemplate`'s `spec.bodyFile` is resolved against [baseDir] (the provisioning file's own directory,
          * as [load] passes it), read here and checked against the body caps; the resource then carries the HTML as `spec.body`
          * (and keeps `bodyFile` so a plan can name the file). A file parsed from bytes with no [baseDir] cannot declare one.
+         * SSO-4057 — the same for a `legalDocument`'s body ([BODY_FILE_KINDS]), held to the legal-document body rules.
          */
         fun parse(
             bytes: ByteArray,
@@ -891,7 +996,7 @@ class ProvisionFile private constructor(
                 val kind = r["kind"].asString()
                 @Suppress("UNCHECKED_CAST")
                 val declaredSpec = jsonMapper.convertValue(r["spec"], Map::class.java) as Map<String, Any?>
-                val spec = if (kind == KIND_EMAIL_TEMPLATE) readEmailTemplateBody(declaredSpec, baseDir, "resources[$i]", unresolved) else declaredSpec
+                val spec = if (kind in BODY_FILE_KINDS) readBodyFile(kind, declaredSpec, baseDir, "resources[$i]", unresolved) else declaredSpec
                 ProvisionResource(
                     kind = kind,
                     name = r["name"]?.takeIf { !it.isNull }?.asString()?.takeIf { it.isNotBlank() } ?: kind,
@@ -926,38 +1031,43 @@ class ProvisionFile private constructor(
 
         /**
          * SSO-4042 — resolve `spec.bodyFile` into `spec.body`: the path is relative to [baseDir] and must stay inside it (the
-         * grammar check in [validateEmailTemplate] refused `..` and absolute paths; this is the resolved-path check), the file
-         * must exist and read as UTF-8, and its content is held to the same caps as an inline body. Problems land on [problems]
-         * (the file fails to load — a template whose body cannot be read must never plan as "create with an empty body").
+         * grammar check in [validateEmailTemplate] / [validateLegalDocument] refused `..` and absolute paths; this is the
+         * resolved-path check), the file must exist and read as UTF-8, and its content is held to the same rules as an inline
+         * body of the [kind] (SSO-4057 — a legal document's: 128 KiB, no control character, no HTML). Problems land on
+         * [problems] (the file fails to load — a body that cannot be read must never plan as "create with an empty body").
          */
-        private fun readEmailTemplateBody(spec: Map<String, Any?>, baseDir: File?, where: String, problems: MutableList<String>): Map<String, Any?> {
+        private fun readBodyFile(kind: String, spec: Map<String, Any?>, baseDir: File?, where: String, problems: MutableList<String>): Map<String, Any?> {
             val path = spec["bodyFile"]?.toString()?.trim()?.takeIf { it.isNotEmpty() } ?: return spec
             if (baseDir == null) {
-                problems += "$where (emailTemplate) spec.bodyFile '$path' cannot be resolved: this provisioning document was not read from a file, so there is no directory to resolve it against — use spec.body"
+                problems += "$where ($kind) spec.bodyFile '$path' cannot be resolved: this provisioning document was not read from a file, so there is no directory to resolve it against — use spec.body"
                 return spec
             }
             val root = baseDir.absoluteFile.normalize()
             val file = File(root, path).absoluteFile.normalize()
             if (!file.path.startsWith(root.path + File.separator)) {
-                problems += "$where (emailTemplate) spec.bodyFile '$path' resolves outside the provisioning file's directory"
+                problems += "$where ($kind) spec.bodyFile '$path' resolves outside the provisioning file's directory"
                 return spec
             }
             if (!file.isFile) {
-                problems += "$where (emailTemplate) spec.bodyFile '$path' not found (${file.path})"
+                problems += "$where ($kind) spec.bodyFile '$path' not found (${file.path})"
                 return spec
             }
-            val html = try {
+            val text = try {
                 file.readText(Charsets.UTF_8)
             } catch (e: Exception) {
-                problems += "$where (emailTemplate) spec.bodyFile '$path' could not be read: ${e.message}"
+                problems += "$where ($kind) spec.bodyFile '$path' could not be read: ${e.message}"
                 return spec
             }
-            val bytes = html.toByteArray(Charsets.UTF_8).size
-            when {
-                html.isBlank() -> problems += "$where (emailTemplate) spec.bodyFile '$path' is blank"
-                bytes > EMAIL_TEMPLATE_MAX_BODY_BYTES -> problems += "$where (emailTemplate) spec.bodyFile '$path' is $bytes bytes, over the $EMAIL_TEMPLATE_MAX_BODY_BYTES-byte limit"
+            if (kind == KIND_LEGAL_DOCUMENT) {
+                legalDocumentBodyProblem(text)?.let { problems += "$where ($kind) spec.bodyFile '$path' $it" }
+            } else {
+                val bytes = text.toByteArray(Charsets.UTF_8).size
+                when {
+                    text.isBlank() -> problems += "$where ($kind) spec.bodyFile '$path' is blank"
+                    bytes > EMAIL_TEMPLATE_MAX_BODY_BYTES -> problems += "$where ($kind) spec.bodyFile '$path' is $bytes bytes, over the $EMAIL_TEMPLATE_MAX_BODY_BYTES-byte limit"
+                }
             }
-            return spec + ("body" to html)
+            return spec + ("body" to text)
         }
 
         // ── SSO-3962 — what is accepted today and refused in a later release ──
@@ -1139,6 +1249,8 @@ class ProvisionFile private constructor(
                 }
                 // SSO-4042 — `emailTemplate`: the closed record, the type enum, the locale grammar, exactly one body source, the caps.
                 if (kind == KIND_EMAIL_TEMPLATE) validateEmailTemplate(spec, r, where, v)
+                // SSO-4057 — `legalDocument`: the closed record, the type enum, the plain-text version / title, the format, one body source, the body rules.
+                if (kind == KIND_LEGAL_DOCUMENT) validateLegalDocument(spec, r, where, v)
 
                 // SSO-4041 — `loginTheme`: the closed record and identity's value grammar, checked before any call.
                 if (kind == KIND_LOGIN_THEME) validateLoginTheme(spec, where, v)
@@ -1164,6 +1276,7 @@ class ProvisionFile private constructor(
             keys.groupBy { it }.filterValues { it.size > 1 }.keys.forEach { v += "duplicate resource '$it' — kind + name must be unique" }
             validateWorkloadPullTrusts(resources.toList(), v)
             validateEmailTemplateCells(resources.toList(), v)
+            validateLegalDocumentCells(resources.toList(), v)
             return v
         }
 
@@ -1666,6 +1779,77 @@ class ProvisionFile private constructor(
         }
 
         /**
+         * SSO-4057 — a `legalDocument`: exactly `{ type, version, title, format?, body | bodyFile }` ([LEGAL_DOCUMENT_SPEC_KEYS]);
+         * `type` one of [LEGAL_DOCUMENT_TYPES]; `version` / `title` plain text as identity accepts it (trimmed, non-empty, at most
+         * [LEGAL_DOCUMENT_MAX_VERSION_CHARS] / [LEGAL_DOCUMENT_MAX_TITLE_CHARS] characters, no `<`, `>` or control character);
+         * `format` one of [LEGAL_DOCUMENT_FORMATS]; EXACTLY ONE of `body` (inline, see [legalDocumentBodyProblem]) and `bodyFile`
+         * (a relative path inside the provisioning file's directory, read and held to the same rules when the file is loaded).
+         * No `grants:` — it is not a platform access object ([SCOPE_ONLY_KINDS]).
+         */
+        private fun validateLegalDocument(spec: JsonNode, r: JsonNode, where: String, v: MutableList<String>) {
+            rejectUnknownKeys(spec, LEGAL_DOCUMENT_SPEC_KEYS, "$where spec", v)
+            if (r["grants"]?.takeIf { !it.isNull } != null) {
+                v += "$where a $KIND_LEGAL_DOCUMENT cannot carry 'grants' — it is not a platform access object (product-api gates legal documents on tenant:legal-documents.* alone)"
+            }
+            spec["type"]?.takeIf { !it.isNull }?.let { t ->
+                val type = t.takeIf { it.isTextual() }?.asString()?.trim()
+                if (type == null || type !in LEGAL_DOCUMENT_TYPES) v += "$where ($KIND_LEGAL_DOCUMENT) spec.type '${t.asString()}' must be one of ${LEGAL_DOCUMENT_TYPES.joinToString(", ")}"
+            }
+            mapOf("version" to LEGAL_DOCUMENT_MAX_VERSION_CHARS, "title" to LEGAL_DOCUMENT_MAX_TITLE_CHARS).forEach { (field, max) ->
+                spec[field]?.takeIf { !it.isNull }?.let { n ->
+                    val text = n.takeIf { it.isTextual() }?.asString()?.trim()
+                    when {
+                        text == null -> v += "$where ($KIND_LEGAL_DOCUMENT) spec.$field must be a string"
+                        text.isEmpty() -> v += "$where ($KIND_LEGAL_DOCUMENT) spec.$field must not be blank"
+                        text.length > max -> v += "$where ($KIND_LEGAL_DOCUMENT) spec.$field is ${text.length} characters, over the $max-character limit"
+                        text.any { it == '<' || it == '>' || it.isISOControl() } -> v += "$where ($KIND_LEGAL_DOCUMENT) spec.$field must be plain text (no '<', '>' or control character)"
+                    }
+                }
+            }
+            spec["format"]?.takeIf { !it.isNull }?.let { f ->
+                val format = f.takeIf { it.isTextual() }?.asString()
+                if (format == null || format !in LEGAL_DOCUMENT_FORMATS) v += "$where ($KIND_LEGAL_DOCUMENT) spec.format '${f.asString()}' must be one of ${LEGAL_DOCUMENT_FORMATS.joinToString(", ")}"
+            }
+            val body = spec["body"]?.takeIf { !it.isNull }
+            val bodyFile = spec["bodyFile"]?.takeIf { !it.isNull }
+            when {
+                body == null && bodyFile == null -> v += "$where ($KIND_LEGAL_DOCUMENT) $ERR_LEGAL_DOCUMENT_BODY_REQUIRED — spec.body (inline Markdown or text) or spec.bodyFile (a path relative to this file) is required"
+                body != null && bodyFile != null -> v += "$where ($KIND_LEGAL_DOCUMENT) $ERR_LEGAL_DOCUMENT_BODY_AMBIGUOUS — declare spec.body OR spec.bodyFile, not both"
+            }
+            body?.let { b ->
+                val text = b.takeIf { it.isTextual() }?.asString()
+                if (text == null) v += "$where ($KIND_LEGAL_DOCUMENT) spec.body must be a string of Markdown or plain text"
+                else legalDocumentBodyProblem(text)?.let { v += "$where ($KIND_LEGAL_DOCUMENT) spec.body $it" }
+            }
+            bodyFile?.let { f ->
+                val path = f.takeIf { it.isTextual() }?.asString()?.trim()
+                when {
+                    path.isNullOrEmpty() -> v += "$where ($KIND_LEGAL_DOCUMENT) spec.bodyFile must be a path relative to the provisioning file"
+                    File(path).isAbsolute || path.startsWith("/") || path.startsWith("\\") -> v += "$where ($KIND_LEGAL_DOCUMENT) spec.bodyFile '$path' must be relative to the provisioning file, not absolute"
+                    path.split('/', '\\').any { it == ".." } -> v += "$where ($KIND_LEGAL_DOCUMENT) spec.bodyFile '$path' must stay inside the provisioning file's directory (no '..')"
+                }
+            }
+        }
+
+        /**
+         * SSO-4057 — what is wrong with a legal document's body, in identity's order (`TenantLegalDocumentRules.validate`): blank
+         * (`invalid_body`), over [LEGAL_DOCUMENT_MAX_BODY_BYTES] UTF-8 bytes (`body_too_large`), a control character other than
+         * newline, carriage return or tab (`invalid_body`), HTML outside the CommonMark autolinks ([legalDocumentContainsHtml],
+         * `html_not_allowed`). Null when it
+         * is acceptable. The phrase completes "spec.body …" / "spec.bodyFile '<path>' …".
+         */
+        fun legalDocumentBodyProblem(body: String): String? {
+            if (body.isBlank()) return "is blank"
+            val bytes = body.toByteArray(Charsets.UTF_8).size
+            if (bytes > LEGAL_DOCUMENT_MAX_BODY_BYTES) return "is $bytes bytes, over the $LEGAL_DOCUMENT_MAX_BODY_BYTES-byte limit"
+            if (body.any { it.isISOControl() && it != '\n' && it != '\r' && it != '\t' }) return "contains a control character (only newline, carriage return and tab are allowed)"
+            legalDocumentHtml(body)?.let { (line, markup) ->
+                return "$ERR_HTML_NOT_ALLOWED — it contains HTML ('$markup…' on line $line): write Markdown or plain text; the platform refuses HTML rather than sanitising it"
+            }
+            return null
+        }
+
+        /**
          * SSO-4041 — a `loginTheme`: exactly the record `PUT /api/v1/login-experience/branding` replaces ([LOGIN_THEME_SPEC_KEYS];
          * an unknown key names the record, because the API's lenient binding would DROP it and the PUT would then clear the
          * field the author meant to set), every declared value in identity's own grammar: `logoUrl` an `https://` URL of at most
@@ -1766,6 +1950,18 @@ class ProvisionFile private constructor(
                 }
                 .filterValues { it.size > 1 }
                 .forEach { (cell, dups) -> v += "duplicate emailTemplate for $cell — declared ${dups.size} times (${dups.joinToString(", ") { "'" + (it["name"]?.asString() ?: KIND_EMAIL_TEMPLATE) + "'" }}); one resource per (environment, type, locale)" }
+        }
+
+        /** SSO-4057 — one `legalDocument` per (environment, type): the API keeps one active document of each type per environment. */
+        private fun validateLegalDocumentCells(resources: List<JsonNode>, v: MutableList<String>) {
+            resources.filter { it.isObject() && it["kind"]?.asString() == KIND_LEGAL_DOCUMENT && it["spec"]?.isObject() == true }
+                .groupBy { r ->
+                    val env = r["environment"]?.takeIf { it.isTextual() }?.asString()?.trim()?.takeIf { it.isNotEmpty() && !isProductionPlane(it) }
+                    val type = r["spec"]["type"]?.takeIf { it.isTextual() }?.asString()?.trim() ?: "?"
+                    if (env == null) type else "$type in environment $env"
+                }
+                .filterValues { it.size > 1 }
+                .forEach { (cell, dups) -> v += "duplicate $KIND_LEGAL_DOCUMENT for $cell — declared ${dups.size} times (${dups.joinToString(", ") { "'" + (it["name"]?.asString() ?: KIND_LEGAL_DOCUMENT) + "'" }}); one resource per (environment, type)" }
         }
 
         /** The (type, locale) a template addresses, as `type <t> locale <l>` — the base locale rendered as [EMAIL_TEMPLATE_BASE_LOCALE]. */

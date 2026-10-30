@@ -283,7 +283,9 @@ thoryn examples share    <name> [--output <file>]   # SSO-2876 — export the se
 # workspace-level singleton customDomain: plan shows the DNS records, apply claims + verifies, only
 # --prune/destroy with --confirm release it — and, SSO-4042, emailTemplate: one transactional email template
 # override per (environment, type, locale) — SSO-4054: per environment, a sandbox without its own copy sends
-# production's — body inline or in a file next to the provisioning file). SSO-3715 (ADR 2026-10-15 platform-is-the-ledger): THERE IS
+# production's — body inline or in a file next to the provisioning file — and, SSO-4057, legalDocument: the
+# environment's ACTIVE terms of use / privacy policy version; a published version never changes, so a new
+# text is a new `version`). SSO-3715 (ADR 2026-10-15 platform-is-the-ledger): THERE IS
 # NO RECEIPT — nothing is written beside the file, committed or cached; plan / apply / destroy / import read
 # live state only, and `apply --output json` / `plan --output json` carry the resolved ids (`resources[]`:
 # {kind, name, id, environment, action}). SSO-3089: every resource is read LIVE by its converge key before
@@ -1419,7 +1421,7 @@ about them. Provisioning as code is therefore two parts, and a project belongs t
 |---|---|---|
 | `apiVersion` | `thoryn.io/tenant/v1` | `thoryn.io/application/v1` |
 | Owner | ONE config project per workspace | MANY app projects per workspace |
-| Kinds | `environment`, `federationMember`, `user` (sandbox test users included), `loginMethods`, `loginFlow`, `loginTheme`, `emailProvider`, `emailTemplate`, `customDomain`, `role`, `workloadIdentityTrust` | `application` (with `tokenClaims` + `roleMapping`, and the applications-API settings) |
+| Kinds | `environment`, `federationMember`, `user` (sandbox test users included), `loginMethods`, `loginFlow`, `loginTheme`, `emailProvider`, `emailTemplate`, `legalDocument`, `customDomain`, `role`, `workloadIdentityTrust` | `application` (with `tokenClaims` + `roleMapping`, and the applications-API settings) |
 | Relation | **defines** the tenant | **uses** the tenant: names roles / environments, never defines them |
 | Identity | the config project's trust: broad `tenant:*` write; production through a reviewed PR | the app project's trust, confined to `tenant:applications.read`, `tenant:applications.write`, `tenant:access.read`; its production client created under a consent-approved **creation slot** (`thoryn access reserve` / `thoryn access approve`) |
 | Who declares its trust | a person, once; the config project then owns and converges it | **the config project** (one `kind: workloadIdentityTrust` per app repository) — an app project never declares a trust, not even its own |
@@ -2079,6 +2081,74 @@ exactly one.
   stages the committed file's body files beside the copy so the copy loads and plans, and the `thoryn-import` artifact
   carries them (`import-summary.json` lists them per file as `bodyFiles`).
 
+### Terms of use and privacy policy as code — `kind: legalDocument` (SSO-4057)
+
+`kind: legalDocument` is the **active version** of an environment's tenant-level Terms of Use or Privacy Policy, hosted by
+Thoryn — the `/api/v1/login-experience/legal-documents/{terms-of-use|privacy-policy}` surface (oauthy SSO-4047, with the
+declarative-client shapes of SSO-4072 — the `…/active` read, body-less listing summaries, the `deleted` flag;
+`tenant:legal-documents.read` to plan, `tenant:legal-documents.write` to apply), addressed with `X-Thoryn-Environment`. Sign-ins
+of every application of the environment that has no document of its own are asked to accept it, and the hosted footer
+links to it when the branding sets no `termsUrl` / `privacyUrl`. The body is **`body`** (inline) **or `bodyFile`** (a
+path relative to the provisioning file, inside its directory, read when the file is loaded) — exactly one.
+
+```yaml
+- kind: legalDocument
+  name: terms                                     # one resource per (environment, type)
+  spec:
+    type: terms-of-use                            # or privacy-policy
+    version: "2026-10"                            # the version label; new text needs a new label
+    title: Acme terms of use
+    bodyFile: legal/terms-of-use.md               # Markdown (default) or `format: text`; or `body: |` inline
+- kind: legalDocument
+  name: privacy-staging
+  environment: staging                            # the sandbox's own document; omitted ⇒ production
+  spec: { type: privacy-policy, version: s1, title: Privacy (staging), format: text, bodyFile: legal/staging/privacy-policy.txt }
+```
+
+- **Versioned, and a published version never changes** (users accepted that text; a version with acceptances cannot
+  even be deleted — GDPR Art. 7). So the file declares which version is **active**, and `plan` decides by the
+  `version` label, reading the active version with its body (`GET …/{type}/active`; `404 no_active_document` means none)
+  and, only when the label is not the active one, the listing (summaries without bodies) and that version by id: the
+  active version with that label, `title`, `format` and body (line endings and trailing whitespace normalised) ⇒ no
+  change; no version with that label ⇒ **publish** it — a create when nothing is active,
+  an update that shows `version: 2026-01 → 2026-10 (publishes a new version; users accept it at their next sign-in)`
+  otherwise; the API activates the new version and deactivates the previous one; a stored, **inactive** version with
+  that label and that content ⇒ **re-activate** it (`POST …/{id}/activate`, nothing published); a version with that
+  label and **other** content ⇒ the red row `legal_document_version_immutable` — give the new text a new `version`; a
+  **deleted** version with that label (the API's `deleted` flag, never inferred from `active: false`) ⇒ the red row
+  `legal_document_version_deleted`: a deleted version cannot be activated (`409 document_deleted`) and its label stays
+  taken (`409 version_exists`), so the document needs a new `version`. A version deleted between plan and apply is the
+  API's `document_deleted`, said as such.
+- **Per environment, no fallback.** identity resolves a sign-in's document as the application's own, else the
+  tenant's for **that** environment, else none. A sandbox without a document of its own has none — so a sandbox
+  declaration is a create there even when production holds the same text. Two resources for one (environment, type)
+  are refused.
+- **The rules are identity's, checked before any call:** `type` is `terms-of-use` or `privacy-policy`; `version`
+  (≤ 64 characters) and `title` (≤ 200) are plain text — no `<`, `>` or control character; `format` is `markdown`
+  (default; a block-level subset — headings, paragraphs, lists, `**bold**`, `https:` / `mailto:` links) or `text`;
+  the body is at most 128 KiB of UTF-8, has no control character but newline / carriage return / tab, and **no HTML**:
+  a `<` followed by a letter, `/`, `!` or `?` is refused (`html_not_allowed`) rather than sanitised — `a < b` in prose
+  is fine, and so is a **CommonMark autolink** (`<https://acme.example/help>`, `<mailto:privacy@acme.example>`,
+  `<legal@acme.example>`; oauthy SSO-4072). The check is the server's, in its two steps: each autolink is replaced with a
+  space, then what remains is tested for markup — so `<https://acme.example><script>` is still refused. The JSON
+  Schema states the same rule as one regex with a negative lookahead (a schema pattern cannot replace first).
+- **No `grants:`, no ownership check** — like a `role`, a legal document is not a platform access object: product-api
+  gates it on `tenant:legal-documents.*` alone. `readOnly: true` declares a reference that must match what is active.
+- **destroy / `--prune` never remove a production document** — the row is left in place and names the call a person
+  makes (`DELETE /api/v1/login-experience/legal-documents/<type>/<id>`, which soft-deletes that version and is refused
+  `409 document_accepted` once anyone accepted it; the CLI has no `legal-documents` command). In a sandbox the
+  document goes with its sandbox when the file declares it. Removing a declaration therefore changes nothing live: to
+  replace a document, publish a new version.
+- **import** renders each environment's **active** version (`GET …/{type}/active`; never the history) with its body in a
+  file next to the provisioning file: `legal/<type>.md` (`.txt` for `format: text`) for production, `legal/<sandbox-slug>/<type>.md` for a
+  sandbox, named by `spec.bodyFile`. An environment with no active document gets no entry. `import --write` and the
+  configuration import (`--for-workflow`) handle these files exactly like email-template bodies (`bodyFiles` in
+  `import-summary.json`).
+- **Scopes:** a legal document has its own narrow pair, `tenant:legal-documents.read` / `.write` (oauthy SSO-4069) —
+  not the broad `tenant:compliance.*`, which also gates retention, SCIM deprovisioning and SSF receivers. `thoryn login`
+  requests both (a person holds them as a workspace admin); a config project's connection and its CI identity need
+  both to plan and apply a `legalDocument`.
+
 ### Hosted-login branding as code — `kind: loginTheme` (SSO-4041, SSO-4048)
 
 `kind: loginTheme` is the hosted sign-in / register look of its environment (`thoryn branding get | set`,
@@ -2228,6 +2298,7 @@ does not guess what you meant.
 | Declares | to plan | to apply |
 |---|---|---|
 | `kind: role` | `tenant:roles.read` (no `tenant:access.read` — there is no ownership check) | `tenant:roles.write` (create, description, permission set, a missing permission) |
+| `kind: legalDocument` (SSO-4057) | `tenant:legal-documents.read` (no `tenant:access.read` — there is no ownership check) | `tenant:legal-documents.write` (publish, activate) |
 | `tokenClaims` | `tenant:applications.read` | `tenant:applications.write` |
 
 ### Declaring a workload-identity trust — `kind: workloadIdentityTrust` (SSO-3689)
@@ -2776,8 +2847,8 @@ thoryn provision workflow check --output json   # what the reusable workflow its
 The check loads every file `.thoryn/workflow.yaml` lists (SSO-3970). A provisioning file or connection that is missing,
 does not parse, declares an unknown `apiVersion` or breaks a file rule (a kind from the other part, for one) fails
 `config.valid` with the file and the reason, and the rules that read it (`config.secret-delivery`, `config.trust-scopes`)
-fail as "not checked" — the check is never green on a file it could not read. An `emailTemplate`'s `spec.bodyFile` is
-read next to its file, as `thoryn provision plan` reads it (SSO-4056).
+fail as "not checked" — the check is never green on a file it could not read. An `emailTemplate`'s (and, SSO-4057, a
+`legalDocument`'s) `spec.bodyFile` is read next to its file, as `thoryn provision plan` reads it (SSO-4056).
 
 **Why there is no script hook.** A workflow file stays in your repository for exactly two reasons the App cannot take
 over: the job's own GitHub **OIDC token is your repository's identity** (Thoryn never holds a credential to your
@@ -2935,6 +3006,7 @@ CLI derives it — every scope is the gate product-api puts on the endpoint the 
 | `emailProvider` / `loginTheme`, `loginFlow`, `loginMethods`, `emailTemplate` / `customDomain` | `tenant:email.read` / `tenant:idp.read` / `tenant:domains.read` | the matching `.write` |
 | `workloadIdentityTrust` | `tenant:workload-identity.read` | `tenant:workload-identity.write`, and every scope the trust carries (`spec.scopes` — the hub's ceiling, `scope_not_grantable`) |
 | `role` (SSO-3941) | `tenant:roles.read` — and NOT `tenant:access.read`: a role is not a platform access object, so no ownership check is asked | `tenant:roles.write` |
+| `legalDocument` (SSO-4057) | `tenant:legal-documents.read` — and NOT `tenant:access.read`, as for a role | `tenant:legal-documents.write` |
 | an application's `tokenClaims` | `tenant:applications.read` (already needed by the application) | `tenant:applications.write` |
 | a `grants:` block | `tenant:access.read` | `tenant:access.write` |
 | no `secretSink`, or `secretSink: { kind: customerManaged }` (SSO-3954, the default) | — (nothing beyond the application's own) | — (nothing is granted) |

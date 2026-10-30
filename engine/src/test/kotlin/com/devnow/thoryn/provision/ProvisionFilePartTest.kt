@@ -46,7 +46,7 @@ class ProvisionFilePartTest {
         assertThat(ProvisionFile.TENANT_KINDS intersect ProvisionFile.APPLICATION_KINDS).isEmpty()
         assertThat(ProvisionFile.TENANT_KINDS + ProvisionFile.APPLICATION_KINDS).isEqualTo(ProvisionFile.KINDS)
         assertThat(ProvisionFile.TENANT_KINDS).containsExactlyInAnyOrder(
-            "environment", "federationMember", "user", "loginMethods", "loginFlow", "loginTheme", "emailProvider", "customDomain", "role", "workloadIdentityTrust", "emailTemplate",
+            "environment", "federationMember", "user", "loginMethods", "loginFlow", "loginTheme", "emailProvider", "customDomain", "role", "workloadIdentityTrust", "emailTemplate", "legalDocument",
         )
         assertThat(ProvisionFile.APPLICATION_KINDS).containsExactly("application")
         ProvisionFile.KINDS.forEach { kind -> assertThat(ProvisionPart.ofKind(kind)).withFailMessage("%s has no part", kind).isNotNull().isNotEqualTo(ProvisionPart.MIXED) }

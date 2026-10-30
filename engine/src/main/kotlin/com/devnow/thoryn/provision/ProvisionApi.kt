@@ -198,6 +198,33 @@ interface ProvisionApi {
     fun putEmailTemplate(type: String, locale: String?, body: Map<String, Any?>): JsonNode = throw unsupported("email templates")
     fun deleteEmailTemplate(type: String, locale: String?): JsonNode = throw unsupported("email templates")
 
+    // ── Tenant-level legal documents (`/api/v1/login-experience/legal-documents/{type}`; SSO-4057, oauthy SSO-4047 / #4290) ──
+    // Scopes `tenant:legal-documents.read` (GET) and `tenant:legal-documents.write` (POST / DELETE) (product owner 2026-10-29; oauthy SSO-4069 / #4290); no platform access object (no
+    // `PlatformSingletonGate`). PER ENVIRONMENT: product-api routes every call by `X-Thoryn-Environment` (absent = production)
+    // and identity keys the documents on (tenant, environment, type) — no fallback between environments. [type] is the path
+    // segment, `terms-of-use` | `privacy-policy`. SSO-4072 (oauthy #4294): every response carries `type` (the path segment;
+    // `docType` is the stored discriminator `terms` | `privacy`, unused here), `deleted` + `deletedAt`, and `createdAt` as an
+    // ISO-8601 instant. [listLegalDocuments] answers every version of the type in the plane, newest first, as SUMMARIES — no
+    // `body` — in `{ data: [ { id, type, version, title, format, active, deleted, deletedAt, createdAt, acceptanceCount } ] }`,
+    // deleted versions included and flagged. [getActiveLegalDocument] answers the ACTIVE version WITH its body, or `404
+    // no_active_document`; [getLegalDocument] one version with its body. [publishLegalDocument] POSTs `{ version, title, body, format }` and
+    // answers `201` with the new version, ACTIVE (the previous active version of the type is deactivated): `400 invalid_version`
+    // / `invalid_title` / `invalid_body` / `invalid_body_format` / `body_too_large` / `html_not_allowed`, `409 version_exists`
+    // (the label is taken in the plane, by any version, deleted ones included). [activateLegalDocument] answers `204` (the other
+    // active version of the type is deactivated), `409 document_deleted` for a deleted version. [deleteLegalDocument] marks a
+    // version nobody accepted DELETED and inactive (`204`; it stays listed, its label taken, never activatable again), `409
+    // document_accepted` otherwise; another tenant's / environment's / type's id is `404`.
+    //
+    // Defaulted (like [listRoles]) so a host that predates legal documents keeps compiling: the default answers `501`, which the
+    // engine surfaces as a failed read (never as "absent").
+
+    fun listLegalDocuments(type: String): JsonNode = throw unsupported("legal documents")
+    fun getActiveLegalDocument(type: String): JsonNode = throw unsupported("legal documents")
+    fun getLegalDocument(type: String, id: String): JsonNode = throw unsupported("legal documents")
+    fun publishLegalDocument(type: String, body: Map<String, Any?>): JsonNode = throw unsupported("legal documents")
+    fun activateLegalDocument(type: String, id: String): Unit = throw unsupported("legal documents")
+    fun deleteLegalDocument(type: String, id: String): Unit = throw unsupported("legal documents")
+
     private fun unsupported(what: String): ProductApiException =
         ProductApiException(501, "not_implemented", "this host does not manage $what", "")
 

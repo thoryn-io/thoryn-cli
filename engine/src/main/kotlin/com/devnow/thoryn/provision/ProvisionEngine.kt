@@ -259,7 +259,8 @@ data class ImportedResource(
     val note: String? = null,
     /**
      * SSO-4042 — files the entry refers to, to be written NEXT TO the provisioning file by the host: path relative to the file →
-     * content. An `emailTemplate`'s body goes to `emails/[<sandbox-slug>/]<type>[.<locale>].html` and its spec names it as `bodyFile`; the engine
+     * content. An `emailTemplate`'s body goes to `emails/[<sandbox-slug>/]<type>[.<locale>].html` (SSO-4057 — a `legalDocument`'s to
+     * `legal/[<sandbox-slug>/]<type>.md|.txt`) and its spec names it as `bodyFile`; the engine
      * (a library) writes nothing, the CLI's `import --write` does.
      */
     val files: Map<String, String> = emptyMap(),
@@ -775,6 +776,10 @@ class ProvisionEngine(
         } catch (ex: ConvergeKeyAmbiguousException) {
             // SSO-3715 (ADR 2026-10-15 §5) — two live matches: red, never a third copy.
             return PlannedChange(r.kind, r.name, ChangeAction.ERROR, "$ERROR_CONVERGE_KEY_AMBIGUOUS — ${ex.message}", resource = r, environment = slug, error = ERROR_CONVERGE_KEY_AMBIGUOUS, fixNote = FILE_FIX_NOTE_AMBIGUOUS)
+        } catch (ex: LegalDocumentLabelRefusedException) {
+            // SSO-4057 — the declared version label is published with OTHER content (a published version never changes), or
+            // (SSO-4072) belongs to a DELETED version (it cannot be activated, and its label stays taken).
+            return PlannedChange(r.kind, r.name, ChangeAction.ERROR, "${ex.code} — ${ex.message}", resource = r, liveId = ex.liveId, environment = slug, diff = ex.diff, error = ex.code, fixNote = FILE_FIX_NOTE_LEGAL_DOCUMENT_VERSION)
         } catch (ex: ProductApiException) {
             // SSO-3722 — product-api answers 404 `unknown_environment` not only for a plane that does not exist but for
             // one this identity has NO reach into (SSO-3118, the 404-not-403 rule): a brand-new repository identity gets it
@@ -1185,8 +1190,9 @@ class ProvisionEngine(
         // SSO-3774 (oauthy ADR 2026-10-16 §4) — a trust is a platform object of its own (`trust:<id>`, S1 SSO-3772), gated
         // per object like an application; its own gate keeps the plane rules a trust still has (create, the pre-S1 platform).
         if (r.kind == ProvisionFile.KIND_WORKLOAD_IDENTITY_TRUST) return gateTrust(r, change, file, envSlugs, slug, reach)
-        // SSO-3941 — a role is not a platform access object: product-api gates it on `tenant:roles.*` alone.
-        if (r.kind == ProvisionFile.KIND_ROLE) return gateRole(r, change)
+        // SSO-3941 — a role is not a platform access object: product-api gates it on `tenant:roles.*` alone. SSO-4057 — nor is a
+        // tenant-level legal document (`tenant:legal-documents.*` alone).
+        if (r.kind in ProvisionFile.SCOPE_ONLY_KINDS) return gateScopeOnly(r, change)
         val gated = gateObject(r, change, file, envSlugs, slug, reach)
         // SSO-3774 (ADR 2026-10-16 I4) — an application this identity may converge may still not BIND a trust it does not manage.
         if (r.kind != ProvisionFile.KIND_APPLICATION || gated.action == ChangeAction.ERROR || gated.readOnly) return gated
@@ -1325,7 +1331,7 @@ class ProvisionEngine(
      * reaches), so there is no relation to ask and no owner: the token's scope is the whole gate, and the plan preflight
      * names it ([ScopeRequirements]). What remains is the file's own `readOnly` contract — a reference must exist and match.
      */
-    private fun gateRole(r: ProvisionResource, change: PlannedChange): PlannedChange = when {
+    private fun gateScopeOnly(r: ProvisionResource, change: PlannedChange): PlannedChange = when {
         !r.readOnly -> change
         change.liveId == null -> refuse(
             r, change, ERROR_READ_ONLY, null,
@@ -1334,7 +1340,7 @@ class ProvisionEngine(
         )
         change.diff.isNotEmpty() -> refuse(
             r, change, ERROR_READ_ONLY, null,
-            "declared `readOnly: true` but differs from the live role in ${change.diff.size} field(s) (${change.diff.keys.joinToString(", ")}) — " +
+            "declared `readOnly: true` but differs from the live ${r.kind} in ${change.diff.size} field(s) (${change.diff.keys.joinToString(", ")}) — " +
                 "a read-only reference is never written; drop `readOnly` to converge it from this file, or align the file with what is live",
             fixNote = FILE_FIX_NOTE,
         )
@@ -1635,6 +1641,12 @@ class ProvisionEngine(
                 id.substringAfter(':', ProvisionFile.EMAIL_TEMPLATE_BASE_LOCALE).takeIf { it != ProvisionFile.EMAIL_TEMPLATE_BASE_LOCALE }?.let { "?locale=$it" }.orEmpty() +
                 (plane?.let { " with header X-Thoryn-Environment: $it (resets that environment's copy — it then sends production's" } ?: " (resets it to the built-in default") +
                 "; the CLI has no `email-templates` command)"
+            // SSO-4057 — the CLI has no `legal-documents` verb; the API call. [id] is `<type>/<version id>`, the API's own path.
+            ProvisionFile.KIND_LEGAL_DOCUMENT -> "DELETE /api/v1/login-experience/legal-documents/$id" +
+                (plane?.let { " with header X-Thoryn-Environment: $it" } ?: "") +
+                " (soft-deletes that version, leaving the environment with no ${id.substringBefore('/')} — no fallback to another environment's; " +
+                "refused 409 document_accepted once a user accepted it: a published document is replaced by publishing a new version, never removed; " +
+                "the CLI has no `legal-documents` command)"
             ProvisionFile.KIND_WORKLOAD_IDENTITY_TRUST -> "thoryn workload-identity trusts delete $id --yes${if (plane == null) " --confirm <workspace-slug>" else ""}$env"
             // SSO-3941 — the CLI has no `roles delete`; the API call, with the production confirmation it needs.
             ProvisionFile.KIND_ROLE -> "DELETE /api/v1/roles/$id (the CLI has no `roles delete`${if (plane == null) "; send X-Thoryn-Confirm: <workspace-slug>" else "; header X-Thoryn-Environment: $plane"})"
@@ -1773,7 +1785,7 @@ class ProvisionEngine(
 
         /** The kind's listing needs (its read scope; `tenant:access.read` for an access object) this identity is known to lack. */
         fun listingMissing(kind: String): List<String> =
-            (listOfNotNull(ScopeRequirements.readScope(kind)) + if (kind == ProvisionFile.KIND_ROLE) emptyList() else listOf(AccessRefs.SCOPE_READ))
+            (listOfNotNull(ScopeRequirements.readScope(kind)) + if (kind in ProvisionFile.SCOPE_ONLY_KINDS) emptyList() else listOf(AccessRefs.SCOPE_READ))
                 .filterNot { canPlan(it) }
 
         /**
@@ -2087,6 +2099,52 @@ class ProvisionEngine(
                 }
             }
         }
+        // SSO-4057 — tenant-level legal documents, PER ENVIRONMENT (oauthy SSO-4047): each plane's ACTIVE version of each type —
+        // the one sign-ins accept and the hosted page shows — is rendered as one entry, its body in a file next to the
+        // provisioning file ([legalDocumentBodyPath]). A plane with no active document of a type renders nothing: there is no
+        // fallback between environments, so a sandbox without its own document has none, and declaring none is not drift. The
+        // historical (inactive) versions are not rendered — the file declares which version is active, not the history. Not a
+        // platform access object (`tenant:legal-documents.*` alone), so — like a role — what this identity may change is its write scope.
+        if (!ofPart(ProvisionFile.KIND_LEGAL_DOCUMENT)) {
+            skip("${ProvisionFile.KIND_LEGAL_DOCUMENT} — not imported: ${partReason(ProvisionFile.KIND_LEGAL_DOCUMENT)}")
+        } else importKind(ProvisionFile.KIND_LEGAL_DOCUMENT) {
+            val access = if (canApply(ScopeRequirements.writeScope(ProvisionFile.KIND_LEGAL_DOCUMENT)!!)) Access.MANAGER else Access.VIEWER
+            (listOf<String?>(null) + sandboxSlugs).forEach plane@{ plane ->
+                ProvisionFile.LEGAL_DOCUMENT_TYPES.forEach type@{ type ->
+                    if (declared.any { it.kind == ProvisionFile.KIND_LEGAL_DOCUMENT && declaredOnPlane(it, plane) && it.spec["type"]?.toString()?.trim() == type }) return@type
+                    // SSO-4072 — the ACTIVE version with its body (`…/{type}/active`; `404 no_active_document` ⇒ none of this type). Any
+                    // other 404 is a plane this identity reaches nothing in — nothing to import there; a product-api that predates the
+                    // active read is said once per plane, never read as "none".
+                    val active = try {
+                        activeLegalDocument(clients(plane), type)
+                    } catch (ex: ProductApiException) {
+                        if (ex.httpStatus == 404) return@plane else throw ex
+                    } catch (ex: ProvisionException) {
+                        return@plane skip("${ProvisionFile.KIND_LEGAL_DOCUMENT} (${planeLabel(plane)}) — not imported: ${ex.message?.substringAfter("legalDocument: ")}")
+                    } ?: return@type
+                    val id = legalDocumentId(type, active.str("id") ?: return@type)
+                    val label = "legal_document:$id (${planeLabel(plane)})"
+                    if (routedAway(plane, label)) return@type
+                    val version = active.str("version")?.trim()
+                    val title = active.str("title")?.trim()
+                    val format = active.str("format")?.trim()?.lowercase() ?: ProvisionFile.LEGAL_DOCUMENT_DEFAULT_FORMAT
+                    val body = active["body"]?.takeIf { !it.isNull }?.asString()
+                    val problem = when {
+                        version == null || title == null || body == null -> "stored without a version, a title or a body"
+                        format !in ProvisionFile.LEGAL_DOCUMENT_FORMATS -> "stored with format '$format', which this CLI does not declare; update the CLI"
+                        else -> ProvisionFile.legalDocumentBodyProblem(body)?.let { "its body $it" }
+                    }
+                    if (problem != null) return@type skip("$label — $problem; not a declarable legalDocument")
+                    val path = legalDocumentBodyPath(plane, type, format)
+                    val spec = linkedMapOf<String, Any?>("type" to type, "version" to version, "title" to title)
+                    if (format != ProvisionFile.LEGAL_DOCUMENT_DEFAULT_FORMAT) spec["format"] = format
+                    spec["bodyFile"] = path
+                    val name = uniqueName(ProvisionFile.KIND_LEGAL_DOCUMENT, listOfNotNull(type, plane).joinToString("-"))
+                    val resource = ProvisionResource(ProvisionFile.KIND_LEGAL_DOCUMENT, name, environmentField(plane), spec)
+                    accept(ImportedResource(resource, id, access, files = mapOf(path to body!!)), "legalDocument/$name (${planeLabel(plane)})")
+                }
+            }
+        }
         // SSO-3689 / SSO-3774 — workload-identity trusts: the API lists a plane's trusts filtered to what this identity reaches
         // (S1: the trusts it holds a relation on, every trust of a plane it views); each is rendered with the relation held on
         // `trust:<id>` UNIONED with the plane's (the plane alone on a platform that predates trust objects), and `readOnly`
@@ -2306,6 +2364,13 @@ class ProvisionEngine(
     /** SSO-3715 — two live resources match one converge key; the plan is red (`converge_key_ambiguous`), never a third copy. */
     private class ConvergeKeyAmbiguousException(message: String) : RuntimeException(message)
 
+    /**
+     * SSO-4057 / SSO-4072 — the declared legal-document version label cannot be the active version ([lookup] → an `ERROR` row in
+     * [probe]): [code] is [ERROR_LEGAL_DOCUMENT_VERSION_IMMUTABLE] (published with other content) or
+     * [ERROR_LEGAL_DOCUMENT_VERSION_DELETED] (the version was deleted).
+     */
+    private class LegalDocumentLabelRefusedException(val code: String, message: String, val liveId: String, val diff: Map<String, String> = emptyMap()) : RuntimeException(message)
+
     /** The one live match of a converge key, or none; two or more is [ConvergeKeyAmbiguousException]. */
     private fun <T> List<T>.singleMatchOrNull(what: String, fix: String): T? = when (size) {
         0 -> null
@@ -2422,6 +2487,60 @@ class ProvisionEngine(
                 Live(emailTemplateId(type, locale), emailTemplateDiff(want, have), mapOf("type" to type, "locale" to (locale ?: ProvisionFile.EMAIL_TEMPLATE_BASE_LOCALE)))
             }
         }
+        ProvisionFile.KIND_LEGAL_DOCUMENT -> {
+            // SSO-4057 / SSO-4072 — the resource's OWN environment (the plane's client sends `X-Thoryn-Environment`; identity keys
+            // on (tenant, environment, type), no fallback). The declaration is "the ACTIVE version is spec.version with this
+            // content"; a published version never changes. Read first the ACTIVE version with its body (`GET …/{type}/active`,
+            // `404 no_active_document` ⇒ none). Then, by the declared label:
+            //  - the active version, same content ⇒ no change (the only read);
+            //  - the active version, OTHER content ⇒ refused (`legal_document_version_immutable`): new text needs a new label;
+            //  - otherwise the listing (summaries, no body) names the label's version, if any:
+            //    - a DELETED version ⇒ refused (`legal_document_version_deleted`): it cannot be activated and its label stays taken;
+            //    - an inactive version: its body is read (`GET …/{type}/{id}`); same content ⇒ re-activate it ([update] → activate,
+            //      nothing published), OTHER content ⇒ `legal_document_version_immutable`;
+            //    - no version: none active ⇒ a create (publish); another active ⇒ an update that publishes the new version.
+            val want = legalDocumentWant(desired)
+            val client = clients(slug)
+            val active = activeLegalDocument(client, want.type)
+            fun liveIdOf(n: JsonNode) = legalDocumentId(want.type, n.str("id") ?: "")
+            fun attributesOf(n: JsonNode) = mapOf("type" to want.type, "version" to (n.str("version")?.trim() ?: ""))
+            fun immutable(n: JsonNode, differs: Map<String, String>): Nothing = throw LegalDocumentLabelRefusedException(
+                ERROR_LEGAL_DOCUMENT_VERSION_IMMUTABLE,
+                "version '${want.version}' of the ${want.type} in ${planeLabel(slug)} is already published with a different ${differs.keys.joinToString(" and ")} " +
+                    "(${differs.values.joinToString("; ")}); a published version never changes — users accepted that text — so give the new text a new spec.version",
+                liveIdOf(n), differs,
+            )
+            if (active != null && active.str("version")?.trim() == want.version) {
+                val differs = legalDocumentContentDiff(want, active)
+                if (differs.isNotEmpty()) immutable(active, differs)
+                return Live(liveIdOf(active), emptyMap(), attributesOf(active))
+            }
+            val labelled = listItems(client.listLegalDocuments(want.type), "data").firstOrNull { it.str("version")?.trim() == want.version }
+            when {
+                labelled != null && labelled.isDeleted() -> throw LegalDocumentLabelRefusedException(
+                    ERROR_LEGAL_DOCUMENT_VERSION_DELETED,
+                    "version '${want.version}' of the ${want.type} in ${planeLabel(slug)} was deleted${labelled.str("deletedAt")?.let { " at $it" } ?: ""}: a deleted version " +
+                        "cannot be activated again (409 document_deleted) and its label stays taken (409 version_exists) — give the document a new spec.version",
+                    liveIdOf(labelled),
+                )
+                labelled != null -> {
+                    val stored = client.getLegalDocument(want.type, labelled.str("id") ?: "")
+                    val differs = legalDocumentContentDiff(want, stored)
+                    if (differs.isNotEmpty()) immutable(labelled, differs)
+                    Live(
+                        liveIdOf(labelled),
+                        mapOf("active" to "${active?.str("version")?.trim()?.let { "version $it" } ?: "no active version"} → version ${want.version} (re-activates the stored version; nothing is published)"),
+                        attributesOf(labelled) + (ATTR_REACTIVATE to "true"),
+                    )
+                }
+                active == null -> null
+                else -> Live(
+                    liveIdOf(active),
+                    mapOf("version" to "${active.str("version")?.trim()} → ${want.version} (publishes a new version; users accept it at their next sign-in)") + legalDocumentContentDiff(want, active),
+                    attributesOf(active),
+                )
+            }
+        }
         ProvisionFile.KIND_LOGIN_FLOW -> {
             // SSO-3715 — the active flow does not record its template, so a loginFlow converges by EXISTENCE: an active
             // flow is a match (its version is the id); none ⇒ the template is applied. A changed `templateId` alone is
@@ -2482,6 +2601,7 @@ class ProvisionEngine(
             ProvisionFile.KIND_LOGIN_METHODS -> putLoginMethods(r, targetSlug(r, file, applied), spec, "+")
             ProvisionFile.KIND_CUSTOM_DOMAIN -> claimCustomDomain(r, spec)
             ProvisionFile.KIND_EMAIL_TEMPLATE -> putEmailTemplate(r, targetSlug(r, file, applied), spec, "+")
+            ProvisionFile.KIND_LEGAL_DOCUMENT -> publishLegalDocument(r, targetSlug(r, file, applied), spec, "+")
             ProvisionFile.KIND_WORKLOAD_IDENTITY_TRUST -> createTrust(r, file, applied, spec)
             ProvisionFile.KIND_ROLE -> createRole(r, targetSlug(r, file, applied), spec)
             else -> throw ProvisionException("${r.key}: unsupported kind '${r.kind}'")
@@ -2634,6 +2754,10 @@ class ProvisionEngine(
             ProvisionFile.KIND_LOGIN_METHODS -> putLoginMethods(r, slug, spec, "~").copy(action = ChangeAction.UPDATE)
             ProvisionFile.KIND_CUSTOM_DOMAIN -> verifyDomain(r, spec).copy(action = ChangeAction.UPDATE)
             ProvisionFile.KIND_EMAIL_TEMPLATE -> putEmailTemplate(r, slug, spec, "~").copy(action = ChangeAction.UPDATE)
+            // SSO-4057 — never a write to a published version: re-activate the stored one, or publish a new one.
+            ProvisionFile.KIND_LEGAL_DOCUMENT ->
+                if (change.attributes[ATTR_REACTIVATE] == "true") reactivateLegalDocument(r, slug, spec, id)
+                else publishLegalDocument(r, slug, spec, "~").copy(action = ChangeAction.UPDATE)
             else -> throw ProvisionException("${r.key}: unsupported kind '${r.kind}'")
         }
     }
@@ -2707,16 +2831,131 @@ class ProvisionEngine(
     private fun emailTemplateDiff(want: Map<String, String?>, have: Map<String, String?>): Map<String, String> {
         val diff = LinkedHashMap<String, String>()
         if (want["subject"]?.trim() != have["subject"]?.trim()) diff["subject"] = "${render(have["subject"])} → ${render(want["subject"])}"
-        val wantBody = normaliseBody(want["body"])
-        val haveBody = normaliseBody(have["body"])
-        if (wantBody != haveBody) {
-            val wantLines = wantBody.lines(); val haveLines = haveBody.lines()
-            val wantCount = wantLines.groupingBy { it }.eachCount(); val haveCount = haveLines.groupingBy { it }.eachCount()
-            val added = wantCount.entries.sumOf { (line, n) -> maxOf(0, n - (haveCount[line] ?: 0)) }
-            val removed = haveCount.entries.sumOf { (line, n) -> maxOf(0, n - (wantCount[line] ?: 0)) }
-            diff["body"] = "body differs (${haveLines.size} → ${wantLines.size} lines, +$added −$removed)"
-        }
+        bodyDiff(want["body"], have["body"])?.let { diff["body"] = it }
         return diff
+    }
+
+    /**
+     * Two bodies compared as the APIs store them ([normaliseBody]: `\r\n` folded to `\n`, trailing whitespace trimmed from every
+     * line and the end); null when equal, else the difference as a line count, never the text (`body differs (N → M lines, +A −D)`).
+     */
+    private fun bodyDiff(want: String?, have: String?): String? {
+        val wantBody = normaliseBody(want)
+        val haveBody = normaliseBody(have)
+        if (wantBody == haveBody) return null
+        val wantLines = wantBody.lines(); val haveLines = haveBody.lines()
+        val wantCount = wantLines.groupingBy { it }.eachCount(); val haveCount = haveLines.groupingBy { it }.eachCount()
+        val added = wantCount.entries.sumOf { (line, n) -> maxOf(0, n - (haveCount[line] ?: 0)) }
+        val removed = haveCount.entries.sumOf { (line, n) -> maxOf(0, n - (wantCount[line] ?: 0)) }
+        return "body differs (${haveLines.size} → ${wantLines.size} lines, +$added −$removed)"
+    }
+
+    // ── legalDocument (SSO-4057) ─────────────────────────────────────────────────────────────────
+
+    /** A declared legal document in the API's normal form: the type and the version / title trimmed, the format lower-cased (omitted ⇒ markdown), the body as declared. */
+    private data class LegalDocumentWant(val type: String, val version: String, val title: String, val format: String, val body: String)
+
+    private fun legalDocumentWant(spec: Map<String, Any?>): LegalDocumentWant = LegalDocumentWant(
+        type = spec["type"].nonBlank() ?: throw ProvisionException("legalDocument: spec.type is required"),
+        version = spec["version"].nonBlank() ?: throw ProvisionException("legalDocument: spec.version is required"),
+        title = spec["title"].nonBlank() ?: throw ProvisionException("legalDocument: spec.title is required"),
+        format = spec["format"].nonBlank()?.lowercase() ?: ProvisionFile.LEGAL_DOCUMENT_DEFAULT_FORMAT,
+        body = spec["body"]?.toString() ?: "",
+    )
+
+    /** The live id of a legal-document version, `<type>/<id>` — the API's own path below `/legal-documents/` (what `--output json` and [removeByHand] carry). */
+    private fun legalDocumentId(type: String, id: String): String = "$type/$id"
+
+    /** Whether a listed legal-document version is the ACTIVE one. */
+    private fun JsonNode.isActive(): Boolean = this["active"]?.takeIf { it.isBoolean }?.asBoolean() == true
+
+    /** SSO-4072 — whether a legal-document version was DELETED: the API's `deleted` flag, never inferred from `active: false`. */
+    private fun JsonNode.isDeleted(): Boolean = this["deleted"]?.takeIf { it.isBoolean }?.asBoolean() == true
+
+    /**
+     * SSO-4072 — the ACTIVE version of [type] with its body (`GET …/{type}/active`), or null when the API answers `404
+     * no_active_document`. Any other 404 is NOT "none active": `unknown_environment` (no reach into the plane) is rethrown for
+     * [probe] to turn into the missing right, and a `not_found` is the answer of a product-api that predates the active read
+     * (oauthy #4294 — it routes `active` as a version id), refused rather than planned as a create that would publish over
+     * the live document.
+     */
+    private fun activeLegalDocument(client: ProvisionApi, type: String): JsonNode? = try {
+        client.getActiveLegalDocument(type)
+    } catch (ex: ProductApiException) {
+        when {
+            ex.httpStatus == 404 && ex.errorCode == ERROR_NO_ACTIVE_DOCUMENT -> null
+            ex.httpStatus == 404 && ex.errorCode == "not_found" -> throw ProvisionException(
+                "legalDocument: GET /api/v1/login-experience/legal-documents/$type/active answered 404 not_found — this product-api predates the " +
+                    "active-version read (oauthy #4294), so the active $type cannot be read safely; deploy it first",
+            )
+            else -> throw ex
+        }
+    }
+
+    /** The content fields of [want] that differ from the stored version [n] — title (trimmed), format, body ([bodyDiff]); empty when it is the same text. */
+    private fun legalDocumentContentDiff(want: LegalDocumentWant, n: JsonNode): Map<String, String> {
+        val diff = LinkedHashMap<String, String>()
+        val title = n.str("title")?.trim()
+        if (title != want.title) diff["title"] = "${render(title)} → ${render(want.title)}"
+        val format = n.str("format")?.trim()?.lowercase() ?: ProvisionFile.LEGAL_DOCUMENT_DEFAULT_FORMAT
+        if (format != want.format) diff["format"] = "$format → ${want.format}"
+        bodyDiff(want.body, n["body"]?.takeIf { !it.isNull }?.asString())?.let { diff["body"] = it }
+        return diff
+    }
+
+    /**
+     * SSO-4057 — where `import` puts an environment's active document, relative to the provisioning file: `legal/<type>.md`
+     * (`.txt` for `format: text`) for the production plane, `legal/<slug>/<type>.md` for a sandbox — the `emails/` layout of
+     * [emailTemplateBodyPath], so one file holding several environments never has two documents claim one body file.
+     */
+    private fun legalDocumentBodyPath(plane: String?, type: String, format: String): String =
+        "legal/" + (plane?.let { "$it/" } ?: "") + type + if (format == "text") ".txt" else ".md"
+
+    /**
+     * `POST /api/v1/login-experience/legal-documents/{type}` with `{ version, title, body, format }`: publishes a NEW version, which
+     * the API activates (deactivating the previous one). Users accept it at their next sign-in.
+     */
+    private fun publishLegalDocument(r: ProvisionResource, slug: String?, spec: Map<String, Any?>, mark: String): AppliedResource {
+        val want = legalDocumentWant(spec)
+        if (want.body.isBlank()) throw ProvisionException("${r.key}: ${ProvisionFile.ERR_LEGAL_DOCUMENT_BODY_REQUIRED} — spec.body or spec.bodyFile is required")
+        val resp = try {
+            clients(slug).publishLegalDocument(want.type, linkedMapOf("version" to want.version, "title" to want.title, "body" to want.body, "format" to want.format))
+        } catch (ex: ProductApiException) {
+            throw legalDocumentFailure(r, ex, want.type, want.version, slug, "publish")
+        }
+        val id = legalDocumentId(want.type, resp.str("id") ?: throw ProvisionException("${r.key}: the legal-document publish returned no id"))
+        val source = spec["bodyFile"]?.toString()?.let { " body=$it" } ?: ""
+        out.println("  $mark legalDocument ${r.name}: ${want.type} version ${want.version}${slug?.let { " (environment $it)" } ?: ""} published and active — users accept it at their next sign-in$source")
+        return AppliedResource(r.kind, r.name, id, slug, mapOf("type" to want.type, "version" to want.version), action = ChangeAction.CREATE)
+    }
+
+    /** `POST …/{type}/{id}/activate` — the stored version the plan found with the declared label and content becomes the active one again. */
+    private fun reactivateLegalDocument(r: ProvisionResource, slug: String?, spec: Map<String, Any?>, id: String): AppliedResource {
+        val want = legalDocumentWant(spec)
+        try {
+            clients(slug).activateLegalDocument(want.type, id.substringAfter('/'))
+        } catch (ex: ProductApiException) {
+            throw legalDocumentFailure(r, ex, want.type, want.version, slug, "activate")
+        }
+        out.println("  ~ legalDocument ${r.name}: ${want.type} version ${want.version}${slug?.let { " (environment $it)" } ?: ""} re-activated (the stored version; nothing published)")
+        return AppliedResource(r.kind, r.name, id, slug, mapOf("type" to want.type, "version" to want.version), action = ChangeAction.UPDATE)
+    }
+
+    /** The API's refusal of a legal-document write, named for the document with the API's own code and detail. */
+    private fun legalDocumentFailure(r: ProvisionResource, ex: ProductApiException, type: String, version: String, slug: String?, what: String): ProvisionException {
+        MissingScopeException.of(ex, ScopeRequirements.writeScope(r.kind), ScopeRequirements.Phase.APPLY, r.key, "$what the legal document")?.let { return it }
+        val where = "the $type version '$version' in ${planeLabel(slug)}"
+        val detail = ex.errorDescription?.takeIf { it.isNotBlank() } ?: ex.message ?: "the legal-document API refused the request"
+        return ProvisionException(
+            "${r.key}: " + when (ex.errorCode) {
+                "version_exists" -> "version_exists — $where was published since the plan was made (a label is unique per type and environment, inactive and deleted versions included); re-run plan"
+                // SSO-4072 — activating a version deleted since the plan: it can never be active again, and its label stays taken.
+                ERROR_DOCUMENT_DELETED -> "$ERROR_DOCUMENT_DELETED — $where was deleted since the plan was made; a deleted version cannot be activated and its label stays taken — give the document a new spec.version"
+                ProvisionFile.ERR_HTML_NOT_ALLOWED -> "${ProvisionFile.ERR_HTML_NOT_ALLOWED} — $detail ($where)"
+                null -> "HTTP ${ex.httpStatus} — $detail ($where)"
+                else -> "${ex.errorCode} — $detail ($where)"
+            },
+        )
     }
 
     private fun normaliseBody(html: String?): String =
@@ -3098,6 +3337,21 @@ class ProvisionEngine(
                 // SSO-4054 — in the row's OWN environment only (`X-Thoryn-Environment`); a sandbox then sends production's copy.
                 clients(c.environment).deleteEmailTemplate(type, locale)
                 out.println("  - emailTemplate ${c.name}: ${emailTemplateId(type, locale)}${c.environment?.let { " (environment $it)" } ?: ""} reset to the built-in default")
+            }
+            ProvisionFile.KIND_LEGAL_DOCUMENT -> {
+                // SSO-4057 — the DELETE soft-deletes that version (the environment then has no document of the type); refused
+                // `409 document_accepted` once a user accepted it (GDPR Art. 7). Reached only through a plan that carries the row:
+                // destroy / --prune never plan one for a production document, and a sandbox's goes with its sandbox.
+                val type = c.attributes["type"] ?: id.substringBefore('/')
+                try {
+                    clients(c.environment).deleteLegalDocument(type, id.substringAfter('/'))
+                } catch (ex: ProductApiException) {
+                    if (ex.httpStatus == 409 && ex.errorCode == "document_accepted") {
+                        throw ProvisionException("${c.key}: document_accepted — users have accepted this $type version, so it cannot be deleted (the acceptances are a GDPR Art. 7 audit trail); publish a new version instead")
+                    }
+                    throw ex
+                }
+                out.println("  - legalDocument ${c.name}: $type version ${c.attributes["version"] ?: id.substringAfter('/')}${c.environment?.let { " (environment $it)" } ?: ""} deleted — the environment has no $type now")
             }
             ProvisionFile.KIND_WORKLOAD_IDENTITY_TRUST -> {
                 // SSO-3689 — only through `--prune` / `destroy`; the trust's workload client stops authenticating at once.
@@ -4075,6 +4329,18 @@ class ProvisionEngine(
         /** The resource may only be viewed (or is declared `readOnly`) and the file would change it. */
         /** SSO-4042 — product-api's answer for a (type, locale) cell with no override: the API's "absent", never a missing right. */
         const val ERROR_TEMPLATE_NOT_CUSTOMIZED = "template_not_customized"
+        /** SSO-4057 — the declared `spec.version` of a legal document is published with other content: a published version never changes. */
+        const val ERROR_LEGAL_DOCUMENT_VERSION_IMMUTABLE = "legal_document_version_immutable"
+        /** SSO-4072 — the declared `spec.version` of a legal document belongs to a DELETED version: it cannot be activated, its label stays taken. */
+        const val ERROR_LEGAL_DOCUMENT_VERSION_DELETED = "legal_document_version_deleted"
+        /** SSO-4072 — product-api's answer on `GET …/{type}/active` when no version of the type is active: the API's "absent". */
+        const val ERROR_NO_ACTIVE_DOCUMENT = "no_active_document"
+        /** SSO-4072 — product-api's `409` when a deleted version is activated. */
+        const val ERROR_DOCUMENT_DELETED = "document_deleted"
+        /** SSO-4057 — the fix request's note for that row: the FILE must change. */
+        const val FILE_FIX_NOTE_LEGAL_DOCUMENT_VERSION = "a change to the file, not a missing right: give the legal document a new spec.version (or, for a changed text, declare the stored text again)"
+        /** SSO-4057 — the plan attribute that tells [update] to re-activate the stored version instead of publishing one. */
+        const val ATTR_REACTIVATE = "reactivate"
         const val ERROR_READ_ONLY = "access_read_only"
         /**
          * SSO-3715 (ADR 2026-10-15 §5) — two or more live resources match the declared converge key (an application's

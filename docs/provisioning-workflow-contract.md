@@ -262,7 +262,10 @@ with them, whose plan is all `noop`.
   `retention-days: 7`, only on success), and on failure the same fix request as the plan job.
 - **The artifact** — exactly each configured file at its repository path, **plus the body files a configured file
   references** (SSO-4042: an `emailTemplate`'s `spec.bodyFile`, relative to its file — staged from the checkout for a
-  committed template, written by the import for a live one), plus `import-summary.json` at the root:
+  committed template, written by the import for a live one; SSO-4057: a `legalDocument`'s the same way, under
+  `legal/` — the body of each environment's ACTIVE version, read with `GET …/legal-documents/{type}/active` (oauthy
+  SSO-4072); a product-api without that read is listed under `notImported`, never imported as "no document"), plus
+  `import-summary.json` at the root:
 
   ```json
   {

@@ -169,6 +169,14 @@ resources:
         # this default signs in (requested ⊄ registered is invalid_scope).
         - tenant:roles.read
         - tenant:roles.write
+        # SSO-4057 / SSO-4070 — a provisioning file's `kind: legalDocument` (the tenant-level terms of use / privacy policy,
+        # oathy SSO-4047, /api/v1/login-experience/legal-documents), gated on its own narrow scope pair (product owner
+        # 2026-10-29). MERGE PRECONDITION (the SSO-2278 grant order): oauthy #4290 with hub V215 (SSO-4069), which grants
+        # tenant:legal-documents.read/.write to `cli`, is deployed first — before this file is applied (the App-dispatched
+        # apply cannot add a scope the CI identity does not hold) and before a release carrying this default signs in
+        # (requested ⊄ registered is invalid_scope).
+        - tenant:legal-documents.read
+        - tenant:legal-documents.write
       requireAuthorizationConsent: false  # first-party: no consent screen for the platform's own CLI
 
   - kind: environment

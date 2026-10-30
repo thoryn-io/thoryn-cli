@@ -115,6 +115,15 @@ class ScopeRequirementsTest {
     }
 
     @Test
+    fun `a declared legal document needs legal-documents read to plan and legal-documents write to apply, and no ownership check`() {
+        // SSO-4057 — product-api's TenantLegalDocumentsController gates on its own tenant:legal-documents.* pair alone (SSO-4069; no platform access object).
+        val needs = ScopeRequirements.of(file("- { kind: legalDocument, name: terms, spec: { type: terms-of-use, version: v1, title: Terms, body: \"x\" } }"))
+        assertThat(scopes(needs, Phase.PLAN)).containsExactly("tenant:legal-documents.read")
+        assertThat(scopes(needs, Phase.APPLY)).containsExactly("tenant:legal-documents.write")
+        assertThat(needs.single { it.scope == "tenant:legal-documents.read" }.resource).isEqualTo("legalDocument/terms")
+    }
+
+    @Test
     fun `an application's tokenClaims is covered by the applications scopes it already needs`() {
         val needs = ScopeRequirements.of(file("- { kind: application, name: a, spec: { displayName: A, tokenClaims: { sources: [permissions] } } }"))
         assertThat(scopes(needs, Phase.PLAN)).containsExactly("tenant:applications.read", "tenant:access.read")
