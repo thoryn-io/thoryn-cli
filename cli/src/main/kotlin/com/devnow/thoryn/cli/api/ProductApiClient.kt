@@ -351,6 +351,37 @@ class ProductApiClient(
     fun getTestEmail(envId: String, emailId: String): JsonNode =
         get("/api/v1/environments/${encode(envId)}/test-emails/${encode(emailId)}")
 
+    // ── Ephemeral sandbox test identities (SSO-4086; product-api /api/v1/environments/{envId}/test-identities) ──
+    //
+    // oauthy ADR 2026-10-30-ephemeral-sandbox-test-identities §1, shipped by product-api SSO-4085 (#4297): a disposable,
+    // email-verified account minted IN A SANDBOX for an application's e2e / CI, with a server-generated password the
+    // `POST` answer carries ONCE and nothing else ever returns. Scopes: `tenant:test-identities.write` (mint, revoke),
+    // `tenant:test-identities.read` (list, get) — granted to the `cli` login client by oauthy hub V216 (#4296). The
+    // production plane is refused structurally (`403 not_a_sandbox`): the sandbox-only rule is the API's, not the CLI's.
+
+    /**
+     * `POST /api/v1/environments/{envId}/test-identities` — mint one. [body] is `{ lifetime?, label? }` (an ISO-8601
+     * duration `PT5M`..`PT24H`, default `PT2H`; up to 64 chars of `[A-Za-z0-9._-]`). Returns the identity WITH its
+     * one-time `password` — the caller prints it exactly once, in the output the user chose, and never logs it.
+     */
+    fun createTestIdentity(envId: String, body: Map<String, Any?>): JsonNode =
+        post("/api/v1/environments/${encode(envId)}/test-identities", body)
+
+    /** `GET /api/v1/environments/{envId}/test-identities` — the sandbox's live and expired-not-yet-purged identities (a `ListEnvelope`; never a password). */
+    fun listTestIdentities(envId: String): JsonNode =
+        get("/api/v1/environments/${encode(envId)}/test-identities")
+
+    /** `GET /api/v1/environments/{envId}/test-identities/{id}` — one, without its password (`410 test_identity_expired` past `expiresAt`). */
+    fun getTestIdentity(envId: String, id: String): JsonNode =
+        get("/api/v1/environments/${encode(envId)}/test-identities/${encode(id)}")
+
+    /**
+     * `DELETE /api/v1/environments/{envId}/test-identities/{id}` — revoke now: the account is erased and its sessions
+     * severed; `204` for a live or an expired-not-yet-purged identity alike, `404 not_found` once purged or unknown.
+     */
+    fun revokeTestIdentity(envId: String, id: String): Unit =
+        deleteNoContent("/api/v1/environments/${encode(envId)}/test-identities/${encode(id)}")
+
     // ── Email provider (SSO-2917; product-api /api/v1/email-provider) ──────────
     //
     // The tenant's bring-your-own SMTP transport config (the activation, per tenant,
@@ -1217,6 +1248,7 @@ class ProductApiClient(
             throw ProductApiException.fromResponse(
                 response.statusCode(), body, mapper,
                 wwwAuthenticate = response.headers().firstValue("WWW-Authenticate").orElse(null),
+                retryAfter = response.headers().firstValue("Retry-After").orElse(null),
             )
         }
         if (body.isBlank()) return mapper.nullNode()

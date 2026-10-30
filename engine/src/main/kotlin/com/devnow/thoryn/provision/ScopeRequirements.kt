@@ -95,16 +95,30 @@ object ScopeRequirements {
     fun beyondBaseline(file: ProvisionFile, needs: List<ScopeNeed>): List<ScopeNeed> =
         if (file.part != ProvisionPart.APPLICATION) emptyList() else needs.filterNot { it.scope in APPLICATION_FILE_SCOPES }
 
+    const val SCOPE_TEST_IDENTITIES_WRITE = "tenant:test-identities.write"
+
+    /**
+     * SSO-4086 (oauthy ADR `2026-10-30-ephemeral-sandbox-test-identities.md` §2) — the two **sandbox tool scopes** an
+     * application's identity holds for its e2e / CI WITHOUT a declared resource asking for them: `tenant:environments.read`
+     * (the sandbox's test inbox, `thoryn env test-emails`) and `tenant:test-identities.write` (minting and revoking a
+     * disposable test account in the sandbox, `thoryn env test-identity`). Neither is derived from an application file —
+     * a test identity is an imperative mint, not a provisioning kind — so [unneeded] treats them as expected on an
+     * application trust rather than as the identity being wider than its file. A tenant-defining scope (`tenant:users.*`)
+     * is still reported, which is the point: the mint is what replaces `tenant:users.write` on an app project.
+     */
+    val SANDBOX_TOOL_SCOPES: Set<String> = setOf(SCOPE_ENVIRONMENTS_READ, SCOPE_TEST_IDENTITIES_WRITE)
+
     /**
      * SSO-3962 — the scopes [held] (a trust's scopes, a connection's `auth.scopes`) that an APPLICATION file does not need:
      * the identity is wider than its file — a tenant-defining scope on an app project's trust is the blur the parts remove.
      * Empty for a tenant or mixed file (their union of kinds decides, as before). Compared with [holds] in reverse: a held
-     * deprecated alias (`tenant:clients.read`) of a needed scope counts as needed.
+     * deprecated alias (`tenant:clients.read`) of a needed scope counts as needed, and (SSO-4086) a held sandbox tool scope
+     * ([SANDBOX_TOOL_SCOPES]) is never unneeded.
      */
     fun unneeded(file: ProvisionFile, needs: List<ScopeNeed>, held: Set<String>): List<String> {
         if (file.part != ProvisionPart.APPLICATION) return emptyList()
         val needed = needs.map { it.scope }.toSet()
-        return held.filter { h -> h !in needed && needed.none { aliasOf(it) == h } }.sorted()
+        return held.filter { h -> h !in needed && h !in SANDBOX_TOOL_SCOPES && needed.none { aliasOf(it) == h } }.sorted()
     }
 
     /** The scope area each kind's endpoint is gated on (`tenant:<area>.read` / `.write`) — the table above. */

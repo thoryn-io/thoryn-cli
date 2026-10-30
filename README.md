@@ -230,6 +230,14 @@ thoryn users roles remove <user> <role> [--environment <slug>]       # idempoten
 thoryn env test-emails list [--env <slug>] [--to <email>] [--channel <ch>] [--limit <n>]
 thoryn env test-emails get <email-id> [--env <slug>]   # one email, incl. its actionLink (e.g. the verify URL)
 
+# Ephemeral sandbox test identities (SSO-4086) — a disposable, email-verified test account minted IN A SANDBOX for your
+# application's e2e / CI; its password is returned ONCE, in the output you choose. Lives PT2H by default (PT5M..PT24H),
+# erased on expiry or on revoke. Production is refused by the API (403 not_a_sandbox) — no flag lifts it. Needs
+# tenant:test-identities.write (create, revoke) / .read (list) AND `manager` on the sandbox. NOT a provisioning kind.
+thoryn env test-identity create [--env <slug>] [--lifetime PT2H] [--label <text>] [--output table|json|env|github-env]
+thoryn env test-identity list   [--env <slug>]          # live + expired-not-yet-purged, with status; never a password
+thoryn env test-identity revoke <id> [--env <slug>]      # erase now, sessions severed (idempotent on an expired one)
+
 # Hosted-login branding (SSO-3037) — the look of the hosted sign-in / register screens end users see,
 # per SELECTED ENVIRONMENT (thoryn env use). Rendered as CSS custom properties; server-validated
 # (hex colors, radius 0-64, theme enum, https logo) + WCAG-AA contrast-guarded. Needs tenant:idp.*.
@@ -1054,6 +1062,75 @@ The complete, applyable manifest — ServiceAccount, the connection ConfigMap, t
 --secret-file /shared/client-secret`), the in-memory `/shared` volume and oauth2-proxy reading
 `--client-secret-file=/shared/client-secret` — is [`examples/kubernetes/`](examples/kubernetes/README.md).
 
+### Test accounts for your application's CI — `thoryn env test-identity` (SSO-4086, epic SSO-4082)
+
+An application's end-to-end tests need an account to sign in with. Until SSO-4082 a starter declared one as
+`kind: user` in its own provisioning file — a tenant-defining write (`tenant:users.write`) on an application
+project's identity, the one thing oauthy ADR 2026-10-25 sealed off. The replacement is an **ephemeral sandbox
+test identity** (oauthy ADR `2026-10-30-ephemeral-sandbox-test-identities.md`): a disposable, email-verified
+account with a synthetic `ti-…@sandbox.thoryn.invalid` address and a server-generated password that is returned
+**once**, minted **in a sandbox only**, living `PT2H` by default (`PT5M`..`PT24H`), erased on expiry (within ten
+minutes) or on `revoke`. It signs in on every existing path (password form, magic link, the headless channel);
+it has no roles (v1) and is not a federated identity. The one thing an application identity may mint in the
+tenant — and the mint is what replaces `tenant:users.write` on an app project.
+
+```bash
+thoryn env test-identity create --env staging --label e2e-run-123       # the record, then the password once
+thoryn env test-identity create --env staging --lifetime PT24H --output env   # export lines, for eval
+thoryn env test-identity list --env staging                             # live + expired, status; never a password
+thoryn env test-identity revoke <id> --env staging                      # erase now; 204 on an expired one too
+```
+
+`--env` defaults to the selected environment (`thoryn env use <slug>`), exactly as `thoryn env test-emails` does;
+the slug is resolved to the environment's id for the call. **Scopes:** `tenant:test-identities.write` (create,
+revoke) and `tenant:test-identities.read` (list) — a narrow family of its own (product owner, 2026-10-30) that
+reaches no real user: it grants nothing on `/api/v1/users`. Both checks apply: the scope AND `manager` on the
+sandbox (an identity without the relation is answered `404 not_found`, never `403` — the platform's existence rule).
+A bare `thoryn login` requests the family (the `cli` login client carries it once oauthy hub V216 is deployed —
+the SSO-2278 grant order), so **a developer mints under their own login too**: `--lifetime PT24H` once a day for a
+local run, re-minted when `expiresAt` has passed. The hub mints the scopes only to an admin who holds them.
+
+**Where the password goes — exactly once, in the output you choose.** The human output prints it under a one-line
+warning; `--output json` prints the response; `--output env` prints
+
+```bash
+export THORYN_TEST_IDENTITY_ID='5d1c2b3a-…'
+export THORYN_TEST_USER_EMAIL='ti-k7m2x9c4pq8v@sandbox.thoryn.invalid'
+export THORYN_TEST_USER_PASSWORD='…'          # single-quoted, a quote in it escaped — safe for eval "$(…)"
+```
+
+and `--output github-env` prints `::add-mask::<password>` **first** (so the password never appears unmasked in a
+job log) and then appends the same three variables to the file `$GITHUB_ENV` names — refusing *before* the mint
+when `$GITHUB_ENV` is not set, so no identity is minted and lost. `list` and `revoke` never print a password, no
+error message carries one, and the CLI never logs it.
+
+**In GitHub Actions** — after the sandbox sign-in, mint once per run; revoke under `if: always()` so a red run does
+not leave the sandbox's cap (25 live identities) filled:
+
+```yaml
+      - run: thoryn login --connection .thoryn/connection.json      # the application's sandbox trust (its scopes carry tenant:test-identities.write)
+      - run: thoryn env test-identity create --env staging --label "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" --output github-env
+      - run: npx playwright test                                     # reads THORYN_TEST_USER_EMAIL / THORYN_TEST_USER_PASSWORD
+      - if: always()
+        run: thoryn env test-identity revoke "$THORYN_TEST_IDENTITY_ID" --env staging
+```
+
+**What the API refuses, and what the CLI says:** `not_a_sandbox` — the environment is the production plane (pick a
+sandbox; passed through unchanged, no flag lifts it); `environment_mismatch` — the token is a sandbox trust bound to
+another sandbox; `not_found` — unknown environment or identity, another workspace's, or your identity is not a
+`manager` of the sandbox; `invalid_lifetime` / `invalid_label` — the grammar above; `test_identity_cap_reached`
+(409) — revoke one or wait for an expiry; `test_identity_rate_limited` (429, with `Retry-After`) — 30 mints per
+client and 60 per sandbox per hour, so mint once per run, not per test; `test_identity_expired` (410) — past its
+`expiresAt`, purge pending; `test_identity_limiter_unavailable` / `facade_not_configured` (503) — the platform side.
+A missing scope renders the usual `Required scope:` + `thoryn login --scope` guidance.
+
+**Not a provisioning kind.** A test identity is an imperative mint with an expiry, not a fact the tenant keeps
+true: there is no `kind: testIdentity`, the bundled schema does not know one, `provision import` never emits one,
+`provision plan` never diffs one, and `kind: user` stays tenant provisioning. The `config.trust-scopes` rule
+treats `tenant:test-identities.write` and `tenant:environments.read` as **sandbox tool scopes** an application
+trust is expected to hold for its own tests (see "Two file parts"); `tenant:users.*` on an application trust is
+still reported as the identity being wider than its file.
+
 ### Project repositories — `thoryn project init` (SSO-3435, epic SSO-3304)
 
 `thoryn project init` sets up a GitHub repository for Thoryn from the command line, with **your own
@@ -1499,8 +1576,11 @@ strictly needs, and the rule names it: `tenant:environments.read` for a client i
 ownership check), `tenant:workload-identity.read` for a `federatedTrust` / `workloadPull` trust resolved by name,
 `tenant:access.write` for a `grants:` block or a `workloadPull` sink's `manager` grant. A connection that declares a scope
 an application file never needs (`tenant:users.write` on an app project, say) **fails** the check: the identity is wider
-than its file — narrow the trust with `thoryn workload-identity trusts set-scopes`. A tenant file needs the union of its
-kinds' scopes, as before.
+than its file — narrow the trust with `thoryn workload-identity trusts set-scopes`. Two **sandbox tool scopes** are the
+exception (SSO-4086): `tenant:environments.read` (the test inbox) and `tenant:test-identities.write` (a disposable test
+account, `thoryn env test-identity`) serve the application's own tests without any declared resource asking for them, so
+an application trust holding them passes and the verdict names them. A tenant file needs the union of its kinds' scopes,
+as before.
 
 **Migration — `thoryn.io/provision/v1` keeps working for one release.** `plan` / `apply` / `import` / `destroy` print a
 `Warning:` on stderr naming the part the file should declare (all tenant kinds → `thoryn.io/tenant/v1`; only
@@ -3031,8 +3111,9 @@ verdict says so, names what a mechanism of the application's own object adds (a 
 `tenant:environments.read`, a `workloadPull` / `federatedTrust` trust's `tenant:workload-identity.read`, a `grants:`
 block's `tenant:access.write`), and **fails a connection that declares a scope the file never needs** — an app project's
 identity wider than its file (`tenant:users.write` on an application repository, say): narrow the trust with
-`thoryn workload-identity trusts set-scopes`. A **tenant file** is the union of its kinds' scopes, the table above; a
-mixed `thoryn.io/provision/v1` file is judged as a tenant file is.
+`thoryn workload-identity trusts set-scopes`. The two sandbox tool scopes, `tenant:environments.read` and
+`tenant:test-identities.write` (SSO-4086), are expected on an application trust and never that finding. A **tenant file**
+is the union of its kinds' scopes, the table above; a mixed `thoryn.io/provision/v1` file is judged as a tenant file is.
 
 **Three places say it, in one wording:**
 

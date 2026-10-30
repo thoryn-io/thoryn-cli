@@ -164,9 +164,16 @@ internal object TrustScopes {
         }
         val planScopes = needs.filter { it.phase == Phase.PLAN }.map { it.scope }.distinct()
         val applyScopes = needs.filter { it.phase == Phase.APPLY }.map { it.scope }.distinct()
+        // SSO-4086 — a sandbox tool scope an application file's connection holds is expected, and the verdict says which.
+        val tools = if (file.part == ProvisionPart.APPLICATION) {
+            declared.filter { it in ScopeRequirements.SANDBOX_TOOL_SCOPES && needs.none { n -> n.scope == it } }.sorted()
+        } else {
+            emptyList()
+        }
         val satisfied = "$filePath needs to plan: ${planScopes.joinToString(" ").ifEmpty { "nothing" }}; to apply, also: " +
             "${applyScopes.filterNot { it in planScopes }.joinToString(" ").ifEmpty { "nothing" }} — $connectionPath declares every one" +
             (partNote(file, needs)?.let { " and nothing the file does not need. $it" } ?: "") +
+            (if (tools.isEmpty()) "" else " It also declares ${tools.joinToString(" ")} — sandbox tool scope(s) for the application's own tests (the test inbox, `thoryn env test-identity`), expected on an application trust.") +
             (if (planProfile) " (the plan profile of $trust must carry the plan scopes: one set without explicit scopes derives every .read scope of the trust; `provision plan` re-checks the minted token)" else "")
         return Verdict(problems, satisfied)
     }

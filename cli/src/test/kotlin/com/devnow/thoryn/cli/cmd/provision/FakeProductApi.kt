@@ -684,8 +684,96 @@ internal class FakeProductApi : Dispatcher() {
     val provisioningWrites: List<Write> get() = writes.filter { !it.path.startsWith("/api/v1/attestations") }
     fun reset() { writes.clear() }
 
-    fun seedEnvironment(slug: String, name: String = slug): String =
-        "env-${++seq}".also { environments += mutableMapOf("id" to it, "slug" to slug, "name" to name, "kind" to "sandbox", "suspended" to false) }
+    fun seedEnvironment(slug: String, name: String = slug, kind: String = "sandbox"): String =
+        "env-${++seq}".also { environments += mutableMapOf("id" to it, "slug" to slug, "name" to name, "kind" to kind, "suspended" to false) }
+
+    // ── SSO-4086 — ephemeral sandbox test identities (product-api /api/v1/environments/{envId}/test-identities, oauthy #4297) ──
+    //
+    // The fake models product-api's gate ORDER (TestIdentitiesService): the environment under the caller's tenant (foreign
+    // → 404 not_found), 403 environment_mismatch for a token bound to another environment, 404 not_found without `manager`
+    // on the environment, 403 not_a_sandbox for the production plane, then the request grammar (TestIdentityRules), the
+    // cap, and the mint. The password lives on the record test-side only and is rendered on the POST answer alone.
+
+    /** Per environment id: the sandbox's test identities, as identity-service keeps them (incl. `password`, never listed). */
+    val testIdentities = mutableMapOf<String, MutableList<MutableMap<String, Any?>>>()
+    /** The NEXT test-identity call is refused with this `(status, errorCode, extensions)` — for the codes the model cannot reach (limiter, facade, upstream, rate). */
+    var nextTestIdentityProblem: Triple<Int, String, Map<String, Any?>>? = null
+    /** `Retry-After` (seconds) on the next `429` the fake answers. */
+    var testIdentityRetryAfter: Long? = null
+    /** ADR §5's v1 default: live identities per sandbox. */
+    var testIdentityCap = 25
+    /** The caller token's `env` claim (a sandbox trust is bound to one sandbox); null ⇒ unbound (an admin's session). */
+    var callerEnvClaim: String? = null
+    /** The password the next mint generates (a test picks one with a quote to see the shell quoting); null ⇒ `Pw-<n>-x9Q`. */
+    var nextTestIdentityPassword: String? = null
+    /** "Now" for `status` and `expiresAt` — fixed so assertions are literal. */
+    var testIdentityNow: java.time.Instant = java.time.Instant.parse("2026-10-30T09:00:00Z")
+    /** A SERVER FAULT the CLI defends against: the list / get view carries `password`. The real API never does; the CLI strips it anyway. */
+    var testIdentityListLeaksPassword = false
+
+    /** Seed one identity directly (e.g. an already-expired one), returning its id. */
+    fun seedTestIdentity(envId: String, label: String? = null, expired: Boolean = false, password: String = "seeded-pw"): String {
+        val slug = environments.first { it["id"] == envId }["slug"].toString()
+        val id = java.util.UUID.nameUUIDFromBytes("ti-${++seq}".toByteArray()).toString()
+        val created = testIdentityNow.minusSeconds(if (expired) 3 * 3600 else 60)
+        testIdentities.getOrPut(envId) { mutableListOf() } += mutableMapOf(
+            "id" to id, "email" to "ti-${id.take(12).replace("-", "")}@sandbox.thoryn.invalid", "password" to password, "emailVerified" to true,
+            "environment" to slug, "label" to label, "createdAt" to created.toString(), "expiresAt" to created.plusSeconds(2 * 3600).toString(), "mintedBy" to caller,
+        )
+        return id
+    }
+
+    private fun testIdentityView(rec: Map<String, Any?>): Map<String, Any?> {
+        val expired = java.time.Instant.parse(rec["expiresAt"].toString()).isBefore(testIdentityNow)
+        return rec.filterKeys { testIdentityListLeaksPassword || it != "password" } + mapOf("status" to if (expired) "expired" else "live")
+    }
+
+    private val TEST_IDENTITY_LABEL = Regex("^[A-Za-z0-9._-]{1,64}$")
+
+    private fun testIdentities(method: String, seg: List<String>, b: Map<String, Any?>): MockResponse {
+        nextTestIdentityProblem?.let { (status, code, ext) ->
+            nextTestIdentityProblem = null
+            val refusal = problem(status, code, ext)
+            if (status == 429) testIdentityRetryAfter?.let { refusal.setHeader("Retry-After", it.toString()) }
+            return refusal
+        }
+        val envId = seg[1]
+        val e = environments.firstOrNull { it["id"] == envId } ?: return problem(404, "not_found")
+        callerEnvClaim?.let { if (it != e["slug"]) return problem(403, "environment_mismatch") }
+        if (!holds("environment:$envId", "manager")) return problem(404, "not_found")
+        if (e["kind"] == "production") return problem(403, "not_a_sandbox")
+        val store = testIdentities.getOrPut(envId) { mutableListOf() }
+        val id = seg.getOrNull(3)
+        return when {
+            id == null && method == "POST" -> {
+                val lifetime = (b["lifetime"] as? String)?.trim()?.takeIf { it.isNotEmpty() }?.let {
+                    runCatching { java.time.Duration.parse(it) }.getOrNull() ?: return problem(400, "invalid_lifetime")
+                } ?: java.time.Duration.ofHours(2)
+                if (lifetime.isZero || lifetime.isNegative || lifetime < java.time.Duration.ofMinutes(5) || lifetime > java.time.Duration.ofHours(24)) return problem(400, "invalid_lifetime")
+                val label = b["label"] as? String
+                if (label != null && !TEST_IDENTITY_LABEL.matches(label)) return problem(400, "invalid_label")
+                if (store.count { testIdentityView(it)["status"] == "live" } >= testIdentityCap) return problem(409, "test_identity_cap_reached", mapOf("cap" to testIdentityCap))
+                val n = ++seq
+                val tid = java.util.UUID.nameUUIDFromBytes("ti-$n".toByteArray()).toString()
+                val rec = mutableMapOf<String, Any?>(
+                    "id" to tid, "email" to "ti-${tid.take(12).replace("-", "")}@sandbox.thoryn.invalid",
+                    "password" to (nextTestIdentityPassword ?: "Pw-$n-x9Q"), "emailVerified" to true, "environment" to e["slug"], "label" to label,
+                    "createdAt" to testIdentityNow.toString(), "expiresAt" to testIdentityNow.plus(lifetime).toString(), "mintedBy" to caller,
+                )
+                nextTestIdentityPassword = null
+                store += rec
+                json(201, rec)
+            }
+            id == null && method == "GET" -> json(200, mapOf("data" to store.map { testIdentityView(it) }, "pagination" to mapOf("limit" to 50, "nextCursor" to null)))
+            id != null && method == "GET" -> {
+                val rec = store.firstOrNull { it["id"] == id } ?: return problem(404, "not_found")
+                val view = testIdentityView(rec)
+                if (view["status"] == "expired") problem(410, "test_identity_expired") else json(200, view)
+            }
+            id != null && method == "DELETE" -> if (store.removeIf { it["id"] == id }) MockResponse().setResponseCode(204) else problem(404, "not_found")
+            else -> problem(405, "method_not_allowed")
+        }
+    }
 
     /** [clientId] pins the id (a file may declare a fixed one); otherwise the fake allocates `app-<n>`. */
     fun seedApplication(
@@ -1104,7 +1192,8 @@ internal class FakeProductApi : Dispatcher() {
     private fun scopeGate(method: String, seg: List<String>): String? {
         val verb = if (method == "GET" || (seg[0] == "access" && seg.getOrNull(1) == "check")) "read" else "write"
         val area = when (seg[0]) {
-            "environments" -> "environments"
+            // SSO-4086 — TestIdentitiesController: its own `tenant:test-identities.*` pair (oauthy hub V216), not the environments area.
+            "environments" -> if (seg.getOrNull(2) == "test-identities") "test-identities" else "environments"
             "applications" -> "applications"
             "users" -> if (seg.getOrNull(2) == "roles") "roles" else "users"
             "federation-members" -> "federation"
@@ -1155,6 +1244,8 @@ internal class FakeProductApi : Dispatcher() {
         }
         if (environmentClaimFilter && seg[0] in PLANE_SCOPED_ROUTES && !reaches(env)) return problem(404, "unknown_environment")
         return when {
+            // ── test identities (SSO-4086) — a sub-resource of the environment, before the environment CRUD ──
+            seg[0] == "environments" && seg.getOrNull(2) == "test-identities" -> testIdentities(method, seg, b)
             // ── environments ──
             route == "/api/v1/environments" && method == "GET" -> json(200, mapOf("environments" to environments.map { withOwner(it, "environment:${it["id"]}") }))
             route == "/api/v1/environments" && method == "POST" -> {
