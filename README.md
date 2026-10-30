@@ -2356,7 +2356,8 @@ What `thoryn provision` does with it:
   `thoryn workload-identity trusts delete <id>` and re-apply to re-create it. **Its scopes change in place
   (SSO-3925):** when only `scopes` (and/or a live profile's `plan.scopes`) differ, the plan is an `update`
   that calls `PUT …/{id}/scopes` (`~ workloadIdentityTrust …: scopes changed in place`) — the id, the `wi_`
-  client, its `owner` and every `connection.json` stay. A **narrowing** converges from CI. A **widening** is a
+  client, its `owner` and every `connection.json` stay. A **narrowing** converges from CI — and plans green
+  under the read-only plan profile (SSO-4089; "The scope ceiling" below). A **widening** is a
   person's act: from a `client:` identity the plan is red **`elevated_action_requires_person`** naming the
   `thoryn workload-identity trusts set-scopes <id> --scope …` line a workspace member runs (signed in with a
   passkey); for a person it is planned with the passkey note, and a sign-in that is not a fresh passkey one is
@@ -2388,7 +2389,14 @@ What `thoryn provision` does with it:
   (the hub's `403 scope_not_grantable`): a trust can never widen the reach of the repository that declares
   it. `plan` states the ceiling on every create; when the session's scopes are known (the token's `scope`
   claim — the CLI passes them) a trust that overreaches is a red plan with the hub's own code before any
-  write; otherwise the hub refuses at apply and the error names the fix.
+  write; otherwise the hub refuses at apply and the error names the fix. The message names what the file
+  **adds** apart from what the trust **already carries** — product-api re-grants the whole new set on a scope
+  change, so a kept scope the identity lacks is named too, as kept. **Under a trust's plan profile (SSO-4089)**
+  — a pull request's plan job, minted read-only scopes by design — the session's scopes say nothing about the
+  identity that will apply, so the ceiling is left to apply: a **narrowing is a plain `update`**, and a create
+  (or a widening that is not already the machine-widening refusal) is planned with the ceiling noted on the
+  row (`grantability of … is checked at apply against the apply identity`). Before SSO-4089 every trust that
+  kept a write scope was red `scope_not_grantable` at PR time, a pure narrowing included.
 - **`apply` prints the consumer's `connection.json` — and never writes it.** The file belongs to the
   repository (or the workload) that signs in with the trust, not to the one that declares it:
 

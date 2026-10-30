@@ -186,6 +186,10 @@ class ProvisionCommand : Callable<Int> {
             // SSO-3689 — the session's scopes: a workloadIdentityTrust may carry only scopes this identity holds (the hub's
             // ceiling); known here, the plan refuses an overreaching trust up front with the hub's own code.
             callerScopes = callerScopesOf(tokens),
+            // SSO-4089 — a plan-profile session (a pull request's plan job) is minted read-only scopes by design and is not
+            // the identity that applies: the engine then leaves a trust's scope ceiling to apply instead of refusing every
+            // trust that keeps a write scope.
+            planProfile = TrustScopes.Session.of(tokens).let { it.isWorkloadIdentity && it.profile == Tokens.PROFILE_PLAN },
         )
 
         /**
