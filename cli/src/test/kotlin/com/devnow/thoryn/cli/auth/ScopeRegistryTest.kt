@@ -81,6 +81,17 @@ class ScopeRegistryTest {
     }
 
     @Test
+    fun `the default login scope requests the test-identities family so env test-identity works under a developer's own login`() {
+        // SSO-4086 — `thoryn env test-identity create|list|revoke` calls /api/v1/environments/{envId}/test-identities
+        // (tenant:test-identities.*). Product owner 2026-10-30: local developers mint too, under their own login, so the
+        // `cli` client carries the family. Hub V216 (oauthy #4296) grants it to `cli`; it must be deployed before a release
+        // carrying this default (the SSO-2278 grant order).
+        val default = com.devnow.thoryn.cli.config.ThorynConfig.DEFAULT_SCOPE.split(' ')
+        assertThat(default).contains("tenant:test-identities.read", "tenant:test-identities.write")
+        assertThat(ScopeRegistry.TENANT_CONFIG_SCOPES).contains("tenant:test-identities.read", "tenant:test-identities.write")
+    }
+
+    @Test
     fun `non-wildcard scope passes through unchanged`() {
         assertThat(ScopeRegistry.expand("openid offline_access"))
             .isEqualTo("openid offline_access")

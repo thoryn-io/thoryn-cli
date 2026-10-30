@@ -384,7 +384,9 @@ object ThorynConfig {
      * the `kind: legalDocument` of a provisioning file — the tenant-level terms of use / privacy policy, oathy SSO-4047; their
      * own narrow scope pair since the product owner's decision of 2026-10-29, instead of the broad `tenant:compliance.*`.
      * Granted to `cli` by oathy hub V215 (SSO-4069, #4290), which must be deployed before a release carrying this default —
-     * same rule).
+     * same rule), SSO-4086 (`test-identities.*` for `thoryn env test-identity create|list|revoke` — ephemeral sandbox test
+     * identities, oauthy ADR 2026-10-30; granted to `cli` / `thoryn-cli` by oauthy hub V216 (SSO-4083, #4296, merged
+     * 2026-10-30), which must be deployed before a release carrying this default — same rule).
      */
     const val DEFAULT_SCOPE =
         "openid offline_access " +
@@ -402,7 +404,8 @@ object ThorynConfig {
             "tenant:workload-identity.read tenant:workload-identity.write " +
             "tenant:github-connections.read tenant:github-connections.write " +
             "tenant:roles.read tenant:roles.write " +
-            "tenant:legal-documents.read tenant:legal-documents.write"
+            "tenant:legal-documents.read tenant:legal-documents.write " +
+            "tenant:test-identities.read tenant:test-identities.write"
 
     /**
      * The `--hub` / `--gateway` "not given" sentinel of the post-login commands (SSO-2827): they use the

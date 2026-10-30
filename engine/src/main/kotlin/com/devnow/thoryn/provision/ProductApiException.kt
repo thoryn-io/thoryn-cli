@@ -29,7 +29,16 @@ class ProductApiException(
     val rawBody: String,
     /** SSO-3396 — the `WWW-Authenticate` challenge, when the API sent one (an RFC 9470 step-up has no body). */
     val wwwAuthenticate: String? = null,
+    /**
+     * SSO-4086 — the `Retry-After` header, when the API sent one (a `429 test_identity_rate_limited` carries the seconds
+     * to wait; RFC 9110 §10.2.3). Kept as sent; [retryAfterSeconds] reads the delay-seconds form.
+     */
+    val retryAfter: String? = null,
 ) : RuntimeException("HTTP $httpStatus: ${errorCode ?: "no_error_code"}${errorDescription?.let { " — $it" } ?: ""}") {
+
+    /** SSO-4086 — `Retry-After` as delay-seconds, when it is one (an HTTP-date form is not parsed: null). */
+    val retryAfterSeconds: Long?
+        get() = retryAfter?.trim()?.toLongOrNull()?.takeIf { it >= 0 }
 
     /** True if this is a "you don't have the right scope" failure. */
     val isInsufficientScope: Boolean
@@ -93,9 +102,9 @@ class ProductApiException(
         fun sessionUnrenewable(guidance: String): ProductApiException =
             ProductApiException(401, ERROR_CODE_SESSION_UNRENEWABLE, guidance, "")
 
-        fun fromResponse(status: Int, body: String, mapper: ObjectMapper, wwwAuthenticate: String? = null): ProductApiException {
+        fun fromResponse(status: Int, body: String, mapper: ObjectMapper, wwwAuthenticate: String? = null, retryAfter: String? = null): ProductApiException {
             val (code, description) = parseOAuthError(body, mapper)
-            return ProductApiException(status, code, description, body, wwwAuthenticate)
+            return ProductApiException(status, code, description, body, wwwAuthenticate, retryAfter)
         }
 
         private fun parseOAuthError(body: String, mapper: ObjectMapper): Pair<String?, String?> {

@@ -56,13 +56,14 @@ import java.util.concurrent.Callable
         EnvironmentCommand.ReactivateSubcommand::class,
         EnvironmentCommand.DeleteSubcommand::class,
         EnvironmentCommand.TestEmailsSubcommand::class,
+        EnvironmentTestIdentityCommand::class,
     ],
 )
 class EnvironmentCommand : Callable<Int> {
 
     override fun call(): Int {
         System.err.println("Usage: thoryn env <subcommand>")
-        System.err.println("Subcommands: list | get | use | create | rename | suspend | reactivate | delete | test-emails")
+        System.err.println("Subcommands: list | get | use | create | rename | suspend | reactivate | delete | test-emails | test-identity")
         return CommandSupport.EXIT_USAGE
     }
 
@@ -558,7 +559,7 @@ class EnvironmentCommand : Callable<Int> {
         internal fun selectedEnvSlug(store: SelectedWorkspaceStore): String? =
             runCatching { store.read()?.environmentSlug }.getOrNull()?.takeIf { it.isNotBlank() }
 
-        /** Shared "no environment to read" guidance for the test-inbox subcommands. */
+        /** Shared "no environment to read" guidance for the test-inbox and test-identity subcommands. */
         internal fun missingEnv(): Int {
             System.err.println("Error: no environment selected. Pass --env <slug>, or run `thoryn env use <slug>` first.")
             return CommandSupport.EXIT_USAGE

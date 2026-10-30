@@ -86,6 +86,11 @@ object ScopeRegistry {
         // read gates `workload-identity trusts list|get`; write gates `trusts create|delete`.
         "tenant:workload-identity.read",
         "tenant:workload-identity.write",
+        // ephemeral sandbox test identities (product-api /api/v1/environments/{envId}/test-identities — SSO-4086,
+        // oauthy ADR 2026-10-30-ephemeral-sandbox-test-identities; granted to `cli` / `thoryn-cli` by oauthy hub V216,
+        // oauthy #4296). read gates `env test-identity list`; write gates `env test-identity create|revoke`.
+        "tenant:test-identities.read",
+        "tenant:test-identities.write",
     )
 
     /**

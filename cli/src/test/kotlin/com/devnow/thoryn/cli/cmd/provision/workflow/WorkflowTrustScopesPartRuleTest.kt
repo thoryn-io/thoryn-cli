@@ -84,6 +84,25 @@ class WorkflowTrustScopesPartRuleTest {
         assertThat(r.detail).contains("and nothing else — this file also asks for tenant:environments.read (application/web (resolve environment 'dev' to its id for the ownership check))")
     }
 
+    /**
+     * SSO-4086 (oauthy ADR 2026-10-30-ephemeral-sandbox-test-identities §2) — the starter's application trust holds the two
+     * sandbox TOOL scopes for its own e2e (`tenant:environments.read` for the test inbox, `tenant:test-identities.write` for a
+     * disposable test account) that no declared resource asks for. They are expected on an application trust — a PASS that
+     * names them — while `tenant:users.write` beside them is still the identity being wider than its file.
+     */
+    @Test
+    fun `an application file whose connection holds the sandbox tool scopes passes, and the verdict names them as expected`() {
+        val r = check("thoryn.io/application/v1", app, three + "tenant:environments.read" + "tenant:test-identities.write")!!
+        assertThat(r.status).isEqualTo(WorkflowCheck.Status.PASS)
+        assertThat(r.detail)
+            .contains("declares every one and nothing the file does not need")
+            .contains("It also declares tenant:environments.read tenant:test-identities.write — sandbox tool scope(s) for the application's own tests")
+            .doesNotContain("wider than its file")
+        val wider = check("thoryn.io/application/v1", app, three + "tenant:test-identities.write" + "tenant:users.write")!!
+        assertThat(wider.status).isEqualTo(WorkflowCheck.Status.FAIL)
+        assertThat(wider.detail).contains("declares tenant:users.write, which .thoryn/provision.yaml (an application file, thoryn.io/application/v1) never needs")
+    }
+
     @Test
     fun `an application file missing one of the three fails as before, with the part's ceiling stated`() {
         val r = check("thoryn.io/application/v1", app, three - "tenant:applications.write")!!

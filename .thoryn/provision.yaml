@@ -177,6 +177,14 @@ resources:
         # (requested ⊄ registered is invalid_scope).
         - tenant:legal-documents.read
         - tenant:legal-documents.write
+        # SSO-4086 — `thoryn env test-identity create|list|revoke` (ephemeral sandbox test identities, oauthy ADR
+        # 2026-10-30-ephemeral-sandbox-test-identities; product-api /api/v1/environments/{envId}/test-identities). A narrow
+        # family of its own (product owner 2026-10-30): it reaches no real user. MERGE PRECONDITION (the SSO-2278 grant
+        # order): oauthy hub V216 (SSO-4083, #4296, merged 2026-10-30), which grants tenant:test-identities.read/.write to
+        # `cli`, is deployed first — before this file is applied (the App-dispatched apply cannot add a scope the CI identity
+        # does not hold) and before a release carrying this default signs in (requested ⊄ registered is invalid_scope).
+        - tenant:test-identities.read
+        - tenant:test-identities.write
       requireAuthorizationConsent: false  # first-party: no consent screen for the platform's own CLI
 
   - kind: environment
