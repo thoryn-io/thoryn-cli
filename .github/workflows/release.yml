@@ -145,8 +145,10 @@ jobs:
         include:
           # macos-15, not macos-14: GitHub retired the macOS 14 image on 2026-11-02.
           # The build host's OS sets the binary's minimum macOS (LC_BUILD_VERSION
-          # minos), so the build step pins MACOSX_DEPLOYMENT_TARGET and the next step
-          # checks it: a macos-15 build must still run on macOS 14 (cli-v0.57.0: minos 14.0).
+          # minos), so cli/pom.xml's native-macos-min-version profile passes
+          # -mmacosx-version-min=14.0 to the linker and the step after the build checks
+          # it: a macos-15 build must still run on macOS 14 (cli-v0.57.0: minos 14.0).
+          # MACOSX_DEPLOYMENT_TARGET alone did not reach the link (cli-v0.58.0: minos 15.0).
           - os: macos-15
             asset: thoryn-darwin-arm64
             march: default
@@ -186,9 +188,6 @@ jobs:
         run: dpkg -s zlib1g-dev >/dev/null 2>&1 || { sudo apt-get update -qq && sudo apt-get install -y -qq zlib1g-dev; }
       - name: Build the native image
         shell: bash
-        env:
-          # Read by the macOS linker only; ignored on Linux and Windows.
-          MACOSX_DEPLOYMENT_TARGET: "14.0"
         run: |
           set -euo pipefail
           # arm64 GraalVM does not support -march=compatibility; the pom activates
@@ -208,7 +207,7 @@ jobs:
           minos="$(otool -l ./cli/target/thoryn | awk '/LC_BUILD_VERSION/{f=1} f&&$1=="minos"{print $2; exit}')"
           echo "minos=${minos:-<none>}"
           if [ "$minos" != "14.0" ]; then
-            echo "::error::the darwin binary needs macOS ${minos:-unknown}, not 14.0 — MACOSX_DEPLOYMENT_TARGET did not reach the link, so macOS 14 users could not run it."
+            echo "::error::the darwin binary needs macOS ${minos:-unknown}, not 14.0 — the -mmacosx-version-min linker option (cli/pom.xml native-macos-min-version) did not take, so macOS 14 users could not run it."
             exit 1
           fi
       # ── SSO-3276 — the built macOS binary's Secure Enclave rung must reach a

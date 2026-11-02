@@ -403,6 +403,36 @@
             </build>
         </profile>
         <!--
+            macOS: the darwin binary must run on macOS 14 although the release builds it
+            on macos-15 (GitHub retired macos-14 on 2026-11-02). The linker stamps the
+            build host's macOS as the binary's minimum (LC_BUILD_VERSION minos) unless
+            told otherwise. MACOSX_DEPLOYMENT_TARGET does not reach native-image's link
+            (cli-v0.58.0 came out at minos 15.0), so the minimum is passed to the
+            linker explicitly. release.yml checks the result with otool.
+        -->
+        <profile>
+            <id>native-macos-min-version</id>
+            <activation>
+                <os>
+                    <family>mac</family>
+                </os>
+            </activation>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.graalvm.buildtools</groupId>
+                        <artifactId>native-maven-plugin</artifactId>
+                        <version>${native-maven-plugin.version}</version>
+                        <configuration>
+                            <buildArgs combine.children="append">
+                                <buildArg>-H:NativeLinkerOption=-mmacosx-version-min=14.0</buildArg>
+                            </buildArgs>
+                        </configuration>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+        <!--
             arm64 (macOS arm64, Linux arm64): GraalVM does not support
             `-march=compatibility` here, so we leave it at the default.
             No additional buildArgs needed — the base `native` profile is enough.
