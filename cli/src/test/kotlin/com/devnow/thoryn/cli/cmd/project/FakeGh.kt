@@ -39,6 +39,8 @@ internal class FakeGh : GhRunner {
     val pulls = mutableMapOf<String, MutableMap<String, String>>()
     /** template fullName → its declaration (null ⇒ the template repository is empty). */
     val declarations = mutableMapOf<String, String?>()
+    /** SSO-4079 — template fullName → its `.thoryn/production/declaration.json` (absent ⇒ 404, a template published before SSO-4120). */
+    val productionDeclarations = mutableMapOf<String, String>()
     val tarballs = mutableMapOf<String, ByteArray>()
     /** clone directory → fullName (what `gh repo view` answers there). */
     val clones = mutableMapOf<Path, String>()
@@ -145,11 +147,12 @@ internal class FakeGh : GhRunner {
     private fun contents(fullName: String, path: String): GhResult {
         if (fullName in declarations) {
             val raw = declarations[fullName] ?: return GhResult(1, "{\"message\":\"This repository is empty.\"}".toByteArray(), "gh: This repository is empty. (HTTP 404)")
-            return if (path == StarterTemplateManifest.PATH) {
-                okJson(mapOf("type" to "file", "content" to Base64.getMimeEncoder().encodeToString(raw.toByteArray())))
-            } else {
-                notFound()
+            val content = when (path) {
+                StarterTemplateManifest.PATH -> raw
+                ProductionDeclaration.PATH -> productionDeclarations[fullName] ?: return notFound()
+                else -> return notFound()
             }
+            return okJson(mapOf("type" to "file", "content" to Base64.getMimeEncoder().encodeToString(content.toByteArray())))
         }
         val content = files[fullName]?.get(path) ?: return notFound()
         return okJson(mapOf("type" to "file", "sha" to "sha-${content.hashCode()}", "content" to Base64.getMimeEncoder().encodeToString(content.toByteArray())))

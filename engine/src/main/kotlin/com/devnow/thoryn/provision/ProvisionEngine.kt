@@ -3746,42 +3746,6 @@ class ProvisionEngine(
         view["provider"]?.toString()?.let { put("provider", it) }
     }
 
-    /** The `provision.yaml` spec of a live trust (`import`), and a note for what the file cannot carry (inline keys are not rendered by the API). */
-    private fun trustSpecOf(n: JsonNode, production: Boolean): Pair<Map<String, Any?>, String?> {
-        val provider = n.str("provider") ?: ProvisionFile.PROVIDER_GITHUB_ACTIONS
-        val spec = linkedMapOf<String, Any?>("provider" to provider)
-        var note: String? = null
-        fun copy(block: String, fields: List<String>) = n[block]?.takeIf { it.isObject }?.let { b ->
-            val pins = linkedMapOf<String, Any?>()
-            fields.forEach { f -> b[f]?.takeIf { !it.isNull }?.let { pins[f] = plain(it) } }
-            pins
-        }
-        when (provider) {
-            ProvisionFile.PROVIDER_GITHUB_ACTIONS -> n["github"]?.takeIf { it.isObject }?.let { g ->
-                val pins = linkedMapOf<String, Any?>("repository" to listOfNotNull(g.str("owner"), g.str("repository")).joinToString("/"))
-                listOf("ownerId", "repositoryId", "environment", "ref").forEach { f -> g[f]?.takeIf { !it.isNull }?.let { pins[f] = plain(it) } }
-                if (g["githubHostedRunnersOnly"]?.asBoolean() == true) pins["githubHostedRunnersOnly"] = true
-                spec["github"] = pins
-                // SSO-3702 — a live plan profile is rendered with its (possibly derived) scopes made explicit, so the file pins what is live.
-                n[ProvisionFile.TRUST_PLAN]?.takeIf { it.isObject && it.str("environment") != null }?.let { p ->
-                    spec[ProvisionFile.TRUST_PLAN] = linkedMapOf<String, Any?>("environment" to p.str("environment")).also { plan ->
-                        p["scopes"]?.takeIf { it.isArray && !it.isEmpty }?.let { plan[ProvisionFile.TRUST_SCOPES] = it.toList().map { s -> s.asString() } }
-                    }
-                }
-            }
-            ProvisionFile.PROVIDER_FORGEJO -> copy("forgejo", listOf("instanceUrl", "owner", "ownerId", "repository", "repositoryId", "ref"))?.let { spec["forgejo"] = it }
-            ProvisionFile.PROVIDER_KUBERNETES -> copy("kubernetes", listOf("issuer", "namespace", "serviceAccount"))?.let { pins ->
-                spec["kubernetes"] = pins
-                n["kubernetes"]?.get("inlineKeyIds")?.takeIf { it.isArray && !it.isEmpty }?.let { kids ->
-                    note = "pins inline public keys (kid ${kids.toList().joinToString(", ") { it.asString() }}) that the API does not render; add spec.kubernetes.jwks by hand (`kubectl get --raw /openid/v1/jwks`) before a re-create is planned"
-                }
-            }
-        }
-        spec[ProvisionFile.TRUST_SCOPES] = n["scopes"]?.takeIf { it.isArray }?.toList()?.map { it.asString() }.orEmpty()
-        if (production) spec[ProvisionFile.TRUST_CONFIRM_PRODUCTION] = true
-        return spec to note
-    }
-
     /** `POST /api/v1/workload-identity/trusts` body: the file's `repository: owner/name` becomes the API's `owner` + `repository`. */
     private fun trustBody(name: String, spec: Map<String, Any?>): Map<String, Any?> {
         val provider = spec["provider"].toString()
@@ -4315,14 +4279,6 @@ class ProvisionEngine(
     /** A record's fields as a plain map (arrays → lists, objects → maps, scalars → text/bool/number). */
     private fun JsonNode.toMap(fields: List<String>): Map<String, Any?> = fields.associateWith { f -> this[f]?.let { plain(it) } }
 
-    private fun plain(n: JsonNode): Any? = when {
-        n.isNull -> null
-        n.isArray -> n.toList().map { plain(it) }
-        n.isObject -> n.properties().associate { it.key to plain(it.value) }
-        n.isBoolean -> n.asBoolean()
-        n.isNumber -> n.numberValue()
-        else -> n.asString()
-    }
 
     /** A list envelope's items: the [preferred] key, any of the known envelope keys, or a bare array. */
     private fun listItems(node: JsonNode, preferred: String): List<JsonNode> {
@@ -4354,6 +4310,59 @@ class ProvisionEngine(
     }
 
     companion object {
+        /**
+         * The `provision.yaml` spec of a live trust (`import`), and a note for what the file cannot carry (inline keys are not rendered by
+         * the API). SSO-4079 — public, so `thoryn project init app --config-repo` declares an app's trusts on the config repository in
+         * exactly the shape `import` renders them (one rendering, never a fork).
+         */
+        fun trustSpecOf(n: JsonNode, production: Boolean): Pair<Map<String, Any?>, String?> {
+            val provider = n.strField("provider") ?: ProvisionFile.PROVIDER_GITHUB_ACTIONS
+            val spec = linkedMapOf<String, Any?>("provider" to provider)
+            var note: String? = null
+            fun copy(block: String, fields: List<String>) = n[block]?.takeIf { it.isObject }?.let { b ->
+                val pins = linkedMapOf<String, Any?>()
+                fields.forEach { f -> b[f]?.takeIf { !it.isNull }?.let { pins[f] = plain(it) } }
+                pins
+            }
+            when (provider) {
+                ProvisionFile.PROVIDER_GITHUB_ACTIONS -> n["github"]?.takeIf { it.isObject }?.let { g ->
+                    val pins = linkedMapOf<String, Any?>("repository" to listOfNotNull(g.strField("owner"), g.strField("repository")).joinToString("/"))
+                    listOf("ownerId", "repositoryId", "environment", "ref").forEach { f -> g[f]?.takeIf { !it.isNull }?.let { pins[f] = plain(it) } }
+                    if (g["githubHostedRunnersOnly"]?.asBoolean() == true) pins["githubHostedRunnersOnly"] = true
+                    spec["github"] = pins
+                    // SSO-3702 — a live plan profile is rendered with its (possibly derived) scopes made explicit, so the file pins what is live.
+                    n[ProvisionFile.TRUST_PLAN]?.takeIf { it.isObject && it.strField("environment") != null }?.let { p ->
+                        spec[ProvisionFile.TRUST_PLAN] = linkedMapOf<String, Any?>("environment" to p.strField("environment")).also { plan ->
+                            p["scopes"]?.takeIf { it.isArray && !it.isEmpty }?.let { plan[ProvisionFile.TRUST_SCOPES] = it.toList().map { s -> s.asString() } }
+                        }
+                    }
+                }
+                ProvisionFile.PROVIDER_FORGEJO -> copy("forgejo", listOf("instanceUrl", "owner", "ownerId", "repository", "repositoryId", "ref"))?.let { spec["forgejo"] = it }
+                ProvisionFile.PROVIDER_KUBERNETES -> copy("kubernetes", listOf("issuer", "namespace", "serviceAccount"))?.let { pins ->
+                    spec["kubernetes"] = pins
+                    n["kubernetes"]?.get("inlineKeyIds")?.takeIf { it.isArray && !it.isEmpty }?.let { kids ->
+                        note = "pins inline public keys (kid ${kids.toList().joinToString(", ") { it.asString() }}) that the API does not render; add spec.kubernetes.jwks by hand (`kubectl get --raw /openid/v1/jwks`) before a re-create is planned"
+                    }
+                }
+            }
+            spec[ProvisionFile.TRUST_SCOPES] = n["scopes"]?.takeIf { it.isArray }?.toList()?.map { it.asString() }.orEmpty()
+            if (production) spec[ProvisionFile.TRUST_CONFIRM_PRODUCTION] = true
+            return spec to note
+        }
+
+        private fun plain(n: JsonNode): Any? = when {
+            n.isNull -> null
+            n.isArray -> n.toList().map { plain(it) }
+            n.isObject -> n.properties().associate { it.key to plain(it.value) }
+            n.isBoolean -> n.asBoolean()
+            n.isNumber -> n.numberValue()
+            else -> n.asString()
+        }
+
+        /** A record's field as non-blank text, or null (the companion's twin of the instance helper [str]). */
+        private fun JsonNode.strField(field: String): String? =
+            this[field]?.takeIf { !it.isNull }?.asString()?.takeIf { it.isNotBlank() }
+
         /** The production plane's environment slug (mirrors oathy `core` `TrustedTenantIssuers.PRODUCTION_ENV_SLUG`). */
         const val PRODUCTION_ENV_SLUG: String = "production"
 

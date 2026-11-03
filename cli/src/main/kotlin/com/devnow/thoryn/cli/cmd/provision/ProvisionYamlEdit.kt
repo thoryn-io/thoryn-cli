@@ -10,7 +10,7 @@ import tools.jackson.dataformat.yaml.YAMLMapper
 
 /**
  * The ONE way the CLI edits a provisioning file's text (SSO-3659 `thoryn provision import --write`; reused by
- * `thoryn project init app --config-repo`, SSO-3669): entries are rendered as a `resources:` list fragment and
+ * `thoryn project init app --config-repo`, SSO-3669 / SSO-4079): entries are rendered as a `resources:` list fragment and
  * APPENDED under the file's `resources:` list — only when that list is the last top-level key, so the appended
  * entries belong to it — which keeps every other line of the file (its comments included) byte for byte. A
  * fresh file gets the header. There is deliberately no second YAML editor: [converge] REPLACES an existing
@@ -74,9 +74,13 @@ internal object ProvisionYamlEdit {
      * re-rendered from its tree: its comments are lost). [header] is prepended to an appended fragment (comment
      * lines for a human reader); it plays no part in the comparison.
      */
-    fun converge(text: String?, entry: JsonNode, source: String, header: String = "", matches: (JsonNode) -> Boolean): Converged {
+    fun converge(text: String?, entry: JsonNode, source: String, header: String = "", matches: (JsonNode) -> Boolean): Converged =
+        converge(text, entry, source, header, ProvisionFile.API_VERSION, matches)
+
+    /** [converge], a fresh file declaring [apiVersion] (SSO-4079: a config project's section is a `thoryn.io/tenant/v1` file). */
+    fun converge(text: String?, entry: JsonNode, source: String, header: String, apiVersion: String, matches: (JsonNode) -> Boolean): Converged {
         val fragment = header + fragment(json.createArrayNode().add(entry))
-        if (text == null || text.isBlank()) return Converged(fresh(fragment), Outcome.ADDED)
+        if (text == null || text.isBlank()) return Converged(fresh(fragment, apiVersion), Outcome.ADDED)
         val root = parse(text, source)
         val resources = root["resources"]?.takeIf { it.isArray }
         val index = resources?.toList()?.indexOfFirst(matches) ?: -1

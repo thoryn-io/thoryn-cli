@@ -2,9 +2,19 @@ package com.devnow.thoryn.cli.cmd.project
 
 import com.devnow.thoryn.cli.api.ProductApiClient
 import com.devnow.thoryn.cli.api.ProductApiException
+import com.devnow.thoryn.cli.cmd.connection.Connection
 import com.devnow.thoryn.cli.cmd.provision.ProvisionYamlEdit
+import com.devnow.thoryn.cli.cmd.provision.WorkflowImportTarget
+import com.devnow.thoryn.cli.cmd.provision.workflow.WorkflowConfig
+import com.devnow.thoryn.cli.cmd.provision.workflow.WorkflowConfigException
+import com.devnow.thoryn.cli.cmd.connection.ConnectionException
+import com.devnow.thoryn.cli.output.YamlWriter
+import com.devnow.thoryn.provision.Access
+import com.devnow.thoryn.provision.ImportedResource
+import com.devnow.thoryn.provision.ProvisionEngine
 import com.devnow.thoryn.provision.ProvisionException
 import com.devnow.thoryn.provision.ProvisionFile
+import com.devnow.thoryn.provision.ProvisionResource
 import tools.jackson.databind.JsonNode
 import java.nio.file.Files
 import java.nio.file.Path
@@ -34,14 +44,29 @@ import java.nio.file.attribute.PosixFilePermission
  * their deterministic name, or — for one the orchestrator created — by their pins), grants are idempotent,
  * variables upserted, identical files skipped.
  *
- * **The app's PRODUCTION client (SSO-3669, ADR 2026-10-13 production-clients-declared-in-the-config-project §1).**
- * An app repository is sandbox-only; with `--config-repo` + `--production-url`, the run ends by proposing the app's
- * production client ON THE CONFIG REPOSITORY: a pull request from the deterministic branch `thoryn/app-<app repo>`
- * (reused on a re-run — never a second one) adding an `application` entry to its production section, converged by
- * `name` (added when absent, replaced when different, nothing proposed when identical), with the `publishTo` block
- * that lands the id in the app repository's `production` GitHub environment. The config repository is resolved and
- * the file computed at pre-flight (a missing repository stops the run before any write, with the by-hand steps; it is
- * never created); the default branch is never written; the command never merges.
+ * **The app's CI trusts belong to the workspace's CONFIG project (SSO-4079, oauthy ADR 2026-10-25 decision 3).** An app
+ * project owns its OAuth clients (its sandbox client in `.thoryn/provision.yaml`, its production client in the template's
+ * `.thoryn/production/provision.yaml`), never its own authority. So:
+ *  - **the production trust** — when the template ships `.thoryn/production/declaration.json` ([ProductionDeclaration]) and
+ *    `--config-repo` names the config project — is created by this run as the signed-in PERSON (an elevated act: product-api
+ *    asks for a passkey sign-in from the last 5 minutes), pinned to the repository ids, its GitHub environment `production`
+ *    (protected first: deploys from the default branch only, `--reviewer`s when GitHub offers them) and the default branch,
+ *    with exactly the application ceiling, no grant and no plan profile; its `wi_` client becomes
+ *    `THORYN_PRODUCTION_WIF_CLIENT_ID` on that environment (and `--production-url` becomes `THORYN_PRODUCTION_URL` there).
+ *    Without `--config-repo` no production trust is created: nothing would own it (product-owner decision D3, 2026-11-03).
+ *  - **ownership** — `owner` on each app trust goes to the config project's identity on that plane (the config repository's
+ *    trust in the app's sandbox, else its production trust; its production trust for the production one). Only a workspace
+ *    admin may set an owner: a refusal leaves the grant `pending` (the config project's first plan asks for it) and the run
+ *    goes on (decision D1).
+ *  - **the declaration** — a pull request on the config repository from the deterministic branch `thoryn/app-<app repo>`
+ *    (reused on a re-run — never a second one) adds one `kind: workloadIdentityTrust` per app trust, rendered exactly as
+ *    `thoryn provision import` renders a live trust ([ProvisionEngine.trustSpecOf]): the production trust to the
+ *    production-plane section, the sandbox trust to the section whose connection is that sandbox (else the production
+ *    section, with `environment:`), converged by name. The config repository is resolved and its files checked at
+ *    pre-flight (a missing repository stops the run before any write, with the by-hand steps; it is never created); its
+ *    default branch is never written; the command never merges.
+ *  - **the creation slot** the production apply needs (`application:<repository>-production` on the production plane) is
+ *    named in every run's output, with the exact `thoryn access reserve` command once the production trust exists.
  */
 internal class ProjectInit(
     private val request: Request,
@@ -72,9 +97,12 @@ internal class ProjectInit(
         val confirmProduction: Boolean,
         /** The command line to repeat, for the hints. */
         val commandLine: String,
-        /** SSO-3669 (app) — `owner/name` of the workspace's config repository the production client is proposed on; null ⇒ no proposal. */
+        /**
+         * SSO-4079 (app) — `owner/name` of the workspace's config repository: it declares and owns the app's CI trusts (a pull
+         * request on it), and only with it is the production trust created. Null ⇒ no config project: sandbox trust only.
+         */
         val configRepo: String? = null,
-        /** SSO-3669 (app) — where the app runs in production; the redirect URIs hang off it. Set together with [configRepo]. */
+        /** SSO-4079 (app) — the deployed app's https base URL: `THORYN_PRODUCTION_URL` on the `production` GitHub environment. */
         val productionUrl: String? = null,
     )
 
@@ -120,6 +148,8 @@ internal class ProjectInit(
         val envSlug: String,
         var envId: String?,
         val githubEnvironment: String?,
+        /** False for an app project's production trust (SSO-4079): it plans nothing, so it carries no plan profile. */
+        val planProfile: Boolean = true,
         /** The trust this connection uses, once [ensureTrust] ran. */
         var trust: JsonNode? = null,
     ) {
@@ -127,7 +157,7 @@ internal class ProjectInit(
          * SSO-3971 — the unprotected GitHub environment the production trust's PLAN profile is keyed on (the seeded stub's
          * `plan-environment`); null for a sandbox connection, which pins no environment and so needs no second profile.
          */
-        val planEnvironment: String? get() = githubEnvironment?.takeIf { spec.production }?.let { ProjectSeeds.planEnvironment(it) }
+        val planEnvironment: String? get() = githubEnvironment?.takeIf { spec.production && planProfile }?.let { ProjectSeeds.planEnvironment(it) }
 
         /** Where this connection's `connection.json` is seeded: beside its `provisionFile`. */
         val connectionPath: String get() = ProjectSeeds.connectionPath(spec.provisionFile)
@@ -137,16 +167,26 @@ internal class ProjectInit(
 
     private class PlannedFile(val entry: TemplateArchive.Entry, val target: Path, val action: FileAction)
 
-    /** SSO-3669 — the config repository and the production-section file as it must read after this app's production client is converged into it. */
+    /**
+     * SSO-4079 — the config repository as pre-flight found it: its production-plane section file, the section of the app's
+     * sandbox (null ⇒ none: the sandbox trust goes to the production section with `environment:`), and those files as its
+     * default branch holds them (null ⇒ absent).
+     */
     private class ConfigProject(
         val repository: GhRepository,
         val appRepository: String,
-        val entry: JsonNode,
-        val converged: ProvisionYamlEdit.Converged,
+        val productionFile: String,
+        val sandboxFile: String?,
+        val existing: Map<String, String?>,
     ) {
-        val branch: String get() = ProjectSeeds.productionClientBranch(appRepository.substringAfter('/'))
-        val name: String get() = ProjectSeeds.productionClientName(appRepository)
+        val branch: String get() = ProjectSeeds.appTrustsBranch(appRepository.substringAfter('/'))
+
+        /** The section a trust on [sandboxSlug] (null ⇒ the production plane) is declared in. */
+        fun fileFor(sandboxSlug: String?): String = if (sandboxSlug != null) sandboxFile ?: productionFile else productionFile
     }
+
+    /** SSO-4079 — the config repository's identity on one plane: the one enabled trust pinned to it there. */
+    private data class ConfigIdentity(val clientId: String, val plane: String)
 
     // ── Entry point ──────────────────────────────────────────────────────────────────────────────
 
@@ -217,7 +257,19 @@ internal class ProjectInit(
             GitHubCli.Availability.NotSignedIn -> throw ghUnavailable(true, workspaceSlug, sandboxSlug, sandbox, production, tenantId)
         }
         val manifest = readTemplate()
-        checkScopeCeiling(manifest, config && sandbox == null)
+        // SSO-4079 — the app's production connection (beside template.json). Its trust is created only for a config project to own.
+        val productionDeclaration = if (config) null else readProductionDeclaration()
+        val createsProductionTrust = productionDeclaration != null && request.configRepo != null
+        if (createsProductionTrust && session.authMode != null) {
+            throw Stop(
+                EXIT_CHECK, "person_required",
+                "Creating the app's PRODUCTION workload identity trust is a person's elevated act (a passkey sign-in from the last 5 minutes); " +
+                    "a machine identity may not. Nothing was changed.",
+                "Sign in as yourself (thoryn login --acr-values ${com.devnow.thoryn.cli.cmd.WorkloadIdentityCommand.PASSKEY_ACR} --max-age 300) and re-run: ${request.commandLine}",
+            )
+        }
+        if (createsProductionTrust && production == null) throw Stop(EXIT_CHECK, "environment_not_found", "The workspace has no production environment.")
+        checkScopeCeiling(manifest, config && sandbox == null, if (createsProductionTrust) productionDeclaration!!.scopes else emptyList())
 
         val repoOwner: String
         val repoName: String
@@ -242,7 +294,7 @@ internal class ProjectInit(
             repository = github.repository(repoOwner, repoName, STEP_PREFLIGHT)
                 ?: throw Stop(EXIT_CHECK, "github_repository_not_found", "gh names this clone's repository $fullName, but GitHub does not show it to your gh sign-in.")
         }
-        val reviewerIds = if (config) {
+        val reviewerIds = if (config || createsProductionTrust) {
             val ids = request.reviewers.associateWith { github.accountId(it, STEP_PREFLIGHT) }
             val missing = ids.filterValues { it == null }.keys
             if (missing.isNotEmpty()) {
@@ -277,11 +329,18 @@ internal class ProjectInit(
             manifest.productionConnection?.let { (name, spec) ->
                 add(Target(name, spec, production!!.slug, production.id, manifest.productionGithubEnvironment))
             }
+            // SSO-4079 — the app's production trust: pinned like the config project's (repository ids + GitHub environment + default
+            // branch), exactly the application ceiling, NO grant and NO plan profile (product-owner decision D2, 2026-11-03).
+            if (createsProductionTrust) {
+                val d = productionDeclaration!!
+                val spec = StarterTemplateManifest.Connection(true, d.clientIdVariable, null, d.provisionFile, d.scopes, grant = null)
+                add(Target(d.connection, spec, production!!.slug, production.id, d.githubEnvironment, planProfile = false))
+            }
         }
         // An existing repository may already carry trusts: refuse up front when one of ours conflicts.
         repository?.let { repo -> targets.filter { it.envId != null }.forEach { findTrust(it, repo) } }
-        // SSO-3669 — the config repository must be reachable, and its production file editable, BEFORE the first change.
-        val configProject = request.configRepo?.let { preflightConfigProject(it, "$repoOwner/$repoName") }
+        // SSO-3669 / SSO-4079 — the config repository must be reachable, and its section files able to take the trusts, BEFORE the first change.
+        val configProject = request.configRepo?.let { preflightConfigProject(it, "$repoOwner/$repoName", repository, targets) }
 
         // ── The run ──────────────────────────────────────────────────────────────────────────────
         report["repository"] = linkedMapOf("fullName" to "$repoOwner/$repoName")
@@ -305,6 +364,28 @@ internal class ProjectInit(
         val productionGithubEnvironment = manifest.productionGithubEnvironment
         var rulesetId: Long? = null
         var environmentReviewers = false
+        val appProduction = if (config) null else targets.firstOrNull { it.spec.production }
+        if (appProduction != null) {
+            // SSO-4079 (D2) — the app's production environment is protected BEFORE any Thoryn write: deployments from the default
+            // branch only, and the --reviewer logins as required reviewers when GitHub offers them on this repository.
+            currentStep = STEP_PROTECTION
+            val environment = appProduction.githubEnvironment!!
+            val protection = github.protectEnvironment(repo, environment, reviewerIds, repo.defaultBranch, STEP_PROTECTION)
+            environmentReviewers = protection.reviewersActive && reviewerIds.isNotEmpty()
+            step(
+                STEP_PROTECTION, if (protection.changed) "set" else "in place",
+                "GitHub environment $environment: deploys from ${repo.defaultBranch} only; " + when {
+                    environmentReviewers -> "required reviewers ${request.reviewers.joinToString(", ")}"
+                    request.reviewers.isEmpty() -> "no required reviewers (none named with --reviewer)"
+                    else -> "required reviewers not offered by this GitHub plan"
+                },
+            )
+            report["productionEnvironment"] = linkedMapOf(
+                "githubEnvironment" to environment, "deploymentBranch" to repo.defaultBranch,
+                "reviewers" to request.reviewers, "reviewersActive" to environmentReviewers,
+                "note" to if (request.reviewers.isNotEmpty() && !environmentReviewers) "GitHub offers environment reviewers on a private repository only on GitHub Enterprise." else null,
+            )
+        }
         if (config) {
             // Production approval, all BEFORE any Thoryn write (a plan refusal leaves nothing in the workspace).
             currentStep = STEP_APPROVAL
@@ -357,10 +438,11 @@ internal class ProjectInit(
         }
 
         currentStep = STEP_TRUSTS
-        val connections = mutableListOf<Map<String, Any?>>()
+        val connectionsByName = linkedMapOf<String, Map<String, Any?>>()
         val clientIds = linkedMapOf<String, String>()
-        targets.forEach { t ->
-            val (trust, adopted) = ensureTrust(t, repo)
+        // SSO-4079 — an app's production trust first: its step-up refusal then leaves nothing in Thoryn.
+        targets.sortedBy { if (it === appProduction) 0 else 1 }.forEach { t ->
+            val (trust, adopted) = if (t === appProduction) ensureProductionTrust(t, repo) else ensureTrust(t, repo)
             val clientId = text(trust, "clientId") ?: throw Stop(EXIT_HTTP, "invalid_response", "product-api returned a trust without a clientId.")
             clientIds[t.connection] = clientId
             t.trust = trust
@@ -369,29 +451,31 @@ internal class ProjectInit(
                 "${t.connection}: ${text(trust, "name")} → $clientId (in ${t.envSlug}${t.githubEnvironment?.let { ", GitHub environment $it" } ?: ""}" +
                     "${t.planEnvironment?.let { "; plan profile in $it" } ?: ""})",
             )
-            connections += linkedMapOf(
+            connectionsByName[t.connection] = linkedMapOf(
                 "connection" to t.connection, "environment" to t.envSlug, "production" to t.spec.production,
                 "githubEnvironment" to t.githubEnvironment, "planEnvironment" to t.planEnvironment, "scopes" to t.spec.scopes,
                 "trustId" to text(trust, "id"), "trustName" to text(trust, "name"), "clientId" to clientId, "adopted" to adopted,
             )
         }
-        report["connections"] = connections
+        report["connections"] = targets.map { connectionsByName.getValue(it.connection) }
 
         currentStep = STEP_ACCESS
         val grants = mutableListOf<Map<String, Any?>>()
         targets.forEach { t ->
+            // SSO-4079 — an app's production trust is granted nothing: a creation slot covers its one client.
+            val grant = t.spec.grant ?: return@forEach
             val subject = "client:" + encodeId(clientIds.getValue(t.connection))
-            val objectRef = if (t.spec.grant.on == StarterTemplateManifest.GRANT_ON_WORKSPACE) "workspace:${encodeId(tenantId!!)}" else "environment:${t.envId}"
+            val objectRef = if (grant.on == StarterTemplateManifest.GRANT_ON_WORKSPACE) "workspace:${encodeId(tenantId!!)}" else "environment:${t.envId}"
             // An existing grant is left alone — read first, so a re-run writes nothing here.
-            if (grantExists(subject, t.spec.grant.relation, objectRef)) {
-                step(STEP_ACCESS, "existing", "$subject ${t.spec.grant.relation} $objectRef")
-                grants += linkedMapOf("subject" to subject, "relation" to t.spec.grant.relation, "object" to objectRef, "existing" to true)
+            if (grantExists(subject, grant.relation, objectRef)) {
+                step(STEP_ACCESS, "existing", "$subject ${grant.relation} $objectRef")
+                grants += linkedMapOf("subject" to subject, "relation" to grant.relation, "object" to objectRef, "existing" to true)
                 return@forEach
             }
             try {
-                thoryn.workspace.createGrant(subject, t.spec.grant.relation, objectRef)
+                thoryn.workspace.createGrant(subject, grant.relation, objectRef)
             } catch (ex: ProductApiException) {
-                if (t.spec.grant.on == StarterTemplateManifest.GRANT_ON_WORKSPACE && ex.httpStatus == 404) {
+                if (grant.on == StarterTemplateManifest.GRANT_ON_WORKSPACE && ex.httpStatus == 404) {
                     throw Stop(
                         EXIT_HTTP, "workspace_grant_unavailable",
                         "This platform cannot yet grant a machine client workspace-wide management (manager on workspace:<id>) through its access-grants API.",
@@ -400,10 +484,15 @@ internal class ProjectInit(
                 }
                 throw ex
             }
-            step(STEP_ACCESS, "granted", "$subject ${t.spec.grant.relation} $objectRef")
-            grants += linkedMapOf("subject" to subject, "relation" to t.spec.grant.relation, "object" to objectRef, "existing" to false)
+            step(STEP_ACCESS, "granted", "$subject ${grant.relation} $objectRef")
+            grants += linkedMapOf("subject" to subject, "relation" to grant.relation, "object" to objectRef, "existing" to false)
         }
         report["grants"] = grants
+        if (configProject != null) {
+            // SSO-4079 (D1) — the config project's identity on each plane owns the app's trust there.
+            currentStep = STEP_OWNER
+            report["owners"] = grantOwners(configProject, targets, production?.slug)
+        }
 
         val values = linkedMapOf(
             StarterTemplateManifest.THORYN_ISSUER to session.issuer,
@@ -413,6 +502,17 @@ internal class ProjectInit(
             values[t.spec.clientIdVariable] = clientIds.getValue(t.connection)
             t.spec.environmentVariable?.let { values[it] = t.envSlug }
         }
+        // SSO-4079 — the app's production variables (the declaration's, on its GitHub environment): the trust's client id, and the
+        // deployed URL when --production-url gave it (otherwise it stays the developer's to set).
+        val declaredVariables = LinkedHashMap(manifest.variables)
+        if (appProduction != null) {
+            val environmentLevel = StarterTemplateManifest.Variable(StarterTemplateManifest.LEVEL_ENVIRONMENT, appProduction.githubEnvironment)
+            declaredVariables[appProduction.spec.clientIdVariable] = environmentLevel
+            request.productionUrl?.let {
+                declaredVariables[ProductionDeclaration.URL_VARIABLE] = environmentLevel
+                values[ProductionDeclaration.URL_VARIABLE] = it.trimEnd('/')
+            }
+        }
         currentStep = STEP_VARIABLES
         val variables = mutableListOf<Map<String, Any?>>()
         // Read before write: a variable already at its value is not set again (a re-run makes no writes).
@@ -420,12 +520,21 @@ internal class ProjectInit(
         fun currentValue(name: String, environment: String?): String? =
             current.getOrPut(environment) { github.listVariables(repo, environment) }?.get(name)
         // Repository-level first; the production-environment variable only once its protection is confirmed.
-        manifest.variables.entries.sortedBy { it.value.level == StarterTemplateManifest.LEVEL_ENVIRONMENT }.forEach { (name, v) ->
+        declaredVariables.entries.sortedBy { it.value.level == StarterTemplateManifest.LEVEL_ENVIRONMENT }.forEach { (name, v) ->
             val value = values[name] ?: throw Stop(EXIT_CHECK, "starter_template_invalid", "The template declares $name, which has no value.")
             if (v.environment != null) {
                 val required = if (environmentReviewers) reviewerIds else emptyList()
-                val protectedNow = rulesetId != null && github.rulesetActive(repo, rulesetId, STEP_VARIABLES) &&
+                // A config project's approval is the ruleset AND the environment; an app project's production is its environment.
+                val protectedNow = (!config || rulesetId != null && github.rulesetActive(repo, rulesetId, STEP_VARIABLES)) &&
                     github.environmentProtected(repo, v.environment, required, STEP_VARIABLES)
+                if (!protectedNow && !config) {
+                    throw Stop(
+                        EXIT_GH, "github_environment_unprotected",
+                        "GitHub environment ${v.environment} does not deploy from ${repo.defaultBranch} only" +
+                            (if (required.isNotEmpty()) " with its required reviewers" else "") + ", so $name was not set.",
+                        "Check the environment's protection rules, then re-run.",
+                    )
+                }
                 if (!protectedNow) {
                     throw Stop(
                         EXIT_GH, "github_environment_unprotected",
@@ -460,8 +569,9 @@ internal class ProjectInit(
         seedFiles(targets, repo, workspaceSlug, sandboxSlug, sandboxName, createdRepo)
         if (configProject != null) {
             currentStep = STEP_CONFIG_PROJECT
-            proposeProductionClient(configProject, repo)
+            proposeAppTrusts(configProject, repo, targets)
         }
+        if (!config) reportProduction(repo, appProduction, productionDeclaration, production?.slug ?: ProvisionEngine.PRODUCTION_ENV_SLUG)
         report["steps"] = steps.map { linkedMapOf("step" to it.name, "status" to it.status, "detail" to it.detail) }
         report["nextSteps"] = nextSteps(repo, config, productionGithubEnvironment)
         return report
@@ -536,7 +646,7 @@ internal class ProjectInit(
      * only scopes the caller holds; the calls themselves need their own scopes. product-api enforces all of it —
      * checking here means a refusal creates nothing. Skipped when the token does not say what it carries.
      */
-    private fun checkScopeCeiling(manifest: StarterTemplateManifest, createsSandbox: Boolean) {
+    private fun checkScopeCeiling(manifest: StarterTemplateManifest, createsSandbox: Boolean, productionScopes: List<String>) {
         val held = thoryn.workspace.sessionScopes() ?: return
         val needed = linkedSetOf(
             "tenant:environments.read", "tenant:workload-identity.read", "tenant:workload-identity.write",
@@ -544,6 +654,7 @@ internal class ProjectInit(
         )
         if (createsSandbox) needed += "tenant:environments.write"
         manifest.connections.values.forEach { needed += it.scopes }
+        needed += productionScopes
         val missing = needed.filterNot { it in held }
         if (missing.isNotEmpty()) {
             throw Stop(
@@ -861,15 +972,7 @@ internal class ProjectInit(
 
     /** The existing trust this connection should use, or null. Throws when the deterministic name is taken by a different trust. */
     private fun findTrust(t: Target, repo: GhRepository): JsonNode? {
-        val client = thoryn.inEnvironment(t.envSlug)
-        val items = mutableListOf<JsonNode>()
-        var cursor: String? = null
-        for (page in 0 until MAX_TRUST_PAGES) {
-            val body = client.listWorkloadIdentityTrusts(null, cursor)
-            items += body["data"]?.takeIf { it.isArray }?.toList().orEmpty()
-            cursor = body["pagination"]?.get("cursor")?.takeUnless { it.isNull }?.asString()?.takeIf { it.isNotBlank() }
-            if (cursor == null || body["pagination"]?.get("hasMore")?.asBoolean(true) == false) break
-        }
+        val items = listTrusts(t.envSlug)
         val name = trustName(t.connection, repo.id)
         items.firstOrNull { text(it, "name") == name }?.let { existing ->
             if (matches(existing, t, repo)) return checkPlanProfile(existing, t)
@@ -880,6 +983,20 @@ internal class ProjectInit(
             )
         }
         return items.firstOrNull { matches(it, t, repo) }?.let { checkPlanProfile(it, t) }
+    }
+
+    /** Every workload identity trust of [envSlug] this session can read (paged, bounded). */
+    private fun listTrusts(envSlug: String): List<JsonNode> {
+        val client = thoryn.inEnvironment(envSlug)
+        val items = mutableListOf<JsonNode>()
+        var cursor: String? = null
+        for (page in 0 until MAX_TRUST_PAGES) {
+            val body = client.listWorkloadIdentityTrusts(null, cursor)
+            items += body["data"]?.takeIf { it.isArray }?.toList().orEmpty()
+            cursor = body["pagination"]?.get("cursor")?.takeUnless { it.isNull }?.asString()?.takeIf { it.isNotBlank() }
+            if (cursor == null || body["pagination"]?.get("hasMore")?.asBoolean(true) == false) break
+        }
+        return items
     }
 
     /** The GitHub environment of [trust]'s plan profile, or null when it has none. */
@@ -1005,31 +1122,42 @@ internal class ProjectInit(
         }
         @Suppress("UNCHECKED_CAST")
         (report["configProject"] as? Map<String, Any?>)?.let { cp ->
-            val variable = ProjectSeeds.PRODUCTION_CLIENT_ID_VARIABLE
-            val environment = ProjectSeeds.PRODUCTION_GITHUB_ENVIRONMENT
             val url = cp["pullRequest"] as? String
             if (url != null) {
                 add(
-                    "Production client pending review: $url — a reviewer of ${cp["repository"]} merges it, and the config project's production run " +
-                        "(approved in its GitHub environment) creates the client and publishes its id to ${repo.fullName} as $variable on its GitHub " +
-                        "environment `$environment` (created when absent). Until then the app has no production client. If that publish cannot reach " +
-                        "${repo.fullName}, set it by hand with the id from ${ProjectSeeds.CONFIG_PRODUCTION_PROVISION_FILE}'s receipt: " +
-                        "gh variable set $variable --body <id> --repo ${repo.fullName} --env $environment",
+                    "CI trusts pending review: $url — a reviewer of ${cp["repository"]} merges it, and the config project declares (and from then on " +
+                        "converges) ${repo.fullName}'s workload identity trusts. They exist already; the entries adopt them by name.",
                 )
             } else {
-                add(
-                    "${cp["repository"]} already declares the production client of ${repo.fullName}; the config project's production run publishes its id " +
-                        "as $variable on ${repo.fullName}'s GitHub environment `$environment`.",
-                )
+                add("${cp["repository"]} already declares ${repo.fullName}'s workload identity trusts as they are live.")
             }
         }
-        if (!config && request.configRepo == null) {
-            // SSO-3962 (oauthy ADR 2026-10-25 decision 1) — the app project owns its production client; the tenant-side act is the slot.
+        @Suppress("UNCHECKED_CAST")
+        ((report["owners"] as? List<Map<String, Any?>>).orEmpty().filter { it["status"] == "pending" }).takeIf { it.isNotEmpty() }?.let { pending ->
             add(
-                "Its PRODUCTION client is declared in this repository's own .thoryn/provision.yaml too (a second `kind: application`, without `environment:`), " +
-                    "once a workspace admin approves a creation slot for this repository's identity: " +
-                    "`thoryn access reserve client:<this repository's wi_ client> application:<clientId>` (or the consent screen, `thoryn access approve`). " +
-                    "The reviewed apply then creates and owns it; the deploy reads the id from `thoryn provision apply --output json` / `thoryn clients list`.",
+                "Ownership pending: only a workspace admin sets an owner. ${request.configRepo}'s first plan asks for it (the consent fix, " +
+                    "`thoryn access approve`), or a workspace admin runs: " + pending.joinToString(" && ") { "thoryn access grant ${it["subject"]} owner ${it["object"]}" },
+            )
+        }
+        if (!config && request.configRepo == null) {
+            // SSO-4079 (D3) — no config project, so no production trust: nothing would own it.
+            add(
+                "No config project owns this repository's CI identity, so no PRODUCTION trust was created. Re-run with --config-repo <owner/name> " +
+                    "(the workspace's config repository; create one with `thoryn project init config --repo <owner/name> --reviewer <login> --confirm-production`): " +
+                    "the run then creates the production trust, makes the config project its owner and proposes both trusts there. " +
+                    "A config project's `thoryn provision import` also picks up the trusts it can see.",
+            )
+        }
+        @Suppress("UNCHECKED_CAST")
+        (report["creationSlot"] as? Map<String, Any?>)?.let { slot ->
+            val command = slot["command"] as? String
+            add(
+                if (command != null) {
+                    "The production apply (deploy.yml on ${repo.defaultBranch}) creates ${slot["object"]} once a workspace admin approves its creation slot: $command"
+                } else {
+                    "The production apply needs a creation slot for ${slot["object"]} (environment ${slot["environment"]}), reserved for this repository's " +
+                        "PRODUCTION identity once the config project declares it: thoryn access reserve client:<production wi_…> ${slot["object"]} --environment ${slot["environment"]}"
+                },
             )
         }
         if (config) {
@@ -1058,18 +1186,52 @@ internal class ProjectInit(
         ((report["provisioning"] as? Map<String, Any?>)?.get("files") as? List<Map<String, Any?>>).orEmpty()
             .filter { it["status"] in statuses }.map { it["path"] as String }
 
-    // ── SSO-3669: the app's production client, proposed on the config repository (ADR 2026-10-13 §1) ──
+    // ── SSO-4079: the app's production trust, its owner, and its declaration on the config repository ───────────────────
+
+    /** The template's `.thoryn/production/declaration.json`, or null when it ships none (a template published before SSO-4120). */
+    private fun readProductionDeclaration(): ProductionDeclaration? {
+        val raw = github.productionDeclaration(request.template, STEP_PREFLIGHT) ?: return null
+        return try {
+            ProductionDeclaration.parse(raw)
+        } catch (ex: StarterTemplateManifest.TemplateException) {
+            throw Stop(EXIT_CHECK, "starter_template_invalid", "The template ${request.template} breaks the production-connection contract: ${ex.message}.", "Nothing was changed.")
+        }
+    }
 
     /**
-     * Pre-flight (reads only): the config repository as the signed-in `gh` sees it — absent or invisible stops the
-     * run with the by-hand steps; it is NEVER created here — and its production-section file converged with this
-     * app's production client ([ProjectSeeds.productionClientEntry]): the entry is appended when absent (every other
-     * line of the file is kept), replaced when it differs, and left alone when identical. The result must be a file
-     * the provisioning loader accepts, or the run stops before the first change.
+     * [ensureTrust] for the app's production trust — a person's ELEVATED act on product-api: without a passkey sign-in from the
+     * last 5 minutes it answers the RFC 9470 step-up, which stops the run with the sign-in that satisfies it (nothing in Thoryn
+     * was written yet: this trust is created first).
      */
-    private fun preflightConfigProject(configRepo: String, appRepository: String): ConfigProject {
-        val path = ProjectSeeds.CONFIG_PRODUCTION_PROVISION_FILE
-        val manual = configProjectManualSteps(configRepo, appRepository)
+    private fun ensureProductionTrust(t: Target, repo: GhRepository): Pair<JsonNode, Boolean> = try {
+        ensureTrust(t, repo)
+    } catch (ex: ProductApiException) {
+        val acr = ex.stepUpAcrValues ?: com.devnow.thoryn.cli.cmd.WorkloadIdentityCommand.PASSKEY_ACR
+        val maxAge = ex.stepUpMaxAge ?: 300
+        val signIn = "thoryn login --acr-values $acr --max-age $maxAge"
+        when {
+            ex.isStepUpRequired || ex.errorCode == "elevation_evidence_required" -> throw Stop(
+                EXIT_HTTP, "insufficient_user_authentication",
+                "Creating the app's PRODUCTION workload identity trust needs a passkey sign-in from the last ${maxAge / 60} minutes.",
+                "Sign in again ($signIn), then re-run: ${request.commandLine} — every step before this one is kept and re-used.",
+                mapOf("acrValues" to acr, "maxAge" to maxAge),
+            )
+            ex.errorCode == "elevated_action_requires_person" -> throw Stop(
+                EXIT_HTTP, "person_required",
+                "Creating the app's PRODUCTION workload identity trust is a person's act; this session is a machine identity.",
+                "Sign in as yourself ($signIn) and re-run: ${request.commandLine}",
+            )
+            else -> throw ex
+        }
+    }
+
+    /**
+     * Pre-flight (reads only): the config repository as the signed-in `gh` sees it — absent or invisible stops the run with the
+     * by-hand steps; it is NEVER created here — its sections ([configSections]) and those files as its default branch holds
+     * them. The files must take this app's trust entries: they are converged with stand-in trusts now, so a file that cannot
+     * (not YAML, `resources` not the last key, an application file) stops the run before the first change.
+     */
+    private fun preflightConfigProject(configRepo: String, appRepository: String, appRepo: GhRepository?, targets: List<Target>): ConfigProject {
         val repository = github.repository(configRepo.substringBefore('/'), configRepo.substringAfter('/'), STEP_PREFLIGHT)
             ?: throw Stop(
                 EXIT_CHECK, "config_repository_not_found",
@@ -1077,107 +1239,326 @@ internal class ProjectInit(
                     "Nothing was changed — not on GitHub, not in Thoryn.",
                 "`thoryn project init app` never creates the config repository. Create it (thoryn project init config --repo $configRepo " +
                     "--reviewer <login> --confirm-production) or ask for access, then re-run: ${request.commandLine}",
-                mapOf("manualSteps" to manual, "configRepository" to configRepo),
+                mapOf("manualSteps" to configProjectManualSteps(configRepo, appRepository, standInTrusts(appRepository, appRepo, targets)), "configRepository" to configRepo),
             )
-        val existing = github.readFile(repository, path, STEP_PREFLIGHT)
-        val entry = ProjectSeeds.productionClientEntry(appRepository, request.productionUrl!!)
-        val source = "$configRepo:$path"
-        val converged = try {
-            ProvisionYamlEdit.converge(existing?.content, entry, source, ProjectSeeds.productionClientHeader(appRepository)) {
-                ProjectSeeds.isProductionClientOf(it, appRepository)
-            }.also { ProvisionFile.parse(it.content.toByteArray(), source) }
+        val sandboxSlug = targets.first { !it.spec.production }.envSlug
+        val (productionFile, sandboxFile) = configSections(repository, sandboxSlug)
+        val existing = listOfNotNull(productionFile, sandboxFile).distinct().associateWith { github.readFile(repository, it, STEP_PREFLIGHT)?.content }
+        val cp = ConfigProject(repository, appRepository, productionFile, sandboxFile, existing)
+        try {
+            convergeTrusts(cp, standInTrusts(appRepository, appRepo, targets))
         } catch (ex: ProvisionException) {
             throw Stop(
                 EXIT_CHECK, "config_provision_file_unusable",
-                "The production client cannot be added to $source: ${ex.message}. Nothing was changed — not on GitHub, not in Thoryn.",
-                "Fix the file on ${repository.defaultBranch} (or add the entry by hand — the steps below) and re-run: ${request.commandLine}",
-                mapOf("manualSteps" to manual, "configRepository" to configRepo),
+                "The app's workload identity trusts cannot be declared in $configRepo: ${ex.message}. Nothing was changed — not on GitHub, not in Thoryn.",
+                "Fix the file on ${repository.defaultBranch} (or add the entries by hand — the steps below) and re-run: ${request.commandLine}",
+                mapOf("manualSteps" to configProjectManualSteps(configRepo, appRepository, standInTrusts(appRepository, appRepo, targets)), "configRepository" to configRepo),
             )
         }
-        return ConfigProject(repository, appRepository, entry, converged)
+        return cp
     }
 
     /**
-     * Propose the converged production-section file through the deterministic branch and ONE pull request
-     * ([GitHubCli.proposeFiles]: the branch is created from the default branch when absent, the file committed only
-     * where it differs from the branch's copy, an open pull request reused) — or nothing, when the default branch
-     * already declares the entry as it must be. The default branch is never written; nothing is merged.
+     * The config repository's sections, as its `.thoryn/workflow.yaml` configures them (absent or unreadable ⇒ the files
+     * `thoryn project init config` seeds): the file planned with the production-plane connection (default
+     * [ProjectSeeds.CONFIG_PRODUCTION_PROVISION_FILE]), and the file whose connection signs in to [sandboxSlug] (null ⇒ none) —
+     * the plane routing `thoryn provision import` uses ([WorkflowImportTarget.planeOf]).
      */
-    private fun proposeProductionClient(cp: ConfigProject, appRepo: GhRepository) {
-        val path = ProjectSeeds.CONFIG_PRODUCTION_PROVISION_FILE
-        val spec = cp.entry["spec"]
-        val target = cp.entry["publishTo"].get(0)
-        val application = linkedMapOf<String, Any?>(
-            "name" to cp.name, "clientType" to text(spec, "clientType"),
-            "grantTypes" to spec["grantTypes"].toList().map { it.asString() }, "scopes" to spec["scopes"].toList().map { it.asString() },
-            "redirectUris" to spec["redirectUris"].toList().map { it.asString() },
-            "postLogoutRedirectUris" to spec["postLogoutRedirectUris"].toList().map { it.asString() },
-            "publishTo" to linkedMapOf(
-                "kind" to text(target, "kind"), "repository" to text(target, "repository"),
-                "environment" to text(target, "environment"), "name" to text(target, "name"),
-            ),
+    private fun configSections(repository: GhRepository, sandboxSlug: String): Pair<String, String?> {
+        val configured = github.readFile(repository, WorkflowConfig.DEFAULT_PATH, STEP_PREFLIGHT)?.let { f ->
+            try {
+                WorkflowConfig.parse(f.content, "${repository.fullName}:${WorkflowConfig.DEFAULT_PATH}").files
+            } catch (ex: WorkflowConfigException) {
+                null
+            }
+        }
+        val entries = configured ?: listOf(ProjectSeeds.CONFIG_PRODUCTION_PROVISION_FILE, ".thoryn/environments/sandbox/provision.yaml")
+            .map { WorkflowConfig.FileEntry(it, ProjectSeeds.connectionPath(it)) }
+        val planes = entries.mapNotNull { e ->
+            val raw = github.readFile(repository, e.connection, STEP_PREFLIGHT) ?: return@mapNotNull null
+            val connection = try {
+                Connection.parse(raw.content.toByteArray(), "${repository.fullName}:${e.connection}")
+            } catch (ex: ConnectionException) {
+                return@mapNotNull null
+            }
+            e.file to WorkflowImportTarget.planeOf(connection)?.takeUnless { ProvisionFile.isProductionPlane(it) }
+        }
+        val productionFile = planes.firstOrNull { it.second == null }?.first ?: ProjectSeeds.CONFIG_PRODUCTION_PROVISION_FILE
+        return productionFile to planes.firstOrNull { it.second == sandboxSlug }?.first
+    }
+
+    /** One trust to declare: the trust record (live, or a stand-in at pre-flight) and its sandbox slug (null ⇒ the production plane). */
+    private class AppTrust(val trust: JsonNode, val sandbox: String?)
+
+    /** One trust as converged into its section: its name, plane, file and what happened to its entry. */
+    private class TrustDeclaration(val name: String, val sandbox: String?, val file: String, val outcome: ProvisionYamlEdit.Outcome)
+
+    /** One section file as it must read after this app's trusts are converged into it. */
+    private class SectionEdit(val path: String, val content: String, val declarations: List<TrustDeclaration>) {
+        val changed: Boolean get() = declarations.any { it.outcome != ProvisionYamlEdit.Outcome.UNCHANGED }
+    }
+
+    /** The trusts this run creates, as product-api renders them — for pre-flight, from the pins it will send. */
+    private fun standInTrusts(appRepository: String, appRepo: GhRepository?, targets: List<Target>): List<AppTrust> = targets.map { t ->
+        standIn(appRepository, appRepo, t.connection, t.githubEnvironment, t.spec.production, t.spec.scopes, t.envSlug)
+    }
+
+    /** A trust record as product-api would render it for [appRepository] (its ids when known, [STAND_IN_ID] otherwise). */
+    private fun standIn(appRepository: String, appRepo: GhRepository?, connection: String, githubEnvironment: String?, production: Boolean, scopes: List<String>, envSlug: String): AppTrust {
+        val github = linkedMapOf<String, Any?>(
+            "owner" to appRepository.substringBefore('/'), "ownerId" to (appRepo?.ownerId ?: STAND_IN_ID),
+            "repository" to appRepository.substringAfter('/'), "repositoryId" to (appRepo?.id ?: STAND_IN_ID),
+            "environment" to githubEnvironment,
+            "ref" to if (production) "refs/heads/${appRepo?.defaultBranch ?: "main"}" else null,
         )
-        val outcome = cp.converged.outcome
+        val trust = linkedMapOf(
+            "id" to "", "name" to trustName(connection, appRepo?.id ?: STAND_IN_ID), "provider" to "github_actions", "github" to github, "scopes" to scopes,
+        )
+        return AppTrust(json.valueToTree(trust), envSlug.takeUnless { production })
+    }
+
+    /**
+     * Converge [trusts] into the sections of [cp]: each to [ConfigProject.fileFor] its plane, by NAME (added when absent —
+     * every other line of the file kept —, replaced when it differs, left alone when identical). Each resulting file must load.
+     */
+    private fun convergeTrusts(cp: ConfigProject, trusts: List<AppTrust>): List<SectionEdit> =
+        trusts.groupBy { cp.fileFor(it.sandbox) }.map { (path, inFile) ->
+            val source = "${cp.repository.fullName}:$path"
+            var content = cp.existing[path]
+            val declarations = inFile.map { t ->
+                val entry = trustEntry(t, content)
+                val name = entry["name"].asString()
+                val converged = ProvisionYamlEdit.converge(content, entry, source, trustHeader(cp.appRepository, t.sandbox), ProvisionFile.API_VERSION_TENANT) {
+                    it.isObject && text(it, "kind") == ProvisionFile.KIND_WORKLOAD_IDENTITY_TRUST && text(it, "name") == name
+                }
+                content = converged.content
+                TrustDeclaration(name, t.sandbox, path, converged.outcome)
+            }
+            ProvisionFile.parse(content!!.toByteArray(), source)
+            SectionEdit(path, content!!, declarations)
+        }
+
+    /**
+     * A trust's `kind: workloadIdentityTrust` entry, exactly as `thoryn provision import` renders a live one: the engine's
+     * [ProvisionEngine.trustSpecOf] (provider, the GitHub pins as live, the plan profile if any, the scopes, `confirmProduction`
+     * on the production plane) under the live NAME (the converge key), and `environment:` — the name the file gives that
+     * sandbox's `environment` resource, else its slug — for a sandbox trust. Normalized through JSON text, so it compares
+     * structurally with what a YAML file holds.
+     */
+    private fun trustEntry(t: AppTrust, fileContent: String?): JsonNode {
+        val (spec, _) = ProvisionEngine.trustSpecOf(t.trust, production = t.sandbox == null)
+        val environment = t.sandbox?.let { environmentNameIn(fileContent, it) ?: it }
+        val resource = ProvisionResource(ProvisionFile.KIND_WORKLOAD_IDENTITY_TRUST, text(t.trust, "name")!!, environment, spec)
+        return json.readTree(json.writeValueAsString(ImportedResource(resource, text(t.trust, "id") ?: "", Access.MANAGER).toEntry()))
+    }
+
+    /** The name [content] gives the `environment` resource of [slug], or null. */
+    private fun environmentNameIn(content: String?, slug: String): String? {
+        val root = content?.let { runCatching { yaml.readTree(it) }.getOrNull() } ?: return null
+        return root["resources"]?.takeIf { it.isArray }?.toList().orEmpty()
+            .firstOrNull { text(it, "kind") == ProvisionFile.KIND_ENVIRONMENT && text(it["spec"], "slug") == slug }?.let { text(it, "name") }
+    }
+
+    /** The comment lines above an APPENDED trust entry (a human reads the config file; the comparison ignores them). */
+    private fun trustHeader(appRepository: String, sandbox: String?): String = """
+        |
+        |  # ${if (sandbox == null) "PRODUCTION" else "Sandbox `$sandbox`"} CI identity of the application repository $appRepository (proposed by
+        |  # `thoryn project init app`, SSO-4079). This config project declares and owns the app's workload identity trusts (oauthy
+        |  # ADR 2026-10-25 decision 3): an application repository never declares its own authority. The trust was created by the
+        |  # setup run; this entry adopts it by name. Widening its scopes is a reviewed pull request here.
+        |
+    """.trimMargin()
+
+    /**
+     * SSO-4079 (D1) — `owner` on each app trust for the config project's identity on that plane: the config repository's trust
+     * in the app's sandbox (none there ⇒ its production trust), its production trust for the production one. Read first (an
+     * existing grant is left alone). Only a workspace admin sets an owner: product-api's refusal (the opaque 404) leaves the
+     * grant `pending` and the run goes on; another owner already set (`409 owner_already_set`) is reported, never replaced.
+     */
+    private fun grantOwners(cp: ConfigProject, targets: List<Target>, productionSlug: String?): List<Map<String, Any?>> {
+        val productionIdentity by lazy { productionSlug?.let { configIdentity(cp.repository, it) } ?: IdentityLookup(null, "the workspace has no production environment") }
+        return targets.map { t ->
+            val trustName = text(t.trust, "name")
+            val trustId = text(t.trust, "id")!!
+            val lookup = if (t.spec.production) {
+                productionIdentity
+            } else {
+                configIdentity(cp.repository, t.envSlug).let { inSandbox ->
+                    if (inSandbox.identity == null && !inSandbox.ambiguous) productionIdentity else inSandbox
+                }
+            }
+            val objectRef = "trust:" + encodeId(trustId)
+            val row = linkedMapOf<String, Any?>("trust" to trustName, "trustId" to trustId, "environment" to t.envSlug, "relation" to OWNER_RELATION, "object" to objectRef)
+            val identity = lookup.identity
+            if (identity == null) {
+                val note = "no grant: ${lookup.note}"
+                step(STEP_OWNER, "skipped", "$trustName: $note")
+                return@map row + mapOf("subject" to null, "status" to "skipped", "note" to note)
+            }
+            val subject = "client:" + encodeId(identity.clientId)
+            row["subject"] = subject
+            row["ownerPlane"] = identity.plane
+            if (grantExists(subject, OWNER_RELATION, objectRef)) {
+                step(STEP_OWNER, "existing", "$subject owner $objectRef ($trustName)")
+                return@map row + mapOf("status" to "existing", "note" to null)
+            }
+            try {
+                thoryn.workspace.createGrant(subject, OWNER_RELATION, objectRef)
+                step(STEP_OWNER, "granted", "$subject owner $objectRef ($trustName)")
+                row + mapOf("status" to "granted", "note" to null)
+            } catch (ex: ProductApiException) {
+                val (status, note) = when {
+                    ex.httpStatus == 404 || ex.httpStatus == 403 ->
+                        "pending" to "only a workspace admin sets an owner; the config project's first plan asks for it (consent: `thoryn access approve`), " +
+                            "or a workspace admin runs: thoryn access grant $subject owner $objectRef"
+                    ex.httpStatus == 409 -> "conflict" to "another identity already owns this trust (${ex.errorCode ?: "owner_already_set"}); a workspace admin revokes it first if ${cp.repository.fullName} should own it"
+                    ex.httpStatus in 400..499 -> "refused" to "product-api refused it (${ex.errorCode ?: ex.httpStatus}): ${ex.message}"
+                    else -> throw ex
+                }
+                step(STEP_OWNER, status, "$subject owner $objectRef ($trustName) — $note")
+                row + mapOf("status" to status, "note" to note)
+            }
+        }
+    }
+
+    /** The config repository's identity on a plane, or why there is none ([ambiguous]: several trusts pin it there). */
+    private class IdentityLookup(val identity: ConfigIdentity?, val note: String, val ambiguous: Boolean = false)
+
+    /** The ONE enabled trust in [envSlug] pinned to [configRepo] (`github.repositoryId`, else `owner/repository`). */
+    private fun configIdentity(configRepo: GhRepository, envSlug: String): IdentityLookup {
+        val trusts = try {
+            listTrusts(envSlug)
+        } catch (ex: ProductApiException) {
+            if (ex.httpStatus in 400..499) return IdentityLookup(null, "the trusts of $envSlug cannot be read with this session (${ex.errorCode ?: ex.httpStatus})")
+            throw ex
+        }
+        val pinned = trusts.filter { tr ->
+            val gh = tr["github"] ?: return@filter false
+            val id = gh["repositoryId"]?.takeIf { it.isIntegralNumber }?.asLong()
+            val sameRepo = if (id != null) id == configRepo.id else
+                "${text(gh, "owner")}/${text(gh, "repository")}".equals(configRepo.fullName, ignoreCase = true)
+            sameRepo && tr["enabled"]?.asBoolean(true) != false && text(tr, "clientId") != null
+        }
+        return when (pinned.size) {
+            1 -> IdentityLookup(ConfigIdentity(text(pinned.single(), "clientId")!!, envSlug), "")
+            0 -> IdentityLookup(null, "${configRepo.fullName} has no workload identity trust in $envSlug")
+            else -> IdentityLookup(
+                null, "${configRepo.fullName} has ${pinned.size} workload identity trusts in $envSlug (${pinned.mapNotNull { text(it, "name") }.joinToString(", ")}); " +
+                    "which one is the config project's is not clear, so nothing was granted",
+                ambiguous = true,
+            )
+        }
+    }
+
+    /**
+     * Propose the converged section files through the deterministic branch and ONE pull request ([GitHubCli.proposeFiles]: the
+     * branch is created from the default branch when absent, a file committed only where it differs from the branch's copy, an
+     * open pull request reused) — or nothing, when the default branch already declares every trust as it is live. The default
+     * branch is never written; nothing is merged.
+     */
+    private fun proposeAppTrusts(cp: ConfigProject, appRepo: GhRepository, targets: List<Target>) {
+        val edits = convergeTrusts(cp, targets.sortedByDescending { it.spec.production }.map { AppTrust(it.trust!!, it.envSlug.takeUnless { _ -> it.spec.production }) })
+        val declarations = edits.flatMap { it.declarations }
+        val changedEdits = edits.filter { it.changed }
         var pullRequest: String? = null
         var changed = false
-        if (outcome == ProvisionYamlEdit.Outcome.UNCHANGED) {
+        if (changedEdits.isEmpty()) {
             step(
                 STEP_CONFIG_PROJECT, "declared",
-                "${cp.repository.fullName}: $path on ${cp.repository.defaultBranch} already declares application ${cp.name} with these redirect URIs and publish target; nothing proposed",
+                "${cp.repository.fullName} already declares ${declarations.joinToString(", ") { it.name }} as they are live on ${cp.repository.defaultBranch}; nothing proposed",
             )
         } else {
             val proposal = github.proposeFiles(
-                cp.repository, listOf(path to cp.converged.content), cp.branch,
-                "Thoryn: the production client of ${appRepo.fullName}", productionClientPullRequestBody(cp, appRepo), STEP_CONFIG_PROJECT,
+                cp.repository, changedEdits.map { it.path to it.content }, cp.branch,
+                "Thoryn: the CI trusts of ${appRepo.fullName}", appTrustsPullRequestBody(cp, appRepo, targets, declarations), STEP_CONFIG_PROJECT,
             )
             pullRequest = proposal.url
             changed = proposal.changed
+            val rerendered = declarations.any { it.outcome == ProvisionYamlEdit.Outcome.UPDATED }
             step(
                 STEP_CONFIG_PROJECT, if (changed) "pending review" else "open",
-                "pull request ${if (changed) "pending review" else "open"}: ${proposal.url} — application ${cp.name} ${outcome.name.lowercase()} in " +
-                    "${cp.repository.fullName}:$path (branch ${cp.branch})" +
-                    if (outcome == ProvisionYamlEdit.Outcome.UPDATED) "; the entry differed, so the file was re-rendered and its comments are not kept" else "",
+                "pull request ${if (changed) "pending review" else "open"}: ${proposal.url} — " +
+                    declarations.joinToString(", ") { "workloadIdentityTrust ${it.name} ${it.outcome.name.lowercase()} in ${it.file}" } + " (branch ${cp.branch})" +
+                    if (rerendered) "; an entry differed, so its file was re-rendered and its comments are not kept" else "",
             )
         }
+        val outcome = when {
+            pullRequest == null -> "declared"
+            declarations.any { it.outcome == ProvisionYamlEdit.Outcome.UPDATED } -> "updated"
+            else -> "added"
+        }
         report["configProject"] = linkedMapOf(
-            "repository" to cp.repository.fullName, "file" to path, "branch" to cp.branch, "pullRequest" to pullRequest,
-            "outcome" to if (pullRequest == null) "declared" else outcome.name.lowercase(), "changed" to changed, "application" to application,
+            "repository" to cp.repository.fullName, "branch" to cp.branch, "pullRequest" to pullRequest, "outcome" to outcome, "changed" to changed,
+            "files" to edits.map { it.path },
+            "trusts" to declarations.map {
+                linkedMapOf("name" to it.name, "environment" to (it.sandbox ?: "production"), "file" to it.file, "outcome" to it.outcome.name.lowercase())
+            },
         )
     }
 
-    /** The pull request's body: what the reviewer approves — a production public client, its redirect URIs, where its id is published. */
-    private fun productionClientPullRequestBody(cp: ConfigProject, appRepo: GhRepository): String {
-        val spec = cp.entry["spec"]
-        val redirects = spec["redirectUris"].toList().map { it.asString() }
-        val signedOut = spec["postLogoutRedirectUris"].toList().map { it.asString() }
-        return buildString {
-            appendLine("Proposed by `thoryn project init app` for the application repository ${appRepo.fullName}.")
-            appendLine()
-            appendLine("Approving and merging this pull request approves, for this config project's next production run:")
-            appendLine()
-            appendLine("- **A production OAuth client** `${cp.name}` (`kind: application`, production plane): a PUBLIC client — PKCE proves it, no secret exists anywhere — with grant type `authorization_code` and scopes `openid profile email`.")
-            appendLine("- **Its redirect URIs**: sign-in callback ${redirects.joinToString(", ") { "`$it`" }}; post-logout ${signedOut.joinToString(", ") { "`$it`" }} (the starter stack's `${ProjectSeeds.CALLBACK_PATH}` and `${ProjectSeeds.SIGNED_OUT_PATH}` under `${request.productionUrl}`).")
-            appendLine("- **Where its id is published**: as the GitHub Actions variable `${ProjectSeeds.PRODUCTION_CLIENT_ID_VARIABLE}` on the `${ProjectSeeds.PRODUCTION_GITHUB_ENVIRONMENT}` environment of ${appRepo.fullName}, on every production apply (`publishTo`). A variable, never a secret: a client id is public by construction.")
-            appendLine()
-            appendLine("Nothing is created until this is merged and the production run is approved. ${appRepo.fullName}'s own `.thoryn/provision.yaml` is unchanged: it declares only its sandbox client. ")
-            append("A later `thoryn project init app` run for the same repository updates this branch and pull request; it never opens a second one.")
+    /** The pull request's body: what the reviewer approves — this config project declaring (and owning) the app's CI identities. */
+    private fun appTrustsPullRequestBody(cp: ConfigProject, appRepo: GhRepository, targets: List<Target>, declarations: List<TrustDeclaration>): String = buildString {
+        appendLine("Proposed by `thoryn project init app` for the application repository ${appRepo.fullName} (SSO-4079).")
+        appendLine()
+        appendLine("Merging this pull request makes this config project DECLARE the CI identities of ${appRepo.fullName} (oauthy ADR 2026-10-25 decision 3): the application repository owns its OAuth clients, never its own authority.")
+        appendLine()
+        declarations.forEach { d ->
+            val t = targets.first { text(it.trust, "name") == d.name }
+            val plane = if (d.sandbox == null) "the production plane" else "sandbox `${d.sandbox}`"
+            val pins = buildList {
+                add("repository ${appRepo.fullName} (id ${appRepo.id})")
+                t.githubEnvironment?.let { add("GitHub environment `$it`") }
+                if (t.spec.production) add("ref `refs/heads/${appRepo.defaultBranch}`")
+            }.joinToString(", ")
+            appendLine("- **`${d.name}`** on $plane (`${d.file}`): pinned to $pins; scopes ${t.spec.scopes.joinToString(" ") { "`$it`" }}" +
+                if (t.spec.production) "; no grant — the app's production client is created under a creation slot a workspace admin approves." else ".")
         }
+        appendLine()
+        appendLine("Both trusts already exist (the setup run created them as a person); these entries adopt them by name, so the next plan shows no change. A later `thoryn project init app` run for the same repository updates this branch and pull request; it never opens a second one.")
     }
 
-    /** The by-hand version of the config-repository pull request — printed when `gh` is unavailable or the config repository is not. */
-    private fun configProjectManualSteps(configRepo: String, appRepository: String): List<String> {
-        val path = ProjectSeeds.CONFIG_PRODUCTION_PROVISION_FILE
+    /**
+     * The by-hand version of the config-repository pull request — printed when `gh` is unavailable or the config repository is
+     * not: the trust entries ([trusts] — stand-ins when the trusts do not exist yet) under the production section, the branch and
+     * the pull request, then the owner grants.
+     */
+    private fun configProjectManualSteps(configRepo: String, appRepository: String, trusts: List<AppTrust>): List<String> {
         val placeholder = appRepository.startsWith("<")
-        val name = if (placeholder) "<app repository name>" else ProjectSeeds.productionClientName(appRepository)
-        val branch = ProjectSeeds.productionClientBranch(if (placeholder) "<app repository name>" else appRepository.substringAfter('/'))
-        val entry = ProjectSeeds.productionClientEntry(appRepository, request.productionUrl ?: "https://<where the app runs>", name)
-        val fragment = ProvisionYamlEdit.fragment(tools.jackson.databind.json.JsonMapper.builder().build().createArrayNode().add(entry))
+        val branch = ProjectSeeds.appTrustsBranch(if (placeholder) "<app repository name>" else appRepository.substringAfter('/'))
+        val path = ProjectSeeds.CONFIG_PRODUCTION_PROVISION_FILE
+        val fragment = ProvisionYamlEdit.fragment(json.createArrayNode().apply { trusts.forEach { add(trustEntry(it, null)) } })
         return listOf(
-            "# The app's PRODUCTION client is declared on the config repository $configRepo — a pull request, never its default branch:",
+            "# The app's CI trusts are declared on the config repository $configRepo — a pull request, never its default branch:",
             "gh repo clone $configRepo && cd ${configRepo.substringAfter('/')} && git switch -c $branch",
-            "# append to $path (under its resources: list):\n$fragment".trimEnd(),
-            "git add $path && git commit -m \"Thoryn: the production client of $appRepository\" && git push -u origin $branch && " +
-                "gh pr create --repo $configRepo --title \"Thoryn: the production client of $appRepository\" --fill",
+            "# append to $path (under its resources: list; a sandbox trust may go to that sandbox's section instead, without the change to environment:):\n$fragment".trimEnd(),
+            "git add $path && git commit -m \"Thoryn: the CI trusts of $appRepository\" && git push -u origin $branch && " +
+                "gh pr create --repo $configRepo --title \"Thoryn: the CI trusts of $appRepository\" --fill",
+            "# then a workspace admin makes the config project their owner: thoryn access grant client:<the config repository's wi_ client on that plane> owner trust:<trust id>",
+        )
+    }
+
+    /**
+     * SSO-4079 — the report's production half: the production trust (created, or why not) and the CREATION SLOT the production apply
+     * needs — `application:<repository>-production` on the production plane, the fixed clientId the template's production file
+     * declares (`{{env.THORYN_APP_NAME}}-production`, THORYN_APP_NAME = the repository's name).
+     */
+    private fun reportProduction(repo: GhRepository, appProduction: Target?, declaration: ProductionDeclaration?, productionSlug: String) {
+        val clientId = appProduction?.trust?.let { text(it, "clientId") }
+        val reason = when {
+            appProduction != null -> null
+            declaration == null -> "the template declares no production connection (${ProductionDeclaration.PATH})"
+            else -> "no config project owns this repository's CI identity: re-run with --config-repo <owner/name>"
+        }
+        report["productionConnection"] = linkedMapOf(
+            "declared" to (declaration != null), "trust" to appProduction?.trust?.let { text(it, "name") }, "clientId" to clientId,
+            "githubEnvironment" to (declaration?.githubEnvironment), "reason" to reason,
+            "productionUrl" to if (appProduction != null) request.productionUrl?.trimEnd('/') else null,
+        )
+        val application = "application:${repo.name}-production"
+        report["creationSlot"] = linkedMapOf(
+            "object" to application, "environment" to productionSlug, "subject" to clientId?.let { "client:$it" },
+            "command" to clientId?.let { "thoryn access reserve client:$it $application --environment $productionSlug" },
+            "status" to if (clientId != null) "awaiting_admin" else "awaiting_production_trust",
         )
     }
 
@@ -1221,6 +1602,20 @@ internal class ProjectInit(
             } else {
                 add("gh variable set THORYN_ENVIRONMENT --body $sandboxSlug --repo $repo")
                 add("gh variable set THORYN_WIF_CLIENT_ID --body <sandbox client id> --repo $repo")
+                if (request.configRepo != null) {
+                    // SSO-4079 — the production trust, when the template ships .thoryn/production/declaration.json.
+                    val env = ProjectSeeds.APP_PRODUCTION_GITHUB_ENVIRONMENT
+                    add("# if the template has ${ProductionDeclaration.PATH}: its production trust, after protecting the GitHub environment $env")
+                    add("gh api --method PUT repos/$repo/environments/$env --input protection.json   # {\"deployment_branch_policy\":{\"protected_branches\":false,\"custom_branch_policies\":true}} (+ \"reviewers\" on GitHub Enterprise)")
+                    add("gh api --method POST repos/$repo/environments/$env/deployment-branch-policies -f name=<default branch> -f type=branch")
+                    add(
+                        "thoryn workload-identity trusts create --environment ${production?.slug ?: "production"} --name starter-production-<repository id> --repository $repo " +
+                            "--owner-id <owner id> --repository-id <repository id> --github-environment $env --ref refs/heads/<default branch> " +
+                            "--scope \"${ProductionDeclaration.SCOPES.joinToString(" ")}\" --confirm-production   # a passkey sign-in from the last 5 minutes",
+                    )
+                    add("gh variable set ${ProductionDeclaration.CLIENT_ID_VARIABLE} --body <production client id> --repo $repo --env $env")
+                    request.productionUrl?.let { add("gh variable set ${ProductionDeclaration.URL_VARIABLE} --body ${it.trimEnd('/')} --repo $repo --env $env") }
+                }
             }
             add(
                 "# .thoryn/connection.json next to each connection's provision.yaml: {\"apiVersion\":\"thoryn.io/connection/v1\",\"workspace\":{\"slug\":\"$workspaceSlug\"}," +
@@ -1228,7 +1623,10 @@ internal class ProjectInit(
                     "— and a starter provision.yaml (apiVersion ${if (request.kind == Kind.CONFIG) ProvisionFile.API_VERSION_TENANT else ProvisionFile.API_VERSION_APPLICATION}) declaring what the connection owns; commit both",
             )
         }.toMutableList()
-        request.configRepo?.let { manual.addAll(configProjectManualSteps(it, repo)) }
+        request.configRepo?.let {
+            val sandboxTrust = standIn(repo, null, "sandbox", null, false, listOf("<connections.sandbox.scopes of .thoryn/template.json>"), sandboxSlug)
+            manual.addAll(configProjectManualSteps(it, repo, listOf(sandboxTrust)))
+        }
         val what = if (signedOut) "gh is not signed in" else "the GitHub CLI (gh) is not installed"
         val fix = if (signedOut) "Run `gh auth login`" else "Install gh (https://cli.github.com) and run `gh auth login`"
         return Stop(
@@ -1265,8 +1663,8 @@ internal class ProjectInit(
 
     private fun productionRefused() = Stop(
         EXIT_USAGE, "production_refused",
-        "An app project connects to an existing SANDBOX; it never gets a production trust.",
-        "Name a sandbox with --environment <slug> (thoryn env list). Production is configured by the workspace's config project.",
+        "--environment names the SANDBOX an app project connects to, never production.",
+        "Name a sandbox with --environment <slug> (thoryn env list). The app's production trust is created with --config-repo: the workspace's config project owns it.",
     )
 
     // ── Internals ────────────────────────────────────────────────────────────────────────────────
@@ -1293,8 +1691,15 @@ internal class ProjectInit(
         const val STEP_FILES: String = "files"
         /** The seeded `.thoryn/` files: connection.json + the starter provision.yaml per connection (ADR 2026-10-13). */
         const val STEP_PROVISIONING: String = "provisioning"
-        /** SSO-3669 — the app's production client, proposed on the config repository. */
+        /** SSO-4079 — the app's workload identity trusts, declared on the config repository (a pull request). */
         const val STEP_CONFIG_PROJECT: String = "config-project"
+        /** SSO-4079 — `owner` on each app trust for the config project's identity on that plane. */
+        const val STEP_OWNER: String = "owner"
+        const val OWNER_RELATION: String = "owner"
+        /** A repository / owner id in a stand-in trust (pre-flight on a repository not created yet; the by-hand steps). */
+        private const val STAND_IN_ID: Long = 1L
+        private val json: tools.jackson.databind.json.JsonMapper = tools.jackson.databind.json.JsonMapper.builder().build()
+        private val yaml: tools.jackson.dataformat.yaml.YAMLMapper = tools.jackson.dataformat.yaml.YAMLMapper.builder().build()
 
         const val DEFAULT_SANDBOX: String = "sandbox"
         const val STEP_APPROVAL: String = "approval"

@@ -118,8 +118,9 @@ internal object ProjectSeeds {
             |  # The application's OAuth client in sandbox `$sandboxSlug`: the sandbox this repository's workload identity
             |  # ($clientId) is trusted in and manages. A public client with PKCE needs no secret; adjust the redirect
             |  # URIs to where the app runs (the same sandbox slug can also be read from CI as "{{env.THORYN_ENVIRONMENT}}").
-            |  # Its PRODUCTION client is declared HERE too, without `environment:` — created once a workspace admin approves a
-            |  # creation slot for this repository's identity (`thoryn access reserve client:$clientId application:<clientId>`).
+            |  # Its PRODUCTION client is declared in .thoryn/production/provision.yaml (when the template ships it), created by the
+            |  # production apply once a workspace admin approves a creation slot for this repository's PRODUCTION identity
+            |  # (`thoryn access reserve client:<production wi_…> application:${repository.name}-production --environment production`).
             |  - kind: application
             |    name: $name
             |    environment: $sandboxSlug
@@ -332,79 +333,20 @@ internal object ProjectSeeds {
         |
     """.trimMargin()
 
-    // ── SSO-3669 — the app's PRODUCTION client, declared in the CONFIG repository (ADR 2026-10-13 production-clients §1) ──
+    // ── SSO-4079 — the app's CI trusts, declared in the CONFIG repository (oauthy ADR 2026-10-25 decision 3) ──
 
-    /** The config project's production section — where every application's production client is declared. */
+    /** The config project's production section — the production-plane file of a config repository that configures none. */
     const val CONFIG_PRODUCTION_PROVISION_FILE: String = ".thoryn/environments/production/provision.yaml"
 
-    /** The app repository's GitHub environment the id is published to, and the variable its production deploy reads (ADR §2). */
-    const val PRODUCTION_GITHUB_ENVIRONMENT: String = "production"
-    const val PRODUCTION_CLIENT_ID_VARIABLE: String = "THORYN_PRODUCTION_CLIENT_ID"
-
     /**
-     * The paths the application starters' shared `.thoryn/provision.yaml` (thoryn-starters `shared/thoryn/`) registers
-     * for every stack — the sign-in callback and the post-logout landing. `.thoryn/template.json` (v2) does not declare
-     * them, so they are this convention, appended to `--production-url`.
+     * `thoryn/app-<app repository name>` — the deterministic branch the app's trusts are proposed on (a re-run reuses it,
+     * SSO-3436). The same branch SSO-3669 proposed the retired production client on, so an open pull request from an older
+     * CLI is converged, never doubled.
      */
-    const val CALLBACK_PATH: String = "/callback"
-    const val SIGNED_OUT_PATH: String = "/signed-out"
+    fun appTrustsBranch(appRepositoryName: String): String = "thoryn/app-$appRepositoryName"
 
-    /** `thoryn/app-<app repository name>` — the deterministic branch the entry is proposed on (a re-run reuses it, SSO-3436). */
-    fun productionClientBranch(appRepositoryName: String): String = "thoryn/app-$appRepositoryName"
-
-    /** The provisioning `name` (the converge key) of the app's production client: the app repository's name (`owner/name` → `name`). */
-    fun productionClientName(appRepository: String): String = resourceName(appRepository.substringAfter('/'), "app")
-
-    /**
-     * The `application` entry for [appRepository]'s production client, exactly the ADR §1 shape: no `environment` (the
-     * production plane), a PUBLIC client (PKCE proves it; nothing is minted, nothing is delivered), `authorization_code`
-     * with `openid profile email`, the redirect URIs under [productionUrl] ([CALLBACK_PATH] / [SIGNED_OUT_PATH]), and a
-     * `publishTo` target that lands the id in the app repository's `production` GitHub environment as
-     * [PRODUCTION_CLIENT_ID_VARIABLE] on every production apply (§2). Built as a tree, so it is COMPARED structurally
-     * with what the config repository already declares (converged by `name`).
-     */
-    fun productionClientEntry(appRepository: String, productionUrl: String, name: String = productionClientName(appRepository)): JsonNode {
-        val base = productionUrl.trimEnd('/')
-        return json.valueToTree(
-            linkedMapOf(
-                "kind" to "application",
-                "name" to name,
-                "spec" to linkedMapOf(
-                    "displayName" to appRepository,
-                    "clientType" to "public",
-                    "grantTypes" to listOf("authorization_code"),
-                    "scopes" to listOf("openid", "profile", "email"),
-                    "redirectUris" to listOf(base + CALLBACK_PATH),
-                    "postLogoutRedirectUris" to listOf(base + SIGNED_OUT_PATH),
-                ),
-                "publishTo" to listOf(
-                    linkedMapOf(
-                        "kind" to "githubActionsVariable",
-                        "repository" to appRepository,
-                        "environment" to PRODUCTION_GITHUB_ENVIRONMENT,
-                        "name" to PRODUCTION_CLIENT_ID_VARIABLE,
-                    ),
-                ),
-            ),
-        )
-    }
-
-    /** True when [resource] (a `resources[]` item of the config file) is the production client of [appRepository] (`owner/name`). */
-    fun isProductionClientOf(resource: JsonNode, appRepository: String): Boolean =
-        resource.isObject && text(resource, "kind") == "application" && text(resource, "name") == productionClientName(appRepository)
-
-    /** The comment lines written above an APPENDED production-client entry (a human reads the config file; the tree comparison ignores them). */
-    fun productionClientHeader(appRepository: String): String = """
-        |
-        |  # Production OAuth client of the application repository $appRepository (proposed by `thoryn project init app`).
-        |  # DEPRECATED SHAPE (SSO-3962, oauthy ADR 2026-10-25 supersedes ADR 2026-10-13 §1–§2): the app project owns its production
-        |  # client in its own thoryn.io/application/v1 file, created under a creation slot a workspace admin approves
-        |  # (`thoryn access reserve`); `publishTo` is accepted for one more release. Move this entry there and drop it here.
-        |  # Owned by this repository: changing a redirect URI is a reviewed pull request here plus an approved production run.
-        |  # A public client with PKCE — no secret exists anywhere. Its id is published to $appRepository's GitHub
-        |  # environment `$PRODUCTION_GITHUB_ENVIRONMENT` as the Actions variable $PRODUCTION_CLIENT_ID_VARIABLE on every production apply.
-        |
-    """.trimMargin()
+    /** The GitHub environment the application starters' production job runs in (thoryn-starters SSO-4120 `declaration.json`). */
+    const val APP_PRODUCTION_GITHUB_ENVIRONMENT: String = "production"
 
     /** A provisioning `name` (the converge key) from a repository or environment name: lower-case slug, or [fallback]. */
     fun resourceName(raw: String, fallback: String): String {

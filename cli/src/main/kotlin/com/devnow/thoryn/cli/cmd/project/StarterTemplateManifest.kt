@@ -35,7 +35,8 @@ data class StarterTemplateManifest(
         val environmentVariable: String?,
         val provisionFile: String,
         val scopes: List<String>,
-        val grant: Grant,
+        /** Null only for an app project's PRODUCTION connection (SSO-4079, [ProductionDeclaration]): that trust is granted nothing. */
+        val grant: Grant?,
     )
 
     class TemplateException(message: String) : RuntimeException(message)

@@ -1,0 +1,28 @@
+{
+  "description": "SSO-4120 — this application's PRODUCTION connection: who the production apply job (deploy.yml) is, and the two variables it reads in the GitHub environment `production`. It has the shape of a .thoryn/template.json connection and variable, so .thoryn/ci/login.sh and require-vars.sh read it (THORYN_TEMPLATE_FILE). It is kept out of template.json on purpose: template.json is what the creation flow sets up, and the production trust is not the creation flow's to create. The workspace's CONFIG project declares it (oauthy ADR 2026-10-25 decision 3, SSO-4079), pinned to this repository and its GitHub environment `production`. Until that trust exists and its clientId is set here, deploy.yml skips with a notice.",
+  "variables": {
+    "THORYN_PRODUCTION_WIF_CLIENT_ID": {
+      "level": "environment",
+      "environment": "production",
+      "description": "clientId (wi_...) of this repository's PRODUCTION workload identity trust, declared by the workspace's config project and pinned to this repository and its GitHub environment `production`."
+    },
+    "THORYN_PRODUCTION_URL": {
+      "level": "environment",
+      "environment": "production",
+      "description": "The deployed application's https base URL, e.g. https://shop.example.com (no trailing slash). The production client's redirect URIs are <url>/callback and <url>/signed-out."
+    }
+  },
+  "connections": {
+    "production": {
+      "description": "Who the production apply job is: the production trust. It creates this application's production client once, under a creation slot a workspace admin approves (oauthy ADR 2026-10-17), owns it, and converges it on every later run. Exactly the application ceiling of oauthy ADR 2026-10-25: no sandbox tool scope, no tenant scope.",
+      "production": true,
+      "clientIdVariable": "THORYN_PRODUCTION_WIF_CLIENT_ID",
+      "provisionFile": ".thoryn/production/provision.yaml",
+      "scopes": [
+        "tenant:applications.read",
+        "tenant:applications.write",
+        "tenant:access.read"
+      ]
+    }
+  }
+}

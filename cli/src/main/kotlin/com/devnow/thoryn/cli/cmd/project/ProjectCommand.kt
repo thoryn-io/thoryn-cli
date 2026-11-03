@@ -23,7 +23,8 @@ import java.util.concurrent.Callable
  *
  *  - `project init config [--repo owner/name] [--sandbox <slug>] --reviewer <login>… --confirm-production`
  *  - `project init app --stack express|spring-boot|aspnet-core --environment <sandbox> [--repo owner/name]
- *    [--config-repo owner/name --production-url https://…]` (SSO-3669: the production client, as a pull request on the config repository)
+ *    [--config-repo owner/name [--production-url https://…] [--reviewer <login>…]]` (SSO-4079: the production trust, the config
+ *    project made owner of the app's trusts, and a pull request declaring them on the config repository)
  *
  * Without `--repo` it works on the clone in the current directory (or `--dir`): it adds the template's files
  * (never overwriting one unless `--force`) and commits nothing.
@@ -116,7 +117,7 @@ class ProjectCommand : Callable<Int> {
         abstract fun reviewers(): List<String>
         abstract fun confirmProduction(): Boolean
         abstract fun kindArgs(): List<String>
-        /** SSO-3669 — the app project's config repository and production URL; null for a config project. */
+        /** SSO-4079 — the app project's config repository and production URL; null for a config project. */
         open fun configRepo(): String? = null
         open fun productionUrl(): String? = null
 
@@ -267,12 +268,13 @@ class ProjectCommand : Callable<Int> {
         }
     }
 
-    /** `thoryn project init app` — one application's project, connected to one existing sandbox. */
+    /** `thoryn project init app` — one application's project, connected to one existing sandbox (and, with --config-repo, production). */
     @Command(
         name = "app",
         description = [
-            "Set up a repository that connects one application to an existing SANDBOX (never production):",
-            "a secret-less workload identity trust its CI signs in with.",
+            "Set up a repository that connects one application to an existing SANDBOX: a secret-less workload identity trust its CI signs in with.",
+            "With --config-repo (the workspace's config project) and a template that declares a production connection, also its PRODUCTION",
+            "trust; the config project is made owner of both and declares them in a pull request on the config repository.",
         ],
         mixinStandardHelpOptions = true,
     )
@@ -287,12 +289,13 @@ class ProjectCommand : Callable<Int> {
             names = ["--config-repo"],
             paramLabel = "<owner/name>",
             description = [
-                "DEPRECATED (SSO-3962, oauthy ADR 2026-10-25): the app project owns its production client in its own thoryn.io/application/v1 file,",
-                "created under a creation slot a workspace admin approves (`thoryn access reserve`) — declare it there, without `environment:`.",
-                "Until then: the workspace's config repository. After the sandbox steps, a pull request on it (branch thoryn/app-<name>, reused on a re-run)",
-                "declares the app's PRODUCTION client — public with PKCE, its id published to this repository's `production` GitHub environment (`publishTo`,",
-                "accepted for one more release). Works only against a config file still on thoryn.io/provision/v1: a thoryn.io/tenant/v1 file refuses an application.",
-                "Needs --production-url. Never merged, never on the config repository's default branch; it is never created here.",
+                "The workspace's config repository (SSO-4079, oauthy ADR 2026-10-25 decision 3): it declares and owns this app's CI trusts.",
+                "When the template ships .thoryn/production/declaration.json, the run (as you — a passkey sign-in from the last 5 minutes)",
+                "protects this repository's `production` GitHub environment (default branch only), creates the PRODUCTION trust pinned to it",
+                "(application scopes only, no grant) and sets THORYN_PRODUCTION_WIF_CLIENT_ID there. Each app trust's owner becomes the config",
+                "project's identity on that plane (workspace admins only: otherwise `pending`, asked for by the config project's first plan),",
+                "and a pull request on the config repository (branch thoryn/app-<name>, reused on a re-run) declares both trusts.",
+                "Never merged, never on its default branch; the config repository is never created here. Without it: sandbox trust only.",
             ],
         )
         var configRepoArg: String? = null
@@ -300,9 +303,22 @@ class ProjectCommand : Callable<Int> {
         @Option(
             names = ["--production-url"],
             paramLabel = "<https://…>",
-            description = ["DEPRECATED with --config-repo (SSO-3962). Where the app runs in production: the client's redirect URIs are <url>/callback and <url>/signed-out (the starters' paths)."],
+            description = [
+                "With --config-repo: the deployed app's https base URL, set as THORYN_PRODUCTION_URL on the `production` GitHub environment",
+                "(the production client's redirect URIs are <url>/callback and <url>/signed-out). Omit it to set the variable yourself.",
+            ],
         )
         var productionUrlArg: String? = null
+
+        @Option(
+            names = ["--reviewer"],
+            paramLabel = "<github-login>",
+            description = ["With --config-repo: a GitHub user who must approve every production deployment (repeatable, 1-6; when GitHub offers environment reviewers)."],
+        )
+        var reviewerArgs: List<String> = mutableListOf()
+
+        private val reviewerList: List<String>
+            get() = reviewerArgs.flatMap { it.split(',', ' ') }.map { it.trim().removePrefix("@") }.filter { it.isNotEmpty() }
 
         override val kind: ProjectInit.Kind = ProjectInit.Kind.APP
         override val stack: String get() = stackArg.trim()
@@ -311,31 +327,32 @@ class ProjectCommand : Callable<Int> {
             if (stack !in APP_STACKS) return "invalid_stack|--stack must be one of ${APP_STACKS.joinToString(" | ")} (was '$stack')."
             val env = environment.trim()
             if (env == PRODUCTION) {
-                return "production_refused|An app project connects to an existing SANDBOX; it never gets a production trust. " +
-                    "Name a sandbox with --environment <slug> (thoryn env list)."
+                return "production_refused|--environment names the SANDBOX an app project connects to, never production. " +
+                    "Name a sandbox with --environment <slug> (thoryn env list); the production trust comes with --config-repo."
             }
             if (!SLUG.matches(env)) return "invalid_environment|--environment must be a sandbox slug (was '$env')."
-            // SSO-3669 — the production client goes to the config repository; both flags, or neither.
+            // SSO-4079 — the production half needs the config project that owns it.
             val cfg = configRepo()
             val url = productionUrl()
             if (cfg != null && !REPO.matches(cfg)) return "invalid_config_repo|--config-repo must be <owner>/<name> (was '$cfg')."
             if (cfg != null && repo?.trim()?.equals(cfg, ignoreCase = true) == true) {
-                return "invalid_config_repo|--config-repo names the app repository itself; an app repository never declares its production client — the workspace's config repository does."
-            }
-            if (cfg != null && url == null) {
-                return "production_url_required|--config-repo declares the app's production client on the config repository; its redirect URIs need " +
-                    "--production-url https://<where the app runs> (${ProjectSeeds.CALLBACK_PATH} and ${ProjectSeeds.SIGNED_OUT_PATH} are appended)."
+                return "invalid_config_repo|--config-repo names the app repository itself; an app repository never declares its own CI trusts — the workspace's config repository does."
             }
             if (url != null && cfg == null) {
-                return "config_repo_required|--production-url goes with --config-repo <owner>/<name>: the production client is declared on the workspace's " +
-                    "config repository, never in the app repository."
+                return "config_repo_required|--production-url goes with --config-repo <owner>/<name>: THORYN_PRODUCTION_URL is set beside the production trust, " +
+                    "which is created only for the workspace's config project to own."
             }
             if (url != null && !PRODUCTION_URL.matches(url)) return "invalid_production_url|--production-url must be an https URL without query or fragment (was '$url')."
+            val r = reviewerList
+            if (r.isNotEmpty() && cfg == null) return "config_repo_required|--reviewer protects the production environment, which is set up only with --config-repo <owner>/<name>."
+            if (r.size > MAX_REVIEWERS) return "invalid_production_reviewers|At most $MAX_REVIEWERS --reviewer (GitHub's limit for an environment)."
+            r.firstOrNull { !LOGIN.matches(it) }?.let { return "invalid_production_reviewers|'$it' is not a GitHub login." }
+            if (r.map { it.lowercase() }.distinct().size != r.size) return "invalid_production_reviewers|A --reviewer is listed twice."
             return null
         }
 
         override fun sandbox(): String = environment.trim()
-        override fun reviewers(): List<String> = emptyList()
+        override fun reviewers(): List<String> = reviewerList
         override fun confirmProduction(): Boolean = false
         override fun configRepo(): String? = configRepoArg?.trim()?.takeIf { it.isNotEmpty() }
         override fun productionUrl(): String? = productionUrlArg?.trim()?.takeIf { it.isNotEmpty() }
@@ -344,6 +361,7 @@ class ProjectCommand : Callable<Int> {
             add("--environment ${environment.trim()}")
             configRepo()?.let { add("--config-repo $it") }
             productionUrl()?.let { add("--production-url $it") }
+            reviewerList.forEach { add("--reviewer $it") }
         }
     }
 
