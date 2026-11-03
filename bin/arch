@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# bin/arch — run thoryn-architecture's `arch` tools at the commit this repository pins
+# (adrs/.architecture-ref). Architecture memory: oathy ADR 2026-11-02, epic SSO-4101, SSO-4116.
+#
+#   bin/arch brief <paths…>          decisions, invariants, rules and contracts for these paths
+#   bin/arch brief --adr <id>        one decision with its relations
+#   bin/arch rule <id>               a rule's full text (what CLAUDE.md used to hold)
+#   bin/arch card <path>             the short card the first-touch hook injects
+#   bin/arch validate                ADR headers, component map, registries
+#
+# The tools are never answered from a stale clone: a mirror of thoryn-io/thoryn-architecture is
+# kept in ~/.cache/thoryn-architecture and the pinned commit is exported once, read-only.
+# ARCH_ROOT=<path> uses a local checkout instead (for working on the tools themselves).
+set -euo pipefail
+
+root="$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)"
+pin="$(tr -d '[:space:]' < "$root/adrs/.architecture-ref")"
+repo_name="${ARCH_REPO_NAME:-thoryn-cli}"
+
+if [[ -n "${ARCH_ROOT:-}" ]]; then
+  tools="$ARCH_ROOT"
+else
+  cache="${XDG_CACHE_HOME:-$HOME/.cache}/thoryn-architecture"
+  tools="$cache/$pin"
+  if [[ ! -f "$tools/tools/arch/cli.py" ]]; then
+    mkdir -p "$cache"
+    mirror="$cache/mirror.git"
+    url="${ARCH_REMOTE:-$(git -C "$root" remote get-url origin | sed -E 's#[^/:]+$#thoryn-architecture.git#')}"
+    if [[ ! -d "$mirror" ]]; then
+      git clone -q --mirror "$url" "$mirror" || { echo "bin/arch: cannot clone $url (no access to thoryn-architecture?)" >&2; exit 3; }
+    fi
+    if ! git -C "$mirror" cat-file -e "$pin^{commit}" 2>/dev/null; then
+      git -C "$mirror" fetch -q --prune origin || { echo "bin/arch: cannot fetch $url" >&2; exit 3; }
+    fi
+    git -C "$mirror" cat-file -e "$pin^{commit}" 2>/dev/null \
+      || { echo "bin/arch: pinned commit $pin is not in thoryn-architecture" >&2; exit 3; }
+    tmp="$(mktemp -d "$cache/.export.XXXXXX")"
+    git -C "$mirror" archive "$pin" | tar -x -C "$tmp"
+    echo "$pin" > "$tmp/.arch-commit"   # an export has no .git; the tools read their commit from here
+    mv "$tmp" "$tools" 2>/dev/null || rm -rf "$tmp"   # another process won the race: use its copy
+  fi
+  [[ -f "$tools/.arch-commit" ]] || echo "$pin" > "$tools/.arch-commit"   # exports made before the marker existed
+fi
+
+# validate, brief and card read this repository unless --repo is given.
+if [[ $# -gt 0 && "$1" =~ ^(validate|brief|card)$ ]] && [[ " $* " != *" --repo "* ]]; then
+  cmd="$1"; shift
+  set -- "$cmd" --repo "$repo_name=$root" "$@"
+fi
+exec python3 "$tools/tools/arch/cli.py" "$@"
