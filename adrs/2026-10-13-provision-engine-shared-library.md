@@ -1,3 +1,26 @@
+---
+id: 2026-10-13-provision-engine-shared-library
+kind: decision
+level: component
+status: accepted
+decided: '2026-10-13'
+deciders: [product-owner]
+jira: [SSO-3662]
+components: [cli-engine, cli]
+concerns: [provisioning-as-code]
+repos: [thoryn-cli, oathy, thoryn-provisioning]
+governs: ["engine/**"]
+relations:
+  depends_on: [oathy:2026-10-13-provisioning-as-code-converge-github-app-and-fga-ownership]
+constraints:
+- id: C1
+  rule: The provisioning engine is the engine/ library module of thoryn-cli and ships inside the CLI.
+- id: C2
+  rule: It is published as a separate library only when an in-process consumer exists.
+review:
+  classified: model
+  last_verified_commit: 6f3c868c4
+---
 # The provisioning engine is a library module of thoryn-cli; it ships inside the CLI and is published only when an in-process consumer exists
 
 Jira: SSO-3662 (epic SSO-3087) · engine changes it lifts: SSO-3659 (thoryn-cli#104) · the consumer that
