@@ -32,6 +32,10 @@ internal class FakeProjectApi : Dispatcher() {
     val notGrantable = mutableSetOf<String>()
     /** The platform before workspace grants exist: a `workspace:` grant is the opaque 404. */
     var workspaceGrantUnavailable = false
+    /** SSO-4079 — the caller is not a workspace admin: an `owner` grant is product-api's opaque 404 (AccessGrantService). */
+    var ownerRefused = false
+    /** SSO-4079 — a production trust needs a passkey sign-in from the last 5 minutes: the RFC 9470 challenge (403 + WWW-Authenticate). */
+    var productionTrustStepUp = false
     private var nextTrust = 1
 
     fun seedSandbox(slug: String, id: String = "env-$slug"): String {
@@ -77,6 +81,11 @@ internal class FakeProjectApi : Dispatcher() {
             route == "/api/v1/access/grants" && method == "POST" -> {
                 val objectRef = body["object"] as String
                 if (objectRef.startsWith("workspace:") && workspaceGrantUnavailable) return problem(404, "not_found")
+                if (body["relation"] == "owner") {
+                    if (ownerRefused) return problem(404, "not_found")
+                    val current = grants.firstOrNull { it["object"] == objectRef && it["relation"] == "owner" }
+                    if (current != null && current["subject"] != body["subject"]) return problem(409, "owner_already_set")
+                }
                 val grant = linkedMapOf("subject" to body["subject"], "relation" to body["relation"], "object" to objectRef)
                 if (grant in grants) {
                     ok(grant + ("createdAt" to "2026-09-30T10:00:00Z"))
@@ -113,6 +122,12 @@ internal class FakeProjectApi : Dispatcher() {
         }
         if (trustsIn(env).any { it["name"] == body["name"] }) return problem(409, "workload_identity_trust_name_taken")
         if (env == "production" && body["confirmProduction"] != true) return problem(400, "production_confirmation_required")
+        if (env == "production" && productionTrustStepUp) {
+            return MockResponse().setResponseCode(403).setHeader("Content-Type", "application/problem+json")
+                .setHeader("WWW-Authenticate", "Bearer error=\"insufficient_user_authentication\", acr_values=\"urn:thoryn:acr:phishing_resistant\", max_age=\"300\"")
+                .setBody(json.writeValueAsString(mapOf("type" to "about:blank", "status" to 403, "errorCode" to "insufficient_user_authentication",
+                    "detail" to "Creating a production workload identity trust needs a passkey sign-in from the last 5 minutes. Sign in again and retry.")))
+        }
         val n = nextTrust++
         val trust = linkedMapOf<String, Any?>(
             "id" to "trust-$n", "environment" to env, "name" to body["name"], "provider" to "github_actions",

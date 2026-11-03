@@ -27,6 +27,7 @@ class ProjectInitAppTest : ProjectTestBase() {
             "gh --version",
             "gh auth status",
             "gh api repos/thoryn-io/starter-express/contents/.thoryn/template.json",
+            "gh api repos/thoryn-io/starter-express/contents/.thoryn/production/declaration.json", // SSO-4079: absent here (404)
             "gh api repos/acme/web",
             "gh api users/acme",
             "gh api --method POST repos/thoryn-io/starter-express/generate -f owner=acme -f name=web -F private=true -f description=Thoryn application project",
@@ -149,7 +150,7 @@ class ProjectInitAppTest : ProjectTestBase() {
         val (exit, _, err) = runCli("project", "init", "app", "--stack", "express", "--environment", "production", "--repo", "acme/web")
 
         assertThat(exit).isEqualTo(ProjectInit.EXIT_USAGE)
-        assertThat(err).contains("never gets a production trust")
+        assertThat(err).contains("names the SANDBOX an app project connects to, never production")
         assertThat(gh.calls).isEmpty()
         assertThat(api.requests).isEmpty()
     }

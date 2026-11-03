@@ -477,7 +477,9 @@ thoryn workload-identity trusts delete <id> [--yes] [--confirm <slug>] # DELETE 
 # (config) or connects one application (app), with your OWN gh CLI and no GitHub App. See "Project repositories".
 thoryn project init config [--repo owner/name] [--sandbox <slug>] --reviewer <login>… --confirm-production
 thoryn project init app --stack express|spring-boot|aspnet-core --environment <sandbox> [--repo owner/name]
-                        [--config-repo owner/name --production-url https://…]   # + the production client, as a PR on the config repo
+                        [--config-repo owner/name [--production-url https://…] [--reviewer <login>…]]
+    # --config-repo (SSO-4079): + the production trust (passkey step-up), the config project made owner of the app's
+    # trusts, and a PR on the config repo declaring them; the creation slot the production apply needs is printed
     # without --repo: works on the clone in the current directory (or --dir); [--force] [--public] [--template owner/repo]
 
 # Operator plane (SSO-3356) — Thoryn staff / self-managed platform operators only. Passkey sign-in on the
@@ -1263,71 +1265,86 @@ the environment.
 thoryn project init app --stack express --environment dev --repo acme/web
 # stacks: express | spring-boot | aspnet-core
 
-# … and its PRODUCTION client, proposed on the workspace's config repository (SSO-3669):
+# … with the workspace's config project owning its CI identities, and its PRODUCTION trust (SSO-4079):
 thoryn project init app --stack express --environment dev --repo acme/web \
-  --config-repo acme/thoryn-config --production-url https://web.acme.example
+  --config-repo acme/thoryn-config --production-url https://web.acme.example --reviewer alice
 ```
 
-#### The app's production client — `--config-repo` + `--production-url` (SSO-3669) — DEPRECATED
+#### The app's CI trusts belong to the config project — `--config-repo` (SSO-4079)
 
-> **Superseded (SSO-3962, oauthy ADR 2026-10-25 decision 1).** The app project owns its production client in its own
-> `thoryn.io/application/v1` file — a second `kind: application` without `environment:` — created by its reviewed apply
-> once a workspace admin approves a **creation slot** for the repository's identity (`thoryn access reserve
-> client:<wi_…> application:<clientId>`, or the consent screen via `thoryn access approve`). The deploy reads the id
-> from `thoryn provision apply --output json` / `thoryn clients list`. The two flags below still work for one release,
-> against a config file still on `thoryn.io/provision/v1` (a `thoryn.io/tenant/v1` file refuses an `application`, exit 4
-> `config_provision_file_unusable`); `publishTo` prints a `Warning:`. See "Two file parts" below.
+An application project owns its OAuth **clients** — its sandbox client in `.thoryn/provision.yaml`, its production
+client in the template's `.thoryn/production/provision.yaml` — but never its own **authority**: the workload identity
+trusts its CI signs in with are declared and owned by the workspace's **config project** (oauthy ADR
+`2026-10-25-provisioning-is-tenant-and-applications`, decision 3). With `--config-repo <owner>/<name>`:
 
-An app repository is **sandbox-only**: it never gets a production trust, and its `.thoryn/provision.yaml` declares
-only its sandbox client. Its **production** OAuth client is declared in the workspace's **config repository**, in
-`.thoryn/environments/production/provision.yaml`, where every production change is a reviewed pull request plus an
-approved production run (oauthy ADR `2026-10-13-production-clients-declared-in-the-config-project`, §1). With
-`--config-repo <owner>/<name>` and `--production-url <https://…>`, `thoryn project init app` proposes that entry for
-you **after** its sandbox steps succeeded, with your own `gh`:
+1. **The production trust (when the template declares one).** An application template that ships
+   `.thoryn/production/declaration.json` (thoryn-starters SSO-4120; read from the template's default branch next to
+   `template.json`) declares its production connection there: `production`, client id variable
+   `THORYN_PRODUCTION_WIF_CLIENT_ID`, scopes **exactly** `tenant:applications.read tenant:applications.write
+   tenant:access.read`, **no grant**, and the variables `THORYN_PRODUCTION_WIF_CLIENT_ID` + `THORYN_PRODUCTION_URL` on the
+   GitHub environment `production`. Anything else in that file is `starter_template_invalid` (exit 4, nothing changed);
+   `template.json` itself keeps exactly one (sandbox) connection, so released CLIs keep accepting the templates. Then,
+   **before any Thoryn write**, the run protects this repository's GitHub environment `production` (deployments from the
+   default branch only; each `--reviewer` as a required reviewer when GitHub offers environment reviewers), and creates
+   the production trust **as you**: pinned to the repository and owner ids, the GitHub environment `production` and
+   `refs/heads/<default branch>`, `confirmProduction`, the three scopes, no plan profile, no grant. Creating a production
+   trust is a person's **elevated** act: a machine session (`thoryn login --client-credentials` / a workload identity) is
+   refused up front (`person_required`), and a sign-in older than 5 minutes gets product-api's step-up — the run stops with
+   `insufficient_user_authentication` and the sign-in that satisfies it
+   (`thoryn login --acr-values urn:thoryn:acr:phishing_resistant --max-age 300`), having written nothing in Thoryn (the
+   production trust is the first Thoryn write). Its `wi_` client is set as `THORYN_PRODUCTION_WIF_CLIENT_ID` on the
+   `production` environment, and `--production-url` (https) as `THORYN_PRODUCTION_URL` — leave it out to set that variable
+   yourself.
+2. **Ownership.** `owner` on each app trust goes to the config project's identity **on that plane**: the config
+   repository's trust in the app's sandbox (none there ⇒ its production trust), and its production trust for the
+   production one — each found in the trusts list by its pinned repository (zero or several matches ⇒ skipped, with a
+   note). Only a workspace admin may set an owner: for anyone else product-api refuses (`404`), and the run **goes on** —
+   the report says `owner: pending`, and the config project's first plan asks a workspace admin for it (the consent fix,
+   `thoryn access approve`), or the admin runs the printed `thoryn access grant client:<wi_…> owner trust:<id>`.
+3. **The declaration — one pull request on the config repository**, from the deterministic branch
+   `thoryn/app-<app repository name>` (reused on a re-run, never a second one; never merged, never its default branch).
+   It adds one `kind: workloadIdentityTrust` per app trust, rendered exactly as `thoryn provision import` renders a live
+   trust (the live name, the GitHub pins as live, `plan` if any, the scopes, `confirmProduction: true` on production):
 
-- **One pull request, from the deterministic branch `thoryn/app-<app repository name>`.** A re-run updates the same
-  branch and the same pull request; it never opens a second one. The config repository's default branch is never
-  written, and the command never merges.
-- **The entry**, converged by `name` (the app repository's name): added when absent — every other line of the file,
-  comments included, is kept as it is — replaced when it differs (the file is then re-rendered from its parsed tree,
-  so its comments are not kept; the output says so), and **nothing is proposed** when the default branch already
-  declares it exactly:
+   ```yaml
+     - kind: workloadIdentityTrust          # in the production section: no `environment:`
+       name: starter-production-1044556600  # the live trust's name — the converge key
+       spec:
+         provider: github_actions
+         github: {repository: acme/web, ownerId: 900, repositoryId: 1044556600, environment: production, ref: refs/heads/main}
+         scopes: [tenant:applications.read, tenant:applications.write, tenant:access.read]
+         confirmProduction: true
+   ```
 
-  ```yaml
-    - kind: application          # no `environment`: the production plane
-      name: web                  # = the app repository's name
-      spec:
-        displayName: acme/web
-        clientType: public       # PKCE proves the client; no secret exists anywhere
-        grantTypes: [authorization_code]
-        scopes: [openid, profile, email]
-        redirectUris: ["https://web.acme.example/callback"]
-        postLogoutRedirectUris: ["https://web.acme.example/signed-out"]
-      publishTo:
-        - kind: githubActionsVariable
-          repository: acme/web   # the app repository
-          environment: production
-          name: THORYN_PRODUCTION_CLIENT_ID
-  ```
+   The production trust goes to the config repository's production-plane section; the sandbox trust to the section whose
+   connection signs in to that sandbox (per `.thoryn/workflow.yaml` and each section's `connection.json` — the plane
+   routing `import` uses), with `environment:` naming it; when no section is that sandbox's, to the production section
+   with `environment: <sandbox>` (the engine routes an object of a sandbox no connection covers to the production
+   connection's file). Entries converge by name: added when absent (every other line, comments included, kept), replaced
+   when they differ (the file is then re-rendered: its comments are lost on the branch, and the output says so), nothing
+   proposed when the default branch already declares them as they are live.
+4. **The creation slot.** The production apply (the starters' `deploy.yml`) creates the client
+   `<repository name>-production` only under a creation slot a workspace admin approves. Every run names it: with the
+   production trust, `thoryn access reserve client:<production wi_> application:<repo>-production --environment
+   production`; without it, that the slot is reserved for the repository's production identity once the config project
+   declares it.
 
-  The redirect URIs are `--production-url` plus `/callback` and `/signed-out`: the paths every application
-  starter registers in its shared `.thoryn/provision.yaml` (the template's `template.json` does not declare them).
-  Edit them in the pull request if your deployment differs.
-- **`publishTo`** (SSO-3668): on every approved production apply, the config project publishes the client's id to the
-  app repository's `production` GitHub environment as the Actions **variable** `THORYN_PRODUCTION_CLIENT_ID`
-  (a variable, never a secret — a client id is public). The app's production deploy job reads
-  `${{ vars.THORYN_PRODUCTION_CLIENT_ID }}`; nothing production-related is written into the app repository.
-- **The pull request body says what the reviewer approves**: a production public client, its redirect URIs, and
-  where its id is published.
-- **Pre-flight, before any write:** the config repository must be visible to your `gh` sign-in and its production
-  file must take the entry. A config repository `gh` cannot see stops the run (exit 4, `config_repository_not_found`)
-  with the by-hand steps — it is **never created** by this command (`thoryn project init config` does that). When
-  `gh` is missing or signed out, the by-hand steps include this pull request.
+**Without `--config-repo`** (product-owner decision D3) nothing owns the repository's CI identity, so no production trust
+is created: the sandbox trust is set up as before, and the output says so and how to add the config project
+(`--config-repo`, or `thoryn project init config` first). A template without `declaration.json` gets no production trust
+either way. **Pre-flight, before any write:** the config repository must be visible to your `gh` sign-in and its section
+files must take the entries; one `gh` cannot see stops the run (exit 4, `config_repository_not_found`) with the by-hand
+steps — it is **never created** by this command.
 
-The report carries it as `configProject` (`repository`, `file`, `branch`, `pullRequest`, `outcome`
-`added | updated | declared`, `application`), and as the step `config-project` (`pending review`, `open` on a re-run
-with nothing new, `declared` when the config repository already has it). Without the two flags the run is unchanged
-and the last next-step says how to add the production client.
+The report (`--json`): `productionEnvironment` (`githubEnvironment`, `deploymentBranch`, `reviewers`, `reviewersActive`),
+`connections[]` (now with the `production` connection), `owners[]` (`trust`, `trustId`, `environment`, `subject`,
+`object`, `status` `granted | existing | pending | conflict | refused | skipped`, `note`), `configProject`
+(`repository`, `branch`, `pullRequest`, `outcome` `added | updated | declared`, `changed`, `files[]`, `trusts[]` —
+`name`, `environment`, `file`, `outcome`), `productionConnection` (`declared`, `trust`, `clientId`, `githubEnvironment`,
+`reason`, `productionUrl`) and `creationSlot` (`object`, `environment`, `subject`, `command`, `status`
+`awaiting_admin | awaiting_production_trust`); steps `protection`, `owner` and `config-project`. **Removed** (SSO-4079):
+`configProject.application` and `configProject.file` — the retired production-client proposal (`kind: application` +
+`publishTo`, SSO-3669) is no longer made.
 
 #### In an existing clone
 
@@ -1394,9 +1411,10 @@ Where they go depends on how the command ran:
 | `--reviewer <login>` | config | A GitHub user who approves every production run. Repeatable, 1–6, required. |
 | `--confirm-production` | config | Required. The project gets a production workload identity that manages the workspace. |
 | `--stack <stack>` | app | `express`, `spring-boot` or `aspnet-core`. |
-| `--environment <sandbox>` | app | The existing sandbox the application connects to. `production` is refused. |
-| `--config-repo <owner/name>` | app | The workspace's config repository. The app's production client is proposed on it as a pull request (branch `thoryn/app-<name>`, reused on a re-run). Requires `--production-url`. Never created here, never merged, never its default branch. |
-| `--production-url <https://…>` | app | Where the app runs in production; the client's redirect URIs are `<url>/callback` and `<url>/signed-out`. https only, no query or fragment. With `--config-repo`. |
+| `--environment <sandbox>` | app | The existing sandbox the application connects to. `production` is refused (the production trust comes with `--config-repo`). |
+| `--config-repo <owner/name>` | app | The workspace's config repository (SSO-4079): it declares and owns the app's CI trusts (a pull request from `thoryn/app-<name>`, reused on a re-run) and becomes their `owner`; with the template's `declaration.json`, the run also creates the production trust. Never created here, never merged, never its default branch. |
+| `--production-url <https://…>` | app | With `--config-repo`: set as `THORYN_PRODUCTION_URL` on the `production` GitHub environment (the production client's redirect URIs are `<url>/callback` and `<url>/signed-out`). https only, no query or fragment. |
+| `--reviewer <login>` | app | With `--config-repo`: a required reviewer on the `production` GitHub environment, when GitHub offers environment reviewers. Repeatable, 1–6, optional. |
 | `--output json\|yaml\|table`, `--json` | both | The report (steps, trusts, grants, variables, files, the seeded provisioning files, next steps) as JSON/YAML. |
 
 Exit codes: `0` done · `1` not signed in to Thoryn · `2` product-api refused a call · `3` a `gh` step
@@ -1407,6 +1425,7 @@ failed · `4` a pre-flight check refused (nothing was changed) · `64` invalid f
 ```text
 gh --version ; gh auth status                                     # installed, signed in (output never shown)
 gh api repos/<template>/contents/.thoryn/template.json             # the template's declaration (must be v2)
+gh api repos/<template>/contents/.thoryn/production/declaration.json   # (app) its production connection; 404 ⇒ none
 gh api repos/<owner>/<name> ; gh api users/<login>                 # the repository's ids; the owner / each reviewer
 gh repo view --json nameWithOwner ; gh api repos/<template>/tarball # (clone only) the repository; the template's files
 gh api --method POST repos/<template>/generate -f owner=… -f name=… -F private=… -f description=…
@@ -1422,15 +1441,16 @@ gh variable list --repo <o>/<r> [--env thoryn-production] --json name,value     
 gh variable set <NAME> --body <value> --repo <o>/<r> [--env thoryn-production]   # only a variable that differs
 gh api repos/<o>/<r>/contents/.thoryn/… ; gh api --method PUT repos/<o>/<r>/contents/.thoryn/… --input -   # (app, new repo) the seeded files
 gh api repos/<o>/<r>/git/ref/heads/thoryn/provisioning ; gh api --method POST repos/<o>/<r>/git/refs … ; gh api [--method POST] repos/<o>/<r>/pulls …   # (config, new repo) the seeded files' pull request
-gh api repos/<cfg> ; gh api repos/<cfg>/contents/.thoryn/environments/production/provision.yaml   # (app, --config-repo) pre-flight: the config repository and its production file
-gh api repos/<cfg>/git/ref/heads/thoryn/app-<name> ; gh api --method POST repos/<cfg>/git/refs … ; gh api repos/<cfg>/contents/…?ref=thoryn/app-<name> ; gh api --method PUT repos/<cfg>/contents/… --input - ; gh api [--method POST] repos/<cfg>/pulls …   # (app, --config-repo) the production client's pull request — only what differs is written
+gh api repos/<o>/<r>/environments/production ; gh api --method PUT … ; gh api [--method POST|DELETE] …/deployment-branch-policies   # (app, --config-repo + declaration) protect `production`, read first
+gh api repos/<cfg> ; gh api repos/<cfg>/contents/.thoryn/workflow.yaml ; gh api repos/<cfg>/contents/<section>/connection.json ; gh api repos/<cfg>/contents/<section>/provision.yaml   # (app, --config-repo) pre-flight: the config repository and its sections
+gh api repos/<cfg>/git/ref/heads/thoryn/app-<name> ; gh api --method POST repos/<cfg>/git/refs … ; gh api repos/<cfg>/contents/…?ref=thoryn/app-<name> ; gh api --method PUT repos/<cfg>/contents/… --input - ; gh api [--method POST] repos/<cfg>/pulls …   # (app, --config-repo) the trusts' pull request — only what differs is written
 ```
 
 On Thoryn it uses your own session and the public customer-plane API: `GET /api/v1/environments`,
 `GET /api/v1/access/mine`, `POST /api/v1/environments` (config, only when the sandbox is missing),
 `GET`/`POST /api/v1/workload-identity/trusts`, `POST /api/v1/workload-identity/trusts/<id>/plan-profile`
 (config, only for an adopted production trust without a plan profile), and `GET`/`POST /api/v1/access/grants`
-(a grant is read first and posted only when missing).
+(a grant is read first and posted only when missing — for an app with `--config-repo`, also `owner` on `trust:<id>`).
 
 #### Nothing half-done, and safe to re-run
 
@@ -1454,8 +1474,9 @@ the same command again:
   only one that differs is set.
 - Identical files are skipped; an existing `provision.yaml` is kept; this repository's own
   `connection.json` is rewritten only when it differs.
-- The production client's pull request on the config repository (`--config-repo`) is reused: the branch
-  `thoryn/app-<name>` is read first, its file committed only when it differs, the open pull request named again.
+- The trusts' pull request on the config repository (`--config-repo`) is reused: the branch `thoryn/app-<name>` is read
+  first, a file committed only when it differs, the open pull request named again. An open pull request an older CLI
+  made there (the retired production client) is converged onto the trusts.
 
 **A second run makes no write** — not to product-api, not to GitHub, not to the working tree. Every
 step reads before it writes, and the report says `Checked the … project` instead of `Set up …`; in JSON,
@@ -1481,10 +1502,15 @@ step reads before it writes, and the report says `Checked the … project` inste
 | `the protection step failed — gh: …` (exit 3) | GitHub refused the environment for another reason. Most often you lack admin rights on the repository. The message is GitHub's own. |
 | `cannot yet grant a machine client workspace-wide management` (exit 2, config) | The platform does not yet support `manager` on `workspace:<id>` for a client. Everything before it is kept and no variable is set. Re-run once it does. |
 | `Trust 'starter-…' … exists but pins another …` (exit 4) | A trust with the deterministic name exists with other pins or scopes. Delete it (`thoryn workload-identity trusts delete <id> --environment <env>`) and re-run. |
-| `GitHub does not show the config repository … to your gh sign-in` (app, exit 4, `config_repository_not_found`) | `--config-repo` names a repository that does not exist or that your `gh` login cannot see. Nothing was changed on either side. The command never creates the config repository: create it with `thoryn project init config --repo <owner>/<name> …`, or ask for access, and re-run. The output lists the by-hand steps (clone, branch `thoryn/app-<name>`, the entry to append, `gh pr create`). |
-| `The production client cannot be added to <cfg>:.thoryn/environments/production/provision.yaml: …` (app, exit 4, `config_provision_file_unusable`) | The config repository's production file is not valid YAML, its `resources:` list is not the last top-level key, or the result would not validate. Nothing was changed. Fix the file on its default branch (or add the entry by hand — the output shows it) and re-run. |
-| `Production client pending review: <url>` (app, success) | The entry went to the config repository as a pull request from `thoryn/app-<name>`. A reviewer of the config project merges it; the approved production run creates the client and publishes its id to this repository's `production` GitHub environment as `THORYN_PRODUCTION_CLIENT_ID`. If that publish cannot reach this repository, the output names the one `gh variable set` to run with the id from the production run's `apply --output json`. |
-| `… the file was re-rendered and its comments are not kept` (app, success) | The config repository already declared this client with other values (another `--production-url`, say). Replacing an entry re-renders the file from its parsed tree, so its comments are lost on the branch; review the diff in the pull request. Adding an entry keeps every existing line. |
+| `GitHub does not show the config repository … to your gh sign-in` (app, exit 4, `config_repository_not_found`) | `--config-repo` names a repository that does not exist or that your `gh` login cannot see. Nothing was changed on either side. The command never creates the config repository: create it with `thoryn project init config --repo <owner>/<name> …`, or ask for access, and re-run. The output lists the by-hand steps (clone, branch `thoryn/app-<name>`, the trust entries to append, `gh pr create`, the owner grants). |
+| `The app's workload identity trusts cannot be declared in <cfg>: …` (app, exit 4, `config_provision_file_unusable`) | A section file of the config repository is not valid YAML, its `resources:` list is not the last top-level key, or the result would not validate (an application file, say). Nothing was changed. Fix the file on its default branch (or add the entries by hand — the output shows them) and re-run. |
+| `The template … breaks the production-connection contract: .thoryn/production/declaration.json: …` (app, exit 4, `starter_template_invalid`) | The template's production declaration asks for other scopes than the application ceiling, declares a grant, or is malformed. Nothing was changed. Fix the template (or use one that is published correctly). |
+| `Creating the app's PRODUCTION workload identity trust is a person's elevated act` (app, exit 4, `person_required`) | A machine session cannot create a production trust. Sign in as yourself and re-run. Nothing was changed. |
+| `Creating the app's PRODUCTION workload identity trust needs a passkey sign-in from the last 5 minutes.` (app, exit 2, `insufficient_user_authentication`) | Product-api's RFC 9470 step-up. Run `thoryn login --acr-values urn:thoryn:acr:phishing_resistant --max-age 300`, then the same command again. The production environment's protection is kept; nothing was written in Thoryn. |
+| `owner … pending` (app, success) | Only a workspace admin sets an owner. The config project's first plan asks for it (the consent fix, `thoryn access approve`), or a workspace admin runs the printed `thoryn access grant client:<wi_…> owner trust:<id>`. |
+| `CI trusts pending review: <url>` (app, success) | The trust entries went to the config repository as a pull request from `thoryn/app-<name>`. A reviewer of the config project merges it; from then on the config project declares (and converges) the app's trusts. They exist already, so the entries adopt them by name. |
+| `… its file was re-rendered and its comments are not kept` (app, success) | The config repository already declared one of these trusts with other values. Replacing an entry re-renders the file from its parsed tree, so its comments are lost on the branch; review the diff in the pull request. Adding an entry keeps every existing line. |
+| `No config project owns this repository's CI identity, so no PRODUCTION trust was created.` (app, success) | Product-owner decision D3: a production trust nothing owns is not created. Re-run with `--config-repo <owner>/<name>` (create the config project first with `thoryn project init config` if there is none). |
 
 ### Two file parts — tenant and application (SSO-3962, epic SSO-3960)
 
@@ -1605,9 +1631,9 @@ kinds are imported), or else the part of its entries (both parts ⇒ the mixed f
 **`publishTo:` is deprecated** (SSO-3668, ADR 2026-10-13 §2 — superseded by ADR 2026-10-25 decision 1): the app
 project owns its production client in every environment, created under a creation slot, and its deploy reads the client
 id from its own apply (`thoryn provision apply --output json`, `thoryn clients list`), not from a variable another
-repository publishes. A file carrying it still publishes today and prints a `Warning:`; a later release refuses it. The
-same goes for `thoryn project init app --config-repo` / `--production-url`, which propose the superseded shape (and only
-work against a config file still on `thoryn.io/provision/v1` — a tenant file refuses an `application`).
+repository publishes. A file carrying it still publishes today and prints a `Warning:`; a later release refuses it.
+`thoryn project init app --config-repo` no longer proposes that shape (SSO-4079): it proposes the app's workload identity
+trusts instead, which a tenant file declares.
 
 ### Least-privilege access grants (SSO-3113, epic SSO-3108)
 

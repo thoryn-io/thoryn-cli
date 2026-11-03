@@ -30,11 +30,12 @@ data class GhRepository(
  * | a repository's ids | `gh api repos/<owner>/<repo>` |
  * | a user's / owner's id | `gh api users/<login>` |
  * | the template declaration | `gh api repos/<template>/contents/.thoryn/template.json` |
+ * | (app) the template's production connection | `gh api repos/<template>/contents/.thoryn/production/declaration.json` (404 ⇒ none) |
  * | the template's files | `gh api repos/<template>/tarball` |
  * | create the repository | `gh api --method POST repos/<template>/generate -f owner=… -f name=… -F private=… -f description=…` |
  * | (config) CODEOWNERS | `gh api repos/<o>/<r>/contents/.github/CODEOWNERS`, `gh api --method PUT … --input -` (with `--repo`); `gh api repos/<o>/<r>/branches/<default>` while a new repository is generated |
  * | (config) approval ruleset | `gh api repos/<o>/<r>/rulesets`, `gh api --method POST repos/<o>/<r>/rulesets --input -`, `gh api --method PUT repos/<o>/<r>/rulesets/<id> --input -`, `gh api repos/<o>/<r>/rulesets/<id>` |
- * | protect the production environment | `gh api repos/<o>/<r>/environments/<env>` (read first), then `gh api --method PUT repos/<o>/<r>/environments/<env> --input -` only when not in shape (again without reviewers on a billing-plan 422) |
+ * | protect the production environment (config; app with `--config-repo`) | `gh api repos/<o>/<r>/environments/<env>` (read first), then `gh api --method PUT repos/<o>/<r>/environments/<env> --input -` only when not in shape (again without reviewers on a billing-plan 422) |
  * | its branch policies | `gh api repos/<o>/<r>/environments/<env>/deployment-branch-policies`, `… --method POST … -f name=<branch> -f type=branch`, `… --method DELETE …/<id>` |
  * | verify the protection | `gh api repos/<o>/<r>/environments/<env>` |
  * | the variables (read first) | `gh variable list --repo <o>/<r> [--env <env>] --json name,value` |
@@ -104,8 +105,17 @@ class GitHubCli(
      * The template's `.thoryn/template.json` from its default branch, or null when the template repository or
      * the file does not exist (an empty, not yet published template repository answers 404 too).
      */
-    fun templateDeclaration(template: String, step: String): String? {
-        val r = gh.run(listOf("api", "repos/$template/contents/${StarterTemplateManifest.PATH}"))
+    fun templateDeclaration(template: String, step: String): String? = templateFile(template, StarterTemplateManifest.PATH, step)
+
+    /**
+     * SSO-4079 — an application template's `.thoryn/production/declaration.json` ([ProductionDeclaration]) from its default
+     * branch, beside template.json; null when the template has none (a template published before thoryn-starters SSO-4120).
+     */
+    fun productionDeclaration(template: String, step: String): String? = templateFile(template, ProductionDeclaration.PATH, step)
+
+    /** [path] of the template repository's default branch, or null when the repository or the file does not exist. */
+    private fun templateFile(template: String, path: String, step: String): String? {
+        val r = gh.run(listOf("api", "repos/$template/contents/$path"))
         if (!r.ok) {
             if (r.httpStatus() == 404) return null
             throw GhCommandException(step, r)
