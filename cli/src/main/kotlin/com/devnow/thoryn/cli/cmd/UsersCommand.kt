@@ -184,10 +184,13 @@ class UsersCommand : Callable<Int> {
                 CommandSupport.gatewayClient(gateway, tokens)
             }
 
-        internal val LIST_HEADERS: List<String> = listOf("id", "email", "status", "emailVerified", "createdAt")
+        // SSO-4284 — `subject` is the `sub` of the user's tokens (empty until their first sign-in); a role assignment
+        // and anything else keyed on the token `sub` addresses the user by it, not by the directory `id`.
+        internal val LIST_HEADERS: List<String> = listOf("id", "subject", "email", "status", "emailVerified", "createdAt")
 
         internal fun row(node: JsonNode): List<Any?> = listOf(
             node["id"]?.asString(),
+            node["subject"]?.takeUnless { it.isNull }?.asString(),
             node["email"]?.asString(),
             node["status"]?.asString(),
             node["emailVerified"]?.asBoolean() ?: false,
@@ -218,6 +221,19 @@ class UsersCommand : Callable<Int> {
                 err.println("Error: provide a user id, or --email <email> to address the user by email.")
                 return null
             }
+            return lookupByEmail(client, trimmedEmail, gateway, err)?.let { row ->
+                row["id"]?.asString()?.takeIf { it.isNotBlank() }.also {
+                    if (it == null) err.println("Error: the directory row for '$trimmedEmail' carried no id.")
+                }
+            }
+        }
+
+        /**
+         * The one directory row whose email is [email], found with a `tenant:users.read` lookup in the selected
+         * environment. Zero matches or more than one both fail (never guess): null, with guidance on [err].
+         */
+        internal fun lookupByEmail(client: ProductApiClient, email: String, gateway: String, err: PrintStream = System.err): JsonNode? {
+            val trimmedEmail = email.trim()
             val matches = try {
                 // The customer-plane collection envelope is `{ "data": [...], "pagination": {...} }`
                 // (product-api ListEnvelope); fall back to `items` for any older/other surface.
@@ -232,9 +248,7 @@ class UsersCommand : Callable<Int> {
                 return null
             }
             return when (matches.size) {
-                1 -> matches[0]["id"]?.asString()?.takeIf { it.isNotBlank() }.also {
-                    if (it == null) err.println("Error: the directory row for '$trimmedEmail' carried no id.")
-                }
+                1 -> matches[0]
                 0 -> {
                     err.println("Error: no user with email '$trimmedEmail' in the selected environment.")
                     null

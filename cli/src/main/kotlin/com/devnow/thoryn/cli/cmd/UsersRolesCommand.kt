@@ -18,7 +18,9 @@ import java.util.concurrent.Callable
  * A role is defined per ENVIRONMENT (declare it with `kind: role` in a provisioning file); these commands assign one to a
  * person in the selected environment (`--environment`, else `env use`, else the production plane), exactly like the
  * other `users` commands. The user is addressed by the **subject** product-api keys an assignment on — the `sub` claim of
- * that person's tokens — and the role by its NAME (or its id). The role's permissions then reach the person's tokens
+ * that person's tokens, the `subject` column of `thoryn users list` — by their directory id (product-api resolves it to the
+ * subject, SSO-4284), or by `--email`; the role by its NAME (or its id). product-api refuses an identifier no sign-in
+ * produced, so an assignment can no longer be stored where no token reads it. The role's permissions then reach the person's tokens
  * through an application that has claims in the token switched on (`tokenClaims: { sources: [permissions] }`).
  *
  * Scopes: `list` → `tenant:roles.read`; `add` / `remove` → `tenant:roles.write` plus `tenant:roles.read` to resolve the
@@ -45,8 +47,11 @@ class UsersRolesCommand : Callable<Int> {
     @Command(name = "list", description = ["List the roles a user holds."], mixinStandardHelpOptions = true)
     class ListSubcommand : Callable<Int> {
 
-        @Parameters(index = "0", paramLabel = "<user>", description = [USER_PARAM_DESC])
-        lateinit var user: String
+        @Parameters(index = "0", arity = "0..1", paramLabel = "<user>", description = [USER_PARAM_DESC])
+        var user: String? = null
+
+        @Option(names = ["--email"], description = [EMAIL_OPTION_DESC])
+        var email: String? = null
 
         @Option(names = ["--environment"], description = [UsersCommand.ENVIRONMENT_OPTION_DESC])
         var environment: String? = null
@@ -62,8 +67,9 @@ class UsersRolesCommand : Callable<Int> {
             val tokens = CommandSupport.readTokens() ?: return CommandSupport.EXIT_NOT_SIGNED_IN
             gateway = CommandSupport.resolveGateway(gateway, tokens)
             val client = UsersCommand.clientFor(gateway, tokens, environment)
+            val target = resolveUser(client, user, email, gateway) ?: return CommandSupport.EXIT_USAGE
             return try {
-                val assignments = allPages { cursor -> client.listUserRoles(user.trim(), cursor = cursor) }
+                val assignments = allPages { cursor -> client.listUserRoles(target.id, cursor = cursor) }
                 val names = allPages { cursor -> client.listRoles(cursor = cursor) }
                     .mapNotNull { r -> r.str("id")?.let { id -> id to (r.str("name") ?: id) } }.toMap()
                 val rows = assignments.map { a ->
@@ -77,7 +83,7 @@ class UsersRolesCommand : Callable<Int> {
                 }
                 when (format) {
                     OutputFormat.TABLE -> Printers.table(LIST_HEADERS, rows.map { it.values.toList() }, System.out)
-                    else -> CommandSupport.emitValue(format, mapOf("user" to user.trim(), "roles" to rows), "")
+                    else -> CommandSupport.emitValue(format, mapOf("user" to target.label, "roles" to rows), "")
                 }
                 CommandSupport.EXIT_OK
             } catch (ex: ProductApiException) {
@@ -92,11 +98,11 @@ class UsersRolesCommand : Callable<Int> {
     @Command(name = "add", description = ["Give a user a role (by name or id)."], mixinStandardHelpOptions = true)
     class AddSubcommand : Callable<Int> {
 
-        @Parameters(index = "0", paramLabel = "<user>", description = [USER_PARAM_DESC])
-        lateinit var user: String
+        @Parameters(arity = "1..2", paramLabel = "<user> <role>", description = [USER_ROLE_PARAMS_DESC])
+        var args: List<String> = emptyList()
 
-        @Parameters(index = "1", paramLabel = "<role>", description = [ROLE_PARAM_DESC])
-        lateinit var role: String
+        @Option(names = ["--email"], description = [EMAIL_OPTION_DESC])
+        var email: String? = null
 
         @Option(names = ["--environment"], description = [UsersCommand.ENVIRONMENT_OPTION_DESC])
         var environment: String? = null
@@ -111,15 +117,19 @@ class UsersRolesCommand : Callable<Int> {
             val format = CommandSupport.parseFormat(outputRaw) ?: return CommandSupport.EXIT_USAGE
             val tokens = CommandSupport.readTokens() ?: return CommandSupport.EXIT_NOT_SIGNED_IN
             gateway = CommandSupport.resolveGateway(gateway, tokens)
+            val (userArg, role) = splitUserAndRole(args, email) ?: return CommandSupport.EXIT_USAGE
             val client = UsersCommand.clientFor(gateway, tokens, environment)
+            val target = resolveUser(client, userArg, email, gateway) ?: return CommandSupport.EXIT_USAGE
             val resolved = resolveRole(client, role, gateway) ?: return CommandSupport.EXIT_HTTP_ERROR
-            val subject = user.trim()
+            val subject = target.label
             return try {
-                client.assignUserRole(subject, resolved.id)
+                val assignment = client.assignUserRole(target.id, resolved.id)
+                // product-api stores the assignment under the platform subject; show it when it differs from the input.
+                val stored = assignment.str("userId")?.takeIf { it != subject }
                 CommandSupport.emitValue(
                     format,
-                    mapOf("user" to subject, "roleId" to resolved.id, "role" to resolved.name, "status" to "assigned"),
-                    "Gave $subject the role ${resolved.name} (${resolved.id})",
+                    linkedMapOf("user" to subject, "subject" to (stored ?: target.id), "roleId" to resolved.id, "role" to resolved.name, "status" to "assigned"),
+                    "Gave $subject${stored?.let { " (subject $it)" } ?: ""} the role ${resolved.name} (${resolved.id})",
                 )
                 CommandSupport.EXIT_OK
             } catch (ex: ProductApiException) {
@@ -143,11 +153,11 @@ class UsersRolesCommand : Callable<Int> {
     @Command(name = "remove", description = ["Take a role away from a user (by name or id)."], mixinStandardHelpOptions = true)
     class RemoveSubcommand : Callable<Int> {
 
-        @Parameters(index = "0", paramLabel = "<user>", description = [USER_PARAM_DESC])
-        lateinit var user: String
+        @Parameters(arity = "1..2", paramLabel = "<user> <role>", description = [USER_ROLE_PARAMS_DESC])
+        var args: List<String> = emptyList()
 
-        @Parameters(index = "1", paramLabel = "<role>", description = [ROLE_PARAM_DESC])
-        lateinit var role: String
+        @Option(names = ["--email"], description = [EMAIL_OPTION_DESC])
+        var email: String? = null
 
         @Option(names = ["--environment"], description = [UsersCommand.ENVIRONMENT_OPTION_DESC])
         var environment: String? = null
@@ -162,11 +172,13 @@ class UsersRolesCommand : Callable<Int> {
             val format = CommandSupport.parseFormat(outputRaw) ?: return CommandSupport.EXIT_USAGE
             val tokens = CommandSupport.readTokens() ?: return CommandSupport.EXIT_NOT_SIGNED_IN
             gateway = CommandSupport.resolveGateway(gateway, tokens)
+            val (userArg, role) = splitUserAndRole(args, email) ?: return CommandSupport.EXIT_USAGE
             val client = UsersCommand.clientFor(gateway, tokens, environment)
+            val target = resolveUser(client, userArg, email, gateway) ?: return CommandSupport.EXIT_USAGE
             val resolved = resolveRole(client, role, gateway) ?: return CommandSupport.EXIT_HTTP_ERROR
-            val subject = user.trim()
+            val subject = target.label
             return try {
-                client.unassignUserRole(subject, resolved.id)
+                client.unassignUserRole(target.id, resolved.id)
                 CommandSupport.emitValue(
                     format,
                     mapOf("user" to subject, "roleId" to resolved.id, "role" to resolved.name, "status" to "removed"),
@@ -186,11 +198,67 @@ class UsersRolesCommand : Callable<Int> {
         internal const val SCOPE_WRITE = "tenant:roles.write"
 
         internal const val USER_PARAM_DESC =
-            "The user's subject — the `sub` claim of their tokens, which product-api keys a role assignment on."
+            "The user's subject (the `sub` of their tokens, the `subject` column of `thoryn users list`) or their directory id. " +
+                "Omit it and use --email to address the user by email."
+        internal const val USER_ROLE_PARAMS_DESC =
+            "The user (their subject or directory id; omit it with --email), then the role's name (as declared with `kind: role`) or its id."
+        internal const val EMAIL_OPTION_DESC =
+            "Address the user by email instead (resolved with a directory lookup; needs tenant:users.read)."
         internal const val ROLE_PARAM_DESC =
             "The role's name (as declared with `kind: role`), or its id."
 
         internal val LIST_HEADERS: List<String> = listOf("roleId", "role", "organizationId", "assignedBy", "assignedAt")
+
+        /** The user a command addresses: [id] goes in the request path, [label] in what the command prints. */
+        internal data class TargetUser(val id: String, val label: String)
+
+        /**
+         * SSO-4284 — the user from a positional [user] (a subject or directory id, sent as is: product-api resolves a
+         * directory id) or from [email] (the directory row's `subject`, else its `id`, which product-api then resolves or
+         * refuses with a reason). Exactly one of the two. Null, with guidance on [err], when neither or both are given or
+         * the email lookup fails.
+         */
+        internal fun resolveUser(
+            client: ProductApiClient,
+            user: String?,
+            email: String?,
+            gateway: String,
+            err: PrintStream = System.err,
+        ): TargetUser? {
+            val trimmedUser = user?.trim()?.takeIf { it.isNotEmpty() }
+            val trimmedEmail = email?.trim()?.takeIf { it.isNotEmpty() }
+            if (trimmedUser != null && trimmedEmail != null) {
+                err.println("Error: pass EITHER a user OR --email, not both.")
+                return null
+            }
+            if (trimmedUser != null) return TargetUser(trimmedUser, trimmedUser)
+            if (trimmedEmail == null) {
+                err.println("Error: provide the user (their subject or directory id), or --email <email>.")
+                return null
+            }
+            val row = UsersCommand.lookupByEmail(client, trimmedEmail, gateway, err) ?: return null
+            val id = row.str("subject") ?: row.str("id")
+            if (id == null) {
+                err.println("Error: the directory row for '$trimmedEmail' carried no id.")
+                return null
+            }
+            return TargetUser(id, trimmedEmail)
+        }
+
+        /** `add` / `remove` positionals: `<user> <role>`, or only `<role>` when [email] addresses the user. */
+        internal fun splitUserAndRole(args: List<String>, email: String?, err: PrintStream = System.err): Pair<String?, String>? =
+            when {
+                email.isNullOrBlank() && args.size == 2 -> args[0] to args[1]
+                !email.isNullOrBlank() && args.size == 1 -> null to args[0]
+                email.isNullOrBlank() -> {
+                    err.println("Error: provide the user and the role: <user> <role>, or --email <email> <role>.")
+                    null
+                }
+                else -> {
+                    err.println("Error: with --email, give only the role: --email <email> <role>.")
+                    null
+                }
+            }
 
         /** A role resolved from the user's input: its id and its name. */
         internal data class ResolvedRole(val id: String, val name: String)
