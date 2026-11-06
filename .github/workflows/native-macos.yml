@@ -1,0 +1,51 @@
+name: native-macos
+
+# SSO-4268 — build the darwin native binary on a pull request that changes how it is built.
+#
+# release.yml builds the native binaries only on a `cli-v*` tag. cli-v0.58.0 was the first time
+# the macos-15 runner change (#200) met a real build: the binary came out at minimum macOS 15.0,
+# the release's check refused it, and the release shipped without thoryn-darwin-arm64. The fix
+# (#202) then merged with no macOS build at all. This workflow runs the release's darwin build
+# and its checks on the pull request instead, so the next such change is proven before a tag.
+#
+# Path-filtered: a macOS runner costs ~10 minutes, and most pull requests do not touch the native
+# build. It is not a required check (a required check that never reports on a filtered-out PR
+# would block it); it reports on the PRs that need it.
+
+on:
+  pull_request:
+    paths:
+      - pom.xml
+      - cli/pom.xml
+      - "cli/src/main/resources/META-INF/native-image/**"
+      - .github/workflows/release.yml
+      - .github/workflows/native-macos.yml
+      - scripts/release/check-macos-minos.sh
+  workflow_dispatch:
+
+concurrency:
+  group: native-macos-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  darwin-arm64:
+    name: native (macos-15, thoryn-darwin-arm64)
+    # Keep in step with release.yml's darwin matrix leg.
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: graalvm/setup-graalvm@v1
+        with:
+          java-version: "21"
+          distribution: graalvm
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build the native image (as release.yml does)
+        run: ./mvnw -q -Pnative -DskipTests package
+      - name: The macOS binary still runs on macOS 14 (minos 14.0)
+        run: bash scripts/release/check-macos-minos.sh cli/target/thoryn
+      - name: The binary starts
+        run: ./cli/target/thoryn --version

@@ -23,6 +23,15 @@
 # the formula never points `brew` at a download that does not exist. `brew`
 # still works for the platforms that shipped; the missing platform simply has no
 # bottle in the formula.
+#
+# SSO-4268 — but an OS with NO binary at all is refused, not omitted. cli-v0.58.0's
+# darwin leg failed, this script wrote a formula with only `on_linux`, and every
+# macOS `brew upgrade thoryn` then died with "formula requires at least a URL".
+# So the formula must carry at least one URL under `on_macos` AND under
+# `on_linux`; otherwise this exits 1 WITHOUT touching Formula/thoryn.rb. The
+# release job goes red, no formula PR opens, and brew keeps installing the
+# previous release (whose formula still has every platform).
+# scripts/release/test-bump-formula.sh covers these cases.
 set -euo pipefail
 
 version="${1:?usage: bump-formula.sh <version> <assets-dir>}"
@@ -75,8 +84,14 @@ linux_amd="$(sha256_of "${assets}/thoryn-linux-amd64")"
 have_macos=0; { [ -n "$darwin_arm" ] || [ -n "$darwin_amd" ]; } && have_macos=1
 have_linux=0; { [ -n "$linux_arm" ] || [ -n "$linux_amd" ]; } && have_linux=1
 
-if [ "$have_macos" -eq 0 ] && [ "$have_linux" -eq 0 ]; then
-  echo "::warning::no brew-installable native binaries were produced for ${version} — the formula will carry no download URLs." >&2
+missing=()
+[ "$have_macos" -eq 1 ] || missing+=("macOS (thoryn-darwin-arm64 / thoryn-darwin-amd64)")
+[ "$have_linux" -eq 1 ] || missing+=("Linux (thoryn-linux-arm64 / thoryn-linux-amd64)")
+if [ "${#missing[@]}" -gt 0 ]; then
+  for os in "${missing[@]}"; do
+    echo "::error::no ${os} binary in ${assets} for ${version} — refusing to write a formula without a URL for it: brew on that OS would fail with 'formula requires at least a URL' (SSO-4268). Formula/thoryn.rb is unchanged. Fix the failed native leg and cut a patch tag." >&2
+  done
+  exit 1
 fi
 
 # Assemble the formula. Bash expands ${...}; Ruby's #{version} is left literal.
