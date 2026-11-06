@@ -55,6 +55,10 @@ jobs:
       - name: Build and test
         run: ./mvnw -B -ntp verify
 
+      # SSO-4268 — the Homebrew formula bump refuses a release with no macOS or no Linux binary.
+      - name: Release scripts — bump-formula.sh
+        run: bash scripts/release/test-bump-formula.sh
+
       # Surefire/HTML reports for triaging a red run without re-running locally.
       - name: Upload test reports
         if: always()

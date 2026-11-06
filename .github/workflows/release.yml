@@ -10,7 +10,9 @@ name: release
 #       thoryn-windows-amd64.exe
 #     Each native leg is best-effort: an unavailable/slow/broken platform runner
 #     (e.g. the retiring Intel-macOS `macos-13`) is tolerated and simply omitted
-#     from the release, rather than failing or blocking it.
+#     from the release, rather than failing or blocking it. The Homebrew formula
+#     is the exception (SSO-4268): a release with no macOS or no Linux binary
+#     is still published, but the formula bump refuses it and the run goes red.
 #   * the container image ghcr.io/thoryn-io/thoryn-cli:<version> (+ :<major>.<minor>), linux/amd64 +
 #     linux/arm64, signed (cosign keyless) with SBOM + provenance — the `image` job (SSO-3687). It is
 #     built from the two linux binaries above and fails on its own (never the release) when one is
@@ -199,17 +201,11 @@ jobs:
           else
             ./mvnw -q -Pnative -Drevision="${{ needs.resolve.outputs.version }}" -DskipTests package
           fi
+      # native-macos.yml runs the same build and check on a pull request that changes the native build.
       - name: The macOS binary still runs on macOS 14 (minos 14.0)
         if: runner.os == 'macOS'
         shell: bash
-        run: |
-          set -euo pipefail
-          minos="$(otool -l ./cli/target/thoryn | awk '/LC_BUILD_VERSION/{f=1} f&&$1=="minos"{print $2; exit}')"
-          echo "minos=${minos:-<none>}"
-          if [ "$minos" != "14.0" ]; then
-            echo "::error::the darwin binary needs macOS ${minos:-unknown}, not 14.0 — the -mmacosx-version-min linker option (cli/pom.xml native-macos-min-version) did not take, so macOS 14 users could not run it."
-            exit 1
-          fi
+        run: bash scripts/release/check-macos-minos.sh cli/target/thoryn
       # ── SSO-3276 — the built macOS binary's Secure Enclave rung must reach a
       #    real answer, never a reflection error. ───────────────────────────────
       #
@@ -461,7 +457,8 @@ jobs:
   # `if: always()` lets publish proceed once the native matrix has SETTLED to any
   # terminal state, and it uploads whichever native binaries actually built. A
   # platform that failed / was skipped / never produced an artifact is simply
-  # absent from the release, not a release-blocking failure.
+  # absent from the release, not a release-blocking failure. It does fail this
+  # job at the formula bump when no macOS or no Linux binary built (SSO-4268).
   release:
     needs: [resolve, verify, native, jar]
     if: ${{ always() && needs.resolve.result == 'success' && needs.verify.result == 'success' && needs.jar.result == 'success' }}
@@ -545,6 +542,10 @@ jobs:
       # required `build + unit tests` check like any other. A PR opened with GITHUB_TOKEN gets its
       # `pull_request` ci run PARKED as action_required, so this step approves that run (see below);
       # auto-merge then lands the PR once it is green.
+      # SSO-4268 — this exits 1, leaving the formula untouched, when the release has no macOS or no
+      # Linux binary: the native legs are continue-on-error, so a failed darwin leg would otherwise end
+      # in a green run and a formula with no macOS URL (cli-v0.58.0). The release above stays published;
+      # the red run is the signal to fix the leg and cut a patch tag.
       - name: Bump the Homebrew formula
         run: bash scripts/release/bump-formula.sh "${{ needs.resolve.outputs.version }}" assets
       - name: Open a PR for the bumped formula
