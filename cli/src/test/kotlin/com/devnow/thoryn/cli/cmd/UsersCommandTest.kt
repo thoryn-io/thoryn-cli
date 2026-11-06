@@ -35,6 +35,25 @@ class UsersCommandTest : CommandTestBase() {
     }
 
     @Test
+    fun `list shows each users subject, the sub their tokens carry, beside the directory id`() {
+        val subject = "47672b790eb1fb989b34b9f9c840b2c6c9e3fd82bbe30a1adfcb2b2182b364ac"
+        server.enqueue(
+            jsonResponse(
+                200,
+                usersEnvelope(
+                    """{"id":"$userId","subject":"$subject","email":"jane@example.com","status":"ACTIVE","emailVerified":true,"createdAt":"2026-09-14T10:00:00Z"}""",
+                ),
+            ),
+        )
+
+        val (exit, out, _) = runCli("users", "list", "--gateway", baseUrl())
+
+        assertThat(exit).isEqualTo(0)
+        assertThat(out.lines().first()).contains("subject")
+        assertThat(out).contains(userId).contains(subject)
+    }
+
+    @Test
     fun `list passes the email filter as a query param`() {
         server.enqueue(jsonResponse(200, usersEnvelope(user())))
 

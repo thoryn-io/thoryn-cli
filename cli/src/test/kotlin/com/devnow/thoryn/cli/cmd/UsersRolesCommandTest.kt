@@ -76,6 +76,59 @@ class UsersRolesCommandTest : CommandTestBase() {
         assertThat(runCli("users", "roles", "remove", sub, "forge-maintainer", "--gateway", baseUrl()).exit).isEqualTo(0)
     }
 
+    // ── SSO-4284 — address the user by email: the assignment goes to the subject their tokens carry ──
+
+    @Test
+    fun `add with --email assigns the role to the users subject, not their directory id`() {
+        val id = api.seedRole(null, "pip-portal-reader")
+        api.users += mutableMapOf("id" to "d236c669-8428-4a9a-a587-b7173d4be171", "subject" to sub, "email" to "mark@thoryn.io", "_env" to null)
+
+        val (exit, out, err) = runCli("users", "roles", "add", "--email", "mark@thoryn.io", "pip-portal-reader", "--gateway", baseUrl())
+
+        assertThat(exit).withFailMessage("%s", err).isEqualTo(0)
+        assertThat(out).contains("Gave mark@thoryn.io (subject $sub) the role pip-portal-reader ($id)")
+        assertThat(api.writes.single().let { "${it.method} ${it.path}" }).isEqualTo("POST /api/v1/users/$sub/roles")
+    }
+
+    @Test
+    fun `add with --email for a user who has not signed in sends the directory id for product-api to resolve or refuse`() {
+        api.seedRole(null, "pip-portal-reader")
+        api.users += mutableMapOf("id" to "d236c669-8428-4a9a-a587-b7173d4be171", "email" to "new@thoryn.io", "_env" to null)
+
+        runCli("users", "roles", "add", "--email", "new@thoryn.io", "pip-portal-reader", "--gateway", baseUrl())
+
+        assertThat(api.writes.single().path).isEqualTo("/api/v1/users/d236c669-8428-4a9a-a587-b7173d4be171/roles")
+    }
+
+    @Test
+    fun `list and remove accept --email too`() {
+        val id = api.seedRole(null, "pip-portal-reader")
+        api.users += mutableMapOf("id" to "d236c669-8428-4a9a-a587-b7173d4be171", "subject" to sub, "email" to "mark@thoryn.io", "_env" to null)
+        api.userRoles += mutableMapOf("userId" to sub, "roleId" to id)
+
+        val (listExit, listOut, _) = runCli("users", "roles", "list", "--email", "mark@thoryn.io", "--gateway", baseUrl())
+        assertThat(listExit).isEqualTo(0)
+        assertThat(listOut).contains("pip-portal-reader")
+
+        val (exit, _, _) = runCli("users", "roles", "remove", "--email", "mark@thoryn.io", "pip-portal-reader", "--gateway", baseUrl())
+        assertThat(exit).isEqualTo(0)
+        assertThat(api.userRoles).isEmpty()
+    }
+
+    @Test
+    fun `a user and --email together, or a missing role with --email, is a usage error before any call`() {
+        api.seedRole(null, "pip-portal-reader")
+
+        val both = runCli("users", "roles", "add", sub, "pip-portal-reader", "--email", "mark@thoryn.io", "--gateway", baseUrl())
+        assertThat(both.exit).isEqualTo(CommandSupport.EXIT_USAGE)
+        assertThat(both.err).contains("with --email, give only the role")
+
+        val neither = runCli("users", "roles", "add", "pip-portal-reader", "--gateway", baseUrl())
+        assertThat(neither.exit).isEqualTo(CommandSupport.EXIT_USAGE)
+        assertThat(neither.err).contains("<user> <role>")
+        assertThat(api.writes).isEmpty()
+    }
+
     @Test
     fun `an unknown role fails before any write, naming the roles that do exist`() {
         api.seedRole(null, "forge-maintainer")

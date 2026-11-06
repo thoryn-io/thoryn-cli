@@ -215,13 +215,17 @@ thoryn users list [--email <email>] [--status <ACTIVE|SUSPENDED>] [--limit <n>] 
 thoryn users suspend (<id> | --email <email>) [--confirm <workspace-slug>] [--environment <slug>]  # production plane needs --confirm
 thoryn users reactivate (<id> | --email <email>) [--environment <slug>]                            # clear a suspension
 # SSO-3941 — the RBAC roles a person holds in the selected environment (product-api /api/v1/users/{sub}/roles;
-# tenant:roles.read / tenant:roles.write). <user> is the person's SUBJECT (the `sub` claim of their tokens — what an
-# assignment is keyed on, not the directory id); <role> is the role's name (as declared with `kind: role`) or its id.
+# tenant:roles.read / tenant:roles.write). <user> is the person's SUBJECT (the `sub` claim of their tokens, the
+# `subject` column of `thoryn users list`) or their directory id, which product-api resolves to the subject (SSO-4284);
+# or address them with --email. An assignment is always stored under the subject, so it reaches their tokens. A
+# directory user who has never signed in has no subject yet: 409 subject_not_yet_assigned — grant after their first
+# sign-in. An identifier no sign-in produced is 404 subject_not_found. <role> is the role's name (as declared with
+# `kind: role`) or its id.
 # A bare `thoryn login` requests tenant:roles.read/.write (the `cli` login client carries them once the platform has
 # granted them to it — the SSO-2278 grant order); the hub mints them only to an admin who holds them.
-thoryn users roles list   <user> [--environment <slug>] [--output json|yaml|table]
-thoryn users roles add    <user> <role> [--environment <slug>]       # already held ⇒ success, "unchanged"
-thoryn users roles remove <user> <role> [--environment <slug>]       # idempotent; no --confirm (the API does not gate it)
+thoryn users roles list   (<user> | --email <email>) [--environment <slug>] [--output json|yaml|table]
+thoryn users roles add    (<user> | --email <email>) <role> [--environment <slug>]  # already held ⇒ success, "unchanged"
+thoryn users roles remove (<user> | --email <email>) <role> [--environment <slug>]  # idempotent; no --confirm
 # --environment targets a plane directly (rides X-Thoryn-Environment) for a client-credentials/CI
 # session that hasn't run `workspace switch` + `env use` (SSO-3068); e.g. `--environment production`.
 
