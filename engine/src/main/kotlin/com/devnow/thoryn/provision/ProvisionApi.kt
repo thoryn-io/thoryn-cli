@@ -65,6 +65,27 @@ interface ProvisionApi {
     fun getActiveLoginFlow(): JsonNode
     fun applyLoginFlowTemplate(templateId: String): JsonNode
     fun activateLoginFlow(version: Int): JsonNode
+    /**
+     * SSO-4345 (oauthy SSO-4335 / SSO-4338) — `GET /api/v1/environments/{envId}/client-id-metadata-documents`: the
+     * environment's Client ID Metadata Document policy, `{ environmentId, environment, enabled, allowedHosts,
+     * refreshTokensEnabled, refreshTokenTtlSeconds?, refreshTokenAbsoluteMaxTtlSeconds?, updatedAt }` (`updatedAt` null while
+     * it has its defaults). `manager` on the environment, else `404 not_found`. Defaulted so a host that predates the route
+     * keeps compiling: the default answers what a product-api from before SSO-4335 answers — `404` with no error code.
+     */
+    fun getClientIdMetadataDocumentPolicy(envId: String): JsonNode =
+        throw ProductApiException(404, null, "this host does not serve the Client ID Metadata Document policy", "")
+
+    /**
+     * SSO-4345 — `PUT` of the same: [body] is the WHOLE policy (`enabled`, `allowedHosts`, `refreshTokensEnabled`, and the
+     * optional lifetimes; a lifetime left out keeps its value). Narrowing needs `manager`; WIDENING (enabling, adding a host,
+     * turning refresh tokens on, lengthening a lifetime) is a person's elevated act: a machine identity is `403
+     * elevated_action_requires_person`, a person without a passkey sign-in from the last five minutes the RFC 9470 step-up
+     * `403`. `400 invalid_allowed_host` / `too_many_allowed_hosts` / `allowed_host_is_issuer` / `allowed_hosts_required` /
+     * `invalid_refresh_token_lifetime`; `409 policy_changed` when it changed meanwhile.
+     */
+    fun putClientIdMetadataDocumentPolicy(envId: String, body: Map<String, Any?>): JsonNode =
+        throw ProductApiException(404, null, "this host does not serve the Client ID Metadata Document policy", "")
+
     fun getLoginMethods(): JsonNode
     fun putLoginMethods(methods: List<String>): JsonNode
     fun resetLoginMethods(): JsonNode

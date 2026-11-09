@@ -1641,6 +1641,7 @@ class ProvisionEngine(
             ProvisionFile.KIND_FEDERATION_MEMBER -> "thoryn federation delete $id$confirm$env"
             ProvisionFile.KIND_EMAIL_PROVIDER -> "DELETE /api/v1/email-provider (reset to the platform sender)$env"
             ProvisionFile.KIND_LOGIN_METHODS -> "thoryn login-methods reset$env"
+            ProvisionFile.KIND_METADATA_DOCUMENTS -> "thoryn env metadata-documents set --disable --hosts '' --refresh-tokens off$env"
             // SSO-4041 — the API has no DELETE; the empty record restores the platform defaults (`thoryn branding set` with an empty value clears one field at a time).
             ProvisionFile.KIND_LOGIN_THEME -> "PUT /api/v1/login-experience/branding {} (the API has no DELETE; the empty record restores the platform defaults — or `thoryn branding set --logo-url '' --primary-color '' --background-color '' --theme '' --display-name '' --page-title '' --favicon-url '' --support-url '' --terms-url '' --privacy-url ''`)$env"
             ProvisionFile.KIND_LOGIN_FLOW -> "activate another login flow (no delete surface)$env"
@@ -2030,6 +2031,24 @@ class ProvisionEngine(
             if (routedAway(plane, "login_methods:${plane ?: PRODUCTION_ENV_SLUG}")) return@singleton
             val methods = stored.toList().map { it.asString() }
             add(ProvisionFile.KIND_LOGIN_METHODS, singletonName(ProvisionFile.KIND_LOGIN_METHODS, plane), environmentField(plane), plane, "login-methods", access, linkedMapOf("methods" to methods))
+        }
+        // SSO-4345 — each plane's Client ID Metadata Document policy. It has no access object of its own: the environment is,
+        // and the defaults — a policy no manager ever wrote (`updatedAt` null) — are nothing to declare.
+        if (ofPart(ProvisionFile.KIND_METADATA_DOCUMENTS)) importKind(ProvisionFile.KIND_METADATA_DOCUMENTS) {
+            (listOf<String?>(null) + sandboxSlugs).forEach { plane ->
+                if (singletonDeclared(ProvisionFile.KIND_METADATA_DOCUMENTS, plane)) return@forEach
+                val label = "metadata_documents:${plane ?: PRODUCTION_ENV_SLUG}"
+                // Omitted, like any object this identity has no relation to: an environment it cannot view is not listed,
+                // and the policy of one it does not manage answers 404.
+                val envId = metadataDocumentsEnvironmentId(plane) ?: return@forEach
+                val live = fetchOrNull { clients(plane).getClientIdMetadataDocumentPolicy(envId) } ?: return@forEach
+                if (live["updatedAt"]?.isNull != false) return@forEach
+                if (routedAway(plane, label)) return@forEach
+                val workspace = "$OBJECT_TYPE_WORKSPACE:${workspaceId ?: "(this workspace)"}"
+                val access = reach.on("$OBJECT_TYPE_ENVIRONMENT:$envId").let { if (it == Access.NONE && reach.managesParent(workspace)) Access.MANAGER else it }
+                val spec = metadataDocumentsLive(live).filterValues { it != null }
+                add(ProvisionFile.KIND_METADATA_DOCUMENTS, singletonName(ProvisionFile.KIND_METADATA_DOCUMENTS, plane), environmentField(plane), plane, envId, access, spec)
+            }
         }
         if (!ofPart(ProvisionFile.KIND_LOGIN_FLOW)) listOtherPart(ProvisionFile.KIND_LOGIN_FLOW, OBJECT_TYPE_LOGIN_FLOW)
         else importKind(ProvisionFile.KIND_LOGIN_FLOW) {
@@ -2558,6 +2577,16 @@ class ProvisionEngine(
             val version = active?.get("version")?.takeIf { !it.isNull }?.asInt()?.toString()
             version?.let { Live(it, emptyMap(), mapOf("activeVersion" to it)) }
         }
+        ProvisionFile.KIND_METADATA_DOCUMENTS -> {
+            // SSO-4345 — the policy of the resource's environment; its defaults (never written: `updatedAt` null) are nothing
+            // to converge against, so the first write plans as a create. The live id is the ENVIRONMENT's id: the policy has no
+            // access object of its own, product-api gates it on `manager` of the environment ([objectRef]).
+            metadataDocumentsEnvironmentId(slug)?.let { envId ->
+                fetchOrNull { clients(slug).getClientIdMetadataDocumentPolicy(envId) }
+                    ?.takeIf { it["updatedAt"]?.isNull == false }
+                    ?.let { live -> Live(envId, diffOf(metadataDocumentsDesired(desired), metadataDocumentsLive(live)), metadataDocumentsAttributes(live)) }
+            }
+        }
         ProvisionFile.KIND_LOGIN_METHODS -> {
             // SSO-3100 — the stored allow-list (null ⇒ the platform default policy, nothing to converge against).
             // Compared as a SET: order is display-only.
@@ -2608,6 +2637,7 @@ class ProvisionEngine(
             ProvisionFile.KIND_LOGIN_THEME -> putLoginTheme(r, targetSlug(r, file, applied), spec, "+")
             ProvisionFile.KIND_LOGIN_FLOW -> applyLoginFlow(r, targetSlug(r, file, applied), spec, "+")
             ProvisionFile.KIND_LOGIN_METHODS -> putLoginMethods(r, targetSlug(r, file, applied), spec, "+")
+            ProvisionFile.KIND_METADATA_DOCUMENTS -> putMetadataDocuments(r, targetSlug(r, file, applied), spec, "+")
             ProvisionFile.KIND_CUSTOM_DOMAIN -> claimCustomDomain(r, spec)
             ProvisionFile.KIND_EMAIL_TEMPLATE -> putEmailTemplate(r, targetSlug(r, file, applied), spec, "+")
             ProvisionFile.KIND_LEGAL_DOCUMENT -> publishLegalDocument(r, targetSlug(r, file, applied), spec, "+")
@@ -2761,6 +2791,7 @@ class ProvisionEngine(
             ProvisionFile.KIND_LOGIN_THEME -> putLoginTheme(r, slug, spec, "~").copy(action = ChangeAction.UPDATE)
             ProvisionFile.KIND_LOGIN_FLOW -> applyLoginFlow(r, slug, spec, "~").copy(action = ChangeAction.UPDATE)
             ProvisionFile.KIND_LOGIN_METHODS -> putLoginMethods(r, slug, spec, "~").copy(action = ChangeAction.UPDATE)
+            ProvisionFile.KIND_METADATA_DOCUMENTS -> putMetadataDocuments(r, slug, spec, "~").copy(action = ChangeAction.UPDATE)
             ProvisionFile.KIND_CUSTOM_DOMAIN -> verifyDomain(r, spec).copy(action = ChangeAction.UPDATE)
             ProvisionFile.KIND_EMAIL_TEMPLATE -> putEmailTemplate(r, slug, spec, "~").copy(action = ChangeAction.UPDATE)
             // SSO-4057 — never a write to a published version: re-activate the stored one, or publish a new one.
@@ -3076,6 +3107,79 @@ class ProvisionEngine(
         return AppliedResource(r.kind, r.name, "login-methods", slug, mapOf("methods" to stored.joinToString(",")), action = ChangeAction.CREATE)
     }
 
+    // ── metadataDocuments (SSO-4345) ─────────────────────────────────────────────────────────────
+
+    /** The id of the environment [slug] names (`null` ⇒ production), or null when the workspace does not list it (yet). */
+    private fun metadataDocumentsEnvironmentId(slug: String?): String? {
+        val wanted = slug ?: PRODUCTION_ENV_SLUG
+        return listItems(clients(null).listEnvironments(), "environments").firstOrNull { it.str("slug") == wanted }?.str("id")
+    }
+
+    /**
+     * The fields a file converges, as the PUT would write them: hosts trimmed and lowercased (the hub stores them so),
+     * `allowedHosts` and `refreshTokensEnabled` defaulted (the PUT replaces the whole policy), and a lifetime left out not
+     * compared (the API keeps it).
+     */
+    private fun metadataDocumentsDesired(spec: Map<String, Any?>): Map<String, Any?> = linkedMapOf(
+        ProvisionFile.MD_ENABLED to coerceBool(spec[ProvisionFile.MD_ENABLED]),
+        ProvisionFile.MD_ALLOWED_HOSTS to metadataDocumentsHosts(spec),
+        ProvisionFile.MD_REFRESH_TOKENS_ENABLED to coerceBool(spec[ProvisionFile.MD_REFRESH_TOKENS_ENABLED]),
+        ProvisionFile.MD_REFRESH_TOKEN_TTL to (spec[ProvisionFile.MD_REFRESH_TOKEN_TTL] as? Number)?.toLong(),
+        ProvisionFile.MD_REFRESH_TOKEN_ABSOLUTE_MAX_TTL to (spec[ProvisionFile.MD_REFRESH_TOKEN_ABSOLUTE_MAX_TTL] as? Number)?.toLong(),
+    )
+
+    private fun metadataDocumentsHosts(spec: Map<String, Any?>): List<String> =
+        (spec[ProvisionFile.MD_ALLOWED_HOSTS] as? List<*>).orEmpty().mapNotNull { it?.toString()?.trim()?.lowercase()?.takeIf { h -> h.isNotEmpty() } }.distinct()
+
+    private fun metadataDocumentsLive(live: JsonNode): Map<String, Any?> = linkedMapOf(
+        ProvisionFile.MD_ENABLED to (live[ProvisionFile.MD_ENABLED]?.asBoolean() ?: false),
+        ProvisionFile.MD_ALLOWED_HOSTS to live[ProvisionFile.MD_ALLOWED_HOSTS]?.takeIf { it.isArray }?.toList()?.map { it.asString() }.orEmpty(),
+        ProvisionFile.MD_REFRESH_TOKENS_ENABLED to (live[ProvisionFile.MD_REFRESH_TOKENS_ENABLED]?.asBoolean() ?: false),
+        ProvisionFile.MD_REFRESH_TOKEN_TTL to live[ProvisionFile.MD_REFRESH_TOKEN_TTL]?.takeIf { it.isNumber }?.asLong(),
+        ProvisionFile.MD_REFRESH_TOKEN_ABSOLUTE_MAX_TTL to live[ProvisionFile.MD_REFRESH_TOKEN_ABSOLUTE_MAX_TTL]?.takeIf { it.isNumber }?.asLong(),
+    )
+
+    private fun metadataDocumentsAttributes(live: JsonNode): Map<String, String> = buildMap {
+        put(ProvisionFile.MD_ENABLED, (live[ProvisionFile.MD_ENABLED]?.asBoolean() ?: false).toString())
+        put(ProvisionFile.MD_ALLOWED_HOSTS, live[ProvisionFile.MD_ALLOWED_HOSTS]?.takeIf { it.isArray }?.toList()?.joinToString(",") { it.asString() }.orEmpty())
+        put(ProvisionFile.MD_REFRESH_TOKENS_ENABLED, (live[ProvisionFile.MD_REFRESH_TOKENS_ENABLED]?.asBoolean() ?: false).toString())
+    }
+
+    /**
+     * SSO-4345 — write the policy of [slug]'s environment: the whole record ([metadataDocumentsDesired]; a lifetime the file
+     * leaves out is not sent, so the API keeps it). A write that widens the policy is a person's elevated act: the step-up
+     * refusal (the applying person's sign-in is not a fresh passkey one) and the machine-identity refusal each name what to do,
+     * and nothing is changed.
+     */
+    private fun putMetadataDocuments(r: ProvisionResource, slug: String?, spec: Map<String, Any?>, mark: String): AppliedResource {
+        val envId = metadataDocumentsEnvironmentId(slug)
+            ?: throw ProvisionException("${r.key}: environment '${slug ?: PRODUCTION_ENV_SLUG}' not found")
+        val body = metadataDocumentsDesired(spec).filterValues { it != null }
+        val resp = try {
+            clients(slug).putClientIdMetadataDocumentPolicy(envId, body)
+        } catch (ex: ProductApiException) {
+            throw when {
+                ex.isStepUpRequired -> ProvisionException(
+                    "${r.key}: widening the Client ID Metadata Document policy of environment '${slug ?: PRODUCTION_ENV_SLUG}' needs a passkey " +
+                        "sign-in from the last ${(ex.stepUpMaxAge ?: ELEVATED_MAX_AGE_SECONDS) / 60} minutes: sign in again with " +
+                        "`thoryn login --acr-values ${ex.stepUpAcrValues ?: PASSKEY_ACR} --max-age ${ex.stepUpMaxAge ?: ELEVATED_MAX_AGE_SECONDS}` and re-run (nothing was changed)",
+                )
+                ex.errorCode == ERROR_ELEVATED_ACTION_REQUIRES_PERSON -> ProvisionException(
+                    "${r.key}: $ERROR_ELEVATED_ACTION_REQUIRES_PERSON — enabling the method, adding a host, turning refresh tokens on or " +
+                        "lengthening a lifetime is a person's act with a fresh passkey sign-in; a workload identity may only narrow the " +
+                        "policy (nothing was changed)",
+                )
+                else -> ProvisionException("${r.key}: ${ex.errorCode ?: "HTTP ${ex.httpStatus}"}${ex.errorDescription?.let { " — $it" } ?: ""} (nothing was changed)")
+            }
+        }
+        val hosts = resp[ProvisionFile.MD_ALLOWED_HOSTS]?.takeIf { it.isArray }?.toList()?.map { it.asString() }.orEmpty()
+        out.println(
+            "  $mark metadataDocuments: ${if (resp[ProvisionFile.MD_ENABLED]?.asBoolean() == true) "enabled" else "disabled"}, " +
+                "hosts [${hosts.joinToString(", ")}], refresh tokens ${if (resp[ProvisionFile.MD_REFRESH_TOKENS_ENABLED]?.asBoolean() == true) "on" else "off"}",
+        )
+        return AppliedResource(r.kind, r.name, envId, slug, metadataDocumentsAttributes(resp), action = ChangeAction.CREATE)
+    }
+
     // ── customDomain (SSO-3413 / SSO-3414) ───────────────────────────────────────────────────────
 
     /**
@@ -3323,6 +3427,14 @@ class ProvisionEngine(
             ProvisionFile.KIND_EMAIL_PROVIDER -> {
                 clients(c.environment).deleteEmailProvider(confirmSlug)
                 out.println("  - emailProvider: reset to the platform sender")
+            }
+            ProvisionFile.KIND_METADATA_DOCUMENTS -> {
+                // SSO-4345 — the API has no DELETE: the reset is the PUT of the defaults (off, no host, no refresh tokens, the
+                // default lifetimes). It only narrows, so it never needs the passkey step-up.
+                val envId = metadataDocumentsEnvironmentId(c.environment)
+                    ?: throw ProvisionException("metadataDocuments ${c.name}: environment '${c.environment ?: PRODUCTION_ENV_SLUG}' not found")
+                clients(c.environment).putClientIdMetadataDocumentPolicy(envId, METADATA_DOCUMENTS_RESET)
+                out.println("  - metadataDocuments: reset to the defaults (off, no allowed host, no refresh tokens)")
             }
             ProvisionFile.KIND_LOGIN_METHODS -> {
                 // SSO-3100 — the delete path IS a reset: back to the default (every method offered).
@@ -4495,6 +4607,13 @@ class ProvisionEngine(
         /** SSO-3925 — what the step-up of a widening asks for (oauthy ADR 2026-10-21 §4b: passkey + 300 s). */
         const val PASSKEY_ACR = "urn:thoryn:acr:phishing_resistant"
         const val ELEVATED_MAX_AGE_SECONDS = 300L
+
+        /** SSO-4345 — the PUT that resets a `metadataDocuments` policy (the API has no DELETE); default lifetimes are kept as live. */
+        val METADATA_DOCUMENTS_RESET: Map<String, Any?> = mapOf(
+            ProvisionFile.MD_ENABLED to false,
+            ProvisionFile.MD_ALLOWED_HOSTS to emptyList<String>(),
+            ProvisionFile.MD_REFRESH_TOKENS_ENABLED to false,
+        )
         /** The hub's scope ceiling: a trust may carry only tenant: scopes the applying identity itself holds. */
         const val ERROR_SCOPE_NOT_GRANTABLE = "scope_not_grantable"
         /** `spec.federatedTrust` names no trust of the application's environment (missing, or declared for another one). */
@@ -4652,6 +4771,9 @@ class ProvisionEngine(
                 ProvisionFile.KIND_LOGIN_THEME -> "login_theme:$envSlug"
                 ProvisionFile.KIND_LOGIN_FLOW -> "login_flow:$envSlug"
                 ProvisionFile.KIND_LOGIN_METHODS -> "login_methods:$envSlug"
+                // SSO-4345 — the policy has no access object of its own: product-api gates it on `manager` of the ENVIRONMENT,
+                // and its live id is that environment's id.
+                ProvisionFile.KIND_METADATA_DOCUMENTS -> "$OBJECT_TYPE_ENVIRONMENT:$id"
                 // SSO-3413 — the workspace-level singleton; its id IS the workspace id (`tnt`).
                 ProvisionFile.KIND_CUSTOM_DOMAIN -> "custom_domain:$id"
                 // SSO-4042 — an email template has no access object of its own: product-api's LoginExperienceController gates EVERY

@@ -57,6 +57,7 @@ import java.util.concurrent.Callable
         EnvironmentCommand.DeleteSubcommand::class,
         EnvironmentCommand.TestEmailsSubcommand::class,
         EnvironmentTestIdentityCommand::class,
+        EnvironmentMetadataDocumentsCommand::class,
     ],
 )
 class EnvironmentCommand : Callable<Int> {
