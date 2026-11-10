@@ -285,6 +285,29 @@ class ProvisionFile private constructor(
         const val KIND_LOGIN_FLOW = "loginFlow"
         /** SSO-3100 — the per-environment sign-in METHOD allow-list (`/api/v1/login-methods`). */
         const val KIND_LOGIN_METHODS = "loginMethods"
+        /**
+         * SSO-4345 — the per-environment Client ID Metadata Document policy (`/api/v1/environments/{envId}/client-id-metadata-
+         * documents`; oauthy ADR 2026-11-05-client-id-metadata-documents C1, D2, D3): whether a client may identify itself by the
+         * `https` URL of its metadata document, from which `client_id` hosts, and whether such clients get refresh tokens (and
+         * for how long). Not an object of the platform authorization graph: the API is gated on `manager` of the environment,
+         * so the engine's access object for it IS the environment (its live id is the environment's id) and it carries no
+         * `grants:` ([ENVIRONMENT_POLICY_KINDS]). A write that widens the policy is a person's elevated act (a fresh passkey
+         * sign-in); see [ProvisionEngine].
+         */
+        const val KIND_METADATA_DOCUMENTS = "metadataDocuments"
+        const val MD_ENABLED = "enabled"
+        const val MD_ALLOWED_HOSTS = "allowedHosts"
+        const val MD_REFRESH_TOKENS_ENABLED = "refreshTokensEnabled"
+        const val MD_REFRESH_TOKEN_TTL = "refreshTokenTtlSeconds"
+        const val MD_REFRESH_TOKEN_ABSOLUTE_MAX_TTL = "refreshTokenAbsoluteMaxTtlSeconds"
+        /** The closed record of a `metadataDocuments` spec. Must equal the schema's `properties`. */
+        val METADATA_DOCUMENTS_SPEC_KEYS: List<String> =
+            listOf(MD_ENABLED, MD_ALLOWED_HOSTS, MD_REFRESH_TOKENS_ENABLED, MD_REFRESH_TOKEN_TTL, MD_REFRESH_TOKEN_ABSOLUTE_MAX_TTL)
+        /** oauthy ADR 2026-08-12 C1 — a refresh-token lifetime is 1 h to 90 d, in seconds. */
+        const val MD_LIFETIME_MIN_SECONDS: Long = 3_600
+        const val MD_LIFETIME_MAX_SECONDS: Long = 7_776_000
+        /** At most this many allowed hosts per environment (the hub's `ClientIdMetadataDocumentHosts.MAX_HOSTS`). */
+        const val MD_MAX_HOSTS: Int = 50
         const val KIND_FEDERATION_MEMBER = "federationMember"
         const val KIND_USER = "user"
         /**
@@ -352,7 +375,7 @@ class ProvisionFile private constructor(
         val TENANT_KINDS: Set<String> = setOf(
             KIND_ENVIRONMENT, KIND_FEDERATION_MEMBER, KIND_USER, KIND_LOGIN_METHODS, KIND_LOGIN_FLOW, KIND_LOGIN_THEME,
             KIND_EMAIL_PROVIDER, KIND_CUSTOM_DOMAIN, KIND_ROLE, KIND_WORKLOAD_IDENTITY_TRUST, KIND_EMAIL_TEMPLATE,
-            KIND_LEGAL_DOCUMENT,
+            KIND_LEGAL_DOCUMENT, KIND_METADATA_DOCUMENTS,
         )
 
         /**
@@ -369,7 +392,15 @@ class ProvisionFile private constructor(
          * One-per-environment kinds — and, SSO-3413, the one-per-WORKSPACE [KIND_CUSTOM_DOMAIN]: `name` is
          * optional (defaults to the kind) and their API is a PUT.
          */
-        val SINGLETON_KINDS: Set<String> = setOf(KIND_EMAIL_PROVIDER, KIND_LOGIN_THEME, KIND_LOGIN_FLOW, KIND_LOGIN_METHODS, KIND_CUSTOM_DOMAIN)
+        val SINGLETON_KINDS: Set<String> =
+            setOf(KIND_EMAIL_PROVIDER, KIND_LOGIN_THEME, KIND_LOGIN_FLOW, KIND_LOGIN_METHODS, KIND_CUSTOM_DOMAIN, KIND_METADATA_DOCUMENTS)
+
+        /**
+         * SSO-4345 — per-environment POLICIES whose API is gated on `manager` of the environment itself: the engine checks
+         * that relation (the workspace's on the production plane), and they cannot carry `grants:` (a grant would be on the
+         * environment, never the policy's to give).
+         */
+        val ENVIRONMENT_POLICY_KINDS: Set<String> = setOf(KIND_METADATA_DOCUMENTS)
 
         /**
          * SSO-3413 — kinds that live on the WORKSPACE, not in an environment: `environment` is refused on them. (SSO-4054 — an
@@ -594,6 +625,8 @@ class ProvisionFile private constructor(
             // SSO-4041 — every field optional: the spec IS the record (an empty one declares the platform defaults); see [validateLoginTheme].
             KIND_LOGIN_THEME to emptySet(),
             KIND_LOGIN_METHODS to setOf("methods"),
+            // SSO-4345 — the policy is replaced whole on the API; `enabled` is the one member a file must state.
+            KIND_METADATA_DOCUMENTS to setOf(MD_ENABLED),
             KIND_CUSTOM_DOMAIN to setOf("host"),
             // SSO-4042 — and exactly one of `body` / `bodyFile`, checked by [validateEmailTemplate].
             KIND_EMAIL_TEMPLATE to setOf("type", "subject"),
@@ -1258,6 +1291,8 @@ class ProvisionFile private constructor(
                 if (kind == KIND_LOGIN_METHODS) spec["methods"]?.takeIf { it.isArray() }?.let { methods ->
                     if (methods.toList().any { !it.isTextual() || it.asString().isBlank() }) v += "$where (loginMethods) spec.methods must be a list of non-empty method names"
                 }
+                // SSO-4345 — `metadataDocuments`: the closed record, the host list, the lifetime range; no grants.
+                if (kind == KIND_METADATA_DOCUMENTS) validateMetadataDocuments(spec, r, where, v)
                 // SSO-3689 — how an application authenticates: the credential ladder's rungs, mirrored client-side.
                 if (kind == KIND_APPLICATION) validateApplicationAuth(spec, r, where, v)
                 // SSO-3766 / SSO-3767 / SSO-3770 — token exchange, authorization detail types, session lifetime.
@@ -1863,6 +1898,50 @@ class ProvisionFile private constructor(
          * left to the API (it is resolved at plan / apply). An EMPTY spec is legal: it declares the platform defaults, and the plan
          * shows every stored field as cleared. The WCAG contrast floor stays identity's (`400 insufficient_contrast` at apply).
          */
+        /**
+         * SSO-4345 — a `metadataDocuments` spec, mirrored from the hub's rules so a plan refuses what the apply would:
+         * the closed record; `enabled` a boolean; `allowedHosts` up to [MD_MAX_HOSTS] non-empty strings (the hub checks the
+         * DNS grammar and refuses an issuer host); enabling needs a host; `refreshTokensEnabled` a boolean; each lifetime a
+         * whole number of seconds in [MD_LIFETIME_MIN_SECONDS]..[MD_LIFETIME_MAX_SECONDS], the total never shorter than the
+         * idle window. No `grants:` ([ENVIRONMENT_POLICY_KINDS]).
+         */
+        private fun validateMetadataDocuments(spec: JsonNode, r: JsonNode, where: String, v: MutableList<String>) {
+            val k = "($KIND_METADATA_DOCUMENTS)"
+            rejectUnknownKeys(spec, METADATA_DOCUMENTS_SPEC_KEYS.toSet(), "$where spec", v)
+            if (r["grants"]?.takeIf { !it.isNull } != null) {
+                v += "$where $k cannot carry 'grants' — the policy is the environment's; access to it is `manager` on the environment"
+            }
+            spec[MD_ENABLED]?.let { if (!it.isBoolean) v += "$where $k spec.$MD_ENABLED must be true or false" }
+            spec[MD_REFRESH_TOKENS_ENABLED]?.let { if (!it.isBoolean) v += "$where $k spec.$MD_REFRESH_TOKENS_ENABLED must be true or false" }
+            val hosts = spec[MD_ALLOWED_HOSTS]
+            if (hosts != null && !hosts.isNull) {
+                if (!hosts.isArray || hosts.toList().any { !it.isTextual || it.asString().isBlank() }) {
+                    v += "$where $k spec.$MD_ALLOWED_HOSTS must be a list of host names such as clients.example.com"
+                } else if (hosts.size() > MD_MAX_HOSTS) {
+                    v += "$where $k spec.$MD_ALLOWED_HOSTS holds ${hosts.size()} hosts; at most $MD_MAX_HOSTS are allowed per environment"
+                }
+            }
+            val hostCount = hosts?.takeIf { it.isArray }?.size() ?: 0
+            if (spec[MD_ENABLED]?.takeIf { it.isBoolean }?.asBoolean() == true && hostCount == 0) {
+                v += "$where $k enabling needs at least one host in spec.$MD_ALLOWED_HOSTS"
+            }
+            val lifetimes = listOf(MD_REFRESH_TOKEN_TTL, MD_REFRESH_TOKEN_ABSOLUTE_MAX_TTL).associateWith { f ->
+                spec[f]?.takeIf { !it.isNull }?.let { n ->
+                    if (!n.isIntegralNumber || n.asLong() !in MD_LIFETIME_MIN_SECONDS..MD_LIFETIME_MAX_SECONDS) {
+                        v += "$where $k spec.$f must be a whole number of seconds from $MD_LIFETIME_MIN_SECONDS (1 hour) to $MD_LIFETIME_MAX_SECONDS (90 days)"
+                        null
+                    } else {
+                        n.asLong()
+                    }
+                }
+            }
+            val ttl = lifetimes[MD_REFRESH_TOKEN_TTL]
+            val total = lifetimes[MD_REFRESH_TOKEN_ABSOLUTE_MAX_TTL]
+            if (ttl != null && total != null && total < ttl) {
+                v += "$where $k spec.$MD_REFRESH_TOKEN_ABSOLUTE_MAX_TTL ($total) must not be shorter than spec.$MD_REFRESH_TOKEN_TTL ($ttl)"
+            }
+        }
+
         private fun validateLoginTheme(spec: JsonNode, where: String, v: MutableList<String>) {
             spec.properties().forEach { entry ->
                 if (entry.key !in LOGIN_THEME_SPEC_KEYS) {

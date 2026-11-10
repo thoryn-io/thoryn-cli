@@ -136,6 +136,9 @@ object ScopeRequirements {
         ProvisionFile.KIND_WORKLOAD_IDENTITY_TRUST to "workload-identity",
         ProvisionFile.KIND_ROLE to "roles",
         ProvisionFile.KIND_LEGAL_DOCUMENT to "legal-documents",
+        // SSO-4345 / oauthy SSO-4369 — product-api gates the policy on `tenant:environments.read` / `.write` (and `manager` on
+        // the environment): environment configuration, never the applications pair an application project's identity holds.
+        ProvisionFile.KIND_METADATA_DOCUMENTS to "environments",
     )
 
     /**

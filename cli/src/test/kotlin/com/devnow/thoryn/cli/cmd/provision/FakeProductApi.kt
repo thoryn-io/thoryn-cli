@@ -687,6 +687,62 @@ internal class FakeProductApi : Dispatcher() {
     fun seedEnvironment(slug: String, name: String = slug, kind: String = "sandbox"): String =
         "env-${++seq}".also { environments += mutableMapOf("id" to it, "slug" to slug, "name" to name, "kind" to kind, "suspended" to false) }
 
+    // ── SSO-4345 — the per-environment Client ID Metadata Document policy (product-api SSO-4335 / SSO-4338) ──
+    //
+    // The fake models product-api's gates: the environment (unknown → 404 not_found), `manager` on it ([metadataDocumentManages];
+    // a miss is 404 not_found), the whole-policy body (400 invalid_request), the hub's rules (an enabled policy needs a host,
+    // the DNS-name grammar in short, the lifetime range), and the elevated act of a WIDENING write ([metadataDocumentWidening]).
+
+    /** Per environment id: the stored policy (absent ⇒ the defaults, `updatedAt` null). */
+    val metadataDocumentPolicies = mutableMapOf<String, MutableMap<String, Any?>>()
+    /** Whether the caller holds `manager` on an environment id (default: the access model — an admin, or a grant on it). */
+    var metadataDocumentManages: (String) -> Boolean = { envId -> holds("environment:$envId", "manager") }
+    /** How a widening write is answered: null (accepted), "step_up" (RFC 9470 403) or "machine" (403 elevated_action_requires_person). */
+    var metadataDocumentWidening: String? = null
+
+    private fun metadataDocumentDefaults(e: Map<String, Any?>): MutableMap<String, Any?> = mutableMapOf(
+        "environmentId" to e["id"], "environment" to e["slug"], "enabled" to false, "allowedHosts" to emptyList<String>(),
+        "refreshTokensEnabled" to false, "refreshTokenTtlSeconds" to 259_200L, "refreshTokenAbsoluteMaxTtlSeconds" to 604_800L, "updatedAt" to null,
+    )
+
+    private fun metadataDocumentPolicy(method: String, seg: List<String>, b: Map<String, Any?>): MockResponse {
+        val e = environments.firstOrNull { it["id"] == seg[1] } ?: return problem(404, "not_found")
+        val envId = e["id"].toString()
+        if (!metadataDocumentManages(envId)) return problem(404, "not_found")
+        val before = metadataDocumentPolicies[envId] ?: metadataDocumentDefaults(e)
+        if (method == "GET") return json(200, before)
+        if (method != "PUT") return MockResponse().setResponseCode(405)
+        val enabled = b["enabled"] as? Boolean
+        val hosts = (b["allowedHosts"] as? List<*>)?.map { it.toString().trim().lowercase() }?.distinct()?.sorted()
+        val refresh = b["refreshTokensEnabled"] as? Boolean
+        if (enabled == null || hosts == null || refresh == null) return problem(400, "invalid_request")
+        if (hosts.size > 50) return problem(400, "too_many_allowed_hosts")
+        if (hosts.any { !Regex("^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$").matches(it) }) return problem(400, "invalid_allowed_host")
+        if (enabled && hosts.isEmpty()) return problem(400, "allowed_hosts_required")
+        val ttl = (b["refreshTokenTtlSeconds"] as? Number)?.toLong() ?: (before["refreshTokenTtlSeconds"] as Number).toLong()
+        val max = (b["refreshTokenAbsoluteMaxTtlSeconds"] as? Number)?.toLong() ?: (before["refreshTokenAbsoluteMaxTtlSeconds"] as Number).toLong()
+        if (listOf(ttl, max).any { it !in 3_600L..7_776_000L } || max < ttl) return problem(400, "invalid_refresh_token_lifetime")
+        @Suppress("UNCHECKED_CAST")
+        val beforeHosts = (before["allowedHosts"] as List<String>).toSet()
+        val widens = (enabled && before["enabled"] != true) || hosts.any { it !in beforeHosts } || (refresh && before["refreshTokensEnabled"] != true) ||
+            ttl > (before["refreshTokenTtlSeconds"] as Number).toLong() || max > (before["refreshTokenAbsoluteMaxTtlSeconds"] as Number).toLong()
+        if (widens) {
+            when (metadataDocumentWidening) {
+                "step_up" -> return problem(403, "insufficient_user_authentication").setHeader(
+                    "WWW-Authenticate",
+                    "Bearer error=\"insufficient_user_authentication\", acr_values=\"urn:thoryn:acr:phishing_resistant\", max_age=\"300\"",
+                )
+                "machine" -> return problem(403, "elevated_action_requires_person")
+            }
+        }
+        val after = metadataDocumentDefaults(e).also {
+            it["enabled"] = enabled; it["allowedHosts"] = hosts; it["refreshTokensEnabled"] = refresh
+            it["refreshTokenTtlSeconds"] = ttl; it["refreshTokenAbsoluteMaxTtlSeconds"] = max; it["updatedAt"] = "2026-11-09T10:00:00Z"
+        }
+        metadataDocumentPolicies[envId] = after
+        return json(200, after)
+    }
+
     // ── SSO-4086 — ephemeral sandbox test identities (product-api /api/v1/environments/{envId}/test-identities, oauthy #4297) ──
     //
     // The fake models product-api's gate ORDER (TestIdentitiesService): the environment under the caller's tenant (foreign
@@ -1193,6 +1249,8 @@ internal class FakeProductApi : Dispatcher() {
         val verb = if (method == "GET" || (seg[0] == "access" && seg.getOrNull(1) == "check")) "read" else "write"
         val area = when (seg[0]) {
             // SSO-4086 — TestIdentitiesController: its own `tenant:test-identities.*` pair (oauthy hub V216), not the environments area.
+            // SSO-4345 / oauthy SSO-4369 — ClientIdMetadataDocumentPolicyController is on the environments pair too (and
+            // `manager` on the environment).
             "environments" -> if (seg.getOrNull(2) == "test-identities") "test-identities" else "environments"
             "applications" -> "applications"
             "users" -> if (seg.getOrNull(2) == "roles") "roles" else "users"
@@ -1246,6 +1304,8 @@ internal class FakeProductApi : Dispatcher() {
         return when {
             // ── test identities (SSO-4086) — a sub-resource of the environment, before the environment CRUD ──
             seg[0] == "environments" && seg.getOrNull(2) == "test-identities" -> testIdentities(method, seg, b)
+            // ── Client ID Metadata Document policy (SSO-4345) — also a sub-resource of the environment ──
+            seg[0] == "environments" && seg.getOrNull(2) == "client-id-metadata-documents" -> metadataDocumentPolicy(method, seg, b)
             // ── environments ──
             route == "/api/v1/environments" && method == "GET" -> json(200, mapOf("environments" to environments.map { withOwner(it, "environment:${it["id"]}") }))
             route == "/api/v1/environments" && method == "POST" -> {

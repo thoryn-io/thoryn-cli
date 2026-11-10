@@ -682,6 +682,17 @@ class ProductApiClient(
     override fun applyLoginFlowTemplate(templateId: String): JsonNode =
         post("/api/v1/login-flows/templates/${encode(templateId)}/apply", emptyMap<String, Any?>())
 
+    // ── Client ID Metadata Document policy (SSO-4345; oauthy SSO-4335 / SSO-4338) ──────────────
+    // One environment's policy: whether clients may identify themselves by the https URL of their metadata document, from
+    // which client_id hosts, and whether they get refresh tokens. tenant:environments.read / .write and `manager` on the
+    // environment (else 404). A widening PUT is an elevated act (RFC 9470 step-up; a machine identity is refused).
+
+    override fun getClientIdMetadataDocumentPolicy(envId: String): JsonNode =
+        get("/api/v1/environments/${encode(envId)}/client-id-metadata-documents")
+
+    override fun putClientIdMetadataDocumentPolicy(envId: String, body: Map<String, Any?>): JsonNode =
+        put("/api/v1/environments/${encode(envId)}/client-id-metadata-documents", body)
+
     // ── Login methods (SSO-3075; product-api /api/v1/login-methods, per environment) ──
     // The allow-list of sign-in methods the hosted login offers for the selected environment. Enables
     // e.g. adding `magic_code` (opt-in, not default-on) — the one thing a magic-code example needs that

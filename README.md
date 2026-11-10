@@ -242,6 +242,15 @@ thoryn env test-identity create [--env <slug>] [--lifetime PT2H] [--label <text>
 thoryn env test-identity list   [--env <slug>]          # live + expired-not-yet-purged, with status; never a password
 thoryn env test-identity revoke <id> [--env <slug>]      # erase now, sessions severed (idempotent on an expired one)
 
+# Client ID Metadata Documents (SSO-4345) — whether a client the workspace never registered (an MCP client, say) may
+# identify itself by the https URL of a metadata document it publishes, from which client_id hosts, and whether such
+# clients get rotating refresh tokens. Off, with no host, until a manager changes it. Needs tenant:environments.read /
+# .write AND `manager` on the environment. Enabling, adding a host, turning refresh tokens on or lengthening a lifetime
+# needs a passkey sign-in from the last five minutes. Also the provisioning kind `metadataDocuments`.
+thoryn env metadata-documents show [--env <slug>]
+thoryn env metadata-documents set  [--env <slug>] [--enable|--disable] [--add-host <host>]... [--remove-host <host>]...
+                                   [--hosts a,b] [--refresh-tokens on|off] [--refresh-idle PT72H] [--refresh-max P7D]
+
 # Hosted-login branding (SSO-3037) — the look of the hosted sign-in / register screens end users see,
 # per SELECTED ENVIRONMENT (thoryn env use). Rendered as CSS custom properties; server-validated
 # (hex colors, radius 0-64, theme enum, https logo) + WCAG-AA contrast-guarded. Needs tenant:idp.*.
@@ -297,7 +306,9 @@ thoryn examples share    <name> [--output <file>]   # SSO-2876 — export the se
 # override per (environment, type, locale) — SSO-4054: per environment, a sandbox without its own copy sends
 # production's — body inline or in a file next to the provisioning file — and, SSO-4057, legalDocument: the
 # environment's ACTIVE terms of use / privacy policy version; a published version never changes, so a new
-# text is a new `version`). SSO-3715 (ADR 2026-10-15 platform-is-the-ledger): THERE IS
+# text is a new `version` — and, SSO-4345, metadataDocuments: the environment's Client ID Metadata Document policy,
+# the whole record (hosts as a set; a refresh-token lifetime left out is kept), gated on `manager` of the environment;
+# a widening apply needs a fresh passkey sign-in, and destroy resets it to the defaults). SSO-3715 (ADR 2026-10-15 platform-is-the-ledger): THERE IS
 # NO RECEIPT — nothing is written beside the file, committed or cached; plan / apply / destroy / import read
 # live state only, and `apply --output json` / `plan --output json` carry the resolved ids (`resources[]`:
 # {kind, name, id, environment, action}). SSO-3089: every resource is read LIVE by its converge key before
@@ -1136,6 +1147,53 @@ true: there is no `kind: testIdentity`, the bundled schema does not know one, `p
 treats `tenant:test-identities.write` and `tenant:environments.read` as **sandbox tool scopes** an application
 trust is expected to hold for its own tests (see "Two file parts"); `tenant:users.*` on an application trust is
 still reported as the identity being wider than its file.
+
+### Clients identified by a metadata-document URL — `thoryn env metadata-documents` (SSO-4345, epic SSO-4254)
+
+With Client ID Metadata Documents (draft-ietf-oauth-client-id-metadata-document-03), a client such as an MCP desktop
+agent uses the `https` URL of a document it publishes as its `client_id`. It is off by default, per environment, and
+limited to the `client_id` hosts a manager allows; a protected resource must also opt in to these clients (its
+application's `metadataDocumentClientsAllowed`). The CLI shows and changes the environment's policy:
+
+```bash
+thoryn env metadata-documents show --env staging
+thoryn env metadata-documents set --env staging --enable --add-host clients.example.com
+thoryn env metadata-documents set --env staging --refresh-tokens on --refresh-idle PT24H --refresh-max P30D
+thoryn env metadata-documents set --env staging --remove-host clients.example.com --disable
+```
+
+- `set` changes only what its flags name: it reads the policy, applies the change and writes the whole record back
+  (the API replaces it whole). An unchanged policy is not written. A change someone else made between the read and the
+  write is overwritten, so run `show` afterwards when two people may be changing the same environment.
+- `--add-host` / `--remove-host` edit the list; `--hosts a,b` replaces it (`--hosts ''` clears it).
+- Refresh-token lifetimes are ISO-8601 durations from `PT1H` to `P90D`: `--refresh-idle` is the idle window (default
+  `PT72H`), `--refresh-max` the total lifetime (default `P7D`, never shorter than the idle window). A lifetime you leave
+  out keeps its value. A client gets a refresh token only when its document lists `refresh_token` and the user consents
+  to `offline_access`.
+- Enabling, adding a host, turning refresh tokens on or lengthening a lifetime is an elevated act: a person signed in
+  with a passkey in the last five minutes (otherwise the CLI prints the `thoryn login --acr-values … --max-age 300` to
+  run, then retry). A machine identity may only narrow the policy.
+
+As code, the same policy is the `metadataDocuments` kind of the tenant file:
+
+```yaml
+apiVersion: thoryn.io/tenant/v1
+resources:
+  - kind: metadataDocuments
+    environment: staging          # omitted ⇒ production
+    spec:
+      enabled: true
+      allowedHosts: [clients.example.com]
+      refreshTokensEnabled: true
+      refreshTokenTtlSeconds: 86400               # optional; left out ⇒ the live value is kept
+      refreshTokenAbsoluteMaxTtlSeconds: 2592000  # optional
+```
+
+`plan` diffs the whole record (hosts as a set). The apply identity needs `manager` on the environment (the workspace on
+production); the kind carries no `grants:`. A widening apply needs the person applying to have signed in with a passkey
+in the last five minutes, so run it from a person's session, not a workload identity; narrowing applies anywhere.
+`destroy` / `--prune` resets the policy to the defaults. `import` renders a policy a manager has written and skips one
+that still has its defaults.
 
 ### Project repositories — `thoryn project init` (SSO-3435, epic SSO-3304)
 
