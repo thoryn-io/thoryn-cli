@@ -4209,7 +4209,7 @@ java -jar cli/target/thoryn.jar login --status
 thoryn-cli/
 ├── pom.xml                                                  # reactor parent (SSO-3662): shared versions + plugin config
 ├── README.md                                                # this file
-├── adrs/                                                    # decisions about this repository
+├── adrs/                                                    # a README: the ADRs are kept in thoryn-architecture adrs/ (SSO-4382)
 ├── examples/kubernetes/                                     # SSO-3684 the Thoryn init-container manifest (a pod pulls its own client secret)
 ├── engine/                                                  # io.thoryn:thoryn-provision-engine — the provisioning engine as a LIBRARY (SSO-3662)
 │   ├── pom.xml
@@ -4295,4 +4295,4 @@ thoryn-cli/
 * `docs/modules/ROOT/pages/cli/index.adoc` — top-level user docs
 * `docs/modules/ROOT/pages/cli/tenant-configuration.adoc` — SSO-1552 clients/federation/workspace/audit
 * `docs/modules/ROOT/pages/cli/non-interactive-automation.adoc` — SSO-1553 client-credentials + tenant seed
-* ADR `adrs/2026-04-25-customer-plane-product-api.md`
+* oathy ADR `2026-04-25-customer-plane-product-api`

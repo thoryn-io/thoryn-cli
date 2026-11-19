@@ -4,7 +4,7 @@
     <modelVersion>4.0.0</modelVersion>
     <!--
         SSO-3662 — the repository is a two-module reactor since the provisioning engine became a
-        library (ADR 2026-10-13-provision-engine-shared-library, in this repo's adrs/):
+        library (ADR 2026-10-13-provision-engine-shared-library, kept in thoryn-architecture adrs/):
 
           engine/  io.thoryn:thoryn-provision-engine — the converge engine behind `thoryn provision`
                    (file model + schema, receipt model, plan/apply/destroy/import, the ownership gate,
