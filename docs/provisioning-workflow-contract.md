@@ -241,7 +241,7 @@ plan job would have. A repository that was green with a broken configured file i
 
 **Status: implemented** in cli-v0.51.0 (SSO-3991; decided under SSO-3989 by the product owner on 2026-10-26; the
 `provision import` changes it builds on are SSO-3990). The design and its reasons are thoryn-provisioning
-`adrs/2026-09-30-starter-orchestrator-service.md`, *Amendment 2026-10-26* (§13). After a config project's setup pull
+ADR `2026-10-19-starter-orchestrator-service-internals`, *Amendment 2026-10-26* (§13). After a config project's setup pull
 request is merged, the App dispatches an import on the default branch; the job imports the workspace's live configuration
 as the repository's own read-only identity and hands the files to the App as an artifact; the App opens a pull request
 with them, whose plan is all `noop`.

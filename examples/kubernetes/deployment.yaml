@@ -1,6 +1,6 @@
 # SSO-3684 (parent SSO-3678) — an application that fetches its OWN Thoryn client secret.
 #
-# The pattern (ADR oauthy/adrs/2026-10-14-kubernetes-workload-identity-and-runtime-credential-pull.md):
+# The pattern (oathy ADR 2026-10-14-kubernetes-workload-identity-and-runtime-credential-pull):
 # a `kubernetes` workload identity trust pins this cluster's OIDC issuer, the namespace and the service
 # account below. The pod's projected ServiceAccount token (`iss` = the cluster, `sub` =
 # system:serviceaccount:forge:forge-oauth2-proxy, `aud` = the trust's audience) IS its credential: the

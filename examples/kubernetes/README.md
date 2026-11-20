@@ -14,8 +14,8 @@
 > `workloadPull` sink, with a deprecation warning, until SSO-3953. What follows is kept for the record.
 
 SSO-3684 (parent [SSO-3678](https://thoryn.atlassian.net/browse/SSO-3678), epic SSO-3304). The hub and
-product-api half is oauthy #4095; the design is oauthy ADR
-`adrs/2026-10-14-kubernetes-workload-identity-and-runtime-credential-pull.md`, the user guide the
+product-api half is oauthy #4095; the design is oathy ADR
+`2026-10-14-kubernetes-workload-identity-and-runtime-credential-pull`, the user guide the
 Kubernetes section of `docs/content/guides/workload-identity-github-actions.mdx` (published at
 thoryn.org/docs). This directory is that guide's manifest, complete and applyable.
 

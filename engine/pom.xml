@@ -17,7 +17,7 @@
         abstraction. The thoryn CLI is built on it; any other in-process host converges a file through the
         same classes. The module has NO picocli, NO TTY handling and NO CLI-only type on its public
         surface — pinned by ProvisionEngineLibraryBoundaryArchTest. ADR:
-        adrs/2026-10-13-provision-engine-shared-library.md.
+        ADR 2026-10-13-provision-engine-shared-library.
     </description>
 
     <!--
