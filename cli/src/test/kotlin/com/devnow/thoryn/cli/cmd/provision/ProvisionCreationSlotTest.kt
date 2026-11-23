@@ -200,7 +200,7 @@ class ProvisionCreationSlotTest : CommandTestBase() {
         assertThat(err).doesNotContain("To fix").doesNotContain(ProvisionEngine.ERROR_NOT_REACHABLE)
         assertThat(exit).isEqualTo(CommandSupport.EXIT_OK)
         assertThat(stdout).contains("forge-forgejo-login").contains("create")
-            .contains("will create (reserved by a workspace admin; expires 2099-11-16T00:00:00Z)")
+            .contains("will create (reserved by a workspace admin; expires ${api.unexpiredSlotExpiresAt})")
         assertThat(out).doesNotExist()
         assertThat(api.slotReads).isEqualTo(1)
         assertThat(api.writes).isEmpty()
@@ -217,7 +217,7 @@ class ProvisionCreationSlotTest : CommandTestBase() {
         assertThat(row["action"].asString()).isEqualTo("create")
         assertThat(row["reservation"]["object"].asString()).isEqualTo("application:forge-forgejo-login")
         assertThat(row["reservation"]["environment"].asString()).isEqualTo("production")
-        assertThat(row["reservation"]["expiresAt"].asString()).isEqualTo("2099-11-16T00:00:00Z")
+        assertThat(row["reservation"]["expiresAt"].asString()).isEqualTo(api.unexpiredSlotExpiresAt)
     }
 
     @Test
@@ -239,7 +239,7 @@ class ProvisionCreationSlotTest : CommandTestBase() {
             val item = request(out)["missing"].single()
             assertThat(item["kind"].asString()).describedAs(label).isEqualTo("creator")
             assertThat(item["cli"].asString()).describedAs(label).isEqualTo(reserve)
-            if (label == "expired") assertThat(item["reason"].asString()).contains("creation slot for it expired at 2026-08-31T00:00:00Z")
+            if (label == "expired") assertThat(item["reason"].asString()).contains("creation slot for it expired at ${api.expiredSlotExpiresAt}")
         }
     }
 

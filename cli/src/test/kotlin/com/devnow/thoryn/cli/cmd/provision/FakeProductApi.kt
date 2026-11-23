@@ -337,6 +337,12 @@ internal class FakeProductApi : Dispatcher() {
     /** Race fixture: an admin releases every slot between the plan and the apply's create (the create then misses the gate). */
     var releaseSlotsBeforeCreate = false
 
+    /** SSO-4472 — the `expiresAt` the fake renders for an UNEXPIRED slot: 30 days from when the fake was built (ISO-8601, seconds). */
+    val unexpiredSlotExpiresAt: String = java.time.Instant.now().truncatedTo(java.time.temporal.ChronoUnit.SECONDS).plus(java.time.Duration.ofDays(30)).toString()
+
+    /** SSO-4472 — the `expiresAt` the fake renders for an EXPIRED slot: 30 days before the fake was built. */
+    val expiredSlotExpiresAt: String = java.time.Instant.now().truncatedTo(java.time.temporal.ChronoUnit.SECONDS).minus(java.time.Duration.ofDays(30)).toString()
+
     fun seedSlot(clientId: String, subject: String, env: String? = null, expired: Boolean = false) {
         slots += mutableMapOf("clientId" to clientId, "subject" to subject, "_env" to env, "createdAt" to if (expired) "2026-08-01T00:00:00Z" else "2026-10-17T00:00:00Z", "expired" to expired)
     }
@@ -346,8 +352,9 @@ internal class FakeProductApi : Dispatcher() {
         "subject" to slot["subject"],
         "environment" to (slot["_env"] ?: "production"),
         "createdAt" to slot["createdAt"],
-        // SSO-4472 — an unexpired slot expires far in the future: a fixed near date (2026-11-16) turned "unexpired" into expired once it passed.
-        "expiresAt" to if (slot["expired"] == true) "2026-08-31T00:00:00Z" else "2099-11-16T00:00:00Z",
+        // SSO-4472 — relative to the clock, so a fixture can never expire: an unexpired slot ends 30 days after the fake was built,
+        // an expired one ended 30 days before (a fixed 2026-11-16 turned "unexpired" into expired once it passed).
+        "expiresAt" to if (slot["expired"] == true) expiredSlotExpiresAt else unexpiredSlotExpiresAt,
         "expired" to slot["expired"],
     )
 
