@@ -946,6 +946,8 @@ class LoginCommand : Callable<Int> {
             // SSO-4472 — a `forgejo` connection: the instance / repository / ref pins, and the plan-profile mirror.
             forgejoPins = connection.forgejo,
             forgejoPlanProfile = connection.planScopes != null,
+            // SSO-4472 — the sandbox the connection derives its audience for: the plane the file states outright.
+            sandboxEnvironment = connection.environment,
             retiredFix = if (connection.audience == null) {
                 { suggestion -> customDomainAudienceFix(suggestion, connection, file) }
             } else {
@@ -970,7 +972,13 @@ class LoginCommand : Callable<Int> {
      * SSO-4472 — the profile line of a Forgejo sign-in: the one the trigger-class rule expected for this job, and — since
      * the hub decides — a notice when the minted scopes contradict an expected plan (a hub that predates the rule).
      */
-    private fun printForgejoProfile(identity: com.devnow.thoryn.cli.auth.JobIdentity?, selected: WorkloadProfile?, pinnedRef: String?, minted: String?) {
+    private fun printForgejoProfile(
+        identity: com.devnow.thoryn.cli.auth.JobIdentity?,
+        selected: WorkloadProfile?,
+        pinnedRef: String?,
+        minted: String?,
+        plane: com.devnow.thoryn.cli.auth.TrustPlane,
+    ) {
         val job = identity?.let { WorkloadIdentityDiagnostics.forgejoJobDescription(it) } ?: "this job"
         when (selected) {
             WorkloadProfile.APPLY -> println("Profile: apply ($job — the connection's scopes).")
@@ -983,7 +991,14 @@ class LoginCommand : Callable<Int> {
             }
             null -> println(
                 "Profile: decided by the hub ($job; no scope was requested — the connection's scopes are requested only for a workflow_dispatch on " +
-                    "${pinnedRef?.let { "the pinned ref '$it'" } ?: "the pinned ref (name it in auth.forgejo.ref)"}).",
+                    "${pinnedRef?.let { "the pinned ref '$it'" } ?: "the pinned ref (name it in auth.forgejo.ref)"}" +
+                    (
+                        if (plane == com.devnow.thoryn.cli.auth.TrustPlane.UNKNOWN) {
+                            "; on a sandbox also for a push, schedule or pull request, but the connection does not say which plane the trust is on (no auth.plan or auth.environment, and the audience has a path)"
+                        } else {
+                            ""
+                        }
+                        ) + ").",
             )
         }
     }
@@ -1063,6 +1078,8 @@ class LoginCommand : Callable<Int> {
         forgejoPins: ForgejoPins? = null,
         /** SSO-4472 — the connection mirrors the `forgejo` trust's plan profile (`auth.plan`). */
         forgejoPlanProfile: Boolean = false,
+        /** SSO-4472 — the sandbox the connection's audience is derived for (`auth.environment`); null when it names none. */
+        sandboxEnvironment: String? = null,
     ): Int {
         try {
             IssuerUrlValidator.validate(audience, devMode)
@@ -1109,7 +1126,7 @@ class LoginCommand : Callable<Int> {
         fun scopeSent(): String? = if (selected == WorkloadProfile.PLAN || hubDecided) null else requestedScope
         fun binding() = WorkloadIdentityBinding(
             clientIdValue, audience, tokenEndpoint, scopeSent(), pins, provider, kubernetesPins, selected, hubDecided, connectionFile, requestedScope,
-            forgejoPins = forgejoPins, forgejoPlanProfile = forgejoPlanProfile,
+            forgejoPins = forgejoPins, forgejoPlanProfile = forgejoPlanProfile, sandboxEnvironment = sandboxEnvironment,
         )
         val flow = WorkloadIdentityFlow(
             clientId = clientIdValue,
@@ -1126,10 +1143,10 @@ class LoginCommand : Callable<Int> {
                 if (forgejo) {
                     // SSO-4472 (ADR 2026-10-14 Amendment 2026-11-23) — the job's trigger class and ref select the profile:
                     // the connection's scopes for an expected APPLY (on production: a dispatch on the pinned ref), none
-                    // otherwise, so the hub mints the matched profile and a plan job never asks for a write scope.
-                    selected = WorkloadProfile.forgejoExpectation(
-                        identity, forgejoPins?.ref, WorkloadIdentityDiagnostics.namesProductionPlane(audience), forgejoPlanProfile,
-                    ).profile
+                    // otherwise, so the hub mints the matched profile and a plan job never asks for a write scope. The plane is
+                    // what the connection states (auth.plan, auth.environment), else a path-less audience (production); when
+                    // neither tells, only what both planes agree on is predicted, and the hub decides the rest.
+                    selected = WorkloadProfile.forgejoExpectation(identity, forgejoPins?.ref, binding().forgejoPlane, forgejoPlanProfile).profile
                     hubDecided = selected != WorkloadProfile.APPLY
                 } else {
                     selected = WorkloadProfile.select(identity, applyEnvironment)
@@ -1156,7 +1173,7 @@ class LoginCommand : Callable<Int> {
             println("Signed in (workload identity / client '$clientIdValue' at $audience, as $who).")
             selectSignedInWorkspace(session)
             if (forgejo) {
-                printForgejoProfile(job, selected, forgejoPins?.ref, tokens.scope)
+                printForgejoProfile(job, selected, forgejoPins?.ref, tokens.scope, binding().forgejoPlane)
             } else when (selected) {
                 WorkloadProfile.PLAN -> println(
                     "Profile: plan (read-only) — this job runs in GitHub environment '${jobEnvironment ?: "(none)"}', not the trust's apply " +

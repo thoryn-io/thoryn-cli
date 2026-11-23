@@ -3,6 +3,7 @@ package com.devnow.thoryn.cli.cmd
 import com.devnow.thoryn.cli.api.ProductApiClient
 import com.devnow.thoryn.cli.api.ProductApiException
 import com.devnow.thoryn.cli.auth.TokenStoreFactory
+import com.devnow.thoryn.cli.auth.TriggerProfileRule
 import com.devnow.thoryn.cli.auth.WorkloadIdentityFlow
 import com.devnow.thoryn.cli.cmd.examples.Prompt
 import com.devnow.thoryn.cli.config.ThorynConfig
@@ -264,7 +265,8 @@ class WorkloadIdentityCommand : Callable<Int> {
             names = ["--ref"],
             description = [
                 "Only jobs on this exact ref, e.g. refs/heads/main. forgejo: required for a production trust (Forgejo has no",
-                "environments) — a workflow_dispatch on it applies; a push or schedule on it, or a pull request into its branch, plans.",
+                "environments), and there it must be a branch ref (refs/heads/<branch>) — a workflow_dispatch on it applies; a push",
+                "or schedule on it, or a pull request into its branch, plans. A sandbox trust may pin any full ref.",
             ],
         )
         var ref: String? = null
@@ -518,6 +520,17 @@ class WorkloadIdentityCommand : Callable<Int> {
                 System.err.println(
                     "Error: a production $PROVIDER_FORGEJO trust must pin --ref (production_requires_ref), e.g. --ref refs/heads/main: " +
                         "Forgejo has no environments, so the ref is the production rule — a workflow_dispatch on it applies.",
+                )
+                return CommandSupport.EXIT_USAGE
+            }
+            // SSO-4472 (ADR 2026-10-14 Amendment 2026-11-23, rule 2: "a production trust pins one branch ref, P = refs/heads/<b>")
+            // — a tag, a pull-request ref or a bare branch name is refused here first. A sandbox trust keeps any full ref.
+            val pinned = ref?.trim()
+            if (confirmProduction && pinned != null && !isBranchRef(pinned)) {
+                System.err.println(
+                    "Error: a production $PROVIDER_FORGEJO trust must pin a branch ref (${ERROR_PRODUCTION_REF_NOT_BRANCH}), and '$pinned' is not one: " +
+                        "use --ref ${branchRefSuggestion(pinned)}. A workflow_dispatch on that branch applies; a push or schedule on it, " +
+                        "or a pull request into it, plans.",
                 )
                 return CommandSupport.EXIT_USAGE
             }
@@ -914,6 +927,29 @@ class WorkloadIdentityCommand : Callable<Int> {
 
         /** SSO-4472 — Forgejo user / organization / repository names (`AlphaDashDot`, as product-api checks them). */
         private val FORGEJO_NAME = Regex("^[A-Za-z0-9._-]{1,100}$")
+
+        /**
+         * SSO-4472 — the hub's refusal of a production Forgejo pin that is not a branch ref (rule 2: `P = refs/heads/<b>`).
+         * The name the hub side (oauthy SSO-4471, PR #4431) was asked to use; refused locally first by `trusts create`.
+         */
+        const val ERROR_PRODUCTION_REF_NOT_BRANCH: String = "production_ref_not_branch"
+
+        /** SSO-4472 — `refs/heads/<branch>` with a non-empty branch: the only ref a production Forgejo trust may pin. */
+        internal fun isBranchRef(ref: String): Boolean =
+            ref.startsWith(TriggerProfileRule.BRANCH_PREFIX) && ref.length > TriggerProfileRule.BRANCH_PREFIX.length
+
+        /**
+         * SSO-4472 — the `--ref` to suggest instead of [ref]: a bare branch name (`main`, `heads/main`) becomes
+         * `refs/heads/main`; any other full ref (a tag, a pull-request ref) the placeholder `refs/heads/<branch>`.
+         */
+        internal fun branchRefSuggestion(ref: String): String {
+            val bare = ref.trim().removePrefix("heads/")
+            return if (!ref.startsWith("refs/") && bare.isNotEmpty() && !bare.startsWith("/")) {
+                TriggerProfileRule.BRANCH_PREFIX + bare
+            } else {
+                "${TriggerProfileRule.BRANCH_PREFIX}<branch>"
+            }
+        }
 
         /** SSO-4472 — an https origin: scheme and host (and port); no path, query, fragment or credentials. */
         internal fun isForgejoInstanceOrigin(url: String): Boolean {
@@ -1488,6 +1524,10 @@ class WorkloadIdentityCommand : Callable<Int> {
                     "Pass --owner-id and --repository-id: `owner.id` and `id` of GET <instance>/api/v1/repos/<owner>/<repo>."
                 "production_requires_ref" ->
                     "A production Forgejo trust must pin a ref: add --ref refs/heads/<branch> (a workflow_dispatch on it applies)."
+                // SSO-4472 — the hub's refusal of a production pin that is not a branch (rule 2: P = refs/heads/<b>).
+                ERROR_PRODUCTION_REF_NOT_BRANCH ->
+                    "A production Forgejo trust must pin a branch ref: use --ref refs/heads/<branch>, normally the default branch " +
+                        "(not a tag or a pull-request ref). A sandbox trust may pin any full ref."
                 "github_repository_not_found" ->
                     "GitHub has no public repository by that name. For a private repository pass --owner-id and --repository-id."
                 "github_unavailable" -> "GitHub could not be reached to look up the repository ids. Retry, or pass --owner-id and --repository-id."

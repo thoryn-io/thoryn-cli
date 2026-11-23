@@ -504,13 +504,14 @@ enum class WorkloadProfile(val wire: String) {
         /**
          * SSO-4472 — the profile seam for a provider WITHOUT environments (Forgejo first): the amendment's trigger-class
          * rule ([TriggerProfileRule], ADR `2026-10-14-plan-identity-and-resource-ownership` Amendment 2026-11-23) applied
-         * to [identity] under a trust pinned to [pinnedRef] (the connection's `auth.forgejo.ref`) on the [production]
-         * plane, with or without a plan profile ([hasPlanProfile], the connection's `auth.plan`). `login --connection`
-         * sends the connection's scopes only for an expected [APPLY] (on production: a dispatch on the pinned ref) and
-         * none otherwise, so the hub's matched profile decides.
+         * to [identity] under a trust pinned to [pinnedRef] (the connection's `auth.forgejo.ref`) on [plane]
+         * ([WorkloadIdentityDiagnostics.forgejoPlane]; [TrustPlane.UNKNOWN] predicts only what both planes agree on), with
+         * or without a plan profile ([hasPlanProfile], the connection's `auth.plan`). `login --connection` sends the
+         * connection's scopes only for an expected [APPLY] (on production: a dispatch on the pinned ref) and none
+         * otherwise, so the hub's matched profile decides.
          */
-        fun forgejoExpectation(identity: JobIdentity, pinnedRef: String?, production: Boolean, hasPlanProfile: Boolean): TriggerExpectation =
-            TriggerProfileRule.expect(ForgejoTriggerMapping.classify(identity.eventName), identity.ref, identity.baseRef, pinnedRef, production, hasPlanProfile)
+        fun forgejoExpectation(identity: JobIdentity, pinnedRef: String?, plane: TrustPlane, hasPlanProfile: Boolean): TriggerExpectation =
+            TriggerProfileRule.expect(ForgejoTriggerMapping.classify(identity.eventName), identity.ref, identity.baseRef, pinnedRef, plane, hasPlanProfile)
 
         /**
          * SSO-3722 — whether a `--connection` sign-in leaves the profile to the HUB: the connection names NO apply
