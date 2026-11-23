@@ -89,6 +89,59 @@ object FakeJobTokens {
 
     const val KUBERNETES_ISSUER: String = "https://kubernetes.default.svc.cluster.local"
 
+    /** SSO-4472 — a neutral public Forgejo instance for tests (never a particular customer's forge). */
+    const val FORGEJO_INSTANCE: String = "https://codeberg.org"
+
+    /**
+     * SSO-4472 — the public shape of a Forgejo Actions job token (Forgejo v17.0.1, measured under SSO-4442; claim set
+     * from `services/actions/auth.go` `IDTokenCustomClaims`): `iss` = `<instance>/api/actions`, every custom claim a
+     * STRING (an absent context value is `""`), the DEFAULT `sub` `repo:<owner>-<ownerId>/<repo>-<repoId>:ref:<ref>` or
+     * `…:pull_request` for a `pull_request` event (the legacy `owner/name` form with [legacySubject]).
+     */
+    fun forgejoClaims(
+        audience: String,
+        instance: String = FORGEJO_INSTANCE,
+        owner: String = "acme",
+        ownerId: String = "7",
+        repository: String = "infra",
+        repositoryId: String = "42",
+        ref: String = "refs/heads/main",
+        eventName: String = "push",
+        baseRef: String? = null,
+        legacySubject: Boolean = false,
+    ): Map<String, Any?> = buildMap {
+        put("iss", "$instance/api/actions")
+        put("aud", audience)
+        val r = if (legacySubject) "$owner/$repository" else "$owner-$ownerId/$repository-$repositoryId"
+        put("sub", "repo:$r:" + if (eventName == "pull_request") "pull_request" else "ref:$ref")
+        put("jti", UUID.randomUUID().toString())
+        put("actor", "maintainer")
+        put("actor_id", "3")
+        put("base_ref", baseRef ?: "")
+        put("event_name", eventName)
+        put("head_ref", if (eventName == "pull_request") "feature" else "")
+        put("ref", ref)
+        put("ref_protected", "false")
+        put("ref_type", "branch")
+        put("repository", "$owner/$repository")
+        put("repository_id", repositoryId)
+        put("repository_owner", owner)
+        put("repository_owner_id", ownerId)
+        put("run_attempt", "1")
+        put("run_id", "1234")
+        put("run_number", "56")
+        put("sha", "89abcdef0123456789abcdef0123456789abcdef")
+        put("workflow", "provision.yml")
+        put("workflow_ref", "$owner/$repository/.forgejo/workflows/provision.yml@$ref")
+        val now = System.currentTimeMillis() / 1000
+        put("iat", now)
+        put("nbf", now)
+        put("exp", now + 3600)
+    }
+
+    fun forgejoToken(audience: String, eventName: String = "push", ref: String = "refs/heads/main", baseRef: String? = null): String =
+        token(forgejoClaims(audience, eventName = eventName, ref = ref, baseRef = baseRef))
+
     fun kubernetesToken(audience: String, namespace: String = "forge", serviceAccount: String = "forge-oauth2-proxy"): String =
         token(kubernetesClaims(audience, namespace, serviceAccount))
 }

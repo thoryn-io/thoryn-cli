@@ -24,6 +24,7 @@ import com.devnow.thoryn.cli.auth.ScopeRegistry
 import com.devnow.thoryn.cli.auth.TokenStore
 import com.devnow.thoryn.cli.auth.TokenStoreFactory
 import com.devnow.thoryn.cli.auth.Tokens
+import com.devnow.thoryn.cli.auth.ForgejoPins
 import com.devnow.thoryn.cli.auth.KubernetesPins
 import com.devnow.thoryn.cli.auth.TrustPins
 import com.devnow.thoryn.cli.auth.WorkloadIdentityBinding
@@ -206,8 +207,8 @@ class LoginCommand : Callable<Int> {
     @Option(
         names = ["--workload-identity", "--github-oidc"],
         description = [
-            "Sign in from a GitHub Actions job under a workload identity trust — no secret. The job needs " +
-                "`permissions: id-token: write`. Requires --client-id <the trust's wi_… client id> and " +
+            "Sign in from a CI job (GitHub Actions, or Forgejo Actions on any instance) under a workload identity trust — " +
+                "no secret. A GitHub job needs `permissions: id-token: write`, a Forgejo job `enable-openid-connect: true`. Requires --client-id <the trust's wi_… client id> and " +
                 "--audience <the trust's audience>; --scope optional (a subset of the trust's scopes). " +
                 "See `thoryn workload-identity trusts create`.",
         ],
@@ -241,8 +242,9 @@ class LoginCommand : Callable<Int> {
         names = ["--token-file"],
         paramLabel = "<path>",
         description = [
-            "With --workload-identity: read the identity token from this file instead of the GitHub Actions runner — " +
-                "a pod's projected ServiceAccount token under a kubernetes trust (see `thoryn workload-identity trusts create --provider kubernetes`).",
+            "With --workload-identity: read the identity token from this file instead of the CI runner — " +
+                "a pod's projected ServiceAccount token under a kubernetes trust (see `thoryn workload-identity trusts create --provider kubernetes`), " +
+                "or a Forgejo job token the job minted itself behind an authenticating proxy (a fresh one per sign-in).",
         ],
     )
     var wifTokenFile: File? = null
@@ -941,6 +943,9 @@ class LoginCommand : Callable<Int> {
             tokenFile = connection.tokenFile,
             provider = connection.effectiveProvider,
             kubernetesPins = connection.kubernetes,
+            // SSO-4472 — a `forgejo` connection: the instance / repository / ref pins, and the plan-profile mirror.
+            forgejoPins = connection.forgejo,
+            forgejoPlanProfile = connection.planScopes != null,
             retiredFix = if (connection.audience == null) {
                 { suggestion -> customDomainAudienceFix(suggestion, connection, file) }
             } else {
@@ -959,6 +964,28 @@ class LoginCommand : Callable<Int> {
             hubDecidesWhenApplyEnvironmentUnknown = connection.effectiveProvider == Connection.PROVIDER_GITHUB_ACTIONS,
             connectionFile = file.path,
         )
+    }
+
+    /**
+     * SSO-4472 — the profile line of a Forgejo sign-in: the one the trigger-class rule expected for this job, and — since
+     * the hub decides — a notice when the minted scopes contradict an expected plan (a hub that predates the rule).
+     */
+    private fun printForgejoProfile(identity: com.devnow.thoryn.cli.auth.JobIdentity?, selected: WorkloadProfile?, pinnedRef: String?, minted: String?) {
+        val job = identity?.let { WorkloadIdentityDiagnostics.forgejoJobDescription(it) } ?: "this job"
+        when (selected) {
+            WorkloadProfile.APPLY -> println("Profile: apply ($job — the connection's scopes).")
+            WorkloadProfile.PLAN -> {
+                println("Profile: plan (read-only) — $job: no scope was requested and the hub minted the trust's plan profile. Writes are refused by design.")
+                val writes = minted?.split(' ')?.filter { it.isNotBlank() && !it.endsWith(".read") }.orEmpty()
+                if (writes.isNotEmpty()) {
+                    println("Notice: the platform minted write scopes (${writes.joinToString(" ")}) to a job the plan profile is selected for — it does not apply the plan-profile rule yet.")
+                }
+            }
+            null -> println(
+                "Profile: decided by the hub ($job; no scope was requested — the connection's scopes are requested only for a workflow_dispatch on " +
+                    "${pinnedRef?.let { "the pinned ref '$it'" } ?: "the pinned ref (name it in auth.forgejo.ref)"}).",
+            )
+        }
     }
 
     /**
@@ -1032,6 +1059,10 @@ class LoginCommand : Callable<Int> {
         hubDecidesWhenApplyEnvironmentUnknown: Boolean = false,
         /** SSO-3722 — the connection file, so a refusal's fix names the exact file to edit. */
         connectionFile: String? = null,
+        /** SSO-4472 — a `forgejo` trust's pins (its `ref` is the production pin the profile rule reads). */
+        forgejoPins: ForgejoPins? = null,
+        /** SSO-4472 — the connection mirrors the `forgejo` trust's plan profile (`auth.plan`). */
+        forgejoPlanProfile: Boolean = false,
     ): Int {
         try {
             IssuerUrlValidator.validate(audience, devMode)
@@ -1073,20 +1104,37 @@ class LoginCommand : Callable<Int> {
         var selected: WorkloadProfile? = null
         var hubDecided = false
         var jobEnvironment: String? = null
+        var job: com.devnow.thoryn.cli.auth.JobIdentity? = null
+        val forgejo = provider == Connection.PROVIDER_FORGEJO
         fun scopeSent(): String? = if (selected == WorkloadProfile.PLAN || hubDecided) null else requestedScope
-        fun binding() = WorkloadIdentityBinding(clientIdValue, audience, tokenEndpoint, scopeSent(), pins, provider, kubernetesPins, selected, hubDecided, connectionFile, requestedScope)
+        fun binding() = WorkloadIdentityBinding(
+            clientIdValue, audience, tokenEndpoint, scopeSent(), pins, provider, kubernetesPins, selected, hubDecided, connectionFile, requestedScope,
+            forgejoPins = forgejoPins, forgejoPlanProfile = forgejoPlanProfile,
+        )
         val flow = WorkloadIdentityFlow(
             clientId = clientIdValue,
             audience = audience,
             tokenEndpoint = tokenEndpoint,
             tokenSender = realHttpSender(),
             tokenFile = tokenFile?.let { java.nio.file.Path.of(it) },
+            provider = provider,
         )
         return try {
             val tokens = flow.run { identity ->
                 jobEnvironment = identity.environment
-                selected = WorkloadProfile.select(identity, applyEnvironment)
-                hubDecided = hubDecidesWhenApplyEnvironmentUnknown && WorkloadProfile.hubDecides(identity, applyEnvironment)
+                job = identity
+                if (forgejo) {
+                    // SSO-4472 (ADR 2026-10-14 Amendment 2026-11-23) — the job's trigger class and ref select the profile:
+                    // the connection's scopes for an expected APPLY (on production: a dispatch on the pinned ref), none
+                    // otherwise, so the hub mints the matched profile and a plan job never asks for a write scope.
+                    selected = WorkloadProfile.forgejoExpectation(
+                        identity, forgejoPins?.ref, WorkloadIdentityDiagnostics.namesProductionPlane(audience), forgejoPlanProfile,
+                    ).profile
+                    hubDecided = selected != WorkloadProfile.APPLY
+                } else {
+                    selected = WorkloadProfile.select(identity, applyEnvironment)
+                    hubDecided = hubDecidesWhenApplyEnvironmentUnknown && WorkloadProfile.hubDecides(identity, applyEnvironment)
+                }
                 scopeSent()
             }
             val session = persistSession(
@@ -1107,7 +1155,9 @@ class LoginCommand : Callable<Int> {
             val who = com.devnow.thoryn.cli.auth.JwtClaims.of(tokens.accessToken)["sub"]?.asString() ?: clientIdValue
             println("Signed in (workload identity / client '$clientIdValue' at $audience, as $who).")
             selectSignedInWorkspace(session)
-            when (selected) {
+            if (forgejo) {
+                printForgejoProfile(job, selected, forgejoPins?.ref, tokens.scope)
+            } else when (selected) {
                 WorkloadProfile.PLAN -> println(
                     "Profile: plan (read-only) — this job runs in GitHub environment '${jobEnvironment ?: "(none)"}', not the trust's apply " +
                         "environment '$applyEnvironment', so no scope was requested and the hub minted the trust's plan profile. Writes are refused by design.",
@@ -1129,7 +1179,8 @@ class LoginCommand : Callable<Int> {
             EXIT_OK
         } catch (e: WorkloadIdentityException) {
             val b = binding()
-            val consentUrl = FixRequests.consentUrl(e.jobIdentity)
+            // The browser consent is the Thoryn GitHub App's: it has no page for a Forgejo run.
+            val consentUrl = if (forgejo) null else FixRequests.consentUrl(e.jobIdentity)
             System.err.println(WorkloadIdentityDiagnostics.render(e, b, consentUrl))
             // SSO-3710 / SSO-3722 — EVERY refusal that had a job token becomes the fix request, when asked for: the same
             // items (a missing plan profile) and notes (file / job edits) the report above rendered, nothing more.

@@ -9,9 +9,9 @@
   "properties": {
     "apiVersion": { "const": "thoryn.io/workflow/v1" },
     "provider": {
-      "description": "The forge whose job token is the repository's identity. `github_actions` only today: a Forgejo trust exists on the hub (oauthy converge ADR Amendment 3) but `thoryn login --connection` cannot exchange a Forgejo job token yet — a recorded product gap.",
+      "description": "The forge whose job token is the repository's identity: `github_actions` (the default) or `forgejo` (SSO-4472) — a Forgejo Actions job on any Forgejo instance, signing in with its own job token under a `forgejo` trust (`auth.provider: forgejo` in its connection).",
       "type": "string",
-      "enum": ["github_actions"],
+      "enum": ["github_actions", "forgejo"],
       "default": "github_actions"
     },
     "files": {

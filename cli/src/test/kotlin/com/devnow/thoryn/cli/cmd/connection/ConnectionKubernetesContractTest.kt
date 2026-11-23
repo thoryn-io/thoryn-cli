@@ -160,7 +160,7 @@ class ConnectionKubernetesContractTest {
     fun `load refuses a file that names an unknown provider`() {
         assertThatThrownBy { Connection.parse(kubernetesConnection.replace("\"kubernetes\"", "\"openshift\"").toByteArray()) }
             .isInstanceOf(ConnectionException::class.java)
-            .hasMessageContaining("auth.provider must be one of github_actions | kubernetes")
+            .hasMessageContaining("auth.provider must be one of github_actions | forgejo | kubernetes")
     }
 
     // --- Drift guard: the bundled schema encodes the same providers and token-source kinds. ---

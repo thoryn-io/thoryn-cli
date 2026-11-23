@@ -149,7 +149,7 @@ toggles default off).
 
 Schema `cli/src/main/resources/examples/workflow.schema.json`; loader `WorkflowConfig` (unknown keys refused at every
 level; each value's grammar checked). Absent ⇒ the built-in defaults. Keys: `apiVersion: thoryn.io/workflow/v1`,
-`provider` (`github_actions` only — Forgejo is a recorded gap, see README), `files[] {file, connection}` (one or many; a
+`provider` (`github_actions`, or `forgejo` since SSO-4472 — a Forgejo job's connection signs in with its own job token), `files[] {file, connection}` (one or many; a
 connection defaults to the `connection.json` beside its file), `env` (`THORYN_*` names only, not workflow-owned, never
 credential-shaped; exported, never evaluated), `fixRequest` (default true), `consentUrl` (SSO-3723 — the browser
 consent base URL, `https://` without query or fragment; `THORYN_CONSENT_URL` for the CLI when the `consent-url` input is
