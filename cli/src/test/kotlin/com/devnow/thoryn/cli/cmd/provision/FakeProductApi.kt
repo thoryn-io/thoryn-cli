@@ -346,7 +346,8 @@ internal class FakeProductApi : Dispatcher() {
         "subject" to slot["subject"],
         "environment" to (slot["_env"] ?: "production"),
         "createdAt" to slot["createdAt"],
-        "expiresAt" to if (slot["expired"] == true) "2026-08-31T00:00:00Z" else "2026-11-16T00:00:00Z",
+        // SSO-4472 — an unexpired slot expires far in the future: a fixed near date (2026-11-16) turned "unexpired" into expired once it passed.
+        "expiresAt" to if (slot["expired"] == true) "2026-08-31T00:00:00Z" else "2099-11-16T00:00:00Z",
         "expired" to slot["expired"],
     )
 
