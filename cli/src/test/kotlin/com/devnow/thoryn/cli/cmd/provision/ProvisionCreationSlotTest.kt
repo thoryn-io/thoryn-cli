@@ -200,7 +200,7 @@ class ProvisionCreationSlotTest : CommandTestBase() {
         assertThat(err).doesNotContain("To fix").doesNotContain(ProvisionEngine.ERROR_NOT_REACHABLE)
         assertThat(exit).isEqualTo(CommandSupport.EXIT_OK)
         assertThat(stdout).contains("forge-forgejo-login").contains("create")
-            .contains("will create (reserved by a workspace admin; expires 2026-11-16T00:00:00Z)")
+            .contains("will create (reserved by a workspace admin; expires 2099-11-16T00:00:00Z)")
         assertThat(out).doesNotExist()
         assertThat(api.slotReads).isEqualTo(1)
         assertThat(api.writes).isEmpty()
@@ -217,7 +217,7 @@ class ProvisionCreationSlotTest : CommandTestBase() {
         assertThat(row["action"].asString()).isEqualTo("create")
         assertThat(row["reservation"]["object"].asString()).isEqualTo("application:forge-forgejo-login")
         assertThat(row["reservation"]["environment"].asString()).isEqualTo("production")
-        assertThat(row["reservation"]["expiresAt"].asString()).isEqualTo("2026-11-16T00:00:00Z")
+        assertThat(row["reservation"]["expiresAt"].asString()).isEqualTo("2099-11-16T00:00:00Z")
     }
 
     @Test
