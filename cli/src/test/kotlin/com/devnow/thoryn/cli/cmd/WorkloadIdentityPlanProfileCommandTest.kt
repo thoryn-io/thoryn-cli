@@ -103,7 +103,7 @@ class WorkloadIdentityPlanProfileCommandTest : CommandTestBase() {
             "--scope", "tenant:applications.read", "--plan-environment", "x", "--gateway", baseUrl(),
         )
         assertThat(kubernetes.exit).isEqualTo(CommandSupport.EXIT_USAGE)
-        assertThat(kubernetes.err).contains("--plan-environment").contains("apply to --provider github_actions only")
+        assertThat(kubernetes.err).contains("--plan-environment").contains("do not apply to --provider kubernetes")
 
         assertThat(server.requestCount).isZero()
     }
@@ -213,10 +213,15 @@ class WorkloadIdentityPlanProfileCommandTest : CommandTestBase() {
     }
 
     @Test
-    fun `set-plan-profile requires --plan-environment`() {
+    fun `set-plan-profile requires --plan-environment for a GitHub trust — read from the trust, nothing written`() {
+        // SSO-4472 — the flag is optional now (a Forgejo trust's plan profile names no environment), so the trust is read first.
+        server.enqueue(jsonResponse(200, fixture("trust-created")))
+
         val (exit, _, err) = runCli("workload-identity", "trusts", "set-plan-profile", trustId, "--gateway", baseUrl())
-        assertThat(exit).isNotEqualTo(0)
-        assertThat(err).contains("--plan-environment")
-        assertThat(server.requestCount).isZero()
+
+        assertThat(exit).isEqualTo(CommandSupport.EXIT_USAGE)
+        assertThat(err).contains("plan_profile_requires_environment").contains("--plan-environment <gh-env> is required for a github_actions trust")
+        assertThat(server.requestCount).isEqualTo(1)
+        assertThat(server.takeRequest().method).isEqualTo("GET")
     }
 }

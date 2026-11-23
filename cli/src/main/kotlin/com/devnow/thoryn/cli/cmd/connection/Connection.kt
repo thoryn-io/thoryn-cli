@@ -1,5 +1,6 @@
 package com.devnow.thoryn.cli.cmd.connection
 
+import com.devnow.thoryn.cli.auth.ForgejoPins
 import com.devnow.thoryn.cli.auth.KubernetesPins
 import com.devnow.thoryn.cli.auth.TrustPins
 import tools.jackson.databind.JsonNode
@@ -27,6 +28,12 @@ import java.io.File
  *    and the identity token comes from a FILE — `auth.tokenSource: {kind: file, path: …}`, the pod's
  *    projected ServiceAccount token — instead of the GitHub Actions runner. Optional `auth.kubernetes`
  *    pins (issuer, namespace, serviceAccount) play the role `auth.github` plays for GitHub.
+ *    SSO-4472 — the same method under a `forgejo` trust (oathy SSO-3661), on ANY Forgejo instance:
+ *    `auth.provider: forgejo`, the job token from the Forgejo Actions runner (the same `ACTIONS_ID_TOKEN_REQUEST_*`
+ *    variables) or — behind an authenticating proxy — from a FILE (`auth.tokenSource: {kind: file, path: …}`).
+ *    Optional `auth.forgejo` pins (instanceUrl, owner, repository, their ids, ref) mirror the trust's, and an optional
+ *    `auth.plan: {scopes}` mirrors its plan profile (ADR 2026-10-14 Amendment 2026-11-23): never sent, it tells the CLI
+ *    the trust has one, so a push on the pinned ref is expected to get the plan profile rather than be refused.
  *
  * **SSO-3702 — ONE connection per repository, no `auth.plan`, no `connection.plan.json`** (SSO-3699 option B,
  * oauthy ADR `2026-10-14-plan-identity-and-resource-ownership`). A `github_actions` trust is ONE `wi_` client with
@@ -36,7 +43,9 @@ import java.io.File
  * [scopes] exactly, as always; in any other environment it sends none, so the hub mints the matched plan profile.
  * A declared `auth.plan` could add nothing the hub does not already enforce (it would at best ask for less, at
  * worst ask for a write scope the hub refuses with `invalid_scope` / `scope_outside_plan_profile`), so the
- * contract deliberately has no such member — `additionalProperties: false` keeps it out.
+ * contract deliberately has no such member — `additionalProperties: false` keeps it out. (SSO-4472: a `forgejo`
+ * connection may carry `auth.plan`, as a MIRROR of the trust's plan profile — on Forgejo the profile is selected by the
+ * job's trigger class and ref, not by anything the job declares, so the CLI needs to know whether one exists.)
  *
  * DATA, not code: the secret is NEVER in the file, only the [secretEnv] name. This class parses and
  * structurally validates against the bundled schema's contract (no third-party JSON-Schema engine —
@@ -77,6 +86,10 @@ internal class Connection private constructor(
     val tokenFile: String? = null,
     /** SSO-3684 — a `kubernetes` trust's pins as the file states them, for local diagnostics only. */
     val kubernetes: KubernetesPins? = null,
+    /** SSO-4472 — a `forgejo` trust's pins as the file states them (the ref also drives the profile expectation). */
+    val forgejo: ForgejoPins? = null,
+    /** SSO-4472 — a `forgejo` trust's plan profile scopes as the file mirrors them (`auth.plan.scopes`), null when absent. */
+    val planScopes: List<String>? = null,
 ) {
 
     /** True for a `workload_identity` connection (no secret; the GitHub Actions job token is the credential). */
@@ -105,8 +118,11 @@ internal class Connection private constructor(
         /** SSO-3684 — a pod in a Kubernetes cluster, authenticating with its projected ServiceAccount token. */
         const val PROVIDER_KUBERNETES = "kubernetes"
 
+        /** SSO-4472 — a Forgejo Actions job on any Forgejo instance (oathy SSO-3661). */
+        const val PROVIDER_FORGEJO = "forgejo"
+
         /** The workload identity providers a connection may name. */
-        val PROVIDERS: List<String> = listOf(PROVIDER_GITHUB_ACTIONS, PROVIDER_KUBERNETES)
+        val PROVIDERS: List<String> = listOf(PROVIDER_GITHUB_ACTIONS, PROVIDER_FORGEJO, PROVIDER_KUBERNETES)
 
         /** SSO-3684 — `auth.tokenSource.kind`: the GitHub Actions runner's job-token endpoint (the default when absent). */
         const val TOKEN_SOURCE_GITHUB_ACTIONS = "github_actions"
@@ -118,13 +134,19 @@ internal class Connection private constructor(
         val TOKEN_SOURCE_KINDS: List<String> = listOf(TOKEN_SOURCE_GITHUB_ACTIONS, TOKEN_SOURCE_FILE)
 
         /** SSO-3308 — `auth.*` members only a `workload_identity` connection may carry. */
-        private val WORKLOAD_ONLY_KEYS = listOf("provider", "audience", "environment", "tokenEndpoint", "github", "tokenSource", "kubernetes")
+        private val WORKLOAD_ONLY_KEYS = listOf("provider", "audience", "environment", "tokenEndpoint", "github", "tokenSource", "kubernetes", "forgejo", "plan")
 
         /** SSO-3308 — `auth.github` members (the trust API's GitHub pin, same names). */
         private val GITHUB_KEYS = setOf("owner", "repository", "ownerId", "repositoryId", "environment", "ref", "githubHostedRunnersOnly")
 
         /** SSO-3684 — `auth.kubernetes` members (the trust API's Kubernetes pin, same names; never the key set). */
         private val KUBERNETES_KEYS = setOf("issuer", "namespace", "serviceAccount")
+
+        /** SSO-4472 — `auth.forgejo` members (the trust API's Forgejo pin, same names). */
+        private val FORGEJO_KEYS = setOf("instanceUrl", "owner", "repository", "ownerId", "repositoryId", "ref")
+
+        /** SSO-4472 — `auth.plan` members (a mirror of a `forgejo` trust's plan profile). */
+        private val PLAN_KEYS = setOf("scopes")
 
         /** SSO-3684 — `auth.tokenSource` members. */
         private val TOKEN_SOURCE_KEYS = setOf("kind", "path")
@@ -202,6 +224,19 @@ internal class Connection private constructor(
                     serviceAccount = text(k, "serviceAccount"),
                 )
             }
+            val forgejo = auth["forgejo"]?.takeIf { it.isObject() }?.let { f ->
+                ForgejoPins(
+                    instanceUrl = text(f, "instanceUrl")?.trimEnd('/'),
+                    owner = text(f, "owner"),
+                    repository = text(f, "repository"),
+                    ownerId = f["ownerId"]?.takeIf { it.isIntegralNumber() }?.asLong(),
+                    repositoryId = f["repositoryId"]?.takeIf { it.isIntegralNumber() }?.asLong(),
+                    ref = text(f, "ref"),
+                )
+            }
+            val planScopes = auth["plan"]?.takeIf { it.isObject() }?.let { p ->
+                p["scopes"]?.takeIf { it.isArray() }?.toList()?.map { it.asString() }.orEmpty()
+            }
             val tokenSource = auth["tokenSource"]?.takeIf { it.isObject() }
             val tokenFile = tokenSource?.takeIf { text(it, "kind") == TOKEN_SOURCE_FILE }?.let { text(it, "path") }
             return Connection(
@@ -218,6 +253,8 @@ internal class Connection private constructor(
                 provider = text(auth, "provider"),
                 tokenFile = tokenFile,
                 kubernetes = kubernetes,
+                forgejo = forgejo,
+                planScopes = planScopes,
             )
         }
 
@@ -286,7 +323,7 @@ internal class Connection private constructor(
                     AUTH_METHOD_WORKLOAD_IDENTITY -> {
                         if (auth.has("secretEnv")) {
                             v += "auth.secretEnv must not be set for '$AUTH_METHOD_WORKLOAD_IDENTITY' — a workload identity " +
-                                "sign-in uses no secret (the GitHub Actions job token is the credential)"
+                                "sign-in uses no secret (the job's own identity token is the credential)"
                         }
                         validateWorkloadIdentity(auth, v)
                     }
@@ -318,6 +355,23 @@ internal class Connection private constructor(
                 if (p !in PROVIDERS) v += "auth.provider must be one of ${PROVIDERS.joinToString(" | ")}"
             }
             val tokenSourceKind = validateTokenSource(auth, v)
+            // SSO-4472 — each provider's pin block belongs to it alone; `auth.plan` is a Forgejo trust's mirror only.
+            if (provider != PROVIDER_FORGEJO) {
+                if (auth.has("forgejo")) v += "auth.forgejo applies to provider '$PROVIDER_FORGEJO' only"
+                if (auth.has("plan")) {
+                    v += "auth has unknown property 'plan' (additionalProperties:false) — a $PROVIDER_GITHUB_ACTIONS trust's plan profile " +
+                        "is selected by the job's GitHub environment, so the connection names no plan (auth.plan mirrors a '$PROVIDER_FORGEJO' trust's only)"
+                }
+            }
+            if (provider == PROVIDER_FORGEJO) {
+                if (auth.has("github")) v += "auth.github applies to provider '$PROVIDER_GITHUB_ACTIONS' only"
+                if (tokenSourceKind == TOKEN_SOURCE_GITHUB_ACTIONS) {
+                    v += "auth.tokenSource kind '$TOKEN_SOURCE_GITHUB_ACTIONS' does not apply to provider '$PROVIDER_FORGEJO' — omit " +
+                        "auth.tokenSource to use the Forgejo Actions runner, or use kind '$TOKEN_SOURCE_FILE' (a token minted inside the job)"
+                }
+                validateForgejoPins(auth, v)
+                validatePlan(auth, v)
+            }
             if (provider == PROVIDER_KUBERNETES) {
                 if (tokenSourceKind != TOKEN_SOURCE_FILE) {
                     v += "auth.tokenSource of kind '$TOKEN_SOURCE_FILE' is required for provider '$PROVIDER_KUBERNETES' — a pod's " +
@@ -378,6 +432,47 @@ internal class Connection private constructor(
             return kind
         }
 
+        /** SSO-4472 — `auth.forgejo`: the trust's pins; the instance an https origin, names non-empty, ids positive. */
+        private fun validateForgejoPins(auth: JsonNode, v: MutableList<String>) {
+            val f = auth["forgejo"] ?: return
+            if (!f.isObject()) {
+                v += "auth.forgejo must be an object"
+                return
+            }
+            rejectUnknownKeys(f, FORGEJO_KEYS, "auth.forgejo", v)
+            listOf("instanceUrl", "owner", "repository", "ref").forEach { k ->
+                f[k]?.let { n -> if (!n.isString() || n.asString().isBlank()) v += "auth.forgejo.$k must be a non-empty string" }
+            }
+            listOf("ownerId", "repositoryId").forEach { k ->
+                f[k]?.let { n -> if (!n.isIntegralNumber() || n.asLong() <= 0) v += "auth.forgejo.$k must be a positive integer" }
+            }
+            f["instanceUrl"]?.takeIf { it.isString() }?.asString()?.let { url ->
+                if (!HTTPS_ORIGIN_PATTERN.matches(url.trimEnd('/'))) {
+                    v += "auth.forgejo.instanceUrl '$url' must be the instance's https origin (https://host[:port], no path), e.g. https://codeberg.org"
+                }
+            }
+        }
+
+        /** SSO-4472 — `auth.plan`: `{scopes}`, each a `tenant:<area>.read` scope (a plan profile is read-only by construction). */
+        private fun validatePlan(auth: JsonNode, v: MutableList<String>) {
+            val p = auth["plan"] ?: return
+            if (!p.isObject()) {
+                v += "auth.plan must be an object"
+                return
+            }
+            rejectUnknownKeys(p, PLAN_KEYS, "auth.plan", v)
+            val scopes = p["scopes"] ?: return
+            if (!scopes.isArray() || scopes.isEmpty) {
+                v += "auth.plan.scopes must be a non-empty array"
+                return
+            }
+            val list = scopes.toList().map { it.asString() }
+            if (list.size != list.toSet().size) v += "auth.plan.scopes must be unique: $list"
+            list.forEach { s ->
+                if (!SCOPE_PATTERN.matches(s) || !s.endsWith(".read")) v += "auth.plan.scopes entry '$s' must be a tenant:<area>.read scope"
+            }
+        }
+
         /** SSO-3684 — `auth.kubernetes`: the trust's pins, each a non-empty string; the issuer an absolute https URL. */
         private fun validateKubernetesPins(auth: JsonNode, v: MutableList<String>) {
             val k = auth["kubernetes"] ?: return
@@ -396,6 +491,9 @@ internal class Connection private constructor(
 
         /** An absolute http(s) URL (the loader's check; the sign-in re-validates the issuer rules). */
         private val HTTP_URL_PATTERN = Regex("^https?://[^\\s/?#]+(/[^\\s?#]*)?$")
+
+        /** SSO-4472 — an https origin: scheme, host and optional port, nothing else (a Forgejo instance URL). */
+        private val HTTPS_ORIGIN_PATTERN = Regex("^https://[^\\s/?#@]+$")
 
         /** SSO-3684 — an absolute https URL (a cluster's OIDC issuer is always https). */
         private val HTTPS_URL_PATTERN = Regex("^https://[^\\s/?#]+(/[^\\s?#]*)?$")

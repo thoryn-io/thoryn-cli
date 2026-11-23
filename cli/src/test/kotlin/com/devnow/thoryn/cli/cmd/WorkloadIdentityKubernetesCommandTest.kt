@@ -189,7 +189,7 @@ class WorkloadIdentityKubernetesCommandTest : CommandTestBase() {
     fun `the GitHub flags are refused on a kubernetes trust, the Kubernetes flags on a GitHub trust, and an unknown provider is refused`() {
         val github = create("--issuer", issuer, "--namespace", "forge", "--repository", "acme/billing", "--ref", "refs/heads/main")
         assertThat(github.exit).isEqualTo(CommandSupport.EXIT_USAGE)
-        assertThat(github.err).contains("--repository, --ref apply to --provider github_actions only")
+        assertThat(github.err).contains("--repository, --ref do not apply to --provider kubernetes")
 
         val kubernetes = runCli(
             "workload-identity", "trusts", "create", "--name", "n", "--repository", "acme/billing", "--namespace", "forge",
@@ -202,7 +202,7 @@ class WorkloadIdentityKubernetesCommandTest : CommandTestBase() {
             "workload-identity", "trusts", "create", "--provider", "gitlab", "--name", "n", "--scope", "tenant:x.read", "--gateway", baseUrl(),
         )
         assertThat(bogus.exit).isEqualTo(CommandSupport.EXIT_USAGE)
-        assertThat(bogus.err).contains("--provider must be github_actions or kubernetes")
+        assertThat(bogus.err).contains("--provider must be github_actions, forgejo or kubernetes")
         assertThat(server.requestCount).isZero()
     }
 

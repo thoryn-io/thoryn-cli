@@ -470,13 +470,19 @@ thoryn keys retirements get <id> --kind <kind>                                  
 # (others get 404). Scopes: tenant:workload-identity.read (list, get) / tenant:workload-identity.write (create, delete).
 # SSO-3684 — `--provider kubernetes`: the same for the PODS of one Kubernetes service account (their projected
 # ServiceAccount token is the credential; read from a FILE by the Thoryn init container, see examples/kubernetes/).
+# SSO-4472 — `--provider forgejo`: the same for one repository's Forgejo Actions jobs on ANY Forgejo instance.
 thoryn workload-identity trusts create --name <n> --repository <owner/repo> --scope <tenant:…> [--environment e]
     [--owner-id n --repository-id n] [--github-environment <gh-env>] [--ref <ref>] [--github-hosted-runners-only] [--confirm-production]
     [--plan-environment <gh-env> [--plan-scope <tenant:…read>…]]   # SSO-3702: the PLAN profile — a second GitHub environment minted
                                                                    # read-only scopes (derived: the .read members of --scope) — one trust, one wi_
 thoryn workload-identity trusts create --provider kubernetes --name <n> --issuer <https url> --scope <tenant:…> [--environment e]
     [--namespace <ns> [--service-account <sa>]] [--jwks-file <cluster-jwks.json>] [--confirm-production]   # production: both pins
-thoryn workload-identity trusts set-plan-profile <id> --plan-environment <gh-env> [--plan-scope <tenant:…read>…]   # POST …/{id}/plan-profile
+thoryn workload-identity trusts create --provider forgejo --name <n> --instance <https origin> --repository <owner/repo>
+    --scope <tenant:…> [--owner-id n --repository-id n] [--ref <ref>] [--plan [--plan-scope <tenant:…read>…]] [--confirm-production]
+                                                                   # ids looked up anonymously on the instance when omitted;
+                                                                   # production: --ref (a workflow_dispatch on it applies)
+thoryn workload-identity trusts set-plan-profile <id> [--plan-environment <gh-env>] [--plan-scope <tenant:…read>…]   # POST …/{id}/plan-profile
+                                                                   # --plan-environment: a GitHub trust's (required there); a Forgejo trust names none
                                                                    # the ONE additive mutation: adds the plan profile, keeps the wi_ client (409 once set)
 thoryn workload-identity trusts set-scopes <id|name> [--scope <tenant:…>…] [--plan-scope <tenant:…read>…]   # PUT …/{id}/scopes (SSO-3925)
                                                                    # scopes changed IN PLACE: same id, same wi_ client, no connection.json or owner moves.
@@ -485,7 +491,7 @@ thoryn workload-identity trusts set-scopes <id|name> [--scope <tenant:…>…] [
                                                                    # --max-age 300`); a workload identity never (elevated_action_requires_person)
 thoryn workload-identity trusts list [--limit n] [--cursor c]         # GET    /api/v1/workload-identity/trusts
 thoryn workload-identity trusts get <id> [--connection]               # GET    /api/v1/workload-identity/trusts/{id} (+ the sign-in line); --connection: ONLY the
-                                                                      # complete connection.json (SSO-3722 — provider + the whole github/kubernetes block), to paste
+                                                                      # complete connection.json (SSO-3722 — provider + the whole github/forgejo/kubernetes block), to paste
 thoryn workload-identity trusts delete <id> [--yes] [--confirm <slug>] # DELETE /api/v1/workload-identity/trusts/{id}
 
 # Project repositories (SSO-3435, epic SSO-3304) — set up a GitHub repository that manages your workspace
@@ -1002,12 +1008,91 @@ render `planEnvironment`, `planScopes` and both `subjectPatterns` (apply, then p
 repository's **one** identity — the `owner` of what it provisions — the engine's ownership gate is green for
 its own resources and stays `owned_elsewhere` for anyone else's (SSO-3659 / SSO-3673, unchanged).
 
-GitHub only for now: a Forgejo job token has no `environment` claim (its selector is the forge-side App
-story's), a Kubernetes trust has no plan jobs (`plan_profile_unsupported`). Needs oauthy SSO-3700 (hub) and
+A Forgejo trust has a plan profile of its own shape — no environment, selected by the job's trigger (see "Forgejo
+Actions" below); a Kubernetes trust has no plan jobs (`plan_profile_unsupported`). Needs oauthy SSO-3700 (hub) and
 SSO-3701 (product-api) deployed; the dogfood migration of this repository's own trust is SSO-3704.
 
 This retargets SSO-2879's `--workload-identity` (an operator-registered token exchange signed with a CI
 key; its `--tenant`, `--wif-*` and `--subject-token` flags are gone).
+
+#### Forgejo Actions — any Forgejo instance (SSO-4472, epic SSO-4473)
+
+A `--provider forgejo` trust lets one repository's **Forgejo Actions** jobs sign in, on any Forgejo instance —
+Codeberg, a self-hosted forge — with no stored secret (oauthy SSO-3661). It pins the **instance** (its https
+origin: the job token's issuer is `<instance>/api/actions`, its keys `<issuer>/.well-known/keys`), the repository
+by the **instance's immutable ids** and, on the production plane, a **ref** — Forgejo has no environments.
+
+```bash
+thoryn workload-identity trusts create --provider forgejo --name infra-ci \
+  --instance https://codeberg.org --repository acme/infra --ref refs/heads/main \
+  --scope "tenant:applications.read tenant:applications.write" --plan --confirm-production
+# Looked up acme/infra on https://codeberg.org: owner id 7, repository id 42.
+# → prints the clientId (wi_…), audience, the complete connection.json below and the job to run.
+```
+
+- **The ids** come from the instance's public API (`GET <instance>/api/v1/repos/<owner>/<repo>`: `owner.id`
+  and `id`), looked up ONCE and anonymously when `--owner-id` / `--repository-id` are omitted — no credential
+  ever passes through the lookup. A private repository, or an API behind an authenticating proxy (a redirect is
+  never followed), fails with the call that prints them: pass both ids. A repository renamed later keeps its
+  ids; a fork, or a repository deleted and re-created, has new ones.
+- **The trust caveat.** Whoever administers the instance controls the key that signs its job tokens. A trust in
+  an instance is a trust in its administrators — on a public instance, its operator.
+- **Which job gets which profile** (ADR `2026-10-14-plan-identity-and-resource-ownership`, Amendment 2026-11-23).
+  On a production trust pinned to `refs/heads/main`: a `workflow_dispatch` on `refs/heads/main` gets the **apply**
+  profile (the trust's scopes — a person's dispatch is the gate); with a plan profile (`--plan`, or later
+  `trusts set-plan-profile <id>`), a `push` or `schedule` on it and a same-repository `pull_request` into `main`
+  get the read-only **plan** profile (the `.read` members of `--scope`, or `--plan-scope`). Everything else is
+  refused: another ref or branch, a fork's pull request (a fork's job gets no token), `pull_request_target`, and
+  `workflow_call` — so call `thoryn login` from a job's own steps, never inside a reusable workflow. A sandbox
+  trust (no ref) gives every dispatch, push, schedule and same-repository pull request its scopes.
+
+```json
+{
+  "apiVersion": "thoryn.io/connection/v1",
+  "workspace": { "slug": "acme" },
+  "auth": {
+    "method": "workload_identity",
+    "provider": "forgejo",
+    "clientId": "wi_5e4f3a2b1c0d9e8f7a6b5c4d",
+    "audience": "https://acme.auth.thoryn.io",
+    "scopes": ["tenant:applications.read", "tenant:applications.write"],
+    "forgejo": { "instanceUrl": "https://codeberg.org", "owner": "acme", "repository": "infra", "ownerId": 7, "repositoryId": 42, "ref": "refs/heads/main" },
+    "plan": { "scopes": ["tenant:applications.read"] }
+  }
+}
+```
+
+```yaml
+jobs:
+  provision:
+    runs-on: <your runner label>
+    enable-openid-connect: true          # Forgejo's key for issuing the job an ID token (forgejo-runner v12.5.0+)
+    steps:
+      # … install the thoryn CLI …
+      - run: thoryn login --connection .thoryn/connection.json
+```
+
+- `thoryn login --connection` asks the runner for a fresh job token for the trust's audience
+  (`ACTIONS_ID_TOKEN_REQUEST_URL` + `audience=`, bearer `ACTIONS_ID_TOKEN_REQUEST_TOKEN` — the same variables as
+  GitHub's) and exchanges it. It sends `auth.scopes` only for a job it expects the **apply** profile for (on
+  production, a `workflow_dispatch` on `auth.forgejo.ref`) and **no scope** for any other, so the hub mints the
+  matched profile and a plan job never asks for a write scope. `auth.plan` is a **mirror** of the trust's plan
+  profile (`trusts get <id> --connection` prints it): never sent, it tells the CLI a push is expected to plan
+  rather than be refused. The sign-in prints which profile (`Profile: apply (a dispatch (workflow_dispatch) on
+  'refs/heads/main' …)`), and the session records it.
+- **Behind an authenticating proxy** the public token URL redirects to the proxy's login page. The CLI never
+  follows that redirect (it carries the runner's bearer) and says so (`job_token_request_redirected`). Mint the
+  token inside the job's own network for the trust's audience, write it to a file, and name it:
+  `"tokenSource": { "kind": "file", "path": "<that file>" }` (or `--token-file` with the flag form). A job token
+  works once: write a fresh one before each `thoryn login`. `tokenSource.kind: github_actions` is refused for
+  `forgejo` — the Forgejo runner is the default when `tokenSource` is absent.
+- A refusal prints the job's **claims, never the token** — `iss`, `sub`, `aud`, `repository`, the ids, `ref`,
+  `base_ref`, `event_name` and its trigger class — and every difference it can see against `auth.forgejo`:
+  another instance (`iss`), repository or id, or a trigger the rule refuses (`trigger: event_not_allowed —
+  workflow_call jobs are always refused …`), each with the edit that fixes it.
+- The hub's plan profile for Forgejo (oauthy SSO-4471) is what makes a push or pull request plan; a platform that
+  predates it answers `--plan` / `set-plan-profile` with `plan_profile_unsupported`, gives a push on the pinned
+  ref the trust's scopes, and refuses a production trust's `pull_request` job.
 
 #### Kubernetes — a pod pulls its own client secret (SSO-3684, parent SSO-3678)
 
@@ -1054,7 +1139,7 @@ The connection contract gains a **token source**: the identity token is read fro
 }
 ```
 
-- `auth.provider` is `github_actions` (default) or `kubernetes`. `auth.tokenSource.kind` is
+- `auth.provider` is `github_actions` (default), `forgejo` or `kubernetes`. `auth.tokenSource.kind` is
   `github_actions` (default when absent: `ACTIONS_ID_TOKEN_REQUEST_*`) or `file` (then `path` is
   required). A `kubernetes` provider REQUIRES a `file` token source; `auth.kubernetes` (the trust's pins,
   diagnostics only — like `auth.github`) belongs to it alone. The path is public configuration; the file's
@@ -2577,8 +2662,8 @@ What `thoryn provision` does with it:
   `plan` shows an existing trust's `clientId` and `audience` on its row. A `kubernetes` trust's document is
   the one `trusts create --provider kubernetes` prints (SSO-3684): `provider: kubernetes`, the file token
   source (`/var/run/secrets/tokens/thoryn/token`, the projected ServiceAccount token) and the cluster pins.
-  For a `forgejo` trust `provider` is left out (the contract validates `github_actions` and `kubernetes`
-  today; a Forgejo job presents its own Actions token as the `client_assertion`).
+  A `forgejo` trust's is the one `trusts create --provider forgejo` prints (SSO-4472): `provider: forgejo`, the
+  instance / repository / ref pins as `auth.forgejo` and, when the trust has one, `auth.plan: {scopes}`.
 - **Ownership is asked per trust (SSO-3774; oauthy ADR `2026-10-16-repository-owned-workload-identity-trusts`).**
   A trust is a platform object of its own, **`trust:<id>`** (the hub's trust UUID): ownable (one `owner`, a
   `client:`, set by a workspace admin — `thoryn access grant client:<wi_…> owner trust:<id>` — or by
@@ -3232,9 +3317,10 @@ ownership stay as they are. Narrowing works from CI; widening is a person's act 
 
 **Recorded gaps (not knobs, by design — tell us if you need them):**
 
-- **Forgejo.** `provider: forgejo` is refused: a Forgejo workload identity trust exists on the hub (oauthy ADR 2026-10-13
-  Amendment 3), but `thoryn login --connection` cannot exchange a Forgejo job token yet, and the App dispatches GitHub
-  workflows only. Until then a Forgejo pipeline is a `client_credentials` connection, outside this workflow.
+- **Forgejo.** `provider: forgejo` is accepted (SSO-4472): its connections sign in with the job's own Forgejo Actions
+  token (see "Forgejo Actions" under Workload identity). This reusable workflow and the App are GitHub's; a Forgejo
+  job runs `thoryn login --connection` and `thoryn provision plan|apply` from its own steps until the Forgejo
+  provisioning action is released.
 - **A step of your own** (a notification, an extra verification, a different CLI) is not configuration. The composite
   Action `.github/actions/provision` and the raw CLI still exist for the manual path (`provision-e2e.yml` is the
   example), but the App-dispatched workflow is the stub, full stop.

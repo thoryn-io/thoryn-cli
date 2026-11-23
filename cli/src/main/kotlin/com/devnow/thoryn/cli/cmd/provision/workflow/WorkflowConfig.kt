@@ -29,8 +29,9 @@ import java.io.File
  *  - `apply.prune` / `apply.destroy` / `apply.confirm` — removals, NEVER on by default: `prune` passes `--prune` to the
  *    apply; `destroy` runs `provision destroy` after a successful apply (an ephemeral fixture); `confirm` is the workspace
  *    slug a production-plane removal needs (the SSO-2413 gate).
- *  - `provider` — the forge the identity token comes from. `github_actions` only: a Forgejo trust exists on the hub
- *    (oauthy ADR Amendment 3) but `thoryn login --connection` cannot exchange a Forgejo job token yet — a recorded gap.
+ *  - `provider` — the forge the identity token comes from: `github_actions` (default) or, since SSO-4472, `forgejo` — a
+ *    Forgejo Actions job on any instance, whose connection signs in with its own job token (`thoryn login --connection`,
+ *    `auth.provider: forgejo`). The value is reported in the `config` object; the workflow that runs on that forge reads it.
  */
 class WorkflowConfig private constructor(
     val provider: String,
@@ -66,7 +67,10 @@ class WorkflowConfig private constructor(
         const val DEFAULT_CONNECTION = ".thoryn/connection.json"
         const val SCHEMA_RESOURCE = "/examples/workflow.schema.json"
         const val PROVIDER_GITHUB_ACTIONS = "github_actions"
-        val PROVIDERS: List<String> = listOf(PROVIDER_GITHUB_ACTIONS)
+
+        /** SSO-4472 — a Forgejo Actions job on any Forgejo instance. */
+        const val PROVIDER_FORGEJO = "forgejo"
+        val PROVIDERS: List<String> = listOf(PROVIDER_GITHUB_ACTIONS, PROVIDER_FORGEJO)
 
         /** A relative path inside the repository: no leading `/`, no `..` segment, no whitespace, no expression. */
         val PATH_GRAMMAR = Regex("^(?!/)(?!.*(^|/)\\.\\.(/|$))[A-Za-z0-9_./@-]{1,512}$")
@@ -148,8 +152,7 @@ class WorkflowConfig private constructor(
             }
             root["provider"]?.let { p ->
                 if (!p.isString || p.asString() !in PROVIDERS) {
-                    errors += "provider must be one of ${PROVIDERS.joinToString(", ")} (was ${p.asString()})" +
-                        if (p.asString() == "forgejo") " — a Forgejo job token cannot be exchanged by `thoryn login --connection` yet; recorded as a product gap (SSO-3719)" else ""
+                    errors += "provider must be one of ${PROVIDERS.joinToString(", ")} (was ${p.asString()})"
                 }
             }
             root["files"]?.let { files ->

@@ -80,7 +80,10 @@ class WorkflowConfigTest {
         assertThat(errorsOf("apiVersion: thoryn.io/workflow/v1\nfixRequest: yes please\n")).contains("fixRequest must be true or false")
         assertThat(errorsOf("apiVersion: thoryn.io/workflow/v1\napply:\n  prune: \"true\"\n")).contains("apply.prune must be true or false")
         assertThat(errorsOf("apiVersion: thoryn.io/workflow/v1\napply:\n  confirm: Acme Corp\n")).contains("apply.confirm must be the workspace slug")
-        assertThat(errorsOf("apiVersion: thoryn.io/workflow/v1\nprovider: forgejo\n")).contains("provider must be one of github_actions").contains("Forgejo").contains("product gap")
+        // SSO-4472 — forgejo is a provider now (its connection signs in with its own job token); an unknown forge is still refused.
+        assertThat(errorsOf("apiVersion: thoryn.io/workflow/v1\nprovider: forgejo\n")).isEmpty()
+        assertThat(WorkflowConfig.parse("apiVersion: thoryn.io/workflow/v1\nprovider: forgejo\n").provider).isEqualTo("forgejo")
+        assertThat(errorsOf("apiVersion: thoryn.io/workflow/v1\nprovider: gitlab\n")).contains("provider must be one of github_actions, forgejo (was gitlab)").doesNotContain("product gap")
     }
 
     @Test

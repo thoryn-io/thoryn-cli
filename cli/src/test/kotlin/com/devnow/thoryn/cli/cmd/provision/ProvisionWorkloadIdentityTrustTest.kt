@@ -125,7 +125,10 @@ class ProvisionWorkloadIdentityTrustTest : CommandTestBase() {
         // The kubernetes document is the one `trusts create --provider kubernetes` prints (SSO-3684): the file token source + the cluster pins.
         assertThat(out).contains("\"provider\" : \"kubernetes\"").contains("\"tokenSource\" : {").contains("\"path\" : \"${ProvisionEngine.KUBERNETES_TOKEN_FILE}\"")
             .contains("\"namespace\" : \"billing\"").contains("\"serviceAccount\" : \"billing-web\"")
-        assertThat(out).contains("a forgejo job presents its own Actions token") // the contract has no forgejo provider yet: `provider` left out
+        // SSO-4472 — the forgejo document is the one `trusts create --provider forgejo` prints: the provider and its pins.
+        assertThat(out).contains("\"provider\" : \"forgejo\"").contains("\"forgejo\" : {").contains("\"instanceUrl\" : \"https://forge.example.org\"")
+            .contains("\"repositoryId\" : 42").contains("\"ref\" : \"refs/heads/main\"")
+            .doesNotContain("a forgejo job presents its own Actions token")
         assertThat(out).doesNotContain("\"n\" : \"n1\"") // never key material in the printed document
         assertThat(File(tempHome.toFile(), ".thoryn/connection.json")).doesNotExist()
 

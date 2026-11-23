@@ -28,6 +28,20 @@ data class KubernetesPins(
     val serviceAccount: String? = null,
 )
 
+/**
+ * SSO-4472 — a `forgejo` trust's pins as the CLI knows them (a connection contract's `auth.forgejo`, the same names as
+ * the trust API's `forgejo` block), compared against the Forgejo Actions job token's `iss`, repository and `ref` claims
+ * on a refusal. The instance is the trust's: its issuer is `<instanceUrl>/api/actions`.
+ */
+data class ForgejoPins(
+    val instanceUrl: String? = null,
+    val owner: String? = null,
+    val repository: String? = null,
+    val ownerId: Long? = null,
+    val repositoryId: Long? = null,
+    val ref: String? = null,
+)
+
 /** SSO-3308 — everything a workload identity sign-in sends, plus the pins it may compare against. */
 data class WorkloadIdentityBinding(
     val clientId: String,
@@ -58,7 +72,18 @@ data class WorkloadIdentityBinding(
      * sent: the `trusts create` the fix proposes carries them even when a plan job sent none.
      */
     val requestedScope: String? = scope,
-)
+    /** SSO-4472 — a `forgejo` trust's pins, when the connection names them. */
+    val forgejoPins: ForgejoPins? = null,
+    /** SSO-4472 — the connection mirrors a plan profile of the `forgejo` trust (`auth.plan`). */
+    val forgejoPlanProfile: Boolean = false,
+) {
+    /** SSO-4472 — the provider this sign-in is judged as: the one it named, else what the token looks like. */
+    internal fun providerOf(identity: JobIdentity?): String = provider ?: when {
+        identity?.isKubernetes == true -> WorkloadIdentityDiagnostics.PROVIDER_KUBERNETES
+        identity?.isForgejo == true -> WorkloadIdentityDiagnostics.PROVIDER_FORGEJO
+        else -> WorkloadIdentityDiagnostics.PROVIDER_GITHUB_ACTIONS
+    }
+}
 
 /**
  * SSO-3308 — turns a refused workload identity sign-in into something a person can act on.
@@ -97,10 +122,12 @@ object WorkloadIdentityDiagnostics {
         if (e.oauthError != "invalid_client") return null
         val identity = e.jobIdentity ?: return null
         if (binding.provider == PROVIDER_KUBERNETES || identity.isKubernetes) return null
+        // SSO-4472 — a Forgejo trust has no plan profile to grant yet (its selector is SSO-4471's to define).
+        if (binding.provider == PROVIDER_FORGEJO || identity.isForgejo) return null
         val apply = binding.pins?.environment ?: return null
         val job = identity.environment ?: return null
         if (job == apply) return null
-        val mismatches = localMismatches(identity, binding.audience, binding.pins, binding.provider, binding.kubernetesPins)
+        val mismatches = localMismatches(identity, binding.audience, binding.pins, binding.provider, binding.kubernetesPins, binding.forgejoPins, binding.forgejoPlanProfile)
         if (mismatches.size != 1 || !mismatches.single().startsWith("environment:")) return null
         return PlanProfileGap(jobEnvironment = job, applyEnvironment = apply)
     }
@@ -116,10 +143,17 @@ object WorkloadIdentityDiagnostics {
         pins: TrustPins?,
         provider: String? = null,
         kubernetesPins: KubernetesPins? = null,
+        forgejoPins: ForgejoPins? = null,
+        forgejoPlanProfile: Boolean = false,
     ): List<String> = buildList {
         // SSO-3684 — a Kubernetes ServiceAccount token is judged against the cluster pins, not GitHub's issuer.
         if (provider == PROVIDER_KUBERNETES || (provider == null && identity.isKubernetes)) {
             addAll(kubernetesMismatches(identity, audience, kubernetesPins))
+            return@buildList
+        }
+        // SSO-4472 — a Forgejo job token is judged against its instance and repository pins, not GitHub's issuer.
+        if (provider == PROVIDER_FORGEJO || (provider == null && identity.isForgejo)) {
+            addAll(forgejoMismatches(identity, audience, forgejoPins, forgejoPlanProfile))
             return@buildList
         }
         identity.issuer?.let { iss ->
@@ -210,8 +244,67 @@ object WorkloadIdentityDiagnostics {
         }
     }
 
+    /**
+     * SSO-4472 — what the CLI can see locally about a Forgejo Actions job token against a `forgejo` trust: the audience it
+     * was requested for; the job's TRIGGER CLASS judged by the amendment's rule ([TriggerProfileRule], the same mapping the
+     * hub's evaluator uses: a `trigger:` line when the hub is expected to refuse it — `event_not_allowed`, `ref_mismatch`,
+     * `base_ref_mismatch`); and — when the connection names them — the instance (the token's `iss` is
+     * `<instance>/api/actions`), the repository and its immutable ids. The hub refuses each of these as `invalid_client`.
+     */
+    internal fun forgejoMismatches(identity: JobIdentity, audience: String, pins: ForgejoPins?, hasPlanProfile: Boolean = false): List<String> = buildList {
+        if (identity.audience.isNotEmpty() && audience !in identity.audience) {
+            add(
+                "aud: the job token is for ${identity.audience.joinToString()} but the sign-in named '$audience' " +
+                    "(a Forgejo job's default audience is <instance>/<owner>; the CLI asks for the trust's with ?audience=).",
+            )
+        }
+        val expectation = WorkloadProfile.forgejoExpectation(identity, pins?.ref, namesProductionPlane(audience), hasPlanProfile)
+        if (expectation is TriggerExpectation.Refused) add("trigger: ${expectation.reason} — ${expectation.explanation}")
+        if (pins == null) return@buildList
+        val expectedIssuer = pins.instanceUrl?.trimEnd('/')?.let { it + WorkloadIdentityFlow.FORGEJO_ISSUER_PATH }
+        if (expectedIssuer != null && identity.issuer != null && identity.issuer.trimEnd('/') != expectedIssuer) {
+            add("iss: the trust pins instance '${pins.instanceUrl}' (issuer $expectedIssuer); this token was issued by '${identity.issuer}'.")
+        }
+        val pinnedRepository = listOfNotNull(pins.owner, pins.repository).takeIf { it.size == 2 }?.joinToString("/")
+        if (pinnedRepository != null && identity.repository != null && !pinnedRepository.equals(identity.repository, ignoreCase = true)) {
+            add("repository: the trust pins '$pinnedRepository'; this job runs in '${identity.repository}'.")
+        }
+        if (pins.repositoryId != null && identity.repositoryId != null && pins.repositoryId.toString() != identity.repositoryId) {
+            add(
+                "repository_id: the trust pins ${pins.repositoryId}; this job's repository has id ${identity.repositoryId} " +
+                    "(a repository deleted and re-created under the same name, or a fork, has another id).",
+            )
+        }
+        if (pins.ownerId != null && identity.repositoryOwnerId != null && pins.ownerId.toString() != identity.repositoryOwnerId) {
+            add(
+                "repository_owner_id: the trust pins ${pins.ownerId}; this job's owner has id ${identity.repositoryOwnerId} " +
+                    "(an account renamed or re-registered under the same name gets a new id).",
+            )
+        }
+    }
+
+    /** SSO-4472 — the profile the amendment's rule expects for this Forgejo job under [binding]'s connection. */
+    internal fun forgejoExpectation(identity: JobIdentity, binding: WorkloadIdentityBinding): TriggerExpectation =
+        WorkloadProfile.forgejoExpectation(identity, binding.forgejoPins?.ref, namesProductionPlane(binding.audience), binding.forgejoPlanProfile)
+
+    /** SSO-4472 — "a push on 'refs/heads/main'": the job's trigger class and ref, for a sign-in line. */
+    fun forgejoJobDescription(identity: JobIdentity): String {
+        val trigger = ForgejoTriggerMapping.classify(identity.eventName)
+        val event = identity.eventName ?: "(no event_name)"
+        return when (trigger) {
+            TriggerClass.CHANGE_REQUEST -> "a pull request ($event) into '${identity.baseRef ?: "(no base_ref)"}'"
+            else -> "a ${trigger.wire} ($event) on '${identity.ref ?: "(no ref)"}'"
+        }
+    }
+
     /** SSO-3684 — the provider name of a `kubernetes` trust (the trust API's `provider`). */
     const val PROVIDER_KUBERNETES: String = "kubernetes"
+
+    /** SSO-4472 — the provider name of a `forgejo` trust (the trust API's `provider`). */
+    const val PROVIDER_FORGEJO: String = WorkloadIdentityFlow.PROVIDER_FORGEJO
+
+    /** The default provider of a workload identity sign-in. */
+    const val PROVIDER_GITHUB_ACTIONS: String = "github_actions"
 
     /**
      * True when [audience] names an environment's PRODUCTION plane: a sandbox audience always carries
@@ -246,29 +339,49 @@ object WorkloadIdentityDiagnostics {
                         "job: add `permissions: id-token: write` (with `contents: read`) to the job that runs `thoryn login` — GitHub sets ${WorkloadIdentityFlow.REQUEST_URL_ENV} / ${WorkloadIdentityFlow.REQUEST_TOKEN_ENV} only then",
                         "outside GitHub Actions: sign in with `thoryn login` (a person) or `thoryn login --client-credentials` (an API key) instead",
                     )
+                    // SSO-4472 — the Forgejo runner's own key, and the proxy case.
+                    WorkloadIdentityFlow.ERROR_NOT_ON_FORGEJO_ACTIONS -> listOf(
+                        "job: set `enable-openid-connect: true` on the Forgejo Actions job that runs `thoryn login` (a runner that issues ID tokens: forgejo-runner v12.5.0 or later) — Forgejo sets ${WorkloadIdentityFlow.REQUEST_URL_ENV} / ${WorkloadIdentityFlow.REQUEST_TOKEN_ENV} only then",
+                        "behind an authenticating proxy: mint the token inside the job for audience '${binding.audience}' and set auth.tokenSource to {\"kind\": \"file\", \"path\": …} in $file",
+                    )
+                    WorkloadIdentityFlow.ERROR_JOB_TOKEN_REDIRECTED -> listOf(
+                        "job: the runner's token URL redirects (an authenticating proxy in front of the instance) — mint the token inside the job for audience '${binding.audience}' and set auth.tokenSource to {\"kind\": \"file\", \"path\": …} in $file",
+                    )
                     WorkloadIdentityFlow.ERROR_JOB_TOKEN_REQUEST_FAILED -> listOf(
-                        "job: grant `permissions: id-token: write` and re-run — the runner refused the job-token request for audience '${binding.audience}'",
+                        if (binding.provider == PROVIDER_FORGEJO) {
+                            "job: set `enable-openid-connect: true` and re-run — the runner refused the job-token request for audience '${binding.audience}'"
+                        } else {
+                            "job: grant `permissions: id-token: write` and re-run — the runner refused the job-token request for audience '${binding.audience}'"
+                        },
                     )
                     WorkloadIdentityFlow.ERROR_TOKEN_FILE_UNREADABLE -> listOf(
-                        "pod: mount the projected ServiceAccount token where the connection reads it — a `projected` volume with a `serviceAccountToken` source (`audience: ${binding.audience}`), or set auth.tokenSource.path in $file to the mounted path",
+                        if (binding.provider == PROVIDER_FORGEJO) {
+                            "job: write the Forgejo Actions token for audience '${binding.audience}' to the file auth.tokenSource.path names in $file before `thoryn login` — a fresh one for every sign-in (a job token works once)"
+                        } else {
+                            "pod: mount the projected ServiceAccount token where the connection reads it — a `projected` volume with a `serviceAccountToken` source (`audience: ${binding.audience}`), or set auth.tokenSource.path in $file to the mounted path"
+                        },
                     )
                     else -> listOf("re-run the job; if it persists, a workspace admin reads the reason with `$AUDIT_COMMAND`")
                 },
             )
         }
         val kubernetes = binding.provider == PROVIDER_KUBERNETES || (binding.provider == null && identity.isKubernetes)
+        val forgejo = binding.providerOf(identity) == PROVIDER_FORGEJO
         return when (e.oauthError) {
             "invalid_client" -> {
                 planProfileGap(e, binding)?.let { return Fix(listOf(it.item()), emptyList()) }
-                val mismatches = localMismatches(identity, binding.audience, binding.pins, binding.provider, binding.kubernetesPins)
+                val mismatches = localMismatches(identity, binding.audience, binding.pins, binding.provider, binding.kubernetesPins, binding.forgejoPins, binding.forgejoPlanProfile)
                 val notes = mutableListOf<String>()
                 if (mismatches.any { it.startsWith("aud:") }) notes += "$file: set auth.audience to the trust's audience exactly (`thoryn workload-identity trusts get <id>` prints it)" + if (kubernetes) "; the projected volume's `audience:` must be the same value" else ""
-                if (mismatches.any { it.startsWith("iss:") } && !kubernetes) notes += "job: a trust accepts only a GitHub Actions job token (${WorkloadIdentityFlow.GITHUB_ACTIONS_ISSUER}) — run `thoryn login --connection` inside the GitHub Actions job itself"
+                if (mismatches.any { it.startsWith("iss:") } && !kubernetes && !forgejo) notes += "job: a trust accepts only a GitHub Actions job token (${WorkloadIdentityFlow.GITHUB_ACTIONS_ISSUER}) — run `thoryn login --connection` inside the GitHub Actions job itself"
                 if (mismatches.any { it.startsWith("event_name: pull_request_target") }) notes += "job: trigger the workflow on `pull_request`, never `pull_request_target` — the platform always refuses it"
-                if (mismatches.any { it.startsWith("event_name: pull_request jobs") }) notes += "job: a production trust refuses `pull_request` jobs — run the plan from the App-dispatched workflow in the trust's plan GitHub environment, or use a sandbox trust"
+                // SSO-4472 — the trigger-class rule: which job gets which profile, and what a refused one should be instead.
+                if (forgejo) forgejoTriggerNote(identity, binding, file)?.let { notes += it }
+                if (mismatches.any { it.startsWith("event_name: pull_request jobs") } && !forgejo) notes += "job: a production trust refuses `pull_request` jobs — run the plan from the App-dispatched workflow in the trust's plan GitHub environment, or use a sandbox trust"
                 if (mismatches.any { it.startsWith("environment:") && it.contains("declares no `environment:`") }) notes += "job: add `environment: ${binding.pins?.environment ?: "<the trust's GitHub environment>"}` to the job"
                 if (mismatches.any { it.startsWith("kubernetes.io:") }) notes += "pod: mount a `projected` volume with a `serviceAccountToken` source — a legacy Secret-based token carries no `kubernetes.io` claim"
                 val pinMismatch = mismatches.any { m -> PIN_FIELDS.any { m.startsWith("$it:") } && !m.contains("declares no `environment:`") }
+                if (forgejo && !pinMismatch && notes.isNotEmpty()) return Fix(emptyList(), notes)
                 if (pinMismatch) {
                     notes += "trust: re-create it with the ${if (kubernetes) "pod's" else "job's"} own pins — `${trustsCreateCommand(identity, binding)}` — then replace $file with the connection.json it prints (`thoryn workload-identity trusts get <id> --connection`); or align the ${if (kubernetes) "pod" else "job"} with the trust (the differences above)"
                 }
@@ -282,6 +395,9 @@ object WorkloadIdentityDiagnostics {
                 emptyList(),
                 when (profileOutside(e.errorDescription)) {
                     WorkloadProfile.PLAN -> when {
+                        // SSO-4472 — a Forgejo plan job is selected by its trigger, never by anything the job or the file declares.
+                        forgejo ->
+                            listOf("job: request no scope from ${forgejoJobDescription(identity)} — the hub mints the plan profile's read-only scopes there (`thoryn login --connection` does this on its own; drop --scope from the flag form)")
                         binding.connectionFile != null && binding.pins?.environment != null ->
                             listOf("$file: auth.github.environment names '${binding.pins.environment}' but the hub matched the PLAN profile for this job's environment '${identity.environment ?: "(none)"}' — set auth.github.environment to the trust's APPLY environment (paste the whole github block from `thoryn workload-identity trusts get <id> --connection`), or drop auth.scopes")
                         binding.connectionFile != null ->
@@ -298,6 +414,26 @@ object WorkloadIdentityDiagnostics {
             )
             WorkloadIdentityFlow.ERROR_TRANSPORT -> Fix(emptyList(), listOf("runner: make ${binding.tokenEndpoint} reachable (egress / DNS from this runner) and re-run; the audience's host is the platform the trust lives on"))
             else -> Fix(emptyList(), listOf("re-run the job; if it persists, a workspace admin reads the reason with `$AUDIT_COMMAND`"))
+        }
+    }
+
+    /**
+     * SSO-4472 — the fix of a Forgejo job the trigger-class rule refuses: a missing plan profile (a push / schedule / pull
+     * request the plan profile is selected for), a hidden trigger (`workflow_call`), or a job on the wrong ref / branch.
+     */
+    private fun forgejoTriggerNote(identity: JobIdentity, binding: WorkloadIdentityBinding, file: String): String? {
+        val refused = forgejoExpectation(identity, binding) as? TriggerExpectation.Refused ?: return null
+        val pin = binding.forgejoPins?.ref
+        val trigger = ForgejoTriggerMapping.classify(identity.eventName)
+        return when {
+            trigger == TriggerClass.HIDDEN_TRIGGER ->
+                "job: run `thoryn login` in the job's own steps (an action), never inside a reusable workflow — the hub refuses every workflow_call job"
+            trigger == TriggerClass.BASE_CODE_CHANGE_INPUT ->
+                "job: trigger the workflow on `pull_request`, never `pull_request_target` — the platform always refuses it"
+            refused.reason == TriggerProfileRule.EVENT_NOT_ALLOWED && trigger in setOf(TriggerClass.PUSH, TriggerClass.SCHEDULE, TriggerClass.CHANGE_REQUEST) ->
+                "trust: give it a plan profile — `thoryn workload-identity trusts set-plan-profile <id>` (its scopes are derived from the trust's .read scopes, or --plan-scope) — then add the auth.plan block to $file (`thoryn workload-identity trusts get <id> --connection` prints it); or apply from a workflow_dispatch on '$pin'"
+            else ->
+                "job: on this trust a workflow_dispatch on '$pin' applies; a push or schedule on it, or a pull request into its branch, plans (with a plan profile); every other job is refused"
         }
     }
 
@@ -318,6 +454,12 @@ object WorkloadIdentityDiagnostics {
         if (kubernetes) {
             append(" --provider kubernetes --issuer ${identity.issuer ?: "<cluster issuer>"}")
             append(" --namespace ${identity.kubernetesNamespace ?: "<namespace>"} --service-account ${identity.kubernetesServiceAccount ?: "<service-account>"}")
+        } else if (binding.providerOf(identity) == PROVIDER_FORGEJO) {
+            // SSO-4472 — the instance from the token's own issuer; a production trust always pins the job's ref.
+            append(" --provider forgejo --instance ${identity.forgejoInstance ?: binding.forgejoPins?.instanceUrl ?: "<instance url>"}")
+            append(" --repository ${identity.repository ?: "<owner/repo>"}")
+            if (identity.repositoryOwnerId != null && identity.repositoryId != null) append(" --owner-id ${identity.repositoryOwnerId} --repository-id ${identity.repositoryId}")
+            if (plane == null || binding.forgejoPins?.ref != null) append(" --ref ${identity.ref ?: binding.forgejoPins?.ref ?: "<ref>"}")
         } else {
             append(" --repository ${identity.repository ?: "<owner/repo>"}")
             if (identity.repositoryOwnerId != null && identity.repositoryId != null) append(" --owner-id ${identity.repositoryOwnerId} --repository-id ${identity.repositoryId}")
@@ -353,7 +495,10 @@ object WorkloadIdentityDiagnostics {
                     when (profileOutside(e.errorDescription)) {
                         WorkloadProfile.PLAN -> {
                             appendLine("Sign-in failed: the requested scope is outside the trust's PLAN profile (HTTP ${e.status ?: 400}: invalid_scope, $REASON_OUTSIDE_PLAN).")
-                            appendLine(
+                            if (binding.providerOf(identity) == PROVIDER_FORGEJO) appendLine(
+                                "This job is ${forgejoJobDescription(identity)}, so the hub matched the trust's plan profile and mints only its " +
+                                    "read-only (.read) scopes; a write scope is never minted to a plan job.",
+                            ) else appendLine(
                                 "This job runs in GitHub environment '${identity.environment ?: "(none)"}'" +
                                     (binding.pins?.environment?.let { " — not the trust's apply environment '$it'" } ?: " and the connection names no apply environment") +
                                     ", so the hub matched the trust's plan profile and mints only its read-only (.read) scopes there; a write scope is never minted to a plan job.",
@@ -390,7 +535,10 @@ object WorkloadIdentityDiagnostics {
                 ),
             )
             // SSO-3702 — which profile the CLI expected the hub to match, and why.
-            binding.profile?.let { p ->
+            binding.profile?.takeIf { binding.providerOf(identity) == PROVIDER_FORGEJO }?.let { p ->
+                appendLine(field("profile", "${p.wire} expected (${forgejoJobDescription(identity)})"))
+            }
+            binding.profile?.takeIf { binding.providerOf(identity) != PROVIDER_FORGEJO }?.let { p ->
                 appendLine(
                     field(
                         "profile",
@@ -399,10 +547,29 @@ object WorkloadIdentityDiagnostics {
                     ),
                 )
             }
-            if (binding.hubDecided) appendLine(field("profile", "decided by the hub (no auth.github.environment in the connection)"))
+            val forgejoJob = binding.providerOf(identity) == PROVIDER_FORGEJO
+            if (binding.hubDecided && forgejoJob) {
+                appendLine(field("profile", "decided by the hub (${forgejoJobDescription(identity)}; the connection's scopes are requested only for a workflow_dispatch on the pinned ref)"))
+            } else if (binding.hubDecided) {
+                appendLine(field("profile", "decided by the hub (no auth.github.environment in the connection)"))
+            }
             appendLine()
             val kubernetes = binding.provider == PROVIDER_KUBERNETES || (binding.provider == null && identity.isKubernetes)
-            if (kubernetes) {
+            val forgejo = !kubernetes && binding.providerOf(identity) == PROVIDER_FORGEJO
+            if (forgejo) {
+                // SSO-4472 — a Forgejo Actions job token: its instance's issuer, the repository, the ref, the event.
+                appendLine("This job (claims of its Forgejo Actions OIDC token; the token itself is not shown):")
+                appendLine(field("iss", identity.issuer))
+                appendLine(field("sub", identity.subject))
+                appendLine(field("aud", identity.audience.joinToString().ifEmpty { null }))
+                appendLine(field("repository", identity.repository))
+                appendLine(field("repository_id", identity.repositoryId))
+                appendLine(field("repository_owner_id", identity.repositoryOwnerId))
+                appendLine(field("ref", identity.ref))
+                appendLine(field("base_ref", identity.baseRef))
+                appendLine(field("event_name", identity.eventName))
+                appendLine(field("trigger class", ForgejoTriggerMapping.classify(identity.eventName).wire))
+            } else if (kubernetes) {
                 // SSO-3684 — a pod's projected ServiceAccount token has a different public shape.
                 appendLine("This pod (claims of its projected ServiceAccount token; the token itself is not shown):")
                 appendLine(field("iss", identity.issuer))
@@ -422,8 +589,12 @@ object WorkloadIdentityDiagnostics {
                 appendLine(field("runner_environment", identity.runnerEnvironment))
             }
             appendLine()
-            val mismatches = localMismatches(identity, binding.audience, binding.pins, binding.provider, binding.kubernetesPins)
-            val pinsKnown = if (kubernetes) binding.kubernetesPins != null else binding.pins != null
+            val mismatches = localMismatches(identity, binding.audience, binding.pins, binding.provider, binding.kubernetesPins, binding.forgejoPins, binding.forgejoPlanProfile)
+            val pinsKnown = when {
+                kubernetes -> binding.kubernetesPins != null
+                forgejo -> binding.forgejoPins != null
+                else -> binding.pins != null
+            }
             if (mismatches.isNotEmpty()) {
                 appendLine("Differences found locally:")
                 mismatches.forEach { appendLine("  - $it") }
@@ -432,13 +603,18 @@ object WorkloadIdentityDiagnostics {
                     when {
                         pinsKnown -> "No difference found locally against the pins the connection names."
                         kubernetes -> "No difference found locally (name the trust's pins in the connection's auth.kubernetes to have the CLI compare them)."
+                        forgejo -> "No difference found locally (name the trust's pins in the connection's auth.forgejo to have the CLI compare them)."
                         else -> "No difference found locally (name the trust's pins in the connection's auth.github to have the CLI compare them)."
                     },
                 )
             }
             appendLine()
             appendLine(
-                if (kubernetes) {
+                if (forgejo) {
+                    "Compare the job above with the trust (`thoryn workload-identity trusts get <id>`): its client id, audience, " +
+                        "instance (the token's issuer), repository ids and ref must all match, and it must live in the environment " +
+                        "the audience names. Whoever administers the instance controls its signing keys."
+                } else if (kubernetes) {
                     "Compare the pod above with the trust (`thoryn workload-identity trusts get <id>`): its client id, audience, " +
                         "issuer, namespace and service account must all match, the token must be a PROJECTED one (a `kubernetes.io` " +
                         "claim), and the trust must live in the environment the audience names. A cluster that rotated its " +

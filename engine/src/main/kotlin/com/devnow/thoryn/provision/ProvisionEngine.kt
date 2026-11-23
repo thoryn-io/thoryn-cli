@@ -3845,6 +3845,8 @@ class ProvisionEngine(
         listOf("id", "name", "clientId", "audience", "tokenEndpoint", "provider", "environment").forEach { f -> n.str(f)?.let { put(f, it) } }
         n["scopes"]?.takeIf { it.isArray }?.let { put("scopes", it.toList().map { s -> s.asString() }) }
         n["github"]?.takeIf { it.isObject }?.let { g -> put("github", plain(g)) }
+        // SSO-4472 — a Forgejo trust's pins (instance, repository, ids, ref), for the connection.json `apply` prints.
+        n["forgejo"]?.takeIf { it.isObject }?.let { f -> put("forgejo", plain(f)) }
         // SSO-3702 — the plan profile and the per-profile subject patterns (apply, plan), as the API renders them.
         n[ProvisionFile.TRUST_PLAN]?.takeIf { it.isObject }?.let { p -> put(ProvisionFile.TRUST_PLAN, plain(p)) }
         n["subjectPatterns"]?.takeIf { it.isArray }?.let { put("subjectPatterns", it.toList().map { s -> s.asString() }) }
@@ -3976,9 +3978,6 @@ class ProvisionEngine(
     private fun printTrustConnection(view: Map<String, Any?>) {
         out.println("    connection.json for the workload that signs in with this trust — not written by apply (it belongs to the consumer repository):")
         json.writerWithDefaultPrettyPrinter().writeValueAsString(connectionDocument(view, applyWorkspace)).lines().forEach { out.println("      $it") }
-        if (view["provider"] == ProvisionFile.PROVIDER_FORGEJO) {
-            out.println("    (the connection contract knows github_actions and kubernetes today; a forgejo job presents its own Actions token as the client_assertion — `provider` is left out so the document validates.)")
-        }
     }
 
     // ── secret-less clients (SSO-3689): the application's `federatedTrust` NAME → id, inline `jwks` → the API's string ──
@@ -4651,21 +4650,23 @@ class ProvisionEngine(
          * The consumer's `connection.json` (ADR 2026-09-09 connection contract) for a trust: `workload_identity` with the
          * trust's `wi_` client, audience, scopes and the provider's pins — exactly what `thoryn workload-identity trusts
          * create` prints: for `github_actions` the GitHub pins; for `kubernetes` (SSO-3684) the file token source (the
-         * projected ServiceAccount token at [KUBERNETES_TOKEN_FILE]) and the cluster pins. The contract validates those
-         * two providers today, so a `forgejo` document carries no `provider` (its job presents its own Actions token).
+         * projected ServiceAccount token at [KUBERNETES_TOKEN_FILE]) and the cluster pins; for `forgejo` (SSO-4472) the
+         * instance / repository / ref pins as `auth.forgejo` and, when the trust has one, its plan profile as `auth.plan:
+         * {scopes}` (a mirror the CLI reads to expect the profile a push gets; never sent). A Forgejo job's token comes from
+         * the runner, so no `tokenSource` is written (an instance behind an authenticating proxy adds `{kind: file}` itself).
          * Rendered, never written, by `apply`; nothing in it is secret.
          */
         fun connectionDocument(view: Map<String, Any?>, workspace: String?): Map<String, Any?> {
             val audience = view["audience"]?.toString()?.trimEnd('/')
             val provider = view["provider"]?.toString()
             val auth = linkedMapOf<String, Any?>("method" to "workload_identity")
-            if (provider == ProvisionFile.PROVIDER_GITHUB_ACTIONS || provider == ProvisionFile.PROVIDER_KUBERNETES) auth["provider"] = provider
+            if (provider in ProvisionFile.TRUST_PROVIDERS) auth["provider"] = provider
             auth["clientId"] = view["clientId"]
             if (audience != null) auth["audience"] = audience
             view["tokenEndpoint"]?.toString()?.takeIf { audience == null || it != "$audience/oauth2/token" }?.let { auth["tokenEndpoint"] = it }
             if (provider == ProvisionFile.PROVIDER_KUBERNETES) auth["tokenSource"] = linkedMapOf("kind" to "file", "path" to KUBERNETES_TOKEN_FILE)
             auth["scopes"] = (view["scopes"] as? List<*>).orEmpty().map { it.toString() }
-            (view["github"] as? Map<*, *>)?.takeIf { provider != ProvisionFile.PROVIDER_KUBERNETES }?.let { g ->
+            (view["github"] as? Map<*, *>)?.takeIf { provider != ProvisionFile.PROVIDER_KUBERNETES && provider != ProvisionFile.PROVIDER_FORGEJO }?.let { g ->
                 val pins = linkedMapOf<String, Any?>()
                 // SSO-3722 — the COMPLETE block connection.schema.json defines: `environment` is the apply environment the
                 // profile selector reads (a snippet without it made the plan job request the apply scopes — thoryn-cicd run
@@ -4679,6 +4680,18 @@ class ProvisionEngine(
                 val pins = CONNECTION_KUBERNETES_PINS.mapNotNull { f -> k[f]?.toString()?.takeIf { it.isNotBlank() }?.let { f to it } }.toMap(linkedMapOf())
                 if (pins.isNotEmpty()) auth["kubernetes"] = pins
             }
+            if (provider == ProvisionFile.PROVIDER_FORGEJO) {
+                (view["forgejo"] as? Map<*, *>)?.let { f ->
+                    val pins = linkedMapOf<String, Any?>()
+                    CONNECTION_FORGEJO_PINS.forEach { k -> f[k]?.let { v -> if (!(v is Number && v.toLong() <= 0) && v.toString().isNotBlank()) pins[k] = v } }
+                    if (pins.isNotEmpty()) auth["forgejo"] = pins
+                }
+                // The plan profile's mirror: present iff the trust carries one; its scopes as the trust renders them.
+                (view["plan"] as? Map<*, *>)?.let { p ->
+                    val scopes = (p["scopes"] as? List<*>).orEmpty().map { it.toString() }.filter { it.isNotBlank() }
+                    auth["plan"] = if (scopes.isEmpty()) linkedMapOf<String, Any?>() else linkedMapOf<String, Any?>("scopes" to scopes)
+                }
+            }
             return linkedMapOf("apiVersion" to "thoryn.io/connection/v1", "workspace" to linkedMapOf("slug" to (workspace ?: "<your-workspace>")), "auth" to auth)
         }
 
@@ -4687,6 +4700,9 @@ class ProvisionEngine(
 
         /** The `auth.github` members of `connection.schema.json` a trust's view fills (the boolean pin is added when true). */
         val CONNECTION_GITHUB_PINS: List<String> = listOf("owner", "repository", "ownerId", "repositoryId", "environment", "ref")
+
+        /** SSO-4472 — the `auth.forgejo` members of `connection.schema.json` a `forgejo` trust's view fills. */
+        val CONNECTION_FORGEJO_PINS: List<String> = listOf("instanceUrl", "owner", "repository", "ownerId", "repositoryId", "ref")
 
         /** The `auth.kubernetes` members of `connection.schema.json` (the pins; never the key set). */
         val CONNECTION_KUBERNETES_PINS: List<String> = listOf("issuer", "namespace", "serviceAccount")

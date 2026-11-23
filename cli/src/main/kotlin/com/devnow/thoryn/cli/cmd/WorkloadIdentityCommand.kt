@@ -38,6 +38,16 @@ import java.util.concurrent.Callable
  * `kubectl get --raw /openid/v1/jwks`); a production trust pins both the namespace and the service account.
  * The documented manifest is `examples/kubernetes/` in this repository.
  *
+ * SSO-4472 (epic SSO-4473; hub oathy SSO-3661) — `--provider forgejo`: the same trust for a **Forgejo Actions** job on
+ * ANY Forgejo instance (Codeberg, a self-hosted forge). It pins the instance (`--instance`, its https origin — the
+ * token's issuer is `<instance>/api/actions`), the repository by the instance's immutable ids (looked up anonymously from
+ * the instance's API when omitted — [ForgejoRepositoryLookup]) and a ref (`--ref`, required on production: Forgejo has
+ * no environments). The profile is selected by the job's trigger class and ref (ADR 2026-10-14 Amendment 2026-11-23):
+ * a workflow_dispatch on the pinned ref applies; a push or schedule on it, or a pull request into its branch, plans
+ * when the trust has a plan profile (`--plan`, `set-plan-profile <id>` — no environment, read-only scopes). A job
+ * signs in with `thoryn login --connection` (`enable-openid-connect: true`), or — on an instance behind an
+ * authenticating proxy — from a token the job minted itself (`auth.tokenSource: {kind: file}`).
+ *
  * SSO-3702 (SSO-3699 **option B**, oauthy ADR `2026-10-14-plan-identity-and-resource-ownership`; hub SSO-3700,
  * product-api SSO-3701) — **one trust, one `wi_` client, two scope PROFILES.** A `github_actions` trust pins
  * its APPLY GitHub environment (the reviewed one) with its scopes, and may carry a **plan profile**
@@ -56,7 +66,9 @@ import java.util.concurrent.Callable
  *     [--plan-scope <s>…]] [--confirm-production]`                                            — POST
  *  - `create --provider kubernetes --name <n> --issuer <https url> [--namespace <ns> --service-account <sa>]
  *     [--jwks-file <path>] --scope <s>… [--confirm-production]`                               — POST
- *  - `set-plan-profile <id> --plan-environment <gh-env> [--plan-scope <s>…]`                 — POST …/{id}/plan-profile
+ *  - `create --provider forgejo --name <n> --instance <https origin> --repository <owner/repo> [--owner-id <id>
+ *     --repository-id <id>] [--ref <ref>] --scope <s>… [--plan [--plan-scope <s>…]] [--confirm-production]` — POST
+ *  - `set-plan-profile <id> [--plan-environment <gh-env>] [--plan-scope <s>…]`               — POST …/{id}/plan-profile
  *  - `set-scopes <id|name> [--scope <s>…] [--plan-scope <s>…]`                                — PUT …/{id}/scopes
  *  - `list [--limit n] [--cursor c]`                                                         — GET
  *  - `get <id>`                                                                              — GET …/{id}
@@ -76,8 +88,8 @@ import java.util.concurrent.Callable
 @Command(
     name = "workload-identity",
     description = [
-        "Let GitHub Actions workflows — or Kubernetes pods — sign in without a stored secret (workload identity trusts).",
-        "A job exchanges its own OIDC token (thoryn login --workload-identity); a pod its projected ServiceAccount token.",
+        "Let GitHub Actions or Forgejo Actions workflows — or Kubernetes pods — sign in without a stored secret (workload identity",
+        "trusts). A job exchanges its own OIDC token (thoryn login --connection); a pod its projected ServiceAccount token.",
     ],
     mixinStandardHelpOptions = true,
     subcommands = [WorkloadIdentityCommand.TrustsCommand::class],
@@ -93,7 +105,7 @@ class WorkloadIdentityCommand : Callable<Int> {
     /** `thoryn workload-identity trusts …` */
     @Command(
         name = "trusts",
-        description = ["Manage the environment's workload identity trusts (one GitHub repository, or one Kubernetes service account, each)."],
+        description = ["Manage the environment's workload identity trusts (one GitHub or Forgejo repository, or one Kubernetes service account, each)."],
         mixinStandardHelpOptions = true,
         subcommands = [CreateSubcommand::class, SetPlanProfileSubcommand::class, SetScopesSubcommand::class, ListSubcommand::class, GetSubcommand::class, DeleteSubcommand::class],
     )
@@ -156,9 +168,11 @@ class WorkloadIdentityCommand : Callable<Int> {
     @Command(
         name = "create",
         description = [
-            "Trust one GitHub repository's Actions jobs — or (--provider kubernetes) the pods of one Kubernetes service",
-            "account — to sign in to this environment without a secret. Prints the client id, audience and token",
-            "endpoint, and a workflow snippet (GitHub) or the connection.json for the Thoryn init container (Kubernetes).",
+            "Trust one GitHub repository's Actions jobs — or (--provider forgejo) one repository's Forgejo Actions jobs on any",
+            "Forgejo instance, or (--provider kubernetes) the pods of one Kubernetes service account — to sign in to this",
+            "environment without a secret. Prints the client id, audience and token endpoint, and the connection.json and a",
+            "workflow snippet (GitHub, Forgejo) or the connection.json for the Thoryn init container (Kubernetes).",
+            "Forgejo example: --provider forgejo --instance https://codeberg.org --repository acme/infra --ref refs/heads/main",
         ],
         mixinStandardHelpOptions = true,
     )
@@ -169,10 +183,11 @@ class WorkloadIdentityCommand : Callable<Int> {
 
         @Option(
             names = ["--provider"],
-            paramLabel = "<github_actions|kubernetes>",
+            paramLabel = "<github_actions|forgejo|kubernetes>",
             description = [
-                "The workload identity provider: github_actions (default; pins a repository) or kubernetes (SSO-3684;",
-                "pins a cluster's OIDC issuer, a namespace and a service account — the pod's projected ServiceAccount token).",
+                "The workload identity provider: github_actions (default; pins a GitHub repository), forgejo (pins a Forgejo",
+                "instance, a repository and a ref) or kubernetes (pins a cluster's OIDC issuer, a namespace and a service account",
+                "— the pod's projected ServiceAccount token).",
             ],
             defaultValue = PROVIDER_GITHUB_ACTIONS,
         )
@@ -181,9 +196,19 @@ class WorkloadIdentityCommand : Callable<Int> {
         @Option(
             names = ["--repository"],
             paramLabel = "<owner/repo>",
-            description = ["github_actions: the GitHub repository whose jobs may sign in, e.g. acme/billing. Required."],
+            description = ["github_actions, forgejo: the repository whose jobs may sign in, e.g. acme/billing. Required."],
         )
         var repository: String? = null
+
+        @Option(
+            names = ["--instance"],
+            paramLabel = "<https url>",
+            description = [
+                "forgejo: the Forgejo instance's https origin, no path — e.g. https://codeberg.org, or your own forge. Its Actions",
+                "OIDC issuer is <instance>/api/actions; whoever administers the instance controls its signing keys. Required.",
+            ],
+        )
+        var instance: String? = null
 
         @Option(
             names = ["--issuer"],
@@ -220,13 +245,13 @@ class WorkloadIdentityCommand : Callable<Int> {
         @Option(
             names = ["--owner-id"],
             description = [
-                "GitHub's immutable owner id (repository_owner_id). Give it with --repository-id for a private repository;",
-                "for a public one both are looked up once when omitted.",
+                "The immutable owner id (repository_owner_id) — GitHub's, or the Forgejo instance's. Give it with --repository-id",
+                "for a private repository; for a public one both are looked up once when omitted (forgejo: from the instance's API).",
             ],
         )
         var ownerId: Long? = null
 
-        @Option(names = ["--repository-id"], description = ["GitHub's immutable repository id (repository_id). Together with --owner-id."])
+        @Option(names = ["--repository-id"], description = ["The immutable repository id (repository_id), GitHub's or the Forgejo instance's. Together with --owner-id."])
         var repositoryId: Long? = null
 
         @Option(
@@ -235,7 +260,13 @@ class WorkloadIdentityCommand : Callable<Int> {
         )
         var githubEnvironment: String? = null
 
-        @Option(names = ["--ref"], description = ["Only jobs on this exact ref, e.g. refs/heads/main."])
+        @Option(
+            names = ["--ref"],
+            description = [
+                "Only jobs on this exact ref, e.g. refs/heads/main. forgejo: required for a production trust (Forgejo has no",
+                "environments) — a workflow_dispatch on it applies; a push or schedule on it, or a pull request into its branch, plans.",
+            ],
+        )
         var ref: String? = null
 
         @Option(names = ["--github-hosted-runners-only"], description = ["Only jobs on GitHub-hosted runners (not self-hosted)."])
@@ -272,11 +303,22 @@ class WorkloadIdentityCommand : Callable<Int> {
             names = ["--plan-scope"],
             paramLabel = "<scope>",
             description = [
-                "Only with --plan-environment: an explicit plan scope (repeatable, or space/comma-separated) — a .read scope among",
-                "--scope. Omitted: the hub DERIVES the plan scopes (every .read member of --scope).",
+                "Only with --plan-environment (github_actions) or --plan (forgejo): an explicit plan scope (repeatable, or",
+                "space/comma-separated) — a .read scope among --scope. Omitted: the hub DERIVES the plan scopes (every .read member of --scope).",
             ],
         )
         var planScopeArgs: List<String> = emptyList()
+
+        @Option(
+            names = ["--plan"],
+            description = [
+                "forgejo: give the production trust its PLAN profile — read-only scopes (the .read members of --scope, or --plan-scope)",
+                "for a push or schedule on --ref and a pull request into its branch; a workflow_dispatch on --ref keeps the apply scopes.",
+                "The job's trigger class selects it, so there is no environment to name. Omit it to add the profile later with",
+                "`trusts set-plan-profile <id>`.",
+            ],
+        )
+        var plan: Boolean = false
 
         override val requiredScope: String = SCOPE_WRITE
 
@@ -284,6 +326,8 @@ class WorkloadIdentityCommand : Callable<Int> {
         private val repo: String get() = repository.orEmpty().trim().substringAfter('/')
 
         private val isKubernetes: Boolean get() = provider.trim() == PROVIDER_KUBERNETES
+
+        private val isForgejo: Boolean get() = provider.trim() == PROVIDER_FORGEJO
 
         /** The requested scopes, split and de-duplicated in order. */
         internal val scopes: List<String>
@@ -300,8 +344,9 @@ class WorkloadIdentityCommand : Callable<Int> {
             when (provider.trim()) {
                 PROVIDER_GITHUB_ACTIONS -> precheckGithub()?.let { return it }
                 PROVIDER_KUBERNETES -> precheckKubernetes()?.let { return it }
+                PROVIDER_FORGEJO -> precheckForgejo()?.let { return it }
                 else -> {
-                    System.err.println("Error: --provider must be $PROVIDER_GITHUB_ACTIONS or $PROVIDER_KUBERNETES (was '$provider').")
+                    System.err.println("Error: --provider must be $PROVIDER_GITHUB_ACTIONS, $PROVIDER_FORGEJO or $PROVIDER_KUBERNETES (was '$provider').")
                     return CommandSupport.EXIT_USAGE
                 }
             }
@@ -317,7 +362,13 @@ class WorkloadIdentityCommand : Callable<Int> {
                 return CommandSupport.EXIT_USAGE
             }
             // SSO-3702 — the plan profile's own rules, refused here before any call with the API's codes.
-            if (planEnvironment != null || planScopeArgs.isNotEmpty()) {
+            // SSO-4472 — a Forgejo trust's plan profile has no environment: [forgejoPlanProblem] judges it instead.
+            if (isForgejo && (plan || planScopeArgs.isNotEmpty())) {
+                forgejoPlanProblem(scopes, planScopes)?.let {
+                    System.err.println("Error: $it")
+                    return CommandSupport.EXIT_USAGE
+                }
+            } else if (planEnvironment != null || planScopeArgs.isNotEmpty()) {
                 planProfileProblem(githubEnvironment, scopes, planEnvironment, planScopes)?.let {
                     System.err.println("Error: $it")
                     return CommandSupport.EXIT_USAGE
@@ -335,6 +386,14 @@ class WorkloadIdentityCommand : Callable<Int> {
             )
             if (kubernetesOnly.isNotEmpty()) {
                 System.err.println("Error: ${kubernetesOnly.joinToString(", ")} apply to --provider $PROVIDER_KUBERNETES only.")
+                return CommandSupport.EXIT_USAGE
+            }
+            val forgejoOnly = listOfNotNull("--instance".takeIf { instance != null }, "--plan".takeIf { plan })
+            if (forgejoOnly.isNotEmpty()) {
+                System.err.println(
+                    "Error: ${forgejoOnly.joinToString(", ")} apply to --provider $PROVIDER_FORGEJO only" +
+                        (if (plan) " (a GitHub trust's plan profile is keyed on a GitHub environment: --plan-environment <gh-env>)." else "."),
+                )
                 return CommandSupport.EXIT_USAGE
             }
             val repository = repository
@@ -371,9 +430,11 @@ class WorkloadIdentityCommand : Callable<Int> {
                 // SSO-3702 — a pod has no PR plan and no GitHub environment: no profiles (plan_profile_unsupported on the API).
                 "--plan-environment".takeIf { planEnvironment != null },
                 "--plan-scope".takeIf { planScopeArgs.isNotEmpty() },
+                "--instance".takeIf { instance != null },
+                "--plan".takeIf { plan },
             )
             if (githubOnly.isNotEmpty()) {
-                System.err.println("Error: ${githubOnly.joinToString(", ")} apply to --provider $PROVIDER_GITHUB_ACTIONS only.")
+                System.err.println("Error: ${githubOnly.joinToString(", ")} do not apply to --provider $PROVIDER_KUBERNETES.")
                 return CommandSupport.EXIT_USAGE
             }
             val issuer = issuer?.trim()?.takeIf { it.isNotEmpty() }
@@ -407,8 +468,66 @@ class WorkloadIdentityCommand : Callable<Int> {
             return null
         }
 
+        /**
+         * SSO-4472 — what the API (product-api `forgejoCommand`) would refuse for a `forgejo` pin, refused here first: the
+         * flags of the other providers, a missing or non-origin `--instance`, a repository that is not `<owner>/<repo>`, ids
+         * that do not come together, and a production trust (asserted by `--confirm-production`) without `--ref`
+         * (`production_requires_ref`).
+         */
+        private fun precheckForgejo(): Int? {
+            val notForgejo = listOfNotNull(
+                "--issuer".takeIf { issuer != null },
+                "--namespace".takeIf { namespace != null },
+                "--service-account".takeIf { serviceAccount != null },
+                "--jwks-file".takeIf { jwksFile != null },
+                "--github-environment".takeIf { githubEnvironment != null },
+                "--github-hosted-runners-only".takeIf { githubHostedRunnersOnly },
+                "--plan-environment".takeIf { planEnvironment != null },
+            )
+            if (notForgejo.isNotEmpty()) {
+                System.err.println(
+                    "Error: ${notForgejo.joinToString(", ")} do not apply to --provider $PROVIDER_FORGEJO" +
+                        (if (planEnvironment != null) " (a Forgejo trust's plan profile has no environment — the job's trigger class selects it: use --plan)." else "."),
+                )
+                return CommandSupport.EXIT_USAGE
+            }
+            val instance = instance?.trim()?.trimEnd('/')?.takeIf { it.isNotEmpty() }
+            if (instance == null) {
+                System.err.println("Error: --instance <https url> is required for a $PROVIDER_FORGEJO trust — the Forgejo instance's origin, e.g. https://codeberg.org.")
+                return CommandSupport.EXIT_USAGE
+            }
+            if (!isForgejoInstanceOrigin(instance)) {
+                System.err.println("Error: --instance must be the Forgejo instance's https origin with no path, query or credentials (was '$instance'), e.g. https://codeberg.org.")
+                return CommandSupport.EXIT_USAGE
+            }
+            val repository = repository
+            if (repository == null) {
+                System.err.println("Error: --repository <owner>/<repo> is required for a $PROVIDER_FORGEJO trust.")
+                return CommandSupport.EXIT_USAGE
+            }
+            val parts = repository.trim().split('/')
+            if (parts.size != 2 || parts.any { it.isBlank() || !FORGEJO_NAME.matches(it) || it == "." || it == ".." }) {
+                System.err.println("Error: --repository must be <owner>/<repo>, each a Forgejo name (letters, digits, '.', '_', '-'; was '$repository').")
+                return CommandSupport.EXIT_USAGE
+            }
+            if ((ownerId == null) != (repositoryId == null)) {
+                System.err.println("Error: --owner-id and --repository-id go together — give both, or neither to look them up on the instance.")
+                return CommandSupport.EXIT_USAGE
+            }
+            if (confirmProduction && ref.isNullOrBlank()) {
+                System.err.println(
+                    "Error: a production $PROVIDER_FORGEJO trust must pin --ref (production_requires_ref), e.g. --ref refs/heads/main: " +
+                        "Forgejo has no environments, so the ref is the production rule — a workflow_dispatch on it applies.",
+                )
+                return CommandSupport.EXIT_USAGE
+            }
+            return null
+        }
+
         override fun run(client: ProductApiClient, format: OutputFormat): Int {
-            val pin: Pair<String, Map<String, Any?>> = if (isKubernetes) {
+            val pin: Pair<String, Map<String, Any?>> = if (isForgejo) {
+                forgejoPin() ?: return CommandSupport.EXIT_USAGE
+            } else if (isKubernetes) {
                 "kubernetes" to mapOf(
                     "issuer" to issuer!!.trim(),
                     "namespace" to namespace?.trim()?.takeIf { it.isNotEmpty() },
@@ -434,7 +553,12 @@ class WorkloadIdentityCommand : Callable<Int> {
                     "scopes" to scopes,
                     "confirmProduction" to confirmProduction.takeIf { it },
                     // SSO-3702 — the plan profile, when declared at create (absent otherwise, never null).
-                    "plan" to planEnvironment?.let { planProfileBody(it, planScopes) },
+                    // SSO-4472 — a Forgejo trust's has no environment: `{}` (derived scopes) or `{scopes}`.
+                    "plan" to if (isForgejo) {
+                        forgejoPlanProfileBody(planScopes).takeIf { plan || planScopes.isNotEmpty() }
+                    } else {
+                        planEnvironment?.let { planProfileBody(it, planScopes) }
+                    },
                 ),
             )
             when (format) {
@@ -446,6 +570,8 @@ class WorkloadIdentityCommand : Callable<Int> {
                     out.println()
                     if (isKubernetesTrust(body)) {
                         printKubernetesUsage(body, workspaceSlugHint(body), out)
+                    } else if (isForgejoTrust(body)) {
+                        printForgejoUsage(body, workspaceSlugHint(body), out)
                     } else {
                         printUsage(body, workspaceSlugHint(body), out)
                     }
@@ -455,6 +581,38 @@ class WorkloadIdentityCommand : Callable<Int> {
             return CommandSupport.EXIT_OK
         }
 
+        /**
+         * SSO-4472 — the `forgejo` pin: the instance origin, the repository's canonical names and immutable ids (given, or
+         * looked up ONCE, anonymously, on the instance — [forgejoLookup]) and the ref. Null after printing why the lookup failed.
+         */
+        private fun forgejoPin(): Pair<String, Map<String, Any?>>? {
+            val instanceUrl = instance!!.trim().trimEnd('/')
+            var ownerName = owner
+            var repositoryName = repo
+            var ids = ownerId?.let { it to repositoryId!! }
+            if (ids == null) {
+                when (val found = forgejoLookup(instanceUrl, ownerName, repositoryName)) {
+                    is ForgejoRepositoryLookup.Result.Found -> {
+                        ownerName = found.owner
+                        repositoryName = found.repository
+                        ids = found.ownerId to found.repositoryId
+                        System.err.println("Looked up $ownerName/$repositoryName on $instanceUrl: owner id ${found.ownerId}, repository id ${found.repositoryId}.")
+                    }
+                    is ForgejoRepositoryLookup.Result.Failed -> {
+                        System.err.println("Error: ${found.message}")
+                        return null
+                    }
+                }
+            }
+            return "forgejo" to mapOf(
+                "instanceUrl" to instanceUrl,
+                "owner" to ownerName,
+                "ownerId" to ids.first,
+                "repository" to repositoryName,
+                "repositoryId" to ids.second,
+                "ref" to ref?.trim()?.takeIf { it.isNotEmpty() },
+            )
+        }
     }
 
     /**
@@ -467,9 +625,10 @@ class WorkloadIdentityCommand : Callable<Int> {
     @Command(
         name = "set-plan-profile",
         description = [
-            "Give an existing GitHub Actions trust its PLAN profile: a second GitHub environment whose jobs are minted read-only",
-            "scopes only (the .read members of the trust's scopes, or --plan-scope). Additive — the wi_ client, its owner relation",
-            "and the committed connection.json stay. Set once: change its scopes with set-scopes --plan-scope; its environment by re-creating the trust.",
+            "Give an existing trust its PLAN profile: read-only scopes only (the .read members of the trust's scopes, or --plan-scope).",
+            "GitHub Actions: for the jobs of a second GitHub environment (--plan-environment). Forgejo: for a push or schedule on the",
+            "trust's ref and a pull request into its branch — the trigger selects it, so name no environment. Additive — the wi_",
+            "client, its owner relation and the committed connection.json stay. Set once: change its scopes with set-scopes --plan-scope.",
         ],
         mixinStandardHelpOptions = true,
     )
@@ -480,10 +639,12 @@ class WorkloadIdentityCommand : Callable<Int> {
         @Option(
             names = ["--plan-environment"],
             paramLabel = "<gh-env>",
-            required = true,
-            description = ["The GitHub environment of the plan jobs (unprotected, e.g. <apply>-plan). Must differ from the trust's apply environment."],
+            description = [
+                "github_actions (required there): the GitHub environment of the plan jobs (unprotected, e.g. <apply>-plan). Must differ",
+                "from the trust's apply environment. forgejo: omit it.",
+            ],
         )
-        lateinit var planEnvironment: String
+        var planEnvironment: String? = null
 
         @Option(
             names = ["--plan-scope"],
@@ -501,7 +662,9 @@ class WorkloadIdentityCommand : Callable<Int> {
 
         override fun precheck(): Int? {
             // The apply environment and the trust's scopes are only known to the API here; the local rules are the plan side's.
-            planProfileProblem(applyEnvironment = null, applyScopes = null, planEnvironment, planScopes)?.let {
+            // SSO-4472 — without --plan-environment it may be a Forgejo trust: only the scopes' own rule is judged here.
+            val problem = if (planEnvironment == null) forgejoPlanProblem(null, planScopes) else planProfileProblem(applyEnvironment = null, applyScopes = null, planEnvironment, planScopes)
+            problem?.let {
                 System.err.println("Error: $it")
                 return CommandSupport.EXIT_USAGE
             }
@@ -509,20 +672,39 @@ class WorkloadIdentityCommand : Callable<Int> {
         }
 
         override fun run(client: ProductApiClient, format: OutputFormat): Int {
-            val body = client.setWorkloadIdentityTrustPlanProfile(id.trim(), planProfileBody(planEnvironment, planScopes))
+            val environment = planEnvironment
+            // SSO-4472 — no environment named: only a Forgejo trust's plan profile is keyed on none. Read the trust to say so first.
+            if (environment == null && !isForgejoTrust(client.getWorkloadIdentityTrust(id.trim()))) {
+                System.err.println(
+                    "Error: plan_profile_requires_environment — --plan-environment <gh-env> is required for a $PROVIDER_GITHUB_ACTIONS trust: " +
+                        "its plan profile is keyed on the GitHub environment the plan jobs run in.",
+                )
+                return CommandSupport.EXIT_USAGE
+            }
+            val request = if (environment == null) forgejoPlanProfileBody(planScopes) else planProfileBody(environment, planScopes)
+            val body = client.setWorkloadIdentityTrustPlanProfile(id.trim(), request)
             when (format) {
                 OutputFormat.TABLE -> {
                     val out = System.out
                     val plan = body["plan"]
                     out.println(
-                        "Workload identity trust '${text(body, "name")}' (id ${text(body, "id")}) now carries a plan profile: GitHub environment " +
-                            "'${text(plan, "environment") ?: planEnvironment.trim()}' is minted ${planScopesOf(body).joinToString(" ").ifEmpty { "its read-only scopes" }} only.",
+                        if (environment == null) {
+                            "Workload identity trust '${text(body, "name")}' (id ${text(body, "id")}) now carries a plan profile: a push or schedule on its ref, " +
+                                "and a pull request into its branch, are minted ${planScopesOf(body).joinToString(" ").ifEmpty { "its read-only scopes" }} only."
+                        } else {
+                            "Workload identity trust '${text(body, "name")}' (id ${text(body, "id")}) now carries a plan profile: GitHub environment " +
+                                "'${text(plan, "environment") ?: environment.trim()}' is minted ${planScopesOf(body).joinToString(" ").ifEmpty { "its read-only scopes" }} only."
+                        },
                     )
                     out.println("The wi_ client ${text(body, "clientId") ?: ""} is unchanged: nothing to re-paste, no owner or grant moves.".replace("  ", " "))
                     out.println()
                     Printers.record(trustFields(body), out)
                     out.println()
-                    printPlanUsage(body, out)
+                    if (isForgejoTrust(body)) {
+                        out.println("Add the plan block to .thoryn/connection.json (`thoryn workload-identity trusts get ${text(body, "id") ?: "<id>"} --connection` prints it whole).")
+                    } else {
+                        printPlanUsage(body, out)
+                    }
                 }
                 else -> CommandSupport.emitRecord(format, body, ::trustFields)
             }
@@ -625,6 +807,7 @@ class WorkloadIdentityCommand : Callable<Int> {
             if (format == OutputFormat.TABLE && items.isEmpty()) {
                 System.out.println("No workload identity trusts in this environment.")
                 System.out.println("Create one with: thoryn workload-identity trusts create --name <name> --repository <owner/repo> --scope <scope>")
+                System.out.println("  (Forgejo: … --provider forgejo --instance https://codeberg.org --repository <owner/repo> --ref refs/heads/main --scope <scope>)")
                 return CommandSupport.EXIT_OK
             }
             CommandSupport.emitList(format, body, LIST_HEADERS, ::row)
@@ -647,7 +830,8 @@ class WorkloadIdentityCommand : Callable<Int> {
             names = ["--connection"],
             description = [
                 "SSO-3722 — print ONLY the trust's complete connection.json (workspace.slug, auth.method/provider/clientId/audience/scopes and",
-                "the whole auth.github — incl. environment, the APPLY environment the profile selector reads — or auth.kubernetes block),",
+                "the whole auth.github — incl. environment, the APPLY environment the profile selector reads — auth.forgejo (+ auth.plan)",
+                "or auth.kubernetes block),",
                 "exactly as connection.schema.json defines it: paste it over .thoryn/connection.json.",
             ],
         )
@@ -668,7 +852,10 @@ class WorkloadIdentityCommand : Callable<Int> {
                     System.out.println("Sign in from the workflow with:")
                     System.out.println("    ${loginLine(body)}")
                     // SSO-3702 — a trust with a plan profile: the plan job's sign-in requests NO scope.
-                    if (planOf(body) != null) {
+                    if (isForgejoTrust(body)) {
+                        System.out.println()
+                        printForgejoProfiles(body, System.out)
+                    } else if (planOf(body) != null) {
                         System.out.println()
                         printPlanUsage(body, System.out)
                     }
@@ -721,6 +908,50 @@ class WorkloadIdentityCommand : Callable<Int> {
 
         /** SSO-3684 — the trust API's `provider` for a pod's projected ServiceAccount token (oathy SSO-3678). */
         const val PROVIDER_KUBERNETES: String = "kubernetes"
+
+        /** SSO-4472 — the trust API's `provider` for a Forgejo Actions job on any instance (oathy SSO-3661). */
+        const val PROVIDER_FORGEJO: String = WorkloadIdentityFlow.PROVIDER_FORGEJO
+
+        /** SSO-4472 — Forgejo user / organization / repository names (`AlphaDashDot`, as product-api checks them). */
+        private val FORGEJO_NAME = Regex("^[A-Za-z0-9._-]{1,100}$")
+
+        /** SSO-4472 — an https origin: scheme and host (and port); no path, query, fragment or credentials. */
+        internal fun isForgejoInstanceOrigin(url: String): Boolean {
+            val u = runCatching { java.net.URI(url) }.getOrNull() ?: return false
+            return u.scheme?.lowercase() == "https" && !u.host.isNullOrBlank() && u.rawPath.isNullOrEmpty() &&
+                u.rawQuery == null && u.rawFragment == null && u.rawUserInfo == null
+        }
+
+        /**
+         * SSO-4472 — the anonymous repository-id lookup `create --provider forgejo` runs when the ids are omitted. A seam for
+         * tests (a fake answers instead of an instance); production uses [ForgejoRepositoryLookup] over a plain client.
+         */
+        @Volatile
+        internal var forgejoLookup: (String, String, String) -> ForgejoRepositoryLookup.Result =
+            { instance, owner, repository -> ForgejoRepositoryLookup().lookup(instance, owner, repository) }
+
+        /** SSO-4472 — a Forgejo trust's `plan` request member: `{}` (scopes derived by the hub) or `{scopes}`. */
+        internal fun forgejoPlanProfileBody(scopes: List<String>): Map<String, Any?> =
+            if (scopes.isEmpty()) emptyMap() else mapOf("scopes" to scopes)
+
+        /**
+         * SSO-4472 — what the API would refuse about a Forgejo plan profile's explicit scopes (C2): one that is not a `.read`
+         * scope (`plan_scope_not_read_only`) or — when the trust's scopes are known ([applyScopes]) — not among them.
+         */
+        internal fun forgejoPlanProblem(applyScopes: List<String>?, planScopes: List<String>): String? {
+            val notReadOnly = planScopes.filterNot { it.startsWith("tenant:") && it.endsWith(".read") }
+            if (notReadOnly.isNotEmpty()) {
+                return "plan_scope_not_read_only — a plan profile is read-only by construction: every --plan-scope must be a tenant:<area>.read scope, not ${notReadOnly.joinToString()}."
+            }
+            if (applyScopes != null) {
+                val notSubset = planScopes.filterNot { it in applyScopes }
+                if (notSubset.isNotEmpty()) return "plan_scope_not_subset — every --plan-scope must be among the trust's --scope list; not ${notSubset.joinToString()}."
+                if (planScopes.isEmpty() && applyScopes.none { it.endsWith(".read") }) {
+                    return "plan_scopes_empty — the plan profile would carry no scope: --scope has no .read scope to derive it from; give --plan-scope <tenant:…read>."
+                }
+            }
+            return null
+        }
 
         /** SSO-3684 — where the documented manifest (`examples/kubernetes/`) mounts the projected token. */
         const val KUBERNETES_TOKEN_FILE: String = WorkloadIdentityFlow.DEFAULT_KUBERNETES_TOKEN_FILE
@@ -880,6 +1111,10 @@ class WorkloadIdentityCommand : Callable<Int> {
             return null
         }
 
+        /** SSO-4472 — true for a `forgejo` trust (by `provider`, else by the pin block present). */
+        internal fun isForgejoTrust(body: JsonNode): Boolean =
+            text(body, "provider") == PROVIDER_FORGEJO || (text(body, "provider") == null && body["forgejo"]?.isObject == true)
+
         /** SSO-3684 — true for a `kubernetes` trust (by `provider`, else by the pin block present). */
         internal fun isKubernetesTrust(body: JsonNode): Boolean =
             text(body, "provider") == PROVIDER_KUBERNETES || (text(body, "provider") == null && body["kubernetes"]?.isObject == true)
@@ -894,6 +1129,15 @@ class WorkloadIdentityCommand : Callable<Int> {
                     text(k, "serviceAccount")?.let { "sa=$it" },
                 ).joinToString(" ").ifEmpty { null }
             }
+            if (isForgejoTrust(node)) {
+                val f = node["forgejo"]
+                return listOfNotNull(
+                    text(f, "instanceUrl"),
+                    listOfNotNull(text(f, "owner"), text(f, "repository")).joinToString("/").ifEmpty { null },
+                    text(f, "ref")?.let { "ref=$it" },
+                    planOf(node)?.let { "plan" },
+                ).joinToString(" ").ifEmpty { null }
+            }
             val github = node["github"]
             return listOfNotNull(
                 listOfNotNull(text(github, "owner"), text(github, "repository")).joinToString("/").ifEmpty { null },
@@ -906,7 +1150,7 @@ class WorkloadIdentityCommand : Callable<Int> {
         internal fun row(node: JsonNode): List<Any?> = listOf(
             text(node, "id"),
             text(node, "name"),
-            text(node, "provider") ?: if (isKubernetesTrust(node)) PROVIDER_KUBERNETES else PROVIDER_GITHUB_ACTIONS,
+            text(node, "provider") ?: if (isKubernetesTrust(node)) PROVIDER_KUBERNETES else if (isForgejoTrust(node)) PROVIDER_FORGEJO else PROVIDER_GITHUB_ACTIONS,
             text(node, "clientId"),
             pinsOf(node),
             scopesOf(node).joinToString(" "),
@@ -956,7 +1200,9 @@ class WorkloadIdentityCommand : Callable<Int> {
         fun trustFields(body: JsonNode): List<Pair<String, Any?>> {
             val github = body["github"]
             val kubernetes = body["kubernetes"]
+            val forgejo = body["forgejo"]
             val ids = listOfNotNull(text(github, "ownerId"), text(github, "repositoryId"))
+            val forgejoIds = listOfNotNull(text(forgejo, "ownerId"), text(forgejo, "repositoryId"))
             val inlineKeyIds = kubernetes?.get("inlineKeyIds")?.takeIf { it.isArray }?.toList()?.mapNotNull { it.asString() }.orEmpty()
             return listOf(
                 "id" to text(body, "id"),
@@ -971,6 +1217,11 @@ class WorkloadIdentityCommand : Callable<Int> {
                 "githubEnvironment" to text(github, "environment"),
                 "ref" to text(github, "ref"),
                 "githubHostedRunnersOnly" to github?.get("githubHostedRunnersOnly")?.takeUnless { it.isNull }?.asBoolean(),
+                // SSO-4472 — the Forgejo pin: the instance, the repository and its instance ids, the ref.
+                "instanceUrl" to text(forgejo, "instanceUrl"),
+                "forgejoRepository" to listOfNotNull(text(forgejo, "owner"), text(forgejo, "repository")).joinToString("/").ifEmpty { null },
+                "forgejoIds" to forgejoIds.takeIf { it.size == 2 }?.let { "owner ${it[0]} / repository ${it[1]}" },
+                "forgejoRef" to text(forgejo, "ref"),
                 // SSO-3684 — the Kubernetes pin: the cluster, the names, and where its keys come from (never key material).
                 "issuer" to text(kubernetes, "issuer"),
                 "namespace" to text(kubernetes, "namespace"),
@@ -1005,7 +1256,9 @@ class WorkloadIdentityCommand : Callable<Int> {
             append(" --audience ${text(body, "audience") ?: "<audience>"}")
             if (isKubernetesTrust(body)) append(" --token-file $KUBERNETES_TOKEN_FILE")
             if (!defaultTokenEndpoint(body)) append(" --token-endpoint ${text(body, "tokenEndpoint")}")
-            scopesOf(body).takeIf { it.isNotEmpty() }?.let { append(" --scope \"${it.joinToString(" ")}\"") }
+            // SSO-4472 — no --scope for a Forgejo trust: the hub mints the profile the job's trigger selects (a dispatch on the
+            // pinned ref the trust's scopes, a plan job the read-only ones) — a fixed --scope would be refused on a plan job.
+            if (!isForgejoTrust(body)) scopesOf(body).takeIf { it.isNotEmpty() }?.let { append(" --scope \"${it.joinToString(" ")}\"") }
         }
 
         /**
@@ -1080,6 +1333,53 @@ class WorkloadIdentityCommand : Callable<Int> {
             k?.get("inlineKeyIds")?.takeIf { it.isArray && !it.isEmpty }?.let { ids ->
                 out.println("Keys are pinned inline (kid ${ids.toList().mapNotNull { it.asString() }.joinToString(" ")}): when the cluster rotates its signing key, replace the trust's JWKS (delete and re-create the trust).")
             }
+        }
+
+        /**
+         * SSO-4472 — how a Forgejo Actions job uses a `forgejo` trust, on any instance: the complete connection.json, a job
+         * that requests its token (`enable-openid-connect: true`) from its own steps, and the profile each trigger gets.
+         */
+        fun printForgejoUsage(body: JsonNode, workspaceSlug: String?, out: PrintStream) {
+            out.println("Use it from a Forgejo Actions job — there is no secret to store. Commit this COMPLETE as .thoryn/connection.json")
+            out.println("(`thoryn workload-identity trusts get ${text(body, "id") ?: "<id>"} --connection` prints it again):")
+            out.println()
+            out.println(connectionJson(body, workspaceSlug).prependIndent("  "))
+            out.println()
+            out.println("and sign in from a step of the job itself — never inside a reusable workflow (the hub refuses every workflow_call job):")
+            out.println()
+            out.println("  jobs:")
+            out.println("    provision:")
+            out.println("      runs-on: <your runner label>")
+            out.println("      enable-openid-connect: true      # lets the job request its OIDC token (forgejo-runner v12.5.0 or later)")
+            out.println("      steps:")
+            out.println("        # … install the thoryn CLI …")
+            out.println("        - run: thoryn login --connection .thoryn/connection.json")
+            out.println()
+            printForgejoProfiles(body, out)
+            out.println()
+            out.println("Behind an authenticating proxy (the job's token URL redirects to a login page): mint the token inside the job for the")
+            out.println("trust's audience, write it to a file, and add \"tokenSource\": { \"kind\": \"file\", \"path\": \"<that file>\" } to auth.")
+            out.println("Each job token works once and the session lasts at most 15 minutes. Whoever administers the instance controls the keys")
+            out.println("that sign its job tokens: trust an instance only as far as you trust its administrators.")
+        }
+
+        /** SSO-4472 — which job of a `forgejo` trust gets which profile (ADR 2026-10-14 Amendment 2026-11-23). */
+        fun printForgejoProfiles(body: JsonNode, out: PrintStream) {
+            val ref = text(body["forgejo"], "ref")
+            if (ref == null) {
+                out.println("No ref pinned: every dispatch, push, schedule or same-repository pull request job of the repository gets the trust's")
+                out.println("scopes (a sandbox trust); pull_request_target and workflow_call jobs are always refused.")
+                return
+            }
+            val branch = ref.removePrefix("refs/heads/")
+            out.println("A workflow_dispatch on $ref applies (the trust's scopes) — the operator's gate.")
+            if (planOf(body) != null) {
+                val scopes = planScopesOf(body)
+                out.println("A push or schedule on $ref, and a pull request into $branch, plan: read-only" + (if (scopes.isEmpty()) " scopes." else " ${scopes.joinToString(" ")}."))
+            } else {
+                out.println("No plan profile: a push, schedule or pull request is refused. Add one with `thoryn workload-identity trusts set-plan-profile ${text(body, "id") ?: "<id>"}`.")
+            }
+            out.println("Every other job — another ref, a fork's pull request, pull_request_target, workflow_call — is refused.")
         }
 
         /** The ready-to-paste workflow job and the equivalent connection contract. */
@@ -1179,6 +1479,15 @@ class WorkloadIdentityCommand : Callable<Int> {
                     "--jwks-file must be a JWK Set of 1-8 RSA / EC PUBLIC keys with kids: use `kubectl get --raw /openid/v1/jwks` unchanged."
                 "invalid_kubernetes_namespace", "invalid_kubernetes_service_account" ->
                     "Use the namespace and service account names exactly as `kubectl` shows them; a service account needs its namespace."
+                // SSO-4472 — the Forgejo pin's refusals (product-api `forgejoCommand`).
+                "invalid_forgejo", "invalid_forgejo_instance" ->
+                    "--instance must be the Forgejo instance's https origin with no path, e.g. https://codeberg.org."
+                "invalid_forgejo_owner", "invalid_forgejo_repository" ->
+                    "--repository must be <owner>/<repo> exactly as the instance names them (letters, digits, '.', '_', '-')."
+                "invalid_forgejo_ids" ->
+                    "Pass --owner-id and --repository-id: `owner.id` and `id` of GET <instance>/api/v1/repos/<owner>/<repo>."
+                "production_requires_ref" ->
+                    "A production Forgejo trust must pin a ref: add --ref refs/heads/<branch> (a workflow_dispatch on it applies)."
                 "github_repository_not_found" ->
                     "GitHub has no public repository by that name. For a private repository pass --owner-id and --repository-id."
                 "github_unavailable" -> "GitHub could not be reached to look up the repository ids. Retry, or pass --owner-id and --repository-id."
@@ -1211,7 +1520,8 @@ class WorkloadIdentityCommand : Callable<Int> {
                     "The plan profile would carry no scope: the trust has no .read scope to derive from — give --plan-scope <tenant:…read>, " +
                         "or add a .read scope to the trust."
                 "plan_profile_unsupported" ->
-                    "Only a github_actions trust carries a plan profile (the GitHub environment claim selects it); a kubernetes trust has no plan jobs."
+                    "This trust cannot carry a plan profile: a kubernetes trust has no plan jobs, a sandbox trust has nothing to separate it from, " +
+                        "and a platform that predates the Forgejo plan profile accepts one on github_actions trusts only."
                 "invalid_plan_environment" -> "--plan-environment must be a GitHub environment name, exactly as the plan job declares it."
                 "workload_identity_trust_not_found" ->
                     "No such trust in this environment, or you cannot read it. List them with `thoryn workload-identity trusts list`."
