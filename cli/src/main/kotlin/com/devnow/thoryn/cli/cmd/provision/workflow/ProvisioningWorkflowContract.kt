@@ -167,6 +167,73 @@ object ProvisioningWorkflowContract {
     /** The inputs a stub MUST pass (the forwarded four and the two environments). */
     val STUB_REQUIRED_INPUTS: List<String> = REUSABLE_INPUTS.filter { it.value.required }.keys.toList()
 
+    // ── SSO-4474 — Forgejo Actions (any instance): the stub calls an ACTION, never a reusable workflow ──────────────
+
+    /**
+     * Where a Forgejo repository keeps its stub. Forgejo reads `.forgejo/workflows/` (and, without it, `.github/workflows/`);
+     * nothing dispatches this path, so it is a convention the check defaults to, not a pin.
+     */
+    const val FORGEJO_WORKFLOW_PATH: String = ".forgejo/workflows/thoryn-provisioning.yml"
+
+    /** The action's own path in this repository. */
+    const val FORGEJO_ACTION_PATH: String = "forgejo/provisioning/action.yml"
+
+    /** The action without its host or `@<ref>`: `<owner>/<repo>/<path>`, as Forgejo's runner parses a remote action. */
+    const val FORGEJO_ACTION_NAME: String = "thoryn-io/thoryn-cli/forgejo/provisioning"
+
+    /**
+     * The action a Forgejo stub calls, without its `@<ref>`. A FULL URL: a bare `owner/repo/path@ref` resolves against the
+     * instance's `DEFAULT_ACTIONS_URL` (data.forgejo.org on most instances), not github.com, where thoryn-cli lives.
+     */
+    const val FORGEJO_ACTION: String = "https://github.com/$FORGEJO_ACTION_NAME"
+
+    /**
+     * The first thoryn-cli release that ships the Forgejo action and lints a Forgejo stub. The action repeats it (its
+     * `minimum=`), which the conformance test pins.
+     */
+    const val FORGEJO_MINIMUM_RELEASE: String = "cli-v0.61.0"
+
+    /**
+     * The events a Forgejo stub must run on: a plan on a pull request into the default branch and on a push to it, an apply
+     * on an operator's dispatch of it (ADR 2026-10-14 Amendment 2026-11-23, C5).
+     */
+    val FORGEJO_REQUIRED_TRIGGERS: List<String> = listOf("pull_request", "push", "workflow_dispatch")
+
+    /** The events a Forgejo stub may run on: [FORGEJO_REQUIRED_TRIGGERS], and `schedule` (a drift plan on the default branch). */
+    val FORGEJO_ALLOWED_TRIGGERS: List<String> = FORGEJO_REQUIRED_TRIGGERS + "schedule"
+
+    /** The keys a Forgejo stub's one job may carry: where it runs, for how long, and its ID token. Nothing that selects code. */
+    val FORGEJO_JOB_KEYS: Set<String> = setOf("name", "runs-on", "timeout-minutes", "enable-openid-connect", "container", "steps")
+
+    /**
+     * The `with:` keys a Forgejo stub's checkout step may not set: each would run something other than the triggering commit
+     * of this repository at the workspace root (an apply of unreviewed code, or a configuration the action cannot find).
+     */
+    val FORGEJO_CHECKOUT_FORBIDDEN_INPUTS: Set<String> = setOf("ref", "repository", "path")
+
+    /** An origin the job may request its ID token from (an in-cluster Service is often plain http): no path, no query. */
+    val ID_TOKEN_ORIGIN_GRAMMAR = Regex("^https?://[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:[0-9]{1,5})?$")
+
+    /**
+     * The action's `inputs`, in order: the stub's `with:` surface. None selects plan or apply (the job's trigger does), none
+     * is a script. The action file is held to this map by the conformance test.
+     */
+    val FORGEJO_ACTION_INPUTS: Map<String, ReusableInput> = linkedMapOf(
+        "issuer" to REUSABLE_INPUTS.getValue("issuer"),
+        "cli-version" to ReusableInput(
+            "A cli-v* release to run. Empty: the release the action was called at (github.action_ref); required when the stub pins a commit.",
+            default = "", grammar = RELEASE_TAG_GRAMMAR, grammarHint = "a cli-v<major>.<minor>.<patch> tag",
+        ),
+        "config" to REUSABLE_INPUTS.getValue("config"),
+        "id-token-origin" to ReusableInput(
+            "Only behind an authenticating proxy: the origin the job requests its ID token from, for connections whose auth.tokenSource is a file.",
+            default = "", grammar = ID_TOKEN_ORIGIN_GRAMMAR, grammarHint = "an http(s):// origin (no path)",
+        ),
+    )
+
+    /** Is [tag] at least [FORGEJO_MINIMUM_RELEASE] — does it ship the Forgejo action? */
+    fun shipsForgejoAction(tag: String): Boolean = isAtLeast(tag, FORGEJO_MINIMUM_RELEASE)
+
     /** `<major>.<minor>.<patch>` of a `cli-v*` tag as a comparable list; null for anything else. */
     fun releaseVersion(tag: String): List<Int>? =
         RELEASE_TAG_GRAMMAR.matchEntire(tag)?.let { tag.removePrefix("cli-v").split('.').map(String::toInt) }

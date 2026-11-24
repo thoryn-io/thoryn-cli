@@ -18,6 +18,10 @@ import java.util.concurrent.Callable
  * The reusable workflow runs this very command with `--output json` and acts on the `config` object it prints — so the
  * file a customer commits is validated by the same code on a laptop and in the job, and a red check names its fix.
  *
+ * SSO-4474 — on Forgejo the stub is `.forgejo/workflows/thoryn-provisioning.yml`, a workflow whose job calls thoryn-cli's
+ * provisioning ACTION; the check defaults to it when `.thoryn/workflow.yaml` says `provider: forgejo` (or when only it
+ * exists), and holds it to the `forgejo.*` rules.
+ *
  * A hand-written workflow (own jobs, own steps) is reported as NOT the supported shape: the rules still say what the App
  * would need from it, but it is unsupported, not promoted. A `uses:` of a workflow that is not thoryn-cli's cannot be
  * verified at all ("run the check on that file").
@@ -40,11 +44,11 @@ class ProvisionWorkflowCommand : Callable<Int> {
 
     @Command(
         name = "check",
-        description = ["Lint the provisioning workflow stub (default .github/workflows/thoryn-provisioning.yml) and .thoryn/workflow.yaml against contract v${ProvisioningWorkflowContract.CONTRACT_VERSION}; print each rule PASS/FAIL with its fix and the effective configuration. Exit 0 when every rule passes, 4 otherwise."],
+        description = ["Lint the provisioning workflow stub (default .github/workflows/thoryn-provisioning.yml; ${ProvisioningWorkflowContract.FORGEJO_WORKFLOW_PATH} when .thoryn/workflow.yaml says provider: forgejo) and .thoryn/workflow.yaml against contract v${ProvisioningWorkflowContract.CONTRACT_VERSION}; print each rule PASS/FAIL with its fix and the effective configuration. Exit 0 when every rule passes, 4 otherwise."],
         mixinStandardHelpOptions = true,
     )
     internal class CheckSubcommand : Callable<Int> {
-        @Option(names = ["--file", "-f"], description = ["The workflow to check (default: ${ProvisioningWorkflowContract.WORKFLOW_PATH}). The reusable workflow itself (on: workflow_call) is checked as the called side."])
+        @Option(names = ["--file", "-f"], description = ["The workflow to check (default: ${ProvisioningWorkflowContract.WORKFLOW_PATH}, or ${ProvisioningWorkflowContract.FORGEJO_WORKFLOW_PATH} for provider forgejo). The reusable workflow itself (on: workflow_call) and the Forgejo action (${ProvisioningWorkflowContract.FORGEJO_ACTION_PATH}) are checked as the called side."])
         var file: File? = null
 
         @Option(names = ["--config"], description = ["The run-time configuration (default: the stub's `with.config`, else ${WorkflowConfig.DEFAULT_PATH}; absent ⇒ built-in defaults)."])
@@ -59,15 +63,32 @@ class ProvisionWorkflowCommand : Callable<Int> {
         override fun call(): Int {
             val format = CommandSupport.parseFormat(outputRaw) ?: return CommandSupport.EXIT_USAGE
             val repoRoot = (root ?: File(".")).absoluteFile
-            val target = file ?: File(repoRoot, ProvisioningWorkflowContract.WORKFLOW_PATH)
+            val forgejo = file == null && defaultsToForgejo(repoRoot)
+            val target = file ?: File(repoRoot, if (forgejo) ProvisioningWorkflowContract.FORGEJO_WORKFLOW_PATH else ProvisioningWorkflowContract.WORKFLOW_PATH)
             if (!target.isFile) {
-                System.err.println("Error: no workflow at ${target.path} — the Thoryn GitHub App dispatches ${ProvisioningWorkflowContract.WORKFLOW_PATH}; commit the stub (see README \"Configure the provisioning workflow\") or pass --file.")
+                System.err.println(
+                    if (forgejo) {
+                        "Error: no workflow at ${target.path} — on Forgejo the stub calls ${ProvisioningWorkflowContract.FORGEJO_ACTION}; commit it (see docs/provisioning-workflow-contract.md §8) or pass --file."
+                    } else {
+                        "Error: no workflow at ${target.path} — the Thoryn GitHub App dispatches ${ProvisioningWorkflowContract.WORKFLOW_PATH}; commit the stub (see README \"Configure the provisioning workflow\") or pass --file."
+                    },
+                )
                 return CommandSupport.EXIT_USAGE
             }
             val display = target.absoluteFile.normalize().relativeToOrNull(repoRoot.normalize())?.path ?: target.path
             val report = WorkflowCheck.evaluate(target.readText(), display, configFile = config, root = repoRoot)
             if (format == OutputFormat.TABLE) print(report) else CommandSupport.emitValue(format, report.toStructured(), "")
             return if (report.ok) CommandSupport.EXIT_OK else CommandSupport.EXIT_CHECK_FAILED
+        }
+
+        /**
+         * SSO-4474 — the default stub is the Forgejo one when the run-time configuration says `provider: forgejo`, or when
+         * only the Forgejo stub exists. An unreadable configuration falls back to the GitHub default (the check reports it).
+         */
+        private fun defaultsToForgejo(repoRoot: File): Boolean {
+            val provider = runCatching { WorkflowConfig.load(config ?: File(repoRoot, WorkflowConfig.DEFAULT_PATH)).provider }.getOrNull()
+            if (provider == WorkflowConfig.PROVIDER_FORGEJO) return true
+            return !File(repoRoot, ProvisioningWorkflowContract.WORKFLOW_PATH).isFile && File(repoRoot, ProvisioningWorkflowContract.FORGEJO_WORKFLOW_PATH).isFile
         }
 
         private fun print(report: WorkflowCheck.Report) {
@@ -84,7 +105,7 @@ class ProvisionWorkflowCommand : Callable<Int> {
             }
             report.inputs?.let { inputs ->
                 println()
-                println("Effective inputs (the stub's with:, defaults filled in)")
+                println(if (report.shape == WorkflowCheck.Shape.FORGEJO_STUB) "Effective inputs (the action's with:, defaults filled in)" else "Effective inputs (the stub's with:, defaults filled in)")
                 inputs.forEach { (k, v) -> println("  ${k.padEnd(18)} ${v.ifEmpty { "(empty)" }}") }
             }
             report.config?.let { c ->

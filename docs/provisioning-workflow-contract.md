@@ -305,3 +305,95 @@ with them, whose plan is all `noop`.
   `readOnly`, never imports the repository's own trusts or production-plane users, imports sandbox test users, renders
   `role`, and guarantees import → plan is all `noop` for every kind it renders. See the README, "What `import` writes
   plans as all `noop`".
+
+## 8. Forgejo Actions — the stub calls an action (`forgejo.*`, `action.*`; SSO-4474, epic SSO-4473)
+
+**Audience: Thoryn engineers and the customer guide (SSO-4475).** On Forgejo (any instance: Codeberg, a self-hosted
+forge, Thoryn's own) there is no Thoryn App and nothing dispatches `mode` / `head_sha` / `check_run_id`. §1–§3 and §7 do
+not apply. What a Forgejo repository keeps:
+
+- **The same `.thoryn/` configuration as on GitHub.** `.thoryn/provision.yaml` says what to provision, `.thoryn/connection.json`
+  says who signs in, and `.thoryn/workflow.yaml` lists the files, env and apply toggles (§5). Two values differ: the
+  connection says `auth.provider: forgejo` (as `thoryn workload-identity trusts get <id> --connection` prints it), and the
+  configuration says `provider: forgejo`. The product configuration is forge-neutral; only the forge's own file changes.
+- **A stub at `.forgejo/workflows/thoryn-provisioning.yml`** (`examples/forgejo/thoryn-provisioning.yml`): it runs on
+  `pull_request` and `push`, both `branches: [<default branch>]`, and on `workflow_dispatch` with no inputs. Its one job
+  sets `enable-openid-connect: true`, checks the repository out, and calls
+  `uses: https://github.com/thoryn-io/thoryn-cli/forgejo/provisioning@cli-v0.61.0` (or newer). The full URL matters: a
+  bare `owner/repo/path@ref` resolves against the instance's `DEFAULT_ACTIONS_URL`, not github.com.
+
+### Why an action and not a reusable workflow
+
+Inside a reusable workflow, Forgejo sets every job's `event_name` to `workflow_call`, whatever started the run, so the
+job token hides its trigger (ADR 2026-10-14 Amendment 2026-11-23, F4). The hub refuses `workflow_call` on every plane
+(rule 4, C6); otherwise a `pull_request_target` run could reach the hub as a default-branch job. An action runs in the
+caller's own job, so the token carries that job's event and ref.
+
+### What runs when (the action, `forgejo/provisioning/action.yml`)
+
+The job's own trigger decides; no input of the action or of the dispatch selects it:
+
+| Trigger | Runs |
+|---|---|
+| `pull_request` into the default branch, same repository | `provision plan` (the trust's read-only plan profile) |
+| `pull_request` from a fork | nothing: skipped, green, with a notice (a fork's job gets no ID token, F1; neither profile, rule 3) |
+| `push` or `schedule` on the default branch | `provision plan` |
+| `workflow_dispatch` on the default branch | `provision apply` (plus `--prune` / `destroy` only as `.thoryn/workflow.yaml` says) |
+| anything else | red before any sign-in |
+
+The hub enforces the same rule on the token (C5). The action only refuses early and names the fix. An apply also refuses
+a checkout that is not the dispatched commit. **Dispatch is not review:** anyone who may dispatch on the default branch
+can apply, and the run executes that branch's reviewed code.
+
+Inputs (`ProvisioningWorkflowContract.FORGEJO_ACTION_INPUTS`): `issuer`, `cli-version` (empty means the release the
+action was called at, `github.action_ref`; it is required with a commit pin), `config`, and `id-token-origin`.
+
+**The CLI** is the release's Linux native binary (`thoryn-linux-amd64` / `-arm64`). A release whose best-effort native leg
+did not build falls back to its `thoryn.jar` when Java 21+ is on PATH. The runner needs bash, curl, jq, git and glibc,
+and must reach github.com (for the action and the release).
+
+**The job token.** By default the CLI asks the runner: `ACTIONS_ID_TOKEN_REQUEST_URL` with `audience=`, plus
+`ACTIONS_ID_TOKEN_REQUEST_TOKEN` (forgejo-runner v12.5.0 or later). An instance behind an authenticating proxy redirects
+that public URL to a login page. There:
+
+- the connection names `auth.tokenSource: {kind: file, path}` and `auth.audience`;
+- the stub passes `id-token-origin` (for example the instance's in-cluster Service);
+- before each sign-in (a job token works once) the action requests a fresh token at `id-token-origin` plus the path of
+  `ACTIONS_ID_TOKEN_REQUEST_URL`, writes it to `path` with mode 0600, and removes it after use.
+
+The request token goes to curl through a config on a pipe, never on a command line, and neither token is printed.
+
+There is no fix-request artifact and no consent link on Forgejo: no App relays them. A red job prints the fix in its log.
+
+### The rules
+
+| Rule | What it holds |
+|---|---|
+| `forgejo.triggers` | `on:` is `pull_request`, `push`, `workflow_dispatch` (and optionally `schedule`); `workflow_call` and `pull_request_target` are refused by name |
+| `forgejo.branches` | `pull_request` and `push` each filter `branches:` to one plain branch name, the same one |
+| `forgejo.job` | exactly one job, keys from `name`, `runs-on`, `timeout-minutes`, `enable-openid-connect`, `container`, `steps`; `enable-openid-connect: true`; a checkout, then the action, once |
+| `forgejo.apply-gate` | the stub can apply only on a `workflow_dispatch` of the default branch: no other step (no `run:`, no other action), a checkout without `ref` / `repository` / `path`, no `env:` anywhere, a dispatch without inputs |
+| `forgejo.uses` | the action's full github.com URL at a `cli-v*` release ≥ `cli-v0.61.0`, or a commit SHA; a copy on another host is UNVERIFIABLE |
+| `forgejo.with` | only the action's inputs, as literals (`mode` and the like are refused: the trigger decides); a commit pin names `cli-version` |
+| `forgejo.config` | `provider: forgejo`; every configured connection on `auth.provider: forgejo`, its `auth.forgejo.ref` on the branch the stub filters, a plan profile mirrored (`auth.plan`) on a production trust, `auth.audience` when its token comes from a file; `id-token-origin` only with a file-sourced connection |
+| `config.*`, `common.*` | as §5. `config.trust-scopes` also holds a Forgejo plan profile with listed scopes (`auth.plan.scopes`) to every scope the file needs to plan |
+| `action.inputs`, `action.steps` | the action itself, as the called side: the contract's inputs, a bash composite that reads the configuration through `provision workflow check --output json`, maps only `workflow_dispatch` to apply, writes nothing back, and passes no expression into a shell |
+
+`thoryn provision workflow check` checks `.forgejo/workflows/thoryn-provisioning.yml` without `--file` when
+`.thoryn/workflow.yaml` says `provider: forgejo`, or when only the Forgejo stub exists. Its `--output json` reports
+`shape: forgejo_stub`. SSO-4474 did **not** bump `contractVersion`: the GitHub stub and the reusable workflow are
+unchanged, and the Forgejo shape is a separate one with its own rule ids.
+
+### Not measured yet
+
+Measured on Forgejo 17.0.1 (SSO-4442): the issuer, key set, `sub` forms, ids and default audience. Read from Forgejo's
+source, not measured: F1–F4. The action and the rules above are tested against fakes; these still need one real run on
+an instance whose trust has a plan profile on a hub that applies the amendment's rule:
+
+- `github.event.repository.default_branch` is present in the payload of each trigger, `schedule` included;
+- `base_ref` on a `pull_request` token is the short branch name (the CLI accepts both forms; the hub compares the short one);
+- a fork's `pull_request` job has no `ACTIONS_ID_TOKEN_REQUEST_URL` (F1), and its payload names the fork as
+  `pull_request.head.repo.full_name`;
+- an inner job of a reusable workflow has `event_name` `workflow_call` (F4);
+- `github.action_ref` is the tag a remote action was called at, and `github.workflow_ref` names the calling stub;
+- the request path under `id-token-origin` mints the same token as the public one (thoryn-cicd's probe used it).

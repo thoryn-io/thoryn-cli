@@ -411,6 +411,8 @@ thoryn provision workflow check [--file <stub>] [--config <.thoryn/workflow.yaml
                                              # against the provisioning workflow contract: every rule PASS/FAIL with its fix + the EFFECTIVE configuration;
                                              # exit 0 / 4. The reusable workflow runs it (--output json) and acts on its `config`. See "Configure the
                                              # provisioning workflow" below. --output json carries `importCapable` (contract v2, SSO-3991).
+                                             # SSO-4474 — with provider: forgejo it lints .forgejo/workflows/thoryn-provisioning.yml (the stub calling the
+                                             # Forgejo action) instead; see "On Forgejo Actions" below.
 thoryn provision workflow import-summary --artifact <dir> --work <dir> --head-sha <sha> [--config] [--root]
                                              # SSO-3991 — the reusable workflow's own step (not a customer command): checks the import job's artifact
                                              # directory holds exactly the configured files and writes import-summary.json beside them; exit 0 / 4.
@@ -3359,6 +3361,48 @@ or land in shell history:
  - Tokens are stored in the OS keychain (see below), never in `argv`.
 
 ## Authentication
+
+### On Forgejo Actions — the same `.thoryn/` files, a stub that calls an action (SSO-4474, epic SSO-4473)
+
+A repository on any Forgejo instance (Codeberg, a self-hosted forge) keeps the **same** `.thoryn/` configuration as
+on GitHub, with two values set for Forgejo: its connection says `"provider": "forgejo"` (print it with
+`thoryn workload-identity trusts get <id> --connection`), and `.thoryn/workflow.yaml` says `provider: forgejo`. The
+forge-specific part is a short stub at `.forgejo/workflows/thoryn-provisioning.yml`
+([`examples/forgejo/thoryn-provisioning.yml`](examples/forgejo/thoryn-provisioning.yml)):
+
+```yaml
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+jobs:
+  provisioning:
+    runs-on: docker
+    enable-openid-connect: true
+    steps:
+      - uses: https://code.forgejo.org/actions/checkout@v4
+      - uses: https://github.com/thoryn-io/thoryn-cli/forgejo/provisioning@cli-v0.61.0
+```
+
+- **What runs when.** A pull request into the default branch plans, with the trust's read-only plan profile. A push to
+  the default branch plans. Only a `workflow_dispatch` of the default branch applies: on Forgejo, an operator's dispatch
+  is the gate, because there are no environments or required reviewers. A fork's pull request is skipped with a notice;
+  a fork gets neither profile.
+- **Why an action.** Inside a reusable workflow, Forgejo reports every job as `workflow_call`, and the platform refuses
+  that token. The action runs in your job, so the token says what started it.
+- **Behind an authenticating proxy**, set the connection's `auth.tokenSource` to `{"kind": "file", "path": …}` with
+  `auth.audience`, and pass `with.id-token-origin` (an origin the runner reaches without the proxy). The action requests
+  a fresh token there before each sign-in and never prints it.
+- **Runners** need bash, curl, jq, git and glibc, and must reach github.com. Run applies on ephemeral runners, or on
+  runners that pull-request jobs cannot reach.
+- **A trust on an instance trusts its administrators.** Whoever runs the instance holds the key that signs its job
+  tokens, so they can mint an apply. For production scopes, prefer an instance you operate.
+
+`thoryn provision workflow check` lints the stub (it picks the Forgejo path when `provider: forgejo`) and refuses one
+that could apply any other way. The rules are in
+[docs/provisioning-workflow-contract.md §8](docs/provisioning-workflow-contract.md).
 
 ### Which platform? (SSO-3182)
 

@@ -37,6 +37,9 @@ import java.io.File
  *  - [Shape.CUSTOM] — a hand-written workflow with its own jobs: NOT the supported shape. The check reports only what the
  *    App needs to dispatch it (`dispatch.*`, `custom.*`) and says so; it is documented as unsupported, not promoted.
  *  A `uses:` of a workflow that is not ours is [Shape.FOREIGN_STUB]: nothing can be verified about the called side.
+ *  - SSO-4474 — [Shape.FORGEJO_STUB]: a Forgejo Actions workflow whose job calls thoryn-cli's provisioning ACTION (on
+ *    pull_request, push, workflow_dispatch; never a reusable workflow, whose jobs' tokens say `workflow_call`). Rules:
+ *    `forgejo.*` ([ForgejoWorkflowRules]), the config (`config.*`). [Shape.FORGEJO_ACTION] is the action itself (`action.*`).
  *
  * Contract v2 (SSO-3991): a stub's `mode` may also offer `import`. `dispatch.import-capable` says whether the App may
  * dispatch `import` to the file ([Report.importCapable]) — and FAILS a file that offers `import` but could not honour it,
@@ -49,6 +52,12 @@ object WorkflowCheck {
         REUSABLE("the reusable workflow (called side)", true),
         CUSTOM("hand-written workflow — not the supported shape", false),
         FOREIGN_STUB("stub calling a workflow that is not thoryn-io/thoryn-cli's", false),
+
+        /** SSO-4474 — a Forgejo Actions workflow whose job calls thoryn-cli's provisioning action ([ForgejoWorkflowRules]). */
+        FORGEJO_STUB("Forgejo stub calling the provisioning action", true),
+
+        /** SSO-4474 — the Forgejo provisioning action itself (`forgejo/provisioning/action.yml`), evaluated as the called side. */
+        FORGEJO_ACTION("the Forgejo provisioning action (called side)", true),
     }
 
     enum class Status { PASS, FAIL, UNVERIFIABLE }
@@ -123,7 +132,18 @@ object WorkflowCheck {
         var inputs: Map<String, String>? = null
         var config: WorkflowConfig? = null
         var configError: String? = null
+        var forgejoBranch: String? = null
         when (shape) {
+            Shape.FORGEJO_STUB -> {
+                val (forgejoRules, effective, branch) = ForgejoWorkflowRules.stubRules(doc)
+                rules += forgejoRules
+                inputs = effective
+                forgejoBranch = branch
+                rules += commonRules(doc, text)
+            }
+            Shape.FORGEJO_ACTION -> {
+                rules += ForgejoWorkflowRules.actionRules(doc, text)
+            }
             Shape.REUSABLE -> {
                 rules += reusableRules(doc, text)
                 rules += commonRules(doc, text)
@@ -158,7 +178,7 @@ object WorkflowCheck {
                 rules += commonRules(doc, text)
             }
         }
-        if (shape == Shape.STUB || shape == Shape.REUSABLE) {
+        if (shape == Shape.STUB || shape == Shape.REUSABLE || shape == Shape.FORGEJO_STUB || shape == Shape.FORGEJO_ACTION) {
             val configRelative = inputs?.get("config") ?: WorkflowConfig.DEFAULT_PATH
             val configPath = configFile ?: (if (root != null) File(root, configRelative) else File(configRelative))
             val configDisplay = configFile?.let { f -> root?.let { r -> f.absoluteFile.normalize().relativeToOrNull(r.absoluteFile.normalize())?.path } ?: f.path } ?: configRelative
@@ -166,6 +186,7 @@ object WorkflowCheck {
                 config = WorkflowConfig.load(configPath, configDisplay)
                 val configured = if (root != null) ConfiguredFiles.load(config, root) else null
                 rules += configValidRule(config, configured)
+                if (shape == Shape.FORGEJO_STUB) rules += ForgejoWorkflowRules.configRule(config, configured?.connections, forgejoBranch, inputs.orEmpty())
                 if (configured != null && config.files.isNotEmpty()) {
                     rules += secretDeliveryRule(config, configured)
                     rules += trustScopesRule(config, configured)
@@ -372,6 +393,9 @@ object WorkflowCheck {
     // ── shape ───────────────────────────────────────────────────────────────────────────────────────────────────
 
     private fun shapeOf(doc: JsonNode): Shape {
+        // SSO-4474 — before `workflow_call`: a Forgejo stub that is itself reusable is a Forgejo stub with a failing trigger.
+        if (ForgejoWorkflowRules.isAction(doc)) return Shape.FORGEJO_ACTION
+        if (ForgejoWorkflowRules.callsAction(doc)) return Shape.FORGEJO_STUB
         if (doc["on"]?.has("workflow_call") == true) return Shape.REUSABLE
         val job = singleUsesJob(doc) ?: return Shape.CUSTOM
         return if (job["uses"].asString().startsWith("$REUSABLE_WORKFLOW@")) Shape.STUB else Shape.FOREIGN_STUB

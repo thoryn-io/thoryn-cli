@@ -1,0 +1,37 @@
+# Thoryn provisioning on Forgejo Actions (SSO-4474): the STUB a Forgejo repository keeps at
+# .forgejo/workflows/thoryn-provisioning.yml, on any instance (Codeberg, a self-hosted forge).
+#
+# It checks the repository out and calls thoryn-cli's provisioning action at a release. The action decides from this
+# job's own trigger:
+#   - a pull request into the default branch plans, read-only (a fork's pull request is skipped, green, with a notice);
+#   - a push to the default branch plans;
+#   - only a workflow_dispatch of the default branch applies. An operator's dispatch is the gate, because Forgejo has no
+#     environments or required reviewers.
+# What it provisions, and as whom, is the same .thoryn/ configuration as on GitHub: .thoryn/provision.yaml,
+# .thoryn/connection.json (`auth.provider: forgejo`) and .thoryn/workflow.yaml (`provider: forgejo`).
+# Lint all of it with `thoryn provision workflow check`.
+#
+# Replace `main` with your default branch: the branch your forgejo trust pins (`--ref refs/heads/main`).
+name: Thoryn provisioning
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  # No inputs: a dispatch takes nothing that could change what an apply does.
+  workflow_dispatch:
+
+jobs:
+  provisioning:
+    # A runner label of your instance. Apply jobs belong on ephemeral runners, or on runners that pull-request jobs
+    # cannot reach: a pull request's job could otherwise take over a later dispatch on a shared, persistent runner.
+    runs-on: docker
+    timeout-minutes: 30
+    # Forgejo issues the job its ID token only with this (forgejo-runner v12.5.0 or later).
+    enable-openid-connect: true
+    steps:
+      - uses: https://code.forgejo.org/actions/checkout@v4
+      - uses: https://github.com/thoryn-io/thoryn-cli/forgejo/provisioning@cli-v0.61.0
+        with:
+          issuer: https://auth.thoryn.io
