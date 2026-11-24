@@ -35,6 +35,7 @@ class LoginForgejoConnectionTest : CommandTestBase() {
 
     @AfterEach
     fun unmount() {
+        System.clearProperty("THORYN_HUB")
         WorkloadIdentityPlatform.leaveRunner()
         com.devnow.thoryn.cli.cmd.provision.FixRequests.resetEnvironmentForTest()
     }
@@ -43,7 +44,11 @@ class LoginForgejoConnectionTest : CommandTestBase() {
         platform.claims = { aud -> FakeJobTokens.forgejoClaims(aud, eventName = eventName, ref = ref, baseRef = baseRef) }
     }
 
-    private fun writeConnection(plan: Boolean = true, extra: String = ""): Path {
+    /**
+     * [audienceMember] is the connection's audience member: the trust's audience by default, or `"environment": "<slug>"`
+     * to derive a sandbox audience from the base issuer env var ([sandboxConnection]).
+     */
+    private fun writeConnection(plan: Boolean = true, extra: String = "", audienceMember: String = "\"audience\": \"${audience()}\""): Path {
         val file = tempHome.resolve("connection.json")
         Files.writeString(
             file,
@@ -55,7 +60,7 @@ class LoginForgejoConnectionTest : CommandTestBase() {
                 "method": "workload_identity",
                 "provider": "forgejo",
                 "clientId": "$clientId",
-                "audience": "${audience()}",
+                $audienceMember,
                 "scopes": ["tenant:applications.read", "tenant:applications.write"],
                 "forgejo": { "instanceUrl": "${FakeJobTokens.FORGEJO_INSTANCE}", "owner": "acme", "repository": "infra", "ownerId": 7, "repositoryId": 42, "ref": "refs/heads/main" }${if (plan) ",\n                \"plan\": { \"scopes\": [\"tenant:applications.read\"] }" else ""}$extra
               }
@@ -177,5 +182,57 @@ class LoginForgejoConnectionTest : CommandTestBase() {
         assertThat(platform.exchanges.single()).containsEntry("client_assertion", token).containsKey("scope")
         assertThat(out).contains("re-reading the identity token at $tokenFile")
         assertThat(FileTokenStore().read()!!.tokenFile).isEqualTo(tokenFile.toString())
+    }
+
+    /** A connection on the `forge` sandbox, as the file states it: `auth.environment` derives `<base>/forge` (no auth.plan). */
+    private fun sandboxConnection(): Path {
+        System.setProperty("THORYN_HUB", baseUrl())
+        return writeConnection(plan = false, audienceMember = "\"environment\": \"forge\"")
+    }
+
+    @Test
+    fun `an audience with a path and no plan profile does not prove a sandbox — a push on the pin asks for NO scope and the hub decides`() {
+        job("push")
+        val sandboxLooking = writeConnection(plan = false, audienceMember = "\"audience\": \"${audience()}/forge\"")
+
+        val (exit, out, err) = runCli("login", "--connection", sandboxLooking.toString())
+
+        assertThat(err).doesNotContain("Error")
+        assertThat(exit).isEqualTo(0)
+        // On production a push on the pin plans; on a sandbox it applies — the file does not say which, so nothing is asked for.
+        assertThat(platform.exchanges.single()).doesNotContainKey("scope")
+        assertThat(out).contains("Profile: decided by the hub (a push (push) on 'refs/heads/main'")
+            .contains("the connection does not say which plane the trust is on")
+        // A dispatch on the pin applies on both planes: the connection's scopes are asked for.
+        platform.exchanges.clear()
+        job("workflow_dispatch")
+        assertThat(runCli("login", "--connection", sandboxLooking.toString()).exit).isEqualTo(0)
+        assertThat(platform.exchanges.single()).containsEntry("scope", "tenant:applications.read tenant:applications.write")
+    }
+
+    @Test
+    fun `on a sandbox the connection states, a push on the pin applies with the connection's scopes`() {
+        job("push")
+
+        val (exit, out, err) = runCli("login", "--connection", sandboxConnection().toString())
+
+        assertThat(err).doesNotContain("Error")
+        assertThat(exit).isEqualTo(0)
+        assertThat(platform.exchanges.single()).containsEntry("scope", "tenant:applications.read tenant:applications.write")
+        assertThat(out).contains("Profile: apply (a push (push) on 'refs/heads/main'")
+    }
+
+    @Test
+    fun `a sandbox trust's ref pin binds a pull request's job too — no scope is asked for, and the refusal says why`() {
+        job("pull_request", ref = "refs/pull/9/head", baseRef = "main")
+        platform.tokenResponses += WorkloadIdentityPlatform.json(401, """{"error":"invalid_client"}""")
+
+        val (exit, _, err) = runCli("login", "--connection", sandboxConnection().toString())
+
+        assertThat(exit).isEqualTo(LoginCommand.EXIT_WORKLOAD_IDENTITY_FAILED)
+        assertThat(platform.exchanges.single()).doesNotContainKey("scope")
+        assertThat(err).contains("trigger: ref_mismatch — the trust pins ref 'refs/heads/main'; this job runs on 'refs/pull/9/head'")
+            .contains("binds pull-request jobs too")
+            .contains("give pull requests a sandbox trust without --ref")
     }
 }

@@ -155,6 +155,52 @@ class WorkloadIdentityForgejoCommandTest : CommandTestBase() {
     }
 
     @Test
+    fun `a production ref that is not a branch is refused first, with the branch ref to pass instead — a bare name becomes refs heads`() {
+        val bare = create("--instance", "https://codeberg.org", "--repository", "acme/infra", "--owner-id", "7", "--repository-id", "42", "--ref", "main", "--confirm-production")
+        assertThat(bare.exit).isEqualTo(CommandSupport.EXIT_USAGE)
+        assertThat(bare.err).contains("production_ref_not_branch").contains("'main' is not one").contains("use --ref refs/heads/main.")
+
+        val tag = create("--instance", "https://codeberg.org", "--repository", "acme/infra", "--owner-id", "7", "--repository-id", "42", "--ref", "refs/tags/v1", "--confirm-production")
+        assertThat(tag.exit).isEqualTo(CommandSupport.EXIT_USAGE)
+        assertThat(tag.err).contains("production_ref_not_branch").contains("'refs/tags/v1' is not one").contains("use --ref refs/heads/<branch>.")
+
+        val pullRef = create("--instance", "https://codeberg.org", "--repository", "acme/infra", "--owner-id", "7", "--repository-id", "42", "--ref", "refs/pull/9/head", "--confirm-production")
+        assertThat(pullRef.err).contains("production_ref_not_branch")
+
+        assertThat(lookups).isEmpty()
+        assertThat(server.requestCount).isZero()
+    }
+
+    @Test
+    fun `a sandbox trust keeps pinning any full ref, a tag included`() {
+        server.enqueue(jsonResponse(200, fixture("trust-created-forgejo")))
+
+        val (exit, _, err) = create("--instance", "https://codeberg.org", "--repository", "acme/infra", "--owner-id", "7", "--repository-id", "42", "--ref", "refs/tags/v1")
+
+        assertThat(err).doesNotContain("production_ref_not_branch")
+        assertThat(exit).isEqualTo(0)
+        @Suppress("UNCHECKED_CAST")
+        val pin = postedBody()["forgejo"] as Map<String, Any?>
+        assertThat(pin).containsEntry("ref", "refs/tags/v1")
+    }
+
+    @Test
+    fun `the API's production_ref_not_branch is rendered with the branch-ref hint`() {
+        server.enqueue(
+            jsonResponse(
+                400,
+                """{"type":"about:blank","title":"Bad Request","status":400,"detail":"A production Forgejo trust pins a branch ref.","instance":"/api/v1/workload-identity/trusts","errorCode":"production_ref_not_branch"}""",
+            ),
+        )
+
+        // A ref the CLI lets through (a branch) — the hub has the final say, and its refusal still gets the hint.
+        val (exit, _, err) = create("--instance", "https://codeberg.org", "--repository", "acme/infra", "--owner-id", "7", "--repository-id", "42", "--ref", "refs/heads/main", "--confirm-production")
+
+        assertThat(exit).isEqualTo(CommandSupport.EXIT_HTTP_ERROR)
+        assertThat(err).contains("production_ref_not_branch").contains("must pin a branch ref: use --ref refs/heads/<branch>")
+    }
+
+    @Test
     fun `set-plan-profile on a Forgejo trust names no environment and posts the scopes alone`() {
         server.enqueue(jsonResponse(200, fixture("trust-created-forgejo")))
         server.enqueue(jsonResponse(200, fixture("trust-created-forgejo")))

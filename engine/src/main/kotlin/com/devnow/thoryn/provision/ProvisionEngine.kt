@@ -3953,6 +3953,7 @@ class ProvisionEngine(
             ProvisionFile.ERR_PRODUCTION_CONFIRMATION_REQUIRED -> "this is the production plane: jobs / pods using the trust act on production; declare spec.confirmProduction: true"
             ProvisionFile.ERR_PRODUCTION_REQUIRES_ENVIRONMENT -> "a production GitHub trust must pin a GitHub environment (spec.github.environment)"
             ProvisionFile.ERR_PRODUCTION_REQUIRES_REF -> "a production Forgejo trust must pin a ref (spec.forgejo.ref)"
+            ProvisionFile.ERR_PRODUCTION_REF_NOT_BRANCH -> "a production Forgejo trust must pin a branch ref (spec.forgejo.ref: refs/heads/<branch>), not a tag or a pull-request ref"
             ProvisionFile.ERR_PRODUCTION_REQUIRES_SERVICE_ACCOUNT -> "a production Kubernetes trust must pin spec.kubernetes.namespace and spec.kubernetes.serviceAccount"
             "github_repository_not_found" -> "GitHub has no public repository by that name; for a private repository declare spec.github.ownerId and spec.github.repositoryId"
             "github_unavailable" -> "GitHub could not be reached to look up the repository ids; retry, or declare spec.github.ownerId and spec.github.repositoryId"

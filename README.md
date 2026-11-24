@@ -1020,7 +1020,10 @@ key; its `--tenant`, `--wif-*` and `--subject-token` flags are gone).
 A `--provider forgejo` trust lets one repository's **Forgejo Actions** jobs sign in, on any Forgejo instance —
 Codeberg, a self-hosted forge — with no stored secret (oauthy SSO-3661). It pins the **instance** (its https
 origin: the job token's issuer is `<instance>/api/actions`, its keys `<issuer>/.well-known/keys`), the repository
-by the **instance's immutable ids** and, on the production plane, a **ref** — Forgejo has no environments.
+by the **instance's immutable ids** and, on the production plane, a **branch ref** (`refs/heads/<branch>`) — Forgejo
+has no environments. A production `--ref` that is not a branch (a tag, a pull-request ref, a bare `main`) is refused
+before any call (`production_ref_not_branch`, with the `--ref refs/heads/…` to pass instead); a sandbox trust may pin
+any full ref.
 
 ```bash
 thoryn workload-identity trusts create --provider forgejo --name infra-ci \
@@ -1044,7 +1047,8 @@ thoryn workload-identity trusts create --provider forgejo --name infra-ci \
   get the read-only **plan** profile (the `.read` members of `--scope`, or `--plan-scope`). Everything else is
   refused: another ref or branch, a fork's pull request (a fork's job gets no token), `pull_request_target`, and
   `workflow_call` — so call `thoryn login` from a job's own steps, never inside a reusable workflow. A sandbox
-  trust (no ref) gives every dispatch, push, schedule and same-repository pull request its scopes.
+  trust (no ref) gives every dispatch, push, schedule and same-repository pull request its scopes; a sandbox trust
+  that pins a ref binds every job to it, so it refuses pull-request jobs (they run on `refs/pull/<n>/head`).
 
 ```json
 {
@@ -1078,7 +1082,11 @@ jobs:
   production, a `workflow_dispatch` on `auth.forgejo.ref`) and **no scope** for any other, so the hub mints the
   matched profile and a plan job never asks for a write scope. `auth.plan` is a **mirror** of the trust's plan
   profile (`trusts get <id> --connection` prints it): never sent, it tells the CLI a push is expected to plan
-  rather than be refused. The sign-in prints which profile (`Profile: apply (a dispatch (workflow_dispatch) on
+  rather than be refused. Because a push plans on production and applies on a sandbox, the CLI reads the trust's
+  **plane** from what the file states — `auth.plan` (plan profiles are production-only) or `auth.environment` (a
+  sandbox) — and otherwise from the audience: one with no path is production. An audience with a path and neither
+  member leaves the plane unknown, and then only a job both planes treat alike (a `workflow_dispatch` on the pin)
+  sends `auth.scopes`; every other job sends none and the hub decides. The sign-in prints which profile (`Profile: apply (a dispatch (workflow_dispatch) on
   'refs/heads/main' …)`), and the session records it.
 - **Behind an authenticating proxy** the public token URL redirects to the proxy's login page. The CLI never
   follows that redirect (it carries the runner's bearer) and says so (`job_token_request_redirected`). Mint the

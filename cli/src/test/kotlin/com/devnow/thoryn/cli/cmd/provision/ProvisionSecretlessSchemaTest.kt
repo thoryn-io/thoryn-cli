@@ -160,6 +160,28 @@ class ProvisionSecretlessSchemaTest {
     }
 
     @Test
+    fun `a production Forgejo trust pins a branch ref — a tag is production_ref_not_branch, and a sandbox keeps any full ref`() {
+        fun forgejo(name: String, ref: String, production: Boolean) =
+            "  - { kind: workloadIdentityTrust, name: $name${if (production) "" else ", environment: s"}, spec: { provider: forgejo, " +
+                "forgejo: { instanceUrl: \"https://codeberg.org\", owner: o, ownerId: 1, repository: r, repositoryId: 2, ref: \"$ref\" }, " +
+                "scopes: [tenant:x.read]${if (production) ", confirmProduction: true" else ""} } }"
+        val file = yaml.readTree(
+            listOf(
+                "apiVersion: thoryn.io/provision/v1",
+                "resources:",
+                forgejo("tag", "refs/tags/v1", production = true),
+                forgejo("pull", "refs/pull/9/head", production = true),
+                forgejo("branch", "refs/heads/main", production = true),
+                forgejo("sandbox-tag", "refs/tags/v1", production = false),
+            ).joinToString("\n"),
+        )
+        val v = ProvisionFile.validate(file)
+        assertThat(v).anyMatch { it.contains("resources[0]") && it.contains(ProvisionFile.ERR_PRODUCTION_REF_NOT_BRANCH) && it.contains("'refs/tags/v1'") }
+        assertThat(v).anyMatch { it.contains("resources[1]") && it.contains(ProvisionFile.ERR_PRODUCTION_REF_NOT_BRANCH) }
+        assertThat(v).noneMatch { it.contains("resources[2]") || it.contains("resources[3]") }
+    }
+
+    @Test
     fun `a workloadIdentityTrust is refused with the trust service's codes — the provider, its pins, the scope grammar and the production rules`() {
         val bad = yaml.readTree(
             """

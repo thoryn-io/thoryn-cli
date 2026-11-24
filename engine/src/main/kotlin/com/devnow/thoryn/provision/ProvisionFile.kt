@@ -833,6 +833,8 @@ class ProvisionFile private constructor(
         const val ERR_PRODUCTION_CONFIRMATION_REQUIRED = "production_confirmation_required"
         const val ERR_PRODUCTION_REQUIRES_ENVIRONMENT = "production_requires_environment"
         const val ERR_PRODUCTION_REQUIRES_REF = "production_requires_ref"
+        /** SSO-4472 — a production Forgejo trust pins a branch ref (`refs/heads/<b>`); the hub's code for anything else. */
+        const val ERR_PRODUCTION_REF_NOT_BRANCH = "production_ref_not_branch"
         const val ERR_PRODUCTION_REQUIRES_SERVICE_ACCOUNT = "production_requires_service_account"
         const val ERR_INVALID_GITHUB_IDS = "invalid_github_ids"
         const val ERR_INVALID_FORGEJO_IDS = "invalid_forgejo_ids"
@@ -1737,6 +1739,10 @@ class ProvisionFile private constructor(
                     if (integral("ownerId") != true || integral("repositoryId") != true) v += "$pw: $ERR_INVALID_FORGEJO_IDS — ownerId and repositoryId (the instance's immutable ids, GET /api/v1/repos/{owner}/{repo}) are required positive integers"
                     text("ref")?.let { if (!GIT_REF_PATTERN.matches(it)) v += "$pw.ref '$it' must be a full ref, e.g. refs/heads/main" }
                     if (production && text("ref") == null) v += "$where $ERR_PRODUCTION_REQUIRES_REF — a production Forgejo trust must pin a ref (spec.$block.ref); Forgejo has no environments"
+                    // SSO-4472 (ADR 2026-10-14 Amendment 2026-11-23, rule 2) — a production pin is a BRANCH ref, P = refs/heads/<b>.
+                    text("ref")?.takeIf { production && !(it.startsWith("refs/heads/") && it.length > "refs/heads/".length) }?.let {
+                        v += "$where $ERR_PRODUCTION_REF_NOT_BRANCH — a production Forgejo trust must pin a branch ref (spec.$block.ref refs/heads/<branch>), not '$it'"
+                    }
                 }
                 PROVIDER_KUBERNETES -> {
                     rejectUnknownKeys(pins, KUBERNETES_PIN_KEYS, pw, v)
