@@ -9,7 +9,7 @@
   "properties": {
     "apiVersion": { "const": "thoryn.io/workflow/v1" },
     "provider": {
-      "description": "The forge whose job token is the repository's identity: `github_actions` (the default) or `forgejo` (SSO-4472) — a Forgejo Actions job on any Forgejo instance, signing in with its own job token under a `forgejo` trust (`auth.provider: forgejo` in its connection).",
+      "description": "The forge whose job token is the repository's identity: `github_actions` (the default) or `forgejo` (SSO-4472) — a Forgejo Actions job on any Forgejo instance, signing in with its own job token under a `forgejo` trust (`auth.provider: forgejo` in its connection). SSO-4474: with `forgejo`, the stub is `.forgejo/workflows/thoryn-provisioning.yml`, whose job calls the action https://github.com/thoryn-io/thoryn-cli/forgejo/provisioning at a cli-v* release (never a reusable workflow, whose jobs' tokens say `workflow_call`). It plans on a pull request and a push to the default branch and applies only on a workflow_dispatch of it; `fixRequest` and `consentUrl` are not used there (no App relays them).",
       "type": "string",
       "enum": ["github_actions", "forgejo"],
       "default": "github_actions"

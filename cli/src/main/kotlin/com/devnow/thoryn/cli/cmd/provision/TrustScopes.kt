@@ -155,6 +155,20 @@ internal object TrustScopes {
                         "${if (connection.isWorkloadIdentity) "$trust (its apply profile)" else "API key client ${connection.clientId}"} and to auth.scopes of $connectionPath"
             }
         }
+        // SSO-4474 — a `forgejo` connection that mirrors a plan profile with LISTED scopes (`auth.plan.scopes`): a pull-request
+        // or push plan is minted exactly those, so a plan scope the file needs and the list lacks is a 403 in the plan job.
+        // An empty list is the derived profile (every `.read` scope of the trust), which the check above already covers.
+        if (connection.isWorkloadIdentity && connection.effectiveProvider == Connection.PROVIDER_FORGEJO) {
+            val listed = connection.planScopes.orEmpty()
+            if (listed.isNotEmpty()) {
+                val notListed = needs.filter { it.phase == Phase.PLAN && ScopeRequirements.holds(declared, it.scope) && !ScopeRequirements.holds(listed.toSet(), it.scope) }
+                ScopeRequirements.byScope(notListed).forEach { (scope, why) ->
+                    problems += "$filePath needs $scope to PLAN (${why.joinToString("; ") { it.label }}), and the plan profile $connectionPath mirrors " +
+                        "(auth.plan.scopes) does not list it — add it to the plan profile of $trust (`thoryn workload-identity trusts set-plan-profile <id> " +
+                        "--plan-scope $scope`) and print the connection again"
+                }
+            }
+        }
         // SSO-3962 — an APPLICATION file's identity is confined to what the file needs: a scope the connection declares and the
         // file never asks for (tenant:users.write on an app project, say) is the blur the two parts remove — a FAIL, naming it.
         ScopeRequirements.unneeded(file, needs, declared).takeIf { it.isNotEmpty() }?.let { wider ->

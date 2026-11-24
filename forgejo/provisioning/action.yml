@@ -1,0 +1,273 @@
+# Thoryn provisioning for Forgejo Actions: the ACTION a Forgejo repository's stub calls, on any Forgejo instance
+# (Codeberg, a self-hosted forge). SSO-4474, epic SSO-4473. Contract: docs/provisioning-workflow-contract.md §8, pinned
+# in code by `ProvisioningWorkflowContract` (FORGEJO_*) and linted by `thoryn provision workflow check`.
+#
+# WHY AN ACTION AND NOT A REUSABLE WORKFLOW. Inside a reusable workflow, Forgejo gives every job the event
+# `workflow_call`, whatever started the run, so the job token hides its trigger. The hub refuses such a token on every
+# plane (thoryn-architecture ADR 2026-10-14-plan-identity-and-resource-ownership, Amendment 2026-11-23, rule 4 / C6).
+# An action runs in the CALLER's job, so the token carries that job's own event and ref.
+#
+# WHAT THE CUSTOMER KEEPS IS THE SAME ON EVERY FORGE. `.thoryn/provision.yaml` (what to provision), `.thoryn/connection.json`
+# (who signs in; `auth.provider: forgejo`) and `.thoryn/workflow.yaml` (files, env, apply toggles; `provider: forgejo`).
+# The Forgejo stub, `.forgejo/workflows/thoryn-provisioning.yml`, only checks the repository out and calls this action
+# at a cli-v* release.
+#
+# WHAT RUNS WHEN. The job's own trigger decides; no input of this action or of the dispatch can widen it:
+#   pull_request into the default branch, same repository  -> plan   (the trust's read-only plan profile)
+#   pull_request from a fork                               -> skipped, green, with a notice (a fork's job gets no ID
+#                                                              token, and a fork gets neither profile: rule 3)
+#   push or schedule on the default branch                 -> plan
+#   workflow_dispatch on the default branch                -> apply  (the operator's dispatch is the gate: Forgejo has
+#                                                              no environments and no required reviewers)
+#   anything else (another branch, pull_request_target, workflow_call, …) -> red, before any sign-in
+# The hub enforces the same rule on the job token (C5); this action only refuses early and clearly. Dispatch is not
+# review: anyone who may dispatch on the default branch can apply, and the run executes that branch's reviewed code.
+#
+# THE JOB TOKEN. By default the CLI asks the runner (ACTIONS_ID_TOKEN_REQUEST_URL with `audience=`, plus
+# ACTIONS_ID_TOKEN_REQUEST_TOKEN; the stub's job sets `enable-openid-connect: true`, forgejo-runner v12.5.0 or later).
+# An instance behind an authenticating proxy redirects that public URL to a login page. There the connection names
+# `auth.tokenSource: {kind: file, path}` and `auth.audience`, and this action requests a fresh token before EACH sign-in
+# (a job token works once) at `id-token-origin` plus the path of ACTIONS_ID_TOKEN_REQUEST_URL, writes it to that path
+# (mode 0600) and removes it after use. The token is never printed.
+#
+# THE CLI. The release's Linux native binary (`thoryn-linux-amd64` / `-arm64`), for the release this action was called
+# at (`github.action_ref`) or `cli-version`. A release whose best-effort native leg did not build falls back to
+# `thoryn.jar` when Java 21+ is on PATH. The runner needs bash, curl, jq, git and glibc.
+#
+# Every input and context value reaches a shell only through `env:` (the template-injection rule, oauthy SSO-3635).
+name: Thoryn provisioning (Forgejo Actions)
+description: Plan on a pull request or a push to the default branch, apply on a workflow_dispatch of the default branch, as this repository's own workload identity.
+author: Thoryn
+
+inputs:
+  issuer:
+    description: "Platform base issuer the connection contract derives the workspace issuer from (THORYN_ISSUER / THORYN_HUB)"
+    required: false
+    default: "https://auth.thoryn.io"
+  cli-version:
+    description: "A cli-v* release to run. Empty: the release this action was called at (required when the stub pins a commit)"
+    required: false
+    default: ""
+  config:
+    description: "Path of the committed run-time configuration (files, env, apply toggles)"
+    required: false
+    default: ".thoryn/workflow.yaml"
+  id-token-origin:
+    description: "Only for an instance behind an authenticating proxy: the origin (http(s)://host[:port]) the job requests its ID token from instead of the public one, for connections with auth.tokenSource kind file"
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Decide what this run does (plan, apply or skip) from the job's own trigger
+      id: mode
+      shell: bash
+      env:
+        EVENT_NAME: ${{ github.event_name }}
+        REF: ${{ github.ref }}
+        BASE_REF: ${{ github.base_ref }}
+        DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        REPOSITORY: ${{ github.repository }}
+        HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+      run: |
+        set -euo pipefail
+        fail() { echo "::error::$*" >&2; exit 1; }
+        summary="${GITHUB_STEP_SUMMARY:-/dev/null}"
+        case "$EVENT_NAME" in
+          workflow_call) fail "this job runs inside a reusable workflow (event workflow_call): its token hides what started the run, and the platform refuses it on every plane. Call this action from the job of a workflow triggered by pull_request, push or workflow_dispatch." ;;
+          pull_request_target) fail "pull_request_target runs the base repository's code for a request that may come from a fork; the platform refuses it on every plane. Trigger the stub on pull_request." ;;
+        esac
+        [ -n "$DEFAULT_BRANCH" ] || fail "the event payload names no default branch (github.event.repository.default_branch is empty for event '$EVENT_NAME'), so this action cannot tell whether the run is on it."
+        default_ref="refs/heads/$DEFAULT_BRANCH"
+        mode=""
+        case "$EVENT_NAME" in
+          pull_request)
+            if [ -n "$HEAD_REPOSITORY" ] && [ "$HEAD_REPOSITORY" != "$REPOSITORY" ]; then
+              mode=skip
+              msg="No plan for this pull request: its code is in the fork $HEAD_REPOSITORY. A fork's job gets no ID token and neither Thoryn profile. To plan it, push the change to a branch of $REPOSITORY and open a pull request from there."
+              echo "::notice::$msg"
+              { echo "## Thoryn provisioning: skipped"; echo; echo "$msg"; } >> "$summary"
+            elif [ "$BASE_REF" = "$DEFAULT_BRANCH" ] || [ "$BASE_REF" = "$default_ref" ]; then
+              mode=plan
+            else
+              fail "a pull request gets a plan only into the default branch '$DEFAULT_BRANCH'; this one targets '${BASE_REF:-(none)}'. Filter the stub's pull_request on branches: [$DEFAULT_BRANCH]."
+            fi ;;
+          push|schedule)
+            [ "$REF" = "$default_ref" ] || fail "a $EVENT_NAME plans only on the default branch '$default_ref'; this run is on '$REF'. Open a pull request into '$DEFAULT_BRANCH' to get a plan."
+            mode=plan ;;
+          workflow_dispatch)
+            [ "$REF" = "$default_ref" ] || fail "an apply runs only on a workflow_dispatch of the default branch '$default_ref'; this dispatch chose '$REF'. Dispatch the workflow on '$DEFAULT_BRANCH'."
+            mode=apply ;;
+          *) fail "event '$EVENT_NAME' does not start Thoryn provisioning: the stub runs on pull_request, push (default branch), schedule or workflow_dispatch (default branch)." ;;
+        esac
+        echo "Thoryn provisioning: $mode ($EVENT_NAME on $REF)"
+        echo "mode=$mode" >> "$GITHUB_OUTPUT"
+
+    - name: Download the released thoryn CLI
+      if: steps.mode.outputs.mode != 'skip'
+      shell: bash
+      env:
+        CLI_VERSION: ${{ inputs.cli-version }}
+        ACTION_REF: ${{ github.action_ref }}
+      run: |
+        set -euo pipefail
+        fail() { echo "::error::$*" >&2; exit 1; }
+        tag="$CLI_VERSION"
+        if [ -z "$tag" ]; then
+          case "$ACTION_REF" in refs/tags/cli-v*) tag="${ACTION_REF#refs/tags/}" ;; cli-v*) tag="$ACTION_REF" ;; esac
+        fi
+        [[ "$tag" =~ ^cli-v[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "this action was called at '${ACTION_REF:-an unknown ref}', which is not a cli-v* release tag: pin the stub's uses: to a cli-v* tag, or set with.cli-version."
+        # The first release whose CLI lints a Forgejo stub (ProvisioningWorkflowContract.FORGEJO_MINIMUM_RELEASE).
+        minimum="0.61.0"
+        [ "$(printf '%s\n' "$minimum" "${tag#cli-v}" | sort -V | head -1)" = "$minimum" ] || fail "release $tag predates Forgejo provisioning: set cli-version to cli-v$minimum or newer (or leave it empty)."
+        case "$(uname -s)/$(uname -m)" in
+          Linux/x86_64|Linux/amd64) asset=thoryn-linux-amd64 ;;
+          Linux/aarch64|Linux/arm64) asset=thoryn-linux-arm64 ;;
+          *) fail "unsupported runner platform $(uname -s)/$(uname -m): the action runs the CLI's Linux build (amd64 or arm64)." ;;
+        esac
+        dir="${RUNNER_TEMP:-/tmp}/thoryn-provisioning"
+        rm -rf "$dir"; mkdir -p "$dir"
+        base="https://github.com/thoryn-io/thoryn-cli/releases/download/$tag"
+        if curl -fsSL --retry 3 -o "$dir/thoryn" "$base/$asset"; then
+          chmod 0755 "$dir/thoryn"
+          echo "Using thoryn CLI release $tag ($asset)"
+        else
+          # A release's native legs are best-effort; its thoryn.jar is always published.
+          java_major="$(java -version 2>&1 | sed -n 's/.*version "\([0-9][0-9]*\).*/\1/p' | head -1 || true)"
+          [ -n "$java_major" ] && [ "$java_major" -ge 21 ] || fail "release $tag has no $asset, and no Java 21+ is on PATH for its thoryn.jar: use a release with the native binary, or a runner image with Java 21."
+          curl -fsSL --retry 3 -o "$dir/thoryn.jar" "$base/thoryn.jar" || fail "could not download thoryn.jar for release $tag"
+          printf '#!/usr/bin/env bash\nexec java -jar "%s" "$@"\n' "$dir/thoryn.jar" > "$dir/thoryn"
+          chmod 0755 "$dir/thoryn"
+          echo "::notice::release $tag has no $asset; running its thoryn.jar on Java $java_major."
+        fi
+        "$dir/thoryn" --version
+
+    - name: Check the stub and read .thoryn/workflow.yaml
+      if: steps.mode.outputs.mode != 'skip'
+      shell: bash
+      env:
+        CONFIG: ${{ inputs.config }}
+        WORKFLOW_REF: ${{ github.workflow_ref }}
+        WORKFLOW: ${{ github.workflow }}
+      run: |
+        set -euo pipefail
+        fail() { echo "::error::$*" >&2; exit 1; }
+        dir="${RUNNER_TEMP:-/tmp}/thoryn-provisioning"
+        # The workflow that called this action: github.workflow_ref is <owner>/<repo>/<path>@<ref>; Forgejo's
+        # github.workflow is the file name; else the stub's documented path.
+        stub=""
+        case "$WORKFLOW_REF" in */*/*@*) stub="${WORKFLOW_REF#*/*/}"; stub="${stub%@*}" ;; esac
+        if [ -z "$stub" ] || [ ! -f "$stub" ]; then
+          case "$WORKFLOW" in *.yml|*.yaml) stub=".forgejo/workflows/${WORKFLOW##*/}" ;; *) stub="" ;; esac
+        fi
+        if [ -z "$stub" ] || [ ! -f "$stub" ]; then stub=".forgejo/workflows/thoryn-provisioning.yml"; fi
+        [ -f "$stub" ] || fail "cannot find the workflow that called this action ($stub): check the repository out before calling it."
+        echo "$stub" > "$dir/stub-path"
+        report="$dir/workflow.json"
+        if ! "$dir/thoryn" provision workflow check --file "$stub" --config "$CONFIG" --output json > "$report"; then
+          "$dir/thoryn" provision workflow check --file "$stub" --config "$CONFIG" || true
+          fail "the provisioning stub or $CONFIG does not satisfy the contract: the rules above name each fix."
+        fi
+        echo "Configuration ($(jq -r '.config.source // "built-in defaults"' "$report")): $(jq -r '[.config.files[].file] | join(", ")' "$report")"
+
+    - name: Plan or apply every configured file as this repository
+      if: steps.mode.outputs.mode != 'skip'
+      shell: bash
+      env:
+        MODE: ${{ steps.mode.outputs.mode }}
+        SHA: ${{ github.sha }}
+        ID_TOKEN_ORIGIN: ${{ inputs.id-token-origin }}
+        THORYN_ISSUER: ${{ inputs.issuer }}
+        THORYN_HUB: ${{ inputs.issuer }}
+        # Headless runner, no OS keychain: the CLI's documented CI token store (an ephemeral file on this runner).
+        THORYN_CI_PLAINTEXT_TOKENS: "1"
+      run: |
+        set -euo pipefail
+        fail() { echo "::error::$*" >&2; exit 1; }
+        dir="${RUNNER_TEMP:-/tmp}/thoryn-provisioning"
+        report="$dir/workflow.json"
+        thoryn="$dir/thoryn"
+        summary="${GITHUB_STEP_SUMMARY:-/dev/null}"
+        if [ "$MODE" = apply ]; then
+          # An apply converges what the dispatched commit on the default branch declares, nothing else.
+          head="$(git rev-parse HEAD 2>/dev/null || true)"
+          [ "$head" = "$SHA" ] || fail "an apply runs only at the dispatched commit $SHA; the checkout is at '${head:-no git checkout}'. Check the repository out without a ref: input."
+        fi
+        # env: allow-listed THORYN_* names from the config, EXPORTED (never evaluated); the CLI already refused anything else.
+        while IFS=$'\t' read -r name value; do
+          [ -n "$name" ] || continue
+          [[ "$name" =~ ^THORYN_[A-Z0-9_]+$ ]] || fail "refusing environment variable '$name'"
+          export "$name=$value"
+        done < <(jq -r '.config.env | to_entries[] | [.key, (.value | tostring)] | @tsv' "$report")
+
+        # Behind an authenticating proxy: a fresh job token for a connection whose auth.tokenSource is a file.
+        token_file=""
+        mint() {
+          local connection="$1" kind audience offered origin path url body code
+          token_file=""
+          kind="$(jq -r '.auth.tokenSource.kind // empty' "$connection")"
+          [ "$kind" = file ] || return 0
+          token_file="$(jq -r '.auth.tokenSource.path // empty' "$connection")"
+          audience="$(jq -r '.auth.audience // empty' "$connection")"
+          [ -n "$token_file" ] && [ -n "$audience" ] || fail "$connection reads its token from a file, so it must name auth.tokenSource.path and auth.audience (the trust's audience, as 'thoryn workload-identity trusts get <id> --connection' prints it)."
+          offered="${ACTIONS_ID_TOKEN_REQUEST_URL:-}"
+          [ -n "$offered" ] && [ -n "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ] || fail "no ID token is offered to this job: set enable-openid-connect: true on the stub's job (forgejo-runner v12.5.0 or later)."
+          origin="$(printf '%s' "$offered" | sed -E 's#^(https?://[^/]+)/.*#\1#')"
+          path="${offered#"$origin"}"
+          # The same route under another origin (an instance whose ROOT_URL has a path keeps it).
+          case "$path" in /api/actions/_apis/pipelines/workflows/*/idtoken*|/*/api/actions/_apis/pipelines/workflows/*/idtoken*) ;; *) fail "ACTIONS_ID_TOKEN_REQUEST_URL has an unexpected path" ;; esac
+          url="${ID_TOKEN_ORIGIN:-$origin}"; url="${url%/}${path}"
+          case "$url" in *\?*) url="${url}&" ;; *) url="${url}?" ;; esac
+          url="${url}audience=$(jq -rn --arg a "$audience" '$a|@uri')"
+          body="$(mktemp)"
+          # The request token goes in a curl config read from a pipe, never on the command line.
+          code="$(curl -s -o "$body" -w '%{http_code}' --max-time 20 \
+            -K <(printf 'header = "Authorization: Bearer %s"\n' "$ACTIONS_ID_TOKEN_REQUEST_TOKEN") "$url" || true)"
+          if [ "$code" != 200 ]; then rm -f "$body"; fail "the instance answered HTTP $code to the ID token request at ${ID_TOKEN_ORIGIN:-$origin} (a 302 is the authenticating proxy: set id-token-origin)."; fi
+          mkdir -p "$(dirname "$token_file")"
+          ( umask 077; jq -r '.value // empty' "$body" > "$token_file" )
+          rm -f "$body"
+          [ -s "$token_file" ] || fail "the instance issued no ID token (HTTP 200 without .value)"
+        }
+        cleanup() { if [ -n "$token_file" ]; then rm -f "$token_file"; fi; }
+        trap cleanup EXIT
+
+        prune="$(jq -r '.config.apply.prune' "$report")"
+        confirm="$(jq -r '.config.apply.confirm' "$report")"
+        destroy="$(jq -r '.config.apply.destroy' "$report")"
+        while read -r entry; do
+          file="$(jq -r '.file' <<<"$entry")"; connection="$(jq -r '.connection' <<<"$entry")"
+          mint "$connection"
+          "$thoryn" login --connection "$connection" < /dev/null
+          if [ "$MODE" = plan ]; then
+            { echo "## Thoryn provisioning plan: $file"; echo; echo '<pre>'; } >> "$summary"
+            "$thoryn" provision plan --file "$file" < /dev/null | tee -a "$summary"
+            echo '</pre>' >> "$summary"
+          else
+            args=(provision apply --file "$file" --yes)
+            # Removals only when the committed configuration says so (both false by default).
+            if [ "$prune" = "true" ]; then args+=(--prune); fi
+            if [ -n "$confirm" ]; then args+=(--confirm "$confirm"); fi
+            { echo "## Applied: $file"; echo; echo '<pre>'; } >> "$summary"
+            "$thoryn" "${args[@]}" < /dev/null | tee -a "$summary"
+            echo '</pre>' >> "$summary"
+          fi
+          cleanup; token_file=""
+        done < <(jq -c '.config.files[]' "$report")
+
+        # apply.destroy: true: an ephemeral fixture is torn down after it was converged. Never the default.
+        if [ "$MODE" = apply ] && [ "$destroy" = "true" ]; then
+          while read -r entry; do
+            file="$(jq -r '.file' <<<"$entry")"; connection="$(jq -r '.connection' <<<"$entry")"
+            mint "$connection"
+            "$thoryn" login --connection "$connection" < /dev/null
+            args=(provision destroy --file "$file" --yes)
+            if [ -n "$confirm" ]; then args+=(--confirm "$confirm"); fi
+            "$thoryn" "${args[@]}" < /dev/null | tee -a "$summary"
+            cleanup; token_file=""
+          done < <(jq -c '.config.files[]' "$report")
+        fi
+        if [ "$MODE" = apply ]; then
+          echo "Applied $(jq -r '.config.files | length' "$report") provisioning file(s) as this repository's own workload identity, from a workflow_dispatch of the default branch. Nothing is committed back." | tee -a "$summary"
+        fi
